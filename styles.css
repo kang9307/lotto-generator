@@ -1,10 +1,10 @@
 /**
  * 로또 번호 생성기 (Lotto Number Generator)
- * Copyright (c) 2023-2025 lotto.rewrite.kr
+ * Copyright (c) 2023-2025 braindetox.kr
  * All rights reserved.
  * 
  * 사유 라이센스 (Proprietary License):
- * 이 소프트웨어는 lotto.rewrite.kr의 독점 소유물입니다.
+ * 이 소프트웨어는 braindetox.kr의 독점 소유물입니다.
  * 저작권자의 명시적인 서면 허가 없이 이 소프트웨어의 전체 또는 일부를
  * 복제, 수정, 배포하거나 파생 작업을 생성하는 것을 금지합니다.
  * 
