@@ -109,10 +109,10 @@ document.addEventListener('DOMContentLoaded', function() {
         togglePasswordVisibilityBtn.addEventListener('click', function() {
             if (validatePasswordInput.type === 'password') {
                 validatePasswordInput.type = 'text';
-                togglePasswordVisibilityBtn.textContent = '숨기기';
+                togglePasswordVisibilityBtn.textContent = '비밀번호 숨기기';
             } else {
                 validatePasswordInput.type = 'password';
-                togglePasswordVisibilityBtn.textContent = '보기';
+                togglePasswordVisibilityBtn.textContent = '비밀번호 보기';
             }
         });
     }
