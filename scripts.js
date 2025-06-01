@@ -22,33 +22,118 @@ document.addEventListener('DOMContentLoaded', function() {
     const lottoPaper = document.getElementById('lotto-paper');
     const issueDate = document.getElementById('issue-date');
     
+    // 메뉴 관련 요소
+    const navLinks = document.querySelectorAll('.nav-link');
+    const utilitySections = document.querySelectorAll('.utility-section');
+    
+    // 탭 관련 요소
+    const tabs = document.querySelectorAll('.tab');
+    const tabContents = document.querySelectorAll('.tab-content');
+    
     // 로또 용지의 행 ID
     const paperRowIds = ['paper-row-A', 'paper-row-B', 'paper-row-C', 'paper-row-D', 'paper-row-E'];
     const paperRowCopyIds = ['paper-row-A-copy', 'paper-row-B-copy', 'paper-row-C-copy', 'paper-row-D-copy', 'paper-row-E-copy'];
     
     // 오늘 날짜를 표시
-    const today = new Date();
-    const formattedDate = `${today.getFullYear()}.${String(today.getMonth()+1).padStart(2, '0')}.${String(today.getDate()).padStart(2, '0')}`;
-    issueDate.textContent = formattedDate;
+    if (issueDate) {
+        const today = new Date();
+        const formattedDate = `${today.getFullYear()}.${String(today.getMonth()+1).padStart(2, '0')}.${String(today.getDate()).padStart(2, '0')}`;
+        issueDate.textContent = formattedDate;
+    }
+    
+    // 탭 전환 이벤트 설정
+    if (tabs.length > 0 && tabContents.length > 0) {
+        tabs.forEach(tab => {
+            tab.addEventListener('click', function() {
+                const tabId = this.getAttribute('data-tab');
+                
+                tabs.forEach(t => t.classList.remove('active'));
+                this.classList.add('active');
+                
+                tabContents.forEach(content => {
+                    content.classList.remove('active');
+                    if (content.id === tabId) {
+                        content.classList.add('active');
+                    }
+                });
+            });
+        });
+    }
+    
+    // 네비게이션 메뉴 이벤트 설정 - 수정된 부분
+    navLinks.forEach(link => {
+        link.addEventListener('click', function(e) {
+            const href = this.getAttribute('href');
+            
+            // .html로 끝나는 실제 페이지 링크는 기본 동작(페이지 이동)을 유지
+            if (href && (href.endsWith('.html') || href === '/' || href === '')) {
+                // 기본 동작을 막지 않음 (preventDefault 호출 없음)
+                return; // 페이지 이동 처리는 브라우저에 맡김
+            }
+            
+            // 내부 링크(#으로 시작하는)에 대해서만 SPA 방식 적용
+            if (href && href.startsWith('#')) {
+                e.preventDefault(); // 내부 링크에 대해서만 기본 동작 방지
+                const targetId = href.substring(1);
+                
+                // 활성 메뉴 표시 변경
+                navLinks.forEach(item => item.classList.remove('active'));
+                this.classList.add('active');
+                
+                // 해당 섹션 표시
+                utilitySections.forEach(section => {
+                    if (section.id === targetId) {
+                        section.classList.add('active');
+                    } else {
+                        section.classList.remove('active');
+                    }
+                });
+            }
+        });
+    });
+    
+    // URL 해시 값에 따라 초기 섹션 표시
+    function handleHashChange() {
+        const hash = window.location.hash;
+        
+        // 해시가 있는 경우에만 SPA 내부 링크 처리
+        if (hash && hash.startsWith('#')) {
+            const targetLink = document.querySelector(`.nav-link[href="${hash}"]`);
+            if (targetLink) {
+                // 내부 링크 클릭 효과
+                targetLink.click();
+            }
+        }
+    }
+    
+    // 초기 페이지 로드 및 해시 변경 시 처리
+    window.addEventListener('hashchange', handleHashChange);
+    handleHashChange();
     
     // 로또 용지 체크박스 이벤트
-    showPaperCheckbox.addEventListener('change', function() {
-        lottoPaper.style.display = this.checked ? 'flex' : 'none';
-        
-        // 체크박스가 체크되면 로또 용지 초기화 및 마킹
-        if (this.checked) {
-            initLottoPaper();
-            markLottoPaper();
-        }
-    });
+    if (showPaperCheckbox && lottoPaper) {
+        showPaperCheckbox.addEventListener('change', function() {
+            lottoPaper.style.display = this.checked ? 'flex' : 'none';
+            
+            // 체크박스가 체크되면 로또 용지 초기화 및 마킹
+            if (this.checked) {
+                initLottoPaper();
+                markLottoPaper();
+            }
+        });
+    }
     
     // 버튼에 클릭 이벤트 추가
-    generateBtn.addEventListener('click', generateLottoNumbers);
+    if (generateBtn) {
+        generateBtn.addEventListener('click', generateLottoNumbers);
+    }
     
     // 인쇄 버튼 이벤트
-    printBtn.addEventListener('click', function() {
-        window.print();
-    });
+    if (printBtn) {
+        printBtn.addEventListener('click', function() {
+            window.print();
+        });
+    }
     
     // 로또 번호 생성 함수
     function generateLottoNumbers() {
@@ -172,18 +257,26 @@ document.addEventListener('DOMContentLoaded', function() {
     function initLottoPaper() {
         // 상단 로또 용지 초기화
         paperRowIds.forEach(rowId => {
-            initLottoRow(rowId);
+            const rowElement = document.getElementById(rowId);
+            if (rowElement) {
+                initLottoRow(rowId);
+            }
         });
         
         // 하단 로또 용지 초기화 (복사본)
         paperRowCopyIds.forEach(rowId => {
-            initLottoRow(rowId);
+            const rowElement = document.getElementById(rowId);
+            if (rowElement) {
+                initLottoRow(rowId);
+            }
         });
     }
 
     // 각 로또 행 초기화 함수
     function initLottoRow(rowId) {
         const rowContainer = document.getElementById(rowId);
+        if (!rowContainer) return;
+        
         rowContainer.innerHTML = ''; // 기존 내용 초기화
         
         // 1~45 번호를 행별로 정렬하여 생성 (5행 9열)
@@ -198,11 +291,11 @@ document.addEventListener('DOMContentLoaded', function() {
         // 각 행의 번호를 순서대로 추가
         rows.forEach(row => {
             row.forEach(num => {
-                const numDiv = document.createElement('div');
-                numDiv.classList.add('paper-number');
-                numDiv.setAttribute('data-number', num);
-                numDiv.textContent = num;
-                rowContainer.appendChild(numDiv);
+                const numSpan = document.createElement('span');
+                numSpan.classList.add('paper-number');
+                numSpan.textContent = num;
+                numSpan.dataset.number = num;
+                rowContainer.appendChild(numSpan);
             });
         });
     }
@@ -210,43 +303,81 @@ document.addEventListener('DOMContentLoaded', function() {
     // 로또 용지 마킹 함수
     function markLottoPaper() {
         // 모든 마킹 초기화
-        const allPaperNumbers = document.querySelectorAll('.paper-number');
-        allPaperNumbers.forEach(num => {
+        const allNumbers = document.querySelectorAll('.paper-number');
+        allNumbers.forEach(num => {
             num.classList.remove('marked');
         });
         
-        // 생성된 게임 수 확인
+        // 결과 컨테이너에서 생성된 모든 게임의 번호 가져오기
         const games = document.querySelectorAll('.game');
-        const gameCount = games.length;
         
-        // 각 게임별로 마킹 (상단 로또 용지)
-        for (let i = 0; i < gameCount && i < 5; i++) { // 최대 5개 게임만 마킹 (A~E)
-            const gameNumbers = games[i].querySelectorAll('.number');
-            const rowId = paperRowIds[i];
+        // 최대 5개 게임만 마킹 (A-E 행)
+        for (let i = 0; i < Math.min(games.length, 5); i++) {
+            const gameNumbers = [];
+            const numberElements = games[i].querySelectorAll('.number');
             
-            markRowNumbers(rowId, gameNumbers);
-        }
-        
-        // 하단 로또 용지도 동일하게 마킹 (복사본)
-        for (let i = 0; i < gameCount && i < 5; i++) {
-            const gameNumbers = games[i].querySelectorAll('.number');
-            const rowId = paperRowCopyIds[i];
+            numberElements.forEach(el => {
+                gameNumbers.push(parseInt(el.textContent));
+            });
             
-            markRowNumbers(rowId, gameNumbers);
+            // 해당 행에 번호 마킹
+            markRowNumbers(paperRowIds[i], gameNumbers);
+            
+            // 복사본 행에도 번호 마킹
+            markRowNumbers(paperRowCopyIds[i], gameNumbers);
         }
     }
     
-    // 각 행의 번호 마킹 함수
+    // 특정 행에 번호 마킹
     function markRowNumbers(rowId, gameNumbers) {
-        gameNumbers.forEach(numElem => {
-            const num = parseInt(numElem.textContent);
-            const paperNumber = document.querySelector(`#${rowId} .paper-number[data-number="${num}"]`);
-            if (paperNumber) {
-                paperNumber.classList.add('marked');
+        const rowElement = document.getElementById(rowId);
+        if (!rowElement) return;
+        
+        const paperNumbers = rowElement.querySelectorAll('.paper-number');
+        
+        paperNumbers.forEach(numEl => {
+            const num = parseInt(numEl.dataset.number);
+            if (gameNumbers.includes(num)) {
+                numEl.classList.add('marked');
             }
         });
     }
     
     // 초기화: 로또 용지 번호 생성
     initLottoPaper();
+
+    // 링크 복사 기능 (있는 경우)
+    const linkCopyBtn = document.getElementById('link-copy');
+    if (linkCopyBtn) {
+        linkCopyBtn.addEventListener('click', function() {
+            const currentUrl = window.location.href;
+            navigator.clipboard.writeText(currentUrl).then(() => {
+                showToast('링크가 복사되었습니다!');
+            });
+        });
+    }
+
+    // 토스트 메시지 표시 함수
+    function showToast(message) {
+        const toast = document.createElement('div');
+        toast.className = 'toast-message';
+        toast.textContent = message;
+        document.body.appendChild(toast);
+        
+        // 토스트 메시지 표시
+        setTimeout(() => {
+            toast.style.display = 'block';
+            setTimeout(() => {
+                toast.style.opacity = '1';
+            }, 10);
+        }, 100);
+        
+        // 2초 후 토스트 메시지 숨기기
+        setTimeout(() => {
+            toast.style.opacity = '0';
+            setTimeout(() => {
+                document.body.removeChild(toast);
+            }, 300);
+        }, 2000);
+    }
 }); 
