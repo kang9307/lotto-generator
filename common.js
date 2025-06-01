@@ -12,7 +12,7 @@ document.addEventListener('DOMContentLoaded', function() {
         const headerHTML = `
         <header class="main-header">
             <div class="header-container">
-                <h1 class="site-title">BrainDetox Utility Box</h1>
+                <h1 class="site-title"><a href="index.html" style="color: inherit; text-decoration: none;">BrainDetox Utility Box</a></h1>
                 <nav class="main-nav">
                     <ul class="nav-list">
                         <li class="nav-item">
