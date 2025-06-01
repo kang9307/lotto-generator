@@ -12,7 +12,7 @@ document.addEventListener('DOMContentLoaded', function() {
         const headerHTML = `
         <header class="main-header">
             <div class="header-container">
-                <h1 class="site-title">늙은아이의 유틸리티 창고</h1>
+                <h1 class="site-title">BrainDetox Utility Box</h1>
                 <nav class="main-nav">
                     <ul class="nav-list">
                         <li class="nav-item">
@@ -27,6 +27,9 @@ document.addEventListener('DOMContentLoaded', function() {
                         <li class="nav-item">
                             <a href="password.html" class="nav-link">비밀번호 생성기</a>
                         </li>
+                        <li class="nav-item">
+                            <a href="qrcode.html" class="nav-link">QR 코드 생성기</a>
+                        </li>
                     </ul>
                 </nav>
             </div>
@@ -36,7 +39,7 @@ document.addEventListener('DOMContentLoaded', function() {
         <footer class="main-footer">
             <div class="footer-container">
                 <p class="footer-text">
-                    &copy; 2025 늙은아이의 유틸리티 창고. 모든 권리 보유.
+                    &copy; 2025 BrainDetox Utility Box. 모든 권리 보유.
                 </p>
                 <p class="footer-text">
                     사이트 내 모든 도구는 무료로 제공되며, 문의사항은 이메일(<a href="mailto:jhtoka@gmail.com" class="footer-link">jhtoka@gmail.com</a>)로 연락 바랍니다.

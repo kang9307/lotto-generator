@@ -1,5 +1,5 @@
 /**
- * 늙은아이의 유틸리티 창고 - 로또 번호 생성기
+ * BrainDetox Utility Box - 로또 번호 생성기
  * Copyright (c) 2023-2025
  */
 
