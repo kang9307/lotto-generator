@@ -4,34 +4,81 @@
  */
 
 document.addEventListener('DOMContentLoaded', function() {
-    // 헤더 로드
-    fetch('components/header.html')
-        .then(response => response.text())
-        .then(data => {
-            document.getElementById('header-placeholder').innerHTML = data;
-            
-            // 현재 페이지 URL 기반으로 활성 메뉴 설정
-            const currentPage = window.location.pathname.split('/').pop() || 'index.html';
-            const menuLinks = document.querySelectorAll('.nav-link');
-            menuLinks.forEach(link => {
-                if (link.getAttribute('href') === currentPage) {
-                    link.classList.add('active');
-                }
-            });
-        })
-        .catch(error => {
-            console.error('헤더를 로드하는 중 오류가 발생했습니다:', error);
-            document.getElementById('header-placeholder').innerHTML = '<p>헤더를 로드할 수 없습니다.</p>';
-        });
+    // 환경 감지 (로컬 파일 시스템인지 웹 서버인지)
+    const isLocalFileSystem = window.location.protocol === 'file:';
     
-    // 푸터 로드
-    fetch('components/footer.html')
-        .then(response => response.text())
-        .then(data => {
-            document.getElementById('footer-placeholder').innerHTML = data;
-        })
-        .catch(error => {
-            console.error('푸터를 로드하는 중 오류가 발생했습니다:', error);
-            document.getElementById('footer-placeholder').innerHTML = '<p>푸터를 로드할 수 없습니다.</p>';
+    if (isLocalFileSystem) {
+        // 로컬 파일 시스템에서는 하드코딩된 HTML 사용
+        const headerHTML = `
+        <header class="main-header">
+            <div class="header-container">
+                <h1 class="site-title">늙은아이의 유틸리티 창고</h1>
+                <nav class="main-nav">
+                    <ul class="nav-list">
+                        <li class="nav-item">
+                            <a href="index.html" class="nav-link">홈</a>
+                        </li>
+                        <li class="nav-item">
+                            <a href="lotto.html" class="nav-link">로또 번호 생성기</a>
+                        </li>
+                        <li class="nav-item">
+                            <a href="subnet.html" class="nav-link">서브넷 계산기</a>
+                        </li>
+                        <li class="nav-item">
+                            <a href="password.html" class="nav-link">비밀번호 생성기</a>
+                        </li>
+                    </ul>
+                </nav>
+            </div>
+        </header>`;
+
+        const footerHTML = `
+        <footer class="main-footer">
+            <div class="footer-container">
+                <p class="footer-text">
+                    &copy; 2025 늙은아이의 유틸리티 창고. 모든 권리 보유.
+                </p>
+                <p class="footer-text">
+                    사이트 내 모든 도구는 무료로 제공되며, 문의사항은 이메일(<a href="mailto:jhtoka@gmail.com" class="footer-link">jhtoka@gmail.com</a>)로 연락 바랍니다.
+                </p>
+            </div>
+        </footer>`;
+
+        document.getElementById('header-placeholder').innerHTML = headerHTML;
+        document.getElementById('footer-placeholder').innerHTML = footerHTML;
+        setupActiveMenu();
+    } else {
+        // 웹 서버 환경에서는 fetch API 사용 (더 현대적인 방식)
+        fetch('components/header.html')
+            .then(response => response.text())
+            .then(data => {
+                document.getElementById('header-placeholder').innerHTML = data;
+                setupActiveMenu();
+            })
+            .catch(error => {
+                console.error('헤더를 로드하는 중 오류가 발생했습니다:', error);
+                document.getElementById('header-placeholder').innerHTML = '<p>헤더를 로드할 수 없습니다.</p>';
+            });
+        
+        fetch('components/footer.html')
+            .then(response => response.text())
+            .then(data => {
+                document.getElementById('footer-placeholder').innerHTML = data;
+            })
+            .catch(error => {
+                console.error('푸터를 로드하는 중 오류가 발생했습니다:', error);
+                document.getElementById('footer-placeholder').innerHTML = '<p>푸터를 로드할 수 없습니다.</p>';
+            });
+    }
+    
+    // 현재 페이지에 맞는 메뉴 활성화
+    function setupActiveMenu() {
+        const currentPage = window.location.pathname.split('/').pop() || 'index.html';
+        const menuLinks = document.querySelectorAll('.nav-link');
+        menuLinks.forEach(link => {
+            if (link.getAttribute('href') === currentPage) {
+                link.classList.add('active');
+            }
         });
+    }
 }); 
