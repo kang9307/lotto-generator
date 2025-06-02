@@ -1,5 +1,5 @@
 <!-- category: 리눅스 -->
-<!-- date: 2025-07-20 -->
+<!-- date: 2025-06-02 -->
 <!-- featured: true -->
 <!-- keywords: 리눅스, grep, awk, 텍스트 처리, 명령어, 정규표현식, Linux, command line, text processing, regular expression -->
 <!-- title: 리눅스 Grep과 AWK 사용 가이드 (Linux Grep and AWK Usage Guide) -->
