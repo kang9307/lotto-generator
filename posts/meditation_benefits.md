@@ -1,5 +1,5 @@
 <!-- category: 건강 -->
-<!-- date: 2025-06-04 -->
+<!-- date: 2025-06-02 -->
 <!-- featured: true -->
 <!-- keywords: 명상, 효능, 스트레스 감소, 불안 완화, 집중력, 마음챙김, 수면, 혈압, 명상법, 초보자, 건강, 정신건강, meditation, mindfulness, stress reduction, anxiety relief, focus, sleep quality, blood pressure, beginner meditation, health, mental health -->
 <!-- title: 명상의 7가지 놀라운 건강 효과와 초보자를 위한 시작 방법 (7 Amazing Health Benefits of Meditation and How to Start as a Beginner) -->

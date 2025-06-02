@@ -1,12 +1,7 @@
----
-title: "건강한 다이어트와 영양의 과학: 지속 가능한 체중 관리 완전 가이드"
-titleEn: "The Science of Healthy Diet and Nutrition: Complete Guide to Sustainable Weight Management"
-date: "2025-01-21"
-category: "영양"
-featured: true
-keywords: ["다이어트", "영양", "체중관리", "건강한 식단", "균형영양", "체중감량", "영양소"]
-keywordsEn: ["diet", "nutrition", "weight management", "healthy eating", "balanced nutrition", "weight loss", "nutrients"]
----
+<!-- title: 건강한 다이어트와 영양의 과학: 지속 가능한 체중 관리 완전 가이드 -->
+<!-- category: 영양 -->
+<!-- date: 2025-01-21 -->
+<!-- keywords: 다이어트, 영양, 체중관리, 건강한 식단, 균형영양, 체중감량, 영양소 -->
 
 # 건강한 다이어트와 영양의 과학: 지속 가능한 체중 관리 완전 가이드
 

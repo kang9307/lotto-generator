@@ -1,12 +1,7 @@
----
-title: "스트레스 관리와 명상의 과학: 마음의 평화를 찾는 완전 가이드"
-titleEn: "The Science of Stress Management and Meditation: Complete Guide to Finding Inner Peace"
-date: "2025-01-21"
-category: "정신건강"
-featured: true
-keywords: ["스트레스 관리", "명상", "마음챙김", "정신건강", "이완법", "스트레스 해소", "마음의 평화"]
-keywordsEn: ["stress management", "meditation", "mindfulness", "mental health", "relaxation", "stress relief", "inner peace"]
----
+<!-- title: 스트레스 관리와 명상의 과학: 마음의 평화를 찾는 완전 가이드 -->
+<!-- category: 정신건강 -->
+<!-- date: 2025-01-21 -->
+<!-- keywords: 스트레스 관리, 명상, 마음챙김, 정신건강, 이완법, 스트레스 해소, 마음의 평화 -->
 
 # 스트레스 관리와 명상의 과학: 마음의 평화를 찾는 완전 가이드
 

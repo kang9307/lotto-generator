@@ -1,12 +1,7 @@
----
-title: "불면증 극복을 위한 과학적으로 입증된 10가지 방법: 숙면의 과학"
-titleEn: "10 Scientifically Proven Methods to Overcome Insomnia: The Science of Quality Sleep"
-date: "2025-01-21"
-category: "건강"
-featured: true
-keywords: ["불면증", "수면장애", "숙면", "수면위생", "인지행동치료", "멜라토닌", "스트레스 관리"]
-keywordsEn: ["insomnia", "sleep disorder", "quality sleep", "sleep hygiene", "CBT-I", "melatonin", "stress management"]
----
+<!-- title: 불면증 극복을 위한 과학적으로 입증된 10가지 방법: 숙면의 과학 -->
+<!-- category: 건강 -->
+<!-- date: 2025-01-21 -->
+<!-- keywords: 불면증, 수면장애, 숙면, 수면위생, 인지행동치료, 멜라토닌, 스트레스 관리 -->
 
 # 불면증 극복을 위한 과학적으로 입증된 10가지 방법: 숙면의 과학
 

@@ -1,6 +1,6 @@
 <!-- title: PHP 언어 완벽 가이드 - 함수와 배열 (PHP Functions and Arrays) -->
 <!-- category: 프로그래밍 -->
-<!-- date: 2025-06-05 -->
+<!-- date: 2025-06-02 -->
 <!-- keywords: PHP, 웹 개발, PHP 함수, PHP 배열, PHP 문자열, PHP 매개변수, PHP 반환값, PHP 함수 참조 -->
 
 # PHP 함수와 배열

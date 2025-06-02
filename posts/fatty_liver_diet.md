@@ -1,8 +1,7 @@
+<!-- title: 지방간을 해소하기 위한 식습관 (Dietary Habits to Resolve Fatty Liver) -->
 <!-- category: 건강 -->
 <!-- date: 2025-01-21 -->
-<!-- featured: true -->
 <!-- keywords: 지방간, 지방간 해소, 지방간 식습관, 지방간 치료, 간 건강, 식단 관리, 지방간 예방, NAFLD -->
-<!-- title: 지방간을 해소하기 위한 식습관 (Dietary Habits to Resolve Fatty Liver) -->
 
 # 지방간을 해소하기 위한 식습관 (Dietary Habits to Resolve Fatty Liver)
 

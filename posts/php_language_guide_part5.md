@@ -1,6 +1,6 @@
 <!-- title: PHP 언어 완벽 가이드 - 객체지향 프로그래밍 (PHP Object-Oriented Programming) -->
 <!-- category: 프로그래밍 -->
-<!-- date: 2025-06-05 -->
+<!-- date: 2025-06-02 -->
 <!-- keywords: PHP, 웹 개발, PHP OOP, PHP 객체지향, PHP 클래스, PHP 인터페이스, PHP 추상 클래스, PHP 네임스페이스, PHP 트레이트 -->
 
 # PHP 객체지향 프로그래밍

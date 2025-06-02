@@ -1,8 +1,7 @@
+<!-- title: 빈혈과 숨가쁨: 답답한 증상의 원인부터 관리까지 (Anemia and Breathlessness: From Causes to Management) -->
 <!-- category: 건강 -->
 <!-- date: 2025-01-21 -->
-<!-- featured: true -->
 <!-- keywords: 빈혈, 숨가쁨, 철결핍성 빈혈, 빈혈 증상, 빈혈 치료, 호흡곤란, 답답함, 혈색소, 철분 -->
-<!-- title: 빈혈과 숨가쁨: 답답한 증상의 원인부터 관리까지 (Anemia and Breathlessness: From Causes to Management) -->
 
 # 빈혈과 숨가쁨: 답답한 증상의 원인부터 관리까지 (Anemia and Breathlessness: From Causes to Management)
 

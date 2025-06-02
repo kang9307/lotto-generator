@@ -1,12 +1,7 @@
----
-title: "재택근무 효율성을 높이는 홈오피스 구성 완벽 가이드: 생산성 극대화 전략"
-titleEn: "Complete Home Office Setup Guide for Remote Work Efficiency: Productivity Maximization Strategies"
-date: "2025-01-21"
-category: "라이프스타일"
-featured: true
-keywords: ["재택근무", "홈오피스", "생산성", "업무환경", "인테리어", "작업공간", "원격근무"]
-keywordsEn: ["remote work", "home office", "productivity", "workspace", "interior design", "work environment", "telecommuting"]
----
+<!-- title: 재택근무 효율성을 높이는 홈오피스 구성 완벽 가이드: 생산성 극대화 전략 -->
+<!-- category: 라이프스타일 -->
+<!-- date: 2025-01-21 -->
+<!-- keywords: 재택근무, 홈오피스, 생산성, 업무환경, 인테리어, 작업공간, 원격근무 -->
 
 # 재택근무 효율성을 높이는 홈오피스 구성 완벽 가이드: 생산성 극대화 전략
 

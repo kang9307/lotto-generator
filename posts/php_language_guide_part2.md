@@ -1,6 +1,6 @@
 <!-- title: PHP 언어 완벽 가이드 - 기초 문법과 데이터 타입 (PHP Basic Syntax and Data Types) -->
 <!-- category: 프로그래밍 -->
-<!-- date: 2025-06-05 -->
+<!-- date: 2025-06-02 -->
 <!-- keywords: PHP, 웹 개발, PHP 기본 문법, PHP 변수, PHP 데이터 타입, PHP 연산자, PHP 조건문, PHP 반복문, PHP 함수 -->
 
 # PHP 기본 문법과 데이터 타입

@@ -1,12 +1,7 @@
----
-title: "면역력 강화를 위한 식습관과 생활 루틴: 자연 면역력 극대화 가이드"
-titleEn: "Diet and Lifestyle for Immune System Boost: Natural Immunity Maximization Guide"
-date: "2025-01-21"
-category: "건강"
-featured: true
-keywords: ["면역력", "면역 강화", "건강한 식습관", "자연 면역", "생활 습관", "영양소", "건강 관리"]
-keywordsEn: ["immunity", "immune boost", "healthy diet", "natural immunity", "lifestyle", "nutrients", "health management"]
----
+<!-- title: 면역력 강화를 위한 식습관과 생활 루틴: 자연 면역력 극대화 가이드 -->
+<!-- category: 건강 -->
+<!-- date: 2025-01-21 -->
+<!-- keywords: 면역력, 면역 강화, 건강한 식습관, 자연 면역, 생활 습관, 영양소, 건강 관리 -->
 
 # 면역력 강화를 위한 식습관과 생활 루틴: 자연 면역력 극대화 가이드
 

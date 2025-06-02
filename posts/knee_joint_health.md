@@ -1,8 +1,7 @@
+<!-- title: 무릎 관절의 건강관리부터 인공관절 수술 후 재활까지 (Knee Joint Health Management and Artificial Joint Surgery Rehabilitation) -->
 <!-- category: 건강 -->
 <!-- date: 2025-01-21 -->
-<!-- featured: true -->
 <!-- keywords: 무릎관절, 관절염, 관절통증, 인공관절, 슬관절, 관절수술, 재활치료, 무릎통증, 퇴행성관절염 -->
-<!-- title: 무릎 관절의 건강관리부터 인공관절 수술 후 재활까지 (Knee Joint Health Management and Artificial Joint Surgery Rehabilitation) -->
 
 # 무릎 관절의 건강관리부터 인공관절 수술 후 재활까지 (Knee Joint Health Management and Artificial Joint Surgery Rehabilitation)
 

@@ -1,5 +1,5 @@
 <!-- category: 건강 -->
-<!-- date: 2025-06-03 -->
+<!-- date: 2025-06-02 -->
 <!-- featured: true -->
 <!-- keywords: 두부, 효능, 대두, 콩, 단백질, 식물성 단백질, 이소플라본, 칼슘, 콜레스테롤, 다이어트, 비건, 채식, 심혈관, 골다공증, tofu, soy, plant-based protein, isoflavones, calcium, cholesterol, diet, vegan, vegetarian, cardiovascular, osteoporosis -->
 <!-- title: 두부의 8가지 놀라운 건강 효능과 활용법 (8 Amazing Health Benefits of Tofu and How to Use It) -->

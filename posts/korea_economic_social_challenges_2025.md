@@ -1,6 +1,6 @@
 <!-- title: 한국의 중대 기로: 경제 한파, 사회적 긴장, 그리고 미래를 위한 모색 (South Korea at a Critical Juncture: Economic Downturn, Social Tensions, and the Search for Future Direction) -->
 <!-- category: 시사/경제 -->
-<!-- date: 2025-06-10 -->
+<!-- date: 2025-06-02 -->
 <!-- keywords: 한국 경제, 경기침체, 사회적 도전, GDP 감소, 청년실업, ACT 유출, 가계부채, 쪽방촌, 저출산, 고령화, 사회경제적 위기 -->
 
 # 한국의 중대 기로: 경제 한파, 사회적 긴장, 그리고 미래를 위한 모색

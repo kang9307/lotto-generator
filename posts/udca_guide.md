@@ -1,8 +1,7 @@
+<!-- title: 우루사(UDCA): 담석 용해 효과부터 올바른 복용법까지 (UDCA: From Gallstone Dissolution to Proper Usage) -->
 <!-- category: 건강 -->
 <!-- date: 2025-01-21 -->
-<!-- featured: true -->
 <!-- keywords: 우루사, UDCA, 담석, 담석 용해, 간 건강, 간 보호, 담낭, 우르소데옥시콜산, 우루사 복용법 -->
-<!-- title: 우루사(UDCA): 담석 용해 효과부터 올바른 복용법까지 (UDCA: From Gallstone Dissolution to Proper Usage) -->
 
 # 우루사(UDCA): 담석 용해 효과부터 올바른 복용법까지 (UDCA: From Gallstone Dissolution to Proper Usage)
 

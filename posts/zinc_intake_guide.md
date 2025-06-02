@@ -1,8 +1,7 @@
+<!-- title: 올바른 아연 섭취 방법 (Proper Zinc Intake Methods) -->
 <!-- category: 건강 -->
 <!-- date: 2025-01-21 -->
-<!-- featured: false -->
 <!-- keywords: 아연, 아연 섭취, 아연 부족, 아연 보충제, 면역력, 아연 효능, 아연 부작용, 아연 흡수 -->
-<!-- title: 올바른 아연 섭취 방법 (Proper Zinc Intake Methods) -->
 
 # 올바른 아연 섭취 방법 (Proper Zinc Intake Methods)
 

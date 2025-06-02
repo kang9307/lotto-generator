@@ -1,8 +1,7 @@
+<!-- title: 커피와 지방간과의 관계 (The Relationship Between Coffee and Fatty Liver) -->
 <!-- category: 건강 -->
 <!-- date: 2025-01-21 -->
-<!-- featured: false -->
 <!-- keywords: 커피, 지방간, 간 건강, 카페인, 항산화, 간 보호, 커피 섭취, 지방간 예방, 클로로겐산 -->
-<!-- title: 커피와 지방간과의 관계 (The Relationship Between Coffee and Fatty Liver) -->
 
 # 커피와 지방간과의 관계 (The Relationship Between Coffee and Fatty Liver)
 

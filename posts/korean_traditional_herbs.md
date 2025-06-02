@@ -1,5 +1,5 @@
 <!-- category: 건강 -->
-<!-- date: 2025-06-03 -->
+<!-- date: 2025-06-02 -->
 <!-- featured: true -->
 <!-- keywords: 한국 전통 약초, 한방, 인삼, 홍삼, 황기, 당귀, 구기자, 오미자, 산수유, 천궁, 약초 효능, 면역력 강화, 한의학, korean herbs, ginseng, red ginseng, medicinal herbs, herbal medicine, immunity boost, traditional korean medicine -->
 <!-- title: 한국 전통 약초 10가지의 놀라운 효능과 활용법 (10 Amazing Benefits of Korean Traditional Herbs) -->

@@ -1,6 +1,6 @@
 <!-- title: PHP 언어 완벽 가이드 - 연산자와 제어 구조 (PHP Operators and Control Structures) -->
 <!-- category: 프로그래밍 -->
-<!-- date: 2025-06-05 -->
+<!-- date: 2025-06-02 -->
 <!-- keywords: PHP, 웹 개발, PHP 연산자, PHP 조건문, PHP 반복문, PHP 제어 구조, PHP 문법, PHP switch, PHP if else -->
 
 # PHP 연산자와 제어 구조

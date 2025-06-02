@@ -1,6 +1,6 @@
 <!-- title: PHP 언어 완벽 가이드 - 기초부터 고급까지 (PHP Language Complete Guide) -->
 <!-- category: 프로그래밍 -->
-<!-- date: 2025-06-05 -->
+<!-- date: 2025-06-02 -->
 <!-- keywords: PHP, 웹 개발, 서버 사이드 스크립팅, 백엔드, 프로그래밍 언어, 웹 애플리케이션, PHP 기초, PHP 문법, PHP 함수, PHP 객체지향 -->
 
 # PHP 언어 완벽 가이드 - 기초부터 고급까지

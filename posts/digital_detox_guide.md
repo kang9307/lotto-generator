@@ -1,12 +1,7 @@
----
-title: "디지털 디톡스: 스마트폰 중독 극복을 위한 완벽 프로그램"
-titleEn: "Digital Detox: Complete Program to Overcome Smartphone Addiction"
-date: "2025-01-21"
-category: "라이프스타일"
-featured: true
-keywords: ["디지털 디톡스", "스마트폰 중독", "디지털 웰빙", "미니멀라이프", "스크린타임", "정신건강"]
-keywordsEn: ["digital detox", "smartphone addiction", "digital wellness", "minimalism", "screen time", "mental health"]
----
+<!-- title: 디지털 디톡스: 스마트폰 중독 극복을 위한 완벽 프로그램 -->
+<!-- category: 라이프스타일 -->
+<!-- date: 2025-01-21 -->
+<!-- keywords: 디지털 디톡스, 스마트폰 중독, 디지털 웰빙, 미니멀라이프, 스크린타임, 정신건강 -->
 
 # 디지털 디톡스: 스마트폰 중독 극복을 위한 완벽 프로그램
 

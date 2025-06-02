@@ -1,12 +1,7 @@
----
-title: "고혈압 관리를 위한 DASH 식이요법 완벽 가이드: 혈압 낮추는 식단의 모든 것"
-titleEn: "Complete DASH Diet Guide for Hypertension Management: Everything About Blood Pressure-Lowering Diet"
-date: "2025-01-21"
-category: "건강"
-featured: true
-keywords: ["DASH 식이요법", "고혈압", "혈압 관리", "식단", "건강한 식습관", "나트륨 제한", "심혈관 건강"]
-keywordsEn: ["DASH diet", "hypertension", "blood pressure management", "diet plan", "healthy eating", "sodium restriction", "cardiovascular health"]
----
+<!-- title: 고혈압 관리를 위한 DASH 식이요법 완벽 가이드: 혈압 낮추는 식단의 모든 것 -->
+<!-- category: 건강 -->
+<!-- date: 2025-01-21 -->
+<!-- keywords: DASH 식이요법, 고혈압, 혈압 관리, 식단, 건강한 식습관, 나트륨 제한, 심혈관 건강 -->
 
 # 고혈압 관리를 위한 DASH 식이요법 완벽 가이드: 혈압 낮추는 식단의 모든 것
 
