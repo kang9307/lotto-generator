@@ -156,10 +156,16 @@ document.addEventListener('DOMContentLoaded', function() {
             keywords: ''  // SEO용 키워드 추가
         };
         
-        // 첫 번째 줄이 H1(#)으로 시작하면 제목으로 사용
-        const titleMatch = content.match(/^# (.+)$/m);
-        if (titleMatch) {
-            metadata.title = titleMatch[1].trim();
+        // 메타데이터 주석에서 제목 추출 (<!-- title: 제목 -->)
+        const titleMetaMatch = content.match(/<!--\s*title:\s*(.+?)\s*-->/);
+        if (titleMetaMatch) {
+            metadata.title = titleMetaMatch[1].trim();
+        } else {
+            // 메타데이터에 제목이 없으면 첫 번째 줄이 H1(#)으로 시작하는지 확인
+            const titleMatch = content.match(/^# (.+)$/m);
+            if (titleMatch) {
+                metadata.title = titleMatch[1].trim();
+            }
         }
         
         // 카테고리 메타데이터 추출 (<!-- category: 카테고리명 -->)
@@ -544,6 +550,7 @@ document.addEventListener('DOMContentLoaded', function() {
                 .replace(/<!--\s*date:.*?-->/g, '')
                 .replace(/<!--\s*featured:.*?-->/g, '')
                 .replace(/<!--\s*keywords:.*?-->/g, '')
+                .replace(/<!--\s*title:.*?-->/g, '') // title 메타데이터 제거
                 .replace(/^#\s+.*?\n\s*\n/m, '\n'); // 첫 번째 h1 제목과 다음 빈 줄까지 제거 (멀티라인)
             
             // 마크다운 렌더링

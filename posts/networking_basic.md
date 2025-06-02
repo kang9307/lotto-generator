@@ -2,8 +2,7 @@
 <!-- date: 2025-06-01 -->
 <!-- featured: true -->
 <!-- keywords: TCP/IP, 네트워킹, 네트워크 기초, IP주소, 서브넷, 포트번호, networking, subnet, IP address, port number -->
-
-# TCP/IP 네트워크 기초 (TCP/IP Networking Basics)
+<!-- title: TCP/IP 네트워크 기초 (TCP/IP Networking Basics) -->
 
 네트워크는 현대 컴퓨팅 환경의 핵심입니다. 이 글에서는 TCP/IP 네트워크의 기본 개념과 작동 원리에 대해 알아봅니다.
 

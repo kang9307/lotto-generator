@@ -2,8 +2,7 @@
 <!-- date: 2025-06-01 -->
 <!-- featured: true -->
 <!-- keywords: JavaScript, 프로그래밍, 웹개발, 기초문법, programming, web development, syntax basics -->
-
-# JavaScript 기초 문법 정리 (JavaScript Basic Syntax)
+<!-- title: JavaScript 기초 문법 정리 (JavaScript Basic Syntax) -->
 
 JavaScript는 웹 개발에서 가장 널리 사용되는 프로그래밍 언어입니다. 이 글에서는 JavaScript의 기본 문법과 주요 개념에 대해 설명합니다.
 
