@@ -47,6 +47,9 @@ document.addEventListener('DOMContentLoaded', function() {
                 <p class="footer-text">
                     사이트 내 모든 도구는 무료로 제공되며, 문의사항은 이메일(<a href="mailto:jhtoka@gmail.com" class="footer-link">jhtoka@gmail.com</a>)로 연락 바랍니다.
                 </p>
+                <p class="footer-text">
+                    <a href="privacy.html" class="footer-link">개인정보 처리방침</a> | <a href="privacy.html" class="footer-link">Privacy Policy</a>
+                </p>
             </div>
         </footer>`;
 

@@ -205,92 +205,179 @@ document.addEventListener('DOMContentLoaded', function() {
             // 실제 파일 목록 확인
             const availablePosts = [];
             
-            // 알려진 모든 마크다운 파일 목록
-            // 로컬 및 웹 환경 모두에서 동작하도록 설정
-            const knownFiles = [
-                'javascript_basic.md',
-                'networking_basic.md'
-                // 더 많은 파일이 추가되면 여기에 추가
-            ];
-            
-            debugLog('총 ' + knownFiles.length + '개의 파일을 로드합니다.');
-            debugLog('마크다운 디렉토리 경로:', markdownDir);
-            // 개인정보 보호를 위해 전체 URL 대신 프로토콜만 표시
-            debugLog('브라우저 환경:', window.location.protocol);
-            
-            // 각 파일에 대해 처리
-            for (const filename of knownFiles) {
-                try {
-                    const filePath = `${markdownDir}${filename}`;
-                    debugLog(`파일 로드 시도: ${filePath}`);
+            try {
+                // 디렉토리 인덱스 파일을 통해 파일 목록 가져오기 시도
+                const response = await fetch(`${markdownDir}index.json`, {
+                    cache: 'no-store'
+                });
+                
+                let fileList = [];
+                
+                if (response.ok) {
+                    // index.json 파일이 있는 경우 (권장 방식)
+                    debugLog('디렉토리 인덱스 파일 발견');
+                    const indexData = await response.json();
+                    fileList = indexData.files || [];
+                    debugLog(`index.json에서 ${fileList.length}개 파일 목록 로드`);
+                } else {
+                    // index.json 파일이 없는 경우 디렉토리 목록 페이지 파싱 시도
+                    debugLog('인덱스 파일 없음. 파일 탐색을 시도합니다.');
                     
-                    // fetch API를 사용하여 파일 로드 시도
-                    // 캐시를 무시하고 항상 새로 로드 (디버깅용)
-                    const response = await fetch(filePath, { 
-                        cache: 'no-store',
-                        headers: {
-                            'Cache-Control': 'no-cache',
-                            'Pragma': 'no-cache'
-                        }
+                    // 마크다운 디렉토리 탐색 시도
+                    const dirResponse = await fetch(markdownDir, {
+                        cache: 'no-store'
                     });
                     
-                    debugLog(`파일 응답 상태: ${response.status} ${response.statusText}`);
-                    
-                    if (response.ok) {
-                        debugLog(`파일 로드 성공: ${filename}`);
-                        const content = await response.text();
-                        debugLog(`파일 내용 로드 (${content.length} 바이트)`);
+                    if (dirResponse.ok) {
+                        const html = await dirResponse.text();
+                        // HTML 디렉토리 목록에서 .md 파일 추출
+                        const parser = new DOMParser();
+                        const doc = parser.parseFromString(html, 'text/html');
+                        const links = doc.querySelectorAll('a');
                         
-                        // 콘텐츠가 비어있는지 확인
-                        if (!content || content.trim() === '') {
-                            debugLog(`경고: ${filename}의 내용이 비어 있습니다.`);
-                            continue;
-                        }
-                        
-                        // 메타데이터 추출
-                        const metadata = extractMetadata(content);
-                        
-                        // 파일 이름에서 ID 추출
-                        const id = getIdFromFilename(filename);
-                        
-                        // 마지막 수정 날짜는 메타데이터의 날짜 사용
-                        const modifiedDate = metadata.date;
-                        
-                        // 포스트 정보 저장
-                        availablePosts.push({
-                            id,
-                            title: metadata.title || filename, // 제목이 없으면 파일명 사용
-                            date: metadata.date,
-                            modifiedDate: modifiedDate,
-                            category: metadata.category,
-                            featured: metadata.featured,
-                            filename,
-                            content: content // 전체 콘텐츠도 저장
+                        links.forEach(link => {
+                            const href = link.getAttribute('href');
+                            if (href && href.endsWith('.md')) {
+                                fileList.push(href);
+                            }
                         });
                         
-                        // 카테고리 추가
-                        if (metadata.category) {
-                            categories.add(metadata.category);
-                        }
+                        debugLog(`디렉토리 탐색에서 ${fileList.length}개 마크다운 파일 발견`);
                     } else {
-                        console.warn(`파일을 찾을 수 없음: ${filename}, 상태 코드: ${response.status}`);
-                        // 추가 디버깅 정보
-                        debugLog(`파일 로드 실패. 상세 정보:`, {
-                            filePath,
-                            status: response.status,
-                            statusText: response.statusText,
-                            headers: Array.from(response.headers.entries())
+                        // 디렉토리 탐색도 실패한 경우 미리 알려진 파일 목록 사용
+                        debugLog('디렉토리 탐색 실패. 하드코딩된 목록 사용');
+                        fileList = [
+                            'javascript_basic.md',
+                            'networking_basic.md',
+                            'linux_grep_awk.md',
+                            'ceph_storage_intro.md',
+                            'artificial_intelligence_intro.md',
+                            'cheonggukjang_benefits.md',
+                            'tofu_health_benefits.md',
+                            'korean_traditional_herbs.md',
+                            'meditation_benefits.md'
+                        ];
+                        debugLog(`하드코딩된 목록에서 ${fileList.length}개 파일 사용`);
+                    }
+                }
+                
+                debugLog('처리할 파일 목록:', fileList);
+                
+                // 각 파일에 대해 처리
+                for (const filename of fileList) {
+                    try {
+                        // 파일명에서 확장자 확인
+                        if (!filename.toLowerCase().endsWith('.md')) {
+                            debugLog(`마크다운 파일이 아님, 건너뜀: ${filename}`);
+                            continue; // 마크다운 파일만 처리
+                        }
+                        
+                        const filePath = `${markdownDir}${filename}`;
+                        debugLog(`파일 로드 시도: ${filePath}`);
+                        
+                        // fetch API를 사용하여 파일 로드 시도
+                        // 캐시를 무시하고 항상 새로 로드 (디버깅용)
+                        const response = await fetch(filePath, { 
+                            cache: 'no-store',
+                            headers: {
+                                'Cache-Control': 'no-cache',
+                                'Pragma': 'no-cache'
+                            }
                         });
                         
-                        // 로컬 파일 시스템에서는 fetch가 실패할 수 있으므로 대체 방법 시도
-                        if (window.location.protocol === 'file:') {
-                            debugLog('로컬 파일 시스템 환경 감지. 대체 방법으로 시도합니다.');
+                        debugLog(`파일 응답 상태: ${response.status} ${response.statusText}`);
+                        
+                        if (response.ok) {
+                            debugLog(`파일 로드 성공: ${filename}`);
+                            const content = await response.text();
+                            debugLog(`파일 내용 로드 (${content.length} 바이트)`);
                             
-                            // 로컬 테스트용 샘플 콘텐츠 생성 (실제 파일 내용과 유사하게)
-                            const sampleContent = createSampleContent(filename);
+                            // 콘텐츠가 비어있는지 확인
+                            if (!content || content.trim() === '') {
+                                debugLog(`경고: ${filename}의 내용이 비어 있습니다.`);
+                                continue;
+                            }
                             
                             // 메타데이터 추출
-                            const metadata = extractMetadata(sampleContent);
+                            const metadata = extractMetadata(content);
+                            
+                            // 파일 이름에서 ID 추출
+                            const id = getIdFromFilename(filename);
+                            
+                            // 마지막 수정 날짜는 메타데이터의 날짜 사용
+                            const modifiedDate = metadata.date;
+                            
+                            // 포스트 정보 저장
+                            availablePosts.push({
+                                id,
+                                title: metadata.title || filename, // 제목이 없으면 파일명 사용
+                                date: metadata.date,
+                                modifiedDate: modifiedDate,
+                                category: metadata.category,
+                                featured: metadata.featured,
+                                filename,
+                                content: content // 전체 콘텐츠도 저장
+                            });
+                            
+                            // 카테고리 추가
+                            if (metadata.category) {
+                                categories.add(metadata.category);
+                            }
+                        } else {
+                            console.warn(`파일을 찾을 수 없음: ${filename}, 상태 코드: ${response.status}`);
+                            // 추가 디버깅 정보
+                            debugLog(`파일 로드 실패. 상세 정보:`, {
+                                filePath,
+                                status: response.status,
+                                statusText: response.statusText,
+                                headers: Array.from(response.headers.entries())
+                            });
+                        }
+                    } catch (error) {
+                        console.error(`파일 ${filename} 처리 중 오류:`, error);
+                        debugLog(`파일 처리 중 예외 발생:`, error);
+                    }
+                }
+                
+            } catch (error) {
+                console.error('파일 목록 가져오기 실패:', error);
+                debugLog('파일 목록 가져오기 실패:', error);
+                
+                // 로컬 파일 시스템이나 오류 발생 시 하드코딩된 목록 사용
+                const fallbackFiles = [
+                    'javascript_basic.md',
+                    'networking_basic.md',
+                    'linux_grep_awk.md',
+                    'ceph_storage_intro.md',
+                    'artificial_intelligence_intro.md',
+                    'cheonggukjang_benefits.md',
+                    'tofu_health_benefits.md',
+                    'korean_traditional_herbs.md',
+                    'meditation_benefits.md'
+                ];
+                
+                debugLog(`폴백 목록 사용: ${fallbackFiles.length}개 파일`);
+                
+                // 각 파일에 대해 처리
+                for (const filename of fallbackFiles) {
+                    try {
+                        const filePath = `${markdownDir}${filename}`;
+                        debugLog(`폴백 파일 로드 시도: ${filePath}`);
+                        
+                        // fetch API를 사용하여 파일 로드 시도
+                        const response = await fetch(filePath, { 
+                            cache: 'no-store',
+                            headers: {
+                                'Cache-Control': 'no-cache',
+                                'Pragma': 'no-cache'
+                            }
+                        });
+                        
+                        if (response.ok) {
+                            const content = await response.text();
+                            
+                            // 메타데이터 추출
+                            const metadata = extractMetadata(content);
                             
                             // 파일 이름에서 ID 추출
                             const id = getIdFromFilename(filename);
@@ -298,26 +385,43 @@ document.addEventListener('DOMContentLoaded', function() {
                             // 포스트 정보 저장
                             availablePosts.push({
                                 id,
-                                title: metadata.title || filename, // 제목이 없으면 파일명 사용
+                                title: metadata.title || filename,
                                 date: metadata.date,
                                 modifiedDate: metadata.date,
                                 category: metadata.category,
                                 featured: metadata.featured,
                                 filename,
-                                content: sampleContent // 샘플 콘텐츠 저장
+                                content: content
                             });
                             
                             // 카테고리 추가
                             if (metadata.category) {
                                 categories.add(metadata.category);
                             }
+                        } else if (window.location.protocol === 'file:') {
+                            // 로컬 테스트용 샘플 콘텐츠 사용
+                            const sampleContent = createSampleContent(filename);
+                            const metadata = extractMetadata(sampleContent);
+                            const id = getIdFromFilename(filename);
                             
-                            debugLog(`로컬 파일 시스템용 샘플 콘텐츠 생성 완료: ${filename}`);
+                            availablePosts.push({
+                                id,
+                                title: metadata.title || filename,
+                                date: metadata.date,
+                                modifiedDate: metadata.date,
+                                category: metadata.category,
+                                featured: metadata.featured,
+                                filename,
+                                content: sampleContent
+                            });
+                            
+                            if (metadata.category) {
+                                categories.add(metadata.category);
+                            }
                         }
+                    } catch (error) {
+                        console.error(`폴백 파일 ${filename} 처리 중 오류:`, error);
                     }
-                } catch (error) {
-                    console.error(`파일 ${filename} 처리 중 오류:`, error);
-                    debugLog(`파일 처리 중 예외 발생:`, error);
                 }
             }
             
@@ -330,12 +434,12 @@ document.addEventListener('DOMContentLoaded', function() {
                 markdownContent.innerHTML = `
                     <div class="error-message">
                         <p>등록된 글이 없습니다.</p>
+                        <p>posts 디렉토리에 마크다운(.md) 파일이 있는지 확인하세요.</p>
                     </div>`;
                 
                 // 파일 로드 실패 시 디버깅 정보 표시
                 debugLog('파일 로드 디버깅 정보:');
                 debugLog('- 마크다운 디렉토리:', markdownDir);
-                debugLog('- 파일 목록:', knownFiles);
                 debugLog('- 환경:', window.location.protocol === 'file:' ? '로컬 파일 시스템' : '웹 서버');
             } else {
                 // 카테고리 필터 업데이트

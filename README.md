@@ -87,6 +87,32 @@ QR 코드 생성기는 다음 주요 기능을 포함합니다:
 - 카테고리 필터링: 주제별 글 필터링 기능
 - 반응형 디자인: 모바일 및 데스크톱 환경 모두 지원
 
+#### 마크다운 파일 추가 방법 (Adding Markdown Files)
+
+새로운 블로그 포스트를 추가하는 방법은 다음과 같습니다:
+
+1. `posts` 디렉토리에 새 마크다운(.md) 파일 생성 (파일명은 영문 소문자와 언더스코어 사용 권장)
+2. 마크다운 파일 상단에 다음 메타데이터 포함:
+   ```markdown
+   <!-- category: 카테고리명 -->
+   <!-- date: YYYY-MM-DD -->
+   <!-- featured: true 또는 false -->
+   <!-- keywords: 키워드1, 키워드2, ... -->
+   <!-- title: 게시물 제목 -->
+   ```
+3. `posts/index.json` 파일에 새 마크다운 파일명 추가:
+   ```json
+   {
+     "files": [
+       "기존_파일.md",
+       "새로운_파일.md"
+     ],
+     "lastUpdated": "업데이트_날짜"
+   }
+   ```
+
+파일을 추가한 후에는 브라우저 새로고침을 통해 즉시 변경사항을 확인할 수 있습니다.
+
 ## SEO 최적화 설정 (SEO Optimization)
 
 ### Google Search Console 설정 (Google Search Console Setup)
