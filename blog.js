@@ -30,6 +30,101 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     }
     
+    // SEO용 메타 태그 업데이트 함수
+    function updateMetaTags(post) {
+        // post가 없으면 기본 메타 태그 사용
+        if (!post) {
+            document.title = '기술 블로그 - BrainDetox Utility Box | Technical Blog';
+            updateMetaTag('description', '프로그래밍, 네트워크, 클라우드, 보안 등 IT 관련 유용한 정보를 마크다운 형식으로 제공합니다. Technical blog providing useful information about programming, networking, cloud, security and other IT topics.');
+            updateMetaTag('keywords', '기술 블로그, 마크다운, 개발, 프로그래밍, IT, 시사, 경제, technical blog, markdown, development, programming, IT, current affairs, economy');
+            
+            // Open Graph 및 Twitter 카드 업데이트
+            updateMetaTag('og:title', '기술 블로그 - BrainDetox Utility Box | Technical Blog', 'property');
+            updateMetaTag('og:description', '프로그래밍, 네트워크, 클라우드, 보안 등 IT 관련 유용한 정보를 마크다운 형식으로 제공합니다.', 'property');
+            updateMetaTag('og:url', window.location.href, 'property');
+            
+            updateMetaTag('twitter:title', '기술 블로그 - BrainDetox Utility Box | Technical Blog');
+            updateMetaTag('twitter:description', '프로그래밍, 네트워크, 클라우드, 보안 등 IT 관련 유용한 정보를 마크다운 형식으로 제공합니다.');
+            
+            return;
+        }
+        
+        // 포스트 정보 기반 메타 태그 생성
+        const postTitle = `${post.title} - BrainDetox 기술 블로그`;
+        
+        // 키워드 추출 - 마크다운 파일에서 keywords 메타데이터 추출
+        const keywordsMatch = post.content && post.content.match(/<!--\s*keywords:\s*(.+?)\s*-->/);
+        const keywords = keywordsMatch ? keywordsMatch[1] : `${post.category}, 기술 블로그, 마크다운, 개발, 프로그래밍, ${post.title}`;
+        
+        // 설명 생성 - 첫 100자 정도의 텍스트 추출 (태그 제거)
+        let description = '';
+        if (post.content) {
+            // HTML 태그 제거 및 내용 추출
+            const tempDiv = document.createElement('div');
+            // 마크다운을 HTML로 변환 후 태그 제거
+            tempDiv.innerHTML = marked.parse(post.content);
+            const textContent = tempDiv.textContent || tempDiv.innerText || '';
+            // 처음 200자 정도 사용 (또는 # 제목 이후 첫 단락)
+            description = textContent.replace(/\s+/g, ' ').trim().substring(0, 200) + '...';
+        } else {
+            description = `${post.title} - ${post.category} 카테고리의 기술 블로그 글입니다.`;
+        }
+        
+        // 영어 설명 추가
+        const englishTitle = post.title.includes('(') ? post.title : `${post.title} | Technical Blog Article`;
+        
+        // 메타 태그 업데이트
+        document.title = postTitle;
+        updateMetaTag('description', `${description} | Technical blog article about ${post.category}.`);
+        updateMetaTag('keywords', keywords);
+        
+        // 정규화된 URL (canonical) 업데이트
+        updateMetaTag('canonical', `${window.location.origin}${window.location.pathname}?post=${post.id}`, 'link');
+        
+        // Open Graph 및 Twitter 카드 업데이트
+        updateMetaTag('og:title', postTitle, 'property');
+        updateMetaTag('og:description', description, 'property');
+        updateMetaTag('og:url', `${window.location.origin}${window.location.pathname}?post=${post.id}`, 'property');
+        updateMetaTag('og:type', 'article', 'property');
+        if (post.category) {
+            updateMetaTag('article:section', post.category, 'property');
+        }
+        updateMetaTag('article:published_time', post.date, 'property');
+        updateMetaTag('article:modified_time', post.modifiedDate || post.date, 'property');
+        
+        updateMetaTag('twitter:title', englishTitle);
+        updateMetaTag('twitter:description', description);
+        
+        debugLog('메타 태그 업데이트 완료:', postTitle);
+    }
+    
+    // 메타 태그 업데이트 헬퍼 함수
+    function updateMetaTag(name, content, attr = 'name') {
+        if (!name || !content) return;
+        
+        // 기존 태그 찾기
+        let meta;
+        if (attr === 'link') {
+            meta = document.querySelector(`link[rel="${name}"]`);
+            // 없으면 생성
+            if (!meta) {
+                meta = document.createElement('link');
+                meta.setAttribute('rel', name);
+                document.head.appendChild(meta);
+            }
+            meta.setAttribute('href', content);
+        } else {
+            meta = document.querySelector(`meta[${attr}="${name}"]`);
+            // 없으면 생성
+            if (!meta) {
+                meta = document.createElement('meta');
+                meta.setAttribute(attr, name);
+                document.head.appendChild(meta);
+            }
+            meta.setAttribute('content', content);
+        }
+    }
+    
     // 날짜 포맷팅 함수
     function formatDate(dateString) {
         const date = new Date(dateString);
@@ -57,7 +152,8 @@ document.addEventListener('DOMContentLoaded', function() {
             title: '',
             date: new Date().toISOString().split('T')[0], // 기본값은 오늘 날짜
             category: '미분류',
-            featured: false
+            featured: false,
+            keywords: ''  // SEO용 키워드 추가
         };
         
         // 첫 번째 줄이 H1(#)으로 시작하면 제목으로 사용
@@ -82,6 +178,12 @@ document.addEventListener('DOMContentLoaded', function() {
         const featuredMatch = content.match(/<!--\s*featured:\s*(true|false)\s*-->/);
         if (featuredMatch) {
             metadata.featured = featuredMatch[1].toLowerCase() === 'true';
+        }
+        
+        // SEO용 키워드 추출 (<!-- keywords: 키워드1, 키워드2, ... -->)
+        const keywordsMatch = content.match(/<!--\s*keywords:\s*(.+?)\s*-->/);
+        if (keywordsMatch) {
+            metadata.keywords = keywordsMatch[1].trim();
         }
         
         debugLog('추출된 메타데이터:', metadata);
@@ -388,6 +490,7 @@ document.addEventListener('DOMContentLoaded', function() {
             
             if (!currentPost) {
                 markdownContent.innerHTML = '<div class="error-message">포스트를 찾을 수 없습니다.</div>';
+                updateMetaTags(null); // 기본 메타태그로 복원
                 return;
             }
             
@@ -439,23 +542,36 @@ document.addEventListener('DOMContentLoaded', function() {
             const cleanContent = content
                 .replace(/<!--\s*category:.*?-->/g, '')
                 .replace(/<!--\s*date:.*?-->/g, '')
-                .replace(/<!--\s*featured:.*?-->/g, '');
+                .replace(/<!--\s*featured:.*?-->/g, '')
+                .replace(/<!--\s*keywords:.*?-->/g, '')
+                .replace(/^#\s+.*?\n/, ''); // 첫 번째 h1 제목 제거
             
             // 마크다운 렌더링
             const htmlContent = marked.parse(cleanContent);
             
-            // 콘텐츠 헤더 추가
+            // SEO를 위한 메타 태그 업데이트
+            updateMetaTags(currentPost);
+            
+            // 콘텐츠 헤더 추가 - 구조화된 데이터 포함
             markdownContent.innerHTML = `
-                <div class="post-content-header">
-                    <h1 class="post-title">${currentPost.title}</h1>
-                    <div class="post-meta">
-                        <span class="post-date">${formatDate(currentPost.date)}</span>
-                        ${currentPost.category ? `<span class="post-category">${currentPost.category}</span>` : ''}
+                <article itemscope itemtype="https://schema.org/BlogPosting">
+                    <meta itemprop="headline" content="${currentPost.title}">
+                    <meta itemprop="datePublished" content="${currentPost.date}">
+                    <meta itemprop="dateModified" content="${currentPost.modifiedDate || currentPost.date}">
+                    <meta itemprop="author" content="BrainDetox">
+                    ${currentPost.keywords ? `<meta itemprop="keywords" content="${currentPost.keywords}">` : ''}
+                    
+                    <div class="post-content-header">
+                        <h1 class="post-title" itemprop="name">${currentPost.title}</h1>
+                        <div class="post-meta">
+                            <span class="post-date" itemprop="datePublished" content="${currentPost.date}">${formatDate(currentPost.date)}</span>
+                            ${currentPost.category ? `<span class="post-category" itemprop="articleSection">${currentPost.category}</span>` : ''}
+                        </div>
                     </div>
-                </div>
-                <div class="post-content">
-                    ${htmlContent}
-                </div>
+                    <div class="post-content" itemprop="articleBody">
+                        ${htmlContent}
+                    </div>
+                </article>
             `;
             
             // 코드 하이라이팅
@@ -466,6 +582,9 @@ document.addEventListener('DOMContentLoaded', function() {
             // URL 파라미터 업데이트
             updateUrlParam(postId);
             
+            // 관련 게시물 표시 (같은 카테고리의 다른 글)
+            renderRelatedPosts(currentPost);
+            
         } catch (error) {
             console.error('포스트를 불러오는 중 오류가 발생했습니다:', error);
             debugLog('포스트 로드 중 예외 발생:', error);
@@ -474,6 +593,51 @@ document.addEventListener('DOMContentLoaded', function() {
                     <p>포스트를 불러올 수 없습니다.</p>
                     <p>오류 메시지: ${error.message}</p>
                 </div>`;
+        }
+    }
+    
+    // 관련 게시물 표시 함수 (SEO 개선)
+    function renderRelatedPosts(currentPost) {
+        if (!currentPost || !currentPost.category || posts.length <= 1) return;
+        
+        // 같은 카테고리의 다른 포스트 찾기 (최대 3개)
+        const relatedPosts = posts
+            .filter(post => post.category === currentPost.category && post.id !== currentPost.id)
+            .sort((a, b) => new Date(b.date) - new Date(a.date))
+            .slice(0, 3);
+        
+        if (relatedPosts.length === 0) return;
+        
+        // 관련 게시물 HTML 생성
+        const relatedPostsHTML = `
+            <div class="related-posts">
+                <h3>관련 게시물 (Related Posts)</h3>
+                <ul>
+                    ${relatedPosts.map(post => `
+                        <li>
+                            <a href="?post=${post.id}" class="related-post-link" data-id="${post.id}">
+                                ${post.title}
+                            </a>
+                            <span class="post-date">${formatDate(post.date)}</span>
+                        </li>
+                    `).join('')}
+                </ul>
+            </div>
+        `;
+        
+        // 관련 게시물 추가
+        const articleElement = markdownContent.querySelector('article');
+        if (articleElement) {
+            articleElement.insertAdjacentHTML('beforeend', relatedPostsHTML);
+            
+            // 관련 게시물 링크에 이벤트 리스너 추가
+            document.querySelectorAll('.related-post-link').forEach(link => {
+                link.addEventListener('click', function(e) {
+                    e.preventDefault();
+                    const postId = this.getAttribute('data-id');
+                    loadPost(postId);
+                });
+            });
         }
     }
     
