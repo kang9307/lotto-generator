@@ -1,4 +1,4 @@
-<!-- category: 미래기술 -->
+<!-- category: IT/기술 -->
 <!-- date: 2025-06-03 -->
 <!-- featured: true -->
 <!-- keywords: 인공지능, AI, 머신러닝, 딥러닝, 미래사회, 기술발전, 사회변화, 4차산업혁명, artificial intelligence, machine learning, future society, technological development, social change -->

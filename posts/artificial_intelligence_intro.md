@@ -1,4 +1,4 @@
-<!-- category: 기술 -->
+<!-- category: IT/기술 -->
 <!-- date: 2025-06-02 -->
 <!-- featured: true -->
 <!-- keywords: 인공지능, AI, 머신러닝, 딥러닝, 자연어처리, 컴퓨터비전, 강화학습, 인공신경망, 생성형 AI, ChatGPT, artificial intelligence, machine learning, deep learning, NLP, computer vision, reinforcement learning, neural networks, generative AI -->

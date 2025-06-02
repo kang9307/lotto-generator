@@ -1,4 +1,4 @@
-<!-- category: 보안 -->
+<!-- category: IT/기술 -->
 <!-- date: 2025-06-02 -->
 <!-- featured: true -->
 <!-- keywords: 안드로이드, 보안, OS버전, 휴대폰보안, 구글플레이프로텍트, 권한관리 -->

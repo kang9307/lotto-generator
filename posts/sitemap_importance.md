@@ -1,4 +1,4 @@
-<!-- category: 웹개발 -->
+<!-- category: IT/기술 -->
 <!-- date: 2025-06-03 -->
 <!-- featured: true -->
 <!-- keywords: 사이트맵, SEO, 검색엔진 최적화, 웹사이트 관리, 구글 크롤링, XML 사이트맵, 검색엔진 인덱싱, sitemap, search engine optimization, google crawling -->
