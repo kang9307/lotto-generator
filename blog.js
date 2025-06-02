@@ -544,7 +544,7 @@ document.addEventListener('DOMContentLoaded', function() {
                 .replace(/<!--\s*date:.*?-->/g, '')
                 .replace(/<!--\s*featured:.*?-->/g, '')
                 .replace(/<!--\s*keywords:.*?-->/g, '')
-                .replace(/^#\s+.*?\n/, ''); // 첫 번째 h1 제목 제거
+                .replace(/^#\s+.*?\n\s*\n/m, '\n'); // 첫 번째 h1 제목과 다음 빈 줄까지 제거 (멀티라인)
             
             // 마크다운 렌더링
             const htmlContent = marked.parse(cleanContent);
