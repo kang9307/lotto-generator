@@ -71,7 +71,7 @@ document.addEventListener('DOMContentLoaded', function() {
         }
         
         // 영어 설명 추가
-        const englishTitle = post.title.includes('(') ? post.title : `${post.title} | Technical Blog Article`;
+        const englishTitle = post.englishTitle || (post.title.includes('(') ? post.title : `${post.title} | Technical Blog Article`);
         
         // 메타 태그 업데이트
         document.title = postTitle;
@@ -92,7 +92,7 @@ document.addEventListener('DOMContentLoaded', function() {
         updateMetaTag('article:published_time', post.date, 'property');
         updateMetaTag('article:modified_time', post.modifiedDate || post.date, 'property');
         
-        updateMetaTag('twitter:title', englishTitle);
+        updateMetaTag('twitter:title', post.englishTitle || englishTitle);
         updateMetaTag('twitter:description', description);
         
         debugLog('메타 태그 업데이트 완료:', postTitle);
@@ -150,6 +150,7 @@ document.addEventListener('DOMContentLoaded', function() {
     function extractMetadata(content) {
         const metadata = {
             title: '',
+            englishTitle: '', // 영문 제목 추가
             date: new Date().toISOString().split('T')[0], // 기본값은 오늘 날짜
             category: '미분류',
             featured: false,
@@ -159,12 +160,29 @@ document.addEventListener('DOMContentLoaded', function() {
         // 메타데이터 주석에서 제목 추출 (<!-- title: 제목 -->)
         const titleMetaMatch = content.match(/<!--\s*title:\s*(.+?)\s*-->/);
         if (titleMetaMatch) {
-            metadata.title = titleMetaMatch[1].trim();
+            const fullTitle = titleMetaMatch[1].trim();
+            
+            // 한글 제목과 영문 제목 분리 (예: "한글 제목 (English Title)")
+            const titleParts = fullTitle.match(/(.*?)\s*\((.*?)\)\s*$/);
+            if (titleParts) {
+                metadata.title = titleParts[1].trim(); // 괄호 앞 부분(한글 제목)
+                metadata.englishTitle = titleParts[2].trim(); // 괄호 안 부분(영문 제목)
+            } else {
+                metadata.title = fullTitle; // 분리할 수 없으면 전체를 한글 제목으로
+            }
         } else {
             // 메타데이터에 제목이 없으면 첫 번째 줄이 H1(#)으로 시작하는지 확인
             const titleMatch = content.match(/^# (.+)$/m);
             if (titleMatch) {
-                metadata.title = titleMatch[1].trim();
+                const fullTitle = titleMatch[1].trim();
+                // H1에서도 한글/영문 분리 시도
+                const titleParts = fullTitle.match(/(.*?)\s*\((.*?)\)\s*$/);
+                if (titleParts) {
+                    metadata.title = titleParts[1].trim();
+                    metadata.englishTitle = titleParts[2].trim();
+                } else {
+                    metadata.title = fullTitle;
+                }
             }
         }
         
@@ -244,20 +262,9 @@ document.addEventListener('DOMContentLoaded', function() {
                         
                         debugLog(`디렉토리 탐색에서 ${fileList.length}개 마크다운 파일 발견`);
                     } else {
-                        // 디렉토리 탐색도 실패한 경우 미리 알려진 파일 목록 사용
-                        debugLog('디렉토리 탐색 실패. 하드코딩된 목록 사용');
-                        fileList = [
-                            'javascript_basic.md',
-                            'networking_basic.md',
-                            'linux_grep_awk.md',
-                            'ceph_storage_intro.md',
-                            'artificial_intelligence_intro.md',
-                            'cheonggukjang_benefits.md',
-                            'tofu_health_benefits.md',
-                            'korean_traditional_herbs.md',
-                            'meditation_benefits.md'
-                        ];
-                        debugLog(`하드코딩된 목록에서 ${fileList.length}개 파일 사용`);
+                        // 디렉토리 탐색도 실패한 경우 오류 메시지 표시
+                        debugLog('디렉토리 탐색 실패. 파일 목록을 가져올 수 없습니다.');
+                        throw new Error('마크다운 파일 목록을 가져올 수 없습니다. posts/index.json 파일이 필요합니다.');
                     }
                 }
                 
@@ -343,86 +350,15 @@ document.addEventListener('DOMContentLoaded', function() {
                 console.error('파일 목록 가져오기 실패:', error);
                 debugLog('파일 목록 가져오기 실패:', error);
                 
-                // 로컬 파일 시스템이나 오류 발생 시 하드코딩된 목록 사용
-                const fallbackFiles = [
-                    'javascript_basic.md',
-                    'networking_basic.md',
-                    'linux_grep_awk.md',
-                    'ceph_storage_intro.md',
-                    'artificial_intelligence_intro.md',
-                    'cheonggukjang_benefits.md',
-                    'tofu_health_benefits.md',
-                    'korean_traditional_herbs.md',
-                    'meditation_benefits.md'
-                ];
-                
-                debugLog(`폴백 목록 사용: ${fallbackFiles.length}개 파일`);
-                
-                // 각 파일에 대해 처리
-                for (const filename of fallbackFiles) {
-                    try {
-                        const filePath = `${markdownDir}${filename}`;
-                        debugLog(`폴백 파일 로드 시도: ${filePath}`);
-                        
-                        // fetch API를 사용하여 파일 로드 시도
-                        const response = await fetch(filePath, { 
-                            cache: 'no-store',
-                            headers: {
-                                'Cache-Control': 'no-cache',
-                                'Pragma': 'no-cache'
-                            }
-                        });
-                        
-                        if (response.ok) {
-                            const content = await response.text();
-                            
-                            // 메타데이터 추출
-                            const metadata = extractMetadata(content);
-                            
-                            // 파일 이름에서 ID 추출
-                            const id = getIdFromFilename(filename);
-                            
-                            // 포스트 정보 저장
-                            availablePosts.push({
-                                id,
-                                title: metadata.title || filename,
-                                date: metadata.date,
-                                modifiedDate: metadata.date,
-                                category: metadata.category,
-                                featured: metadata.featured,
-                                filename,
-                                content: content
-                            });
-                            
-                            // 카테고리 추가
-                            if (metadata.category) {
-                                categories.add(metadata.category);
-                            }
-                        } else if (window.location.protocol === 'file:') {
-                            // 로컬 테스트용 샘플 콘텐츠 사용
-                            const sampleContent = createSampleContent(filename);
-                            const metadata = extractMetadata(sampleContent);
-                            const id = getIdFromFilename(filename);
-                            
-                            availablePosts.push({
-                                id,
-                                title: metadata.title || filename,
-                                date: metadata.date,
-                                modifiedDate: metadata.date,
-                                category: metadata.category,
-                                featured: metadata.featured,
-                                filename,
-                                content: sampleContent
-                            });
-                            
-                            if (metadata.category) {
-                                categories.add(metadata.category);
-                            }
-                        }
-                    } catch (error) {
-                        console.error(`폴백 파일 ${filename} 처리 중 오류:`, error);
-                    }
-                }
+                // 오류 메시지 표시
+                postList.innerHTML = '<li class="post-item error">파일 목록을 불러올 수 없습니다. posts/index.json 파일을 확인해주세요.</li>';
+                markdownContent.innerHTML = `
+                    <div class="error-message">
+                        <p>포스트 목록을 불러올 수 없습니다.</p>
+                        <p>posts/index.json 파일이 있는지 확인하세요.</p>
+                        <p>오류 메시지: ${error.message}</p>
+                    </div>`;
+                return [];
             }
             
             debugLog(`총 ${availablePosts.length}개의 포스트를 로드했습니다.`);
@@ -674,6 +610,7 @@ document.addEventListener('DOMContentLoaded', function() {
                     
                     <div class="post-content-header">
                         <h1 class="post-title" itemprop="name">${currentPost.title}</h1>
+                        ${currentPost.englishTitle ? `<h2 class="post-subtitle">${currentPost.englishTitle}</h2>` : ''}
                         <div class="post-meta">
                             <span class="post-date" itemprop="datePublished" content="${currentPost.date}">${formatDate(currentPost.date)}</span>
                             ${currentPost.category ? `<span class="post-category" itemprop="articleSection">${currentPost.category}</span>` : ''}
