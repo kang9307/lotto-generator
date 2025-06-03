@@ -1,5 +1,5 @@
 /**
- * 기술 블로그 - 마크다운 파일 로더 및 렌더러
+ * 기술 블로그 - HTML 파일 로더 및 렌더러
  * Copyright (c) 2025 braindetox.kr
  */
 
@@ -12,8 +12,8 @@ document.addEventListener('DOMContentLoaded', function() {
     const totalPostsEl = document.getElementById('totalPosts');
     const featuredList = document.getElementById('featuredList');
     
-    // 마크다운 파일이 저장된 디렉토리 경로
-    const markdownDir = './posts/';
+    // HTML 파일이 저장된 디렉토리 경로
+    const postsDir = './posts/';
     
     // 현재 로드된 포스트 데이터
     let posts = [];
@@ -35,16 +35,16 @@ document.addEventListener('DOMContentLoaded', function() {
         // post가 없으면 기본 메타 태그 사용
         if (!post) {
             document.title = '기술 블로그 - BrainDetox Utility Box | Technical Blog';
-            updateMetaTag('description', '프로그래밍, 네트워크, 클라우드, 보안 등 IT 관련 유용한 정보를 마크다운 형식으로 제공합니다. Technical blog providing useful information about programming, networking, cloud, security and other IT topics.');
-            updateMetaTag('keywords', '기술 블로그, 마크다운, 개발, 프로그래밍, IT, 시사, 경제, technical blog, markdown, development, programming, IT, current affairs, economy');
+            updateMetaTag('description', '프로그래밍, 네트워크, 클라우드, 보안 등 IT 관련 유용한 정보를 제공합니다. Technical blog providing useful information about programming, networking, cloud, security and other IT topics.');
+            updateMetaTag('keywords', '기술 블로그, 개발, 프로그래밍, IT, 시사, 경제, technical blog, development, programming, IT, current affairs, economy');
             
             // Open Graph 및 Twitter 카드 업데이트
             updateMetaTag('og:title', '기술 블로그 - BrainDetox Utility Box | Technical Blog', 'property');
-            updateMetaTag('og:description', '프로그래밍, 네트워크, 클라우드, 보안 등 IT 관련 유용한 정보를 마크다운 형식으로 제공합니다.', 'property');
+            updateMetaTag('og:description', '프로그래밍, 네트워크, 클라우드, 보안 등 IT 관련 유용한 정보를 제공합니다.', 'property');
             updateMetaTag('og:url', window.location.href, 'property');
             
             updateMetaTag('twitter:title', '기술 블로그 - BrainDetox Utility Box | Technical Blog');
-            updateMetaTag('twitter:description', '프로그래밍, 네트워크, 클라우드, 보안 등 IT 관련 유용한 정보를 마크다운 형식으로 제공합니다.');
+            updateMetaTag('twitter:description', '프로그래밍, 네트워크, 클라우드, 보안 등 IT 관련 유용한 정보를 제공합니다.');
             
             return;
         }
@@ -52,20 +52,10 @@ document.addEventListener('DOMContentLoaded', function() {
         // 포스트 정보 기반 메타 태그 생성
         const postTitle = `${post.title} - BrainDetox 기술 블로그`;
         
-        // 키워드 추출 - 마크다운 파일에서 keywords 메타데이터 추출
-        const keywordsMatch = post.content && post.content.match(/<!--\s*keywords:\s*(.+?)\s*-->/);
-        const keywords = keywordsMatch ? keywordsMatch[1] : `${post.category}, 기술 블로그, 마크다운, 개발, 프로그래밍, ${post.title}`;
-        
         // 설명 생성 - 첫 100자 정도의 텍스트 추출 (태그 제거)
         let description = '';
-        if (post.content) {
-            // HTML 태그 제거 및 내용 추출
-            const tempDiv = document.createElement('div');
-            // 마크다운을 HTML로 변환 후 태그 제거
-            tempDiv.innerHTML = marked.parse(post.content);
-            const textContent = tempDiv.textContent || tempDiv.innerText || '';
-            // 처음 200자 정도 사용 (또는 # 제목 이후 첫 단락)
-            description = textContent.replace(/\s+/g, ' ').trim().substring(0, 200) + '...';
+        if (post.description) {
+            description = post.description;
         } else {
             description = `${post.title} - ${post.category} 카테고리의 기술 블로그 글입니다.`;
         }
@@ -76,7 +66,7 @@ document.addEventListener('DOMContentLoaded', function() {
         // 메타 태그 업데이트
         document.title = postTitle;
         updateMetaTag('description', `${description} | Technical blog article about ${post.category}.`);
-        updateMetaTag('keywords', keywords);
+        updateMetaTag('keywords', post.keywords || `${post.category}, 기술 블로그, ${post.title}`);
         
         // 정규화된 URL (canonical) 업데이트
         updateMetaTag('canonical', `${window.location.origin}${window.location.pathname}?post=${post.id}`, 'link');
@@ -146,75 +136,7 @@ document.addEventListener('DOMContentLoaded', function() {
         return filename.replace(/\.[^/.]+$/, "");
     }
     
-    // 마크다운 파일에서 메타데이터 추출 함수
-    function extractMetadata(content) {
-        const metadata = {
-            title: '',
-            englishTitle: '', // 영문 제목 추가
-            date: new Date().toISOString().split('T')[0], // 기본값은 오늘 날짜
-            category: '미분류',
-            featured: false,
-            keywords: ''  // SEO용 키워드 추가
-        };
-        
-        // 메타데이터 주석에서 제목 추출 (<!-- title: 제목 -->)
-        const titleMetaMatch = content.match(/<!--\s*title:\s*(.+?)\s*-->/);
-        if (titleMetaMatch) {
-            const fullTitle = titleMetaMatch[1].trim();
-            
-            // 한글 제목과 영문 제목 분리 (예: "한글 제목 (English Title)")
-            const titleParts = fullTitle.match(/(.*?)\s*\((.*?)\)\s*$/);
-            if (titleParts) {
-                metadata.title = titleParts[1].trim(); // 괄호 앞 부분(한글 제목)
-                metadata.englishTitle = titleParts[2].trim(); // 괄호 안 부분(영문 제목)
-            } else {
-                metadata.title = fullTitle; // 분리할 수 없으면 전체를 한글 제목으로
-            }
-        } else {
-            // 메타데이터에 제목이 없으면 첫 번째 줄이 H1(#)으로 시작하는지 확인
-            const titleMatch = content.match(/^# (.+)$/m);
-            if (titleMatch) {
-                const fullTitle = titleMatch[1].trim();
-                // H1에서도 한글/영문 분리 시도
-                const titleParts = fullTitle.match(/(.*?)\s*\((.*?)\)\s*$/);
-                if (titleParts) {
-                    metadata.title = titleParts[1].trim();
-                    metadata.englishTitle = titleParts[2].trim();
-                } else {
-                    metadata.title = fullTitle;
-                }
-            }
-        }
-        
-        // 카테고리 메타데이터 추출 (<!-- category: 카테고리명 -->)
-        const categoryMatch = content.match(/<!--\s*category:\s*(.+?)\s*-->/);
-        if (categoryMatch) {
-            metadata.category = categoryMatch[1].trim();
-        }
-        
-        // 날짜 메타데이터 추출 (<!-- date: YYYY-MM-DD -->)
-        const dateMatch = content.match(/<!--\s*date:\s*(\d{4}-\d{2}-\d{2})\s*-->/);
-        if (dateMatch) {
-            metadata.date = dateMatch[1];
-        }
-        
-        // 추천 글 메타데이터 추출 (<!-- featured: true|false -->)
-        const featuredMatch = content.match(/<!--\s*featured:\s*(true|false)\s*-->/);
-        if (featuredMatch) {
-            metadata.featured = featuredMatch[1].toLowerCase() === 'true';
-        }
-        
-        // SEO용 키워드 추출 (<!-- keywords: 키워드1, 키워드2, ... -->)
-        const keywordsMatch = content.match(/<!--\s*keywords:\s*(.+?)\s*-->/);
-        if (keywordsMatch) {
-            metadata.keywords = keywordsMatch[1].trim();
-        }
-        
-        debugLog('추출된 메타데이터:', metadata);
-        return metadata;
-    }
-    
-    // 마크다운 파일 목록 가져오기
+    // 포스트 목록 가져오기
     async function fetchPostList() {
         try {
             debugLog('포스트 목록 가져오기 시작...');
@@ -225,124 +147,181 @@ document.addEventListener('DOMContentLoaded', function() {
             
             try {
                 // 디렉토리 인덱스 파일을 통해 파일 목록 가져오기 시도
-                const response = await fetch(`${markdownDir}index.json`, {
+                const response = await fetch(`${postsDir}index.json`, {
                     cache: 'no-store'
                 });
                 
-                let fileList = [];
-                
                 if (response.ok) {
-                    // index.json 파일이 있는 경우 (권장 방식)
+                    // index.json 파일이 있는 경우
                     debugLog('디렉토리 인덱스 파일 발견');
                     const indexData = await response.json();
-                    fileList = indexData.files || [];
-                    debugLog(`index.json에서 ${fileList.length}개 파일 목록 로드`);
+                    
+                    // HTML 파일 목록 및 포스트 메타데이터 가져오기
+                    if (indexData.posts && Array.isArray(indexData.posts)) {
+                        // posts 배열이 있는 경우 (새로운 방식)
+                        debugLog(`index.json에서 ${indexData.posts.length}개 포스트 메타데이터 로드`);
+                        
+                        for (const post of indexData.posts) {
+                            availablePosts.push({
+                                id: post.id,
+                                title: post.title,
+                                date: post.date,
+                                modifiedDate: post.modifiedDate || post.date,
+                                category: post.category,
+                                featured: post.featured,
+                                filename: post.filename
+                            });
+                            
+                            // 카테고리 추가
+                            if (post.category) {
+                                categories.add(post.category);
+                            }
+                        }
+                    } else if (indexData.files && Array.isArray(indexData.files)) {
+                        // files 배열만 있는 경우 (기존 방식)
+                        const fileList = indexData.files;
+                        debugLog(`index.json에서 ${fileList.length}개 파일 목록 로드`);
+                        
+                        // 각 파일에 대해 처리
+                        for (const filename of fileList) {
+                            // 파일명에서 확장자 확인
+                            if (!filename.toLowerCase().endsWith('.html')) {
+                                debugLog(`HTML 파일이 아님, 건너뜀: ${filename}`);
+                                continue; // HTML 파일만 처리
+                            }
+                            
+                            const filePath = `${postsDir}${filename}`;
+                            debugLog(`파일 로드 시도: ${filePath}`);
+                            
+                            try {
+                                // fetch API를 사용하여 파일 로드 시도
+                                const response = await fetch(filePath, { 
+                                    cache: 'no-store',
+                                    headers: {
+                                        'Cache-Control': 'no-cache',
+                                        'Pragma': 'no-cache'
+                                    }
+                                });
+                                
+                                if (response.ok) {
+                                    debugLog(`파일 로드 성공: ${filename}`);
+                                    const htmlContent = await response.text();
+                                    
+                                    // HTML에서 메타데이터 추출
+                                    const parser = new DOMParser();
+                                    const doc = parser.parseFromString(htmlContent, 'text/html');
+                                    
+                                    // 제목 추출
+                                    const titleEl = doc.querySelector('meta[property="og:title"]') || doc.querySelector('title');
+                                    const title = titleEl ? titleEl.getAttribute('content') || titleEl.textContent : filename;
+                                    
+                                    // 날짜 추출
+                                    const dateEl = doc.querySelector('meta[property="article:published_time"]') || doc.querySelector('meta[itemprop="datePublished"]');
+                                    const date = dateEl ? dateEl.getAttribute('content') : new Date().toISOString().split('T')[0];
+                                    
+                                    // 카테고리 추출
+                                    const categoryEl = doc.querySelector('meta[property="article:section"]') || doc.querySelector('meta[itemprop="articleSection"]');
+                                    const category = categoryEl ? categoryEl.getAttribute('content') : '미분류';
+                                    
+                                    // 파일 이름에서 ID 추출
+                                    const id = getIdFromFilename(filename);
+                                    
+                                    // 포스트 정보 저장
+                                    availablePosts.push({
+                                        id,
+                                        title,
+                                        date,
+                                        modifiedDate: date,
+                                        category,
+                                        featured: false,
+                                        filename
+                                    });
+                                    
+                                    // 카테고리 추가
+                                    if (category) {
+                                        categories.add(category);
+                                    }
+                                } else {
+                                    console.warn(`파일을 찾을 수 없음: ${filename}, 상태 코드: ${response.status}`);
+                                }
+                            } catch (error) {
+                                console.error(`파일 ${filename} 처리 중 오류:`, error);
+                            }
+                        }
+                    }
                 } else {
                     // index.json 파일이 없는 경우 디렉토리 목록 페이지 파싱 시도
-                    debugLog('인덱스 파일 없음. 파일 탐색을 시도합니다.');
+                    debugLog('인덱스 파일 없음. 디렉토리 탐색을 시도합니다.');
                     
-                    // 마크다운 디렉토리 탐색 시도
-                    const dirResponse = await fetch(markdownDir, {
+                    // 포스트 디렉토리 탐색 시도
+                    const dirResponse = await fetch(postsDir, {
                         cache: 'no-store'
                     });
                     
                     if (dirResponse.ok) {
                         const html = await dirResponse.text();
-                        // HTML 디렉토리 목록에서 .md 파일 추출
+                        // HTML 디렉토리 목록에서 .html 파일 추출
                         const parser = new DOMParser();
                         const doc = parser.parseFromString(html, 'text/html');
                         const links = doc.querySelectorAll('a');
                         
+                        // HTML 파일 목록 추출
+                        const fileList = [];
                         links.forEach(link => {
                             const href = link.getAttribute('href');
-                            if (href && href.endsWith('.md')) {
+                            if (href && href.endsWith('.html')) {
                                 fileList.push(href);
                             }
                         });
                         
-                        debugLog(`디렉토리 탐색에서 ${fileList.length}개 마크다운 파일 발견`);
+                        debugLog(`디렉토리 탐색에서 ${fileList.length}개 HTML 파일 발견`);
+                        
+                        // 각 HTML 파일 처리
+                        for (const filename of fileList) {
+                            const filePath = `${postsDir}${filename}`;
+                            const response = await fetch(filePath);
+                            
+                            if (response.ok) {
+                                const htmlContent = await response.text();
+                                
+                                // HTML에서 메타데이터 추출
+                                const parser = new DOMParser();
+                                const doc = parser.parseFromString(htmlContent, 'text/html');
+                                
+                                // 제목 추출
+                                const titleEl = doc.querySelector('meta[property="og:title"]') || doc.querySelector('title');
+                                const title = titleEl ? titleEl.getAttribute('content') || titleEl.textContent : filename;
+                                
+                                // 날짜 추출
+                                const dateEl = doc.querySelector('meta[property="article:published_time"]') || doc.querySelector('meta[itemprop="datePublished"]');
+                                const date = dateEl ? dateEl.getAttribute('content') : new Date().toISOString().split('T')[0];
+                                
+                                // 카테고리 추출
+                                const categoryEl = doc.querySelector('meta[property="article:section"]') || doc.querySelector('meta[itemprop="articleSection"]');
+                                const category = categoryEl ? categoryEl.getAttribute('content') : '미분류';
+                                
+                                // 포스트 정보 저장
+                                const id = getIdFromFilename(filename);
+                                availablePosts.push({
+                                    id,
+                                    title,
+                                    date,
+                                    modifiedDate: date,
+                                    category,
+                                    featured: false,
+                                    filename
+                                });
+                                
+                                // 카테고리 추가
+                                if (category) {
+                                    categories.add(category);
+                                }
+                            }
+                        }
                     } else {
                         // 디렉토리 탐색도 실패한 경우 오류 메시지 표시
                         debugLog('디렉토리 탐색 실패. 파일 목록을 가져올 수 없습니다.');
-                        throw new Error('마크다운 파일 목록을 가져올 수 없습니다. posts/index.json 파일이 필요합니다.');
-                    }
-                }
-                
-                debugLog('처리할 파일 목록:', fileList);
-                
-                // 각 파일에 대해 처리
-                for (const filename of fileList) {
-                    try {
-                        // 파일명에서 확장자 확인
-                        if (!filename.toLowerCase().endsWith('.md')) {
-                            debugLog(`마크다운 파일이 아님, 건너뜀: ${filename}`);
-                            continue; // 마크다운 파일만 처리
-                        }
-                        
-                        const filePath = `${markdownDir}${filename}`;
-                        debugLog(`파일 로드 시도: ${filePath}`);
-                        
-                        // fetch API를 사용하여 파일 로드 시도
-                        // 캐시를 무시하고 항상 새로 로드 (디버깅용)
-                        const response = await fetch(filePath, { 
-                            cache: 'no-store',
-                            headers: {
-                                'Cache-Control': 'no-cache',
-                                'Pragma': 'no-cache'
-                            }
-                        });
-                        
-                        debugLog(`파일 응답 상태: ${response.status} ${response.statusText}`);
-                        
-                        if (response.ok) {
-                            debugLog(`파일 로드 성공: ${filename}`);
-                            const content = await response.text();
-                            debugLog(`파일 내용 로드 (${content.length} 바이트)`);
-                            
-                            // 콘텐츠가 비어있는지 확인
-                            if (!content || content.trim() === '') {
-                                debugLog(`경고: ${filename}의 내용이 비어 있습니다.`);
-                                continue;
-                            }
-                            
-                            // 메타데이터 추출
-                            const metadata = extractMetadata(content);
-                            
-                            // 파일 이름에서 ID 추출
-                            const id = getIdFromFilename(filename);
-                            
-                            // 마지막 수정 날짜는 메타데이터의 날짜 사용
-                            const modifiedDate = metadata.date;
-                            
-                            // 포스트 정보 저장
-                            availablePosts.push({
-                                id,
-                                title: metadata.title || filename, // 제목이 없으면 파일명 사용
-                                date: metadata.date,
-                                modifiedDate: modifiedDate,
-                                category: metadata.category,
-                                featured: metadata.featured,
-                                filename,
-                                content: content // 전체 콘텐츠도 저장
-                            });
-                            
-                            // 카테고리 추가
-                            if (metadata.category) {
-                                categories.add(metadata.category);
-                            }
-                        } else {
-                            console.warn(`파일을 찾을 수 없음: ${filename}, 상태 코드: ${response.status}`);
-                            // 추가 디버깅 정보
-                            debugLog(`파일 로드 실패. 상세 정보:`, {
-                                filePath,
-                                status: response.status,
-                                statusText: response.statusText,
-                                headers: Array.from(response.headers.entries())
-                            });
-                        }
-                    } catch (error) {
-                        console.error(`파일 ${filename} 처리 중 오류:`, error);
-                        debugLog(`파일 처리 중 예외 발생:`, error);
+                        throw new Error('HTML 파일 목록을 가져올 수 없습니다. posts/index.json 파일이 필요합니다.');
                     }
                 }
                 
@@ -370,12 +349,12 @@ document.addEventListener('DOMContentLoaded', function() {
                 markdownContent.innerHTML = `
                     <div class="error-message">
                         <p>등록된 글이 없습니다.</p>
-                        <p>posts 디렉토리에 마크다운(.md) 파일이 있는지 확인하세요.</p>
+                        <p>posts 디렉토리에 HTML 파일이 있는지 확인하세요.</p>
                     </div>`;
                 
                 // 파일 로드 실패 시 디버깅 정보 표시
                 debugLog('파일 로드 디버깅 정보:');
-                debugLog('- 마크다운 디렉토리:', markdownDir);
+                debugLog('- 포스트 디렉토리:', postsDir);
                 debugLog('- 환경:', window.location.protocol === 'file:' ? '로컬 파일 시스템' : '웹 서버');
             } else {
                 // 카테고리 필터 업데이트
@@ -543,95 +522,104 @@ document.addEventListener('DOMContentLoaded', function() {
             // 로딩 표시
             markdownContent.innerHTML = '<div class="loading-spinner">포스트를 불러오는 중...</div>';
             
-            let content;
-            
-            // 이미 로드된 콘텐츠가 있으면 사용, 없으면 가져오기
-            if (currentPost.content) {
-                content = currentPost.content;
-                debugLog(`캐시된 콘텐츠 사용: ${currentPost.filename}`);
-            } else {
-                // 마크다운 파일 내용 가져오기
-                try {
-                    const filePath = `${markdownDir}${currentPost.filename}`;
-                    debugLog(`파일 콘텐츠 로드 시도: ${filePath}`);
-                    
-                    const response = await fetch(filePath, {
-                        cache: 'no-store',
-                        headers: {
-                            'Cache-Control': 'no-cache',
-                            'Pragma': 'no-cache'
+            // HTML 파일 내용 가져오기
+            try {
+                const filePath = `${postsDir}${currentPost.filename}`;
+                debugLog(`HTML 파일 콘텐츠 로드 시도: ${filePath}`);
+                
+                const response = await fetch(filePath, {
+                    cache: 'no-store',
+                    headers: {
+                        'Cache-Control': 'no-cache',
+                        'Pragma': 'no-cache'
+                    }
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`파일을 불러올 수 없습니다: ${response.status} ${response.statusText}`);
+                }
+                
+                const htmlContent = await response.text();
+                debugLog(`HTML 파일 콘텐츠 로드 성공: ${htmlContent.length} 바이트`);
+                
+                // HTML 파서로 문서 파싱
+                const parser = new DOMParser();
+                const doc = parser.parseFromString(htmlContent, 'text/html');
+                
+                // article 요소 추출
+                const articleContent = doc.querySelector('article');
+                
+                if (articleContent) {
+                    // 메타데이터 업데이트
+                    const metaTags = doc.querySelectorAll('meta');
+                    metaTags.forEach(meta => {
+                        const name = meta.getAttribute('name') || meta.getAttribute('property');
+                        const content = meta.getAttribute('content');
+                        
+                        if (name && content) {
+                            if (name === 'keywords') {
+                                currentPost.keywords = content;
+                            } else if (name === 'description') {
+                                currentPost.description = content;
+                            }
                         }
                     });
                     
-                    if (!response.ok) {
-                        throw new Error(`파일을 불러올 수 없습니다: ${response.status} ${response.statusText}`);
+                    // JSON-LD 스크립트 확인
+                    const jsonLdScript = doc.querySelector('script[type="application/ld+json"]');
+                    if (jsonLdScript) {
+                        try {
+                            const jsonLdData = JSON.parse(jsonLdScript.textContent);
+                            if (jsonLdData.keywords) {
+                                currentPost.keywords = jsonLdData.keywords;
+                            }
+                        } catch (e) {
+                            debugLog('JSON-LD 파싱 오류:', e);
+                        }
                     }
                     
-                    content = await response.text();
-                    // 캐싱을 위해 포스트 객체에 콘텐츠 저장
-                    currentPost.content = content;
-                    debugLog(`파일 콘텐츠 로드 성공: ${content.length} 바이트`);
-                } catch (error) {
-                    debugLog(`파일 콘텐츠 로드 실패:`, error);
+                    // SEO를 위한 메타 태그 업데이트
+                    updateMetaTags(currentPost);
                     
-                    // 로컬 파일 시스템에서는 샘플 콘텐츠 사용
-                    if (window.location.protocol === 'file:') {
-                        content = createSampleContent(currentPost.filename);
-                        debugLog(`로컬 파일 시스템용 샘플 콘텐츠 사용`);
+                    // 포스트 콘텐츠 표시
+                    markdownContent.innerHTML = '';
+                    markdownContent.appendChild(articleContent.cloneNode(true));
+                    
+                    // 코드 하이라이팅 적용 (이미 HTML에 포함된 경우 필요 없음)
+                    markdownContent.querySelectorAll('pre code').forEach(block => {
+                        if (window.hljs) {
+                            hljs.highlightElement(block);
+                        }
+                    });
+                } else {
+                    // article 요소가 없으면 전체 body 내용 사용
+                    const bodyContent = doc.querySelector('body');
+                    if (bodyContent) {
+                        markdownContent.innerHTML = bodyContent.innerHTML;
                     } else {
-                        throw error;
+                        markdownContent.innerHTML = htmlContent;
                     }
-                }
-            }
-            
-            // 메타데이터 주석 제거 (표시되지 않도록)
-            const cleanContent = content
-                .replace(/<!--\s*category:.*?-->/g, '')
-                .replace(/<!--\s*date:.*?-->/g, '')
-                .replace(/<!--\s*featured:.*?-->/g, '')
-                .replace(/<!--\s*keywords:.*?-->/g, '')
-                .replace(/<!--\s*title:.*?-->/g, '') // title 메타데이터 제거
-                .replace(/^#\s+.*?\n\s*\n/m, '\n'); // 첫 번째 h1 제목과 다음 빈 줄까지 제거 (멀티라인)
-            
-            // 마크다운 렌더링
-            const htmlContent = marked.parse(cleanContent);
-            
-            // SEO를 위한 메타 태그 업데이트
-            updateMetaTags(currentPost);
-            
-            // 콘텐츠 헤더 추가 - 구조화된 데이터 포함
-            markdownContent.innerHTML = `
-                <article itemscope itemtype="https://schema.org/BlogPosting">
-                    <meta itemprop="headline" content="${currentPost.title}">
-                    <meta itemprop="datePublished" content="${currentPost.date}">
-                    <meta itemprop="dateModified" content="${currentPost.modifiedDate || currentPost.date}">
-                    <meta itemprop="author" content="BrainDetox">
-                    ${currentPost.keywords ? `<meta itemprop="keywords" content="${currentPost.keywords}">` : ''}
                     
-                    <div class="post-content-header">
-                        <h1 class="post-title" itemprop="name">${currentPost.title}</h1>
-                        ${currentPost.englishTitle ? `<h2 class="post-subtitle">${currentPost.englishTitle}</h2>` : ''}
-                        <div class="post-meta">
-                            <span class="post-date" itemprop="datePublished" content="${currentPost.date}">${formatDate(currentPost.date)}</span>
-                            ${currentPost.category ? `<span class="post-category" itemprop="articleSection">${currentPost.category}</span>` : ''}
-                        </div>
-                    </div>
-                    <div class="post-content" itemprop="articleBody">
-                        ${htmlContent}
-                    </div>
-                </article>
-            `;
-            
-            // 코드 하이라이팅
-            document.querySelectorAll('pre code').forEach(block => {
-                hljs.highlightElement(block);
-            });
-            
-            // URL 파라미터 업데이트
-            updateUrlParam(postId);
-            
-            // 관련 게시물 표시 (같은 카테고리의 다른 글)
-            renderRelatedPosts(currentPost);
+                    // SEO를 위한 메타 태그 업데이트
+                    updateMetaTags(currentPost);
+                }
+                
+                // URL 파라미터 업데이트
+                updateUrlParam(postId);
+                
+                // 관련 게시물 표시 (같은 카테고리의 다른 글)
+                renderRelatedPosts(currentPost);
+                
+            } catch (error) {
+                debugLog(`HTML 파일 콘텐츠 로드 실패:`, error);
+                
+                // 오류 메시지 표시
+                markdownContent.innerHTML = `
+                    <div class="error-message">
+                        <p>포스트를 불러올 수 없습니다.</p>
+                        <p>오류 메시지: ${error.message}</p>
+                    </div>`;
+            }
             
         } catch (error) {
             console.error('포스트를 불러오는 중 오류가 발생했습니다:', error);
@@ -775,7 +763,7 @@ document.addEventListener('DOMContentLoaded', function() {
     });
     
     // 링크 복사 버튼
-    document.getElementById('link-share')?.addEventListener('click', function() {
+    document.getElementById('link-copy')?.addEventListener('click', function() {
         const postParam = currentPost ? `?post=${currentPost.id}` : '';
         const shareUrl = `${window.location.origin}${window.location.pathname}${postParam}`;
         navigator.clipboard.writeText(shareUrl)
@@ -801,144 +789,6 @@ document.addEventListener('DOMContentLoaded', function() {
         
         // 5분마다 목록 새로고침 (자동 업데이트)
         setInterval(fetchPostList, 5 * 60 * 1000);
-    }
-    
-    // 로컬 테스트용 샘플 콘텐츠 생성 함수
-    function createSampleContent(filename) {
-        // 파일명에 따라 다른 샘플 콘텐츠 생성
-        if (filename === 'javascript_basic.md') {
-            return `# JavaScript 기초
-<!-- category: 프로그래밍 -->
-<!-- date: 2024-05-15 -->
-<!-- featured: true -->
-
-## 소개
-
-JavaScript는 웹의 언어로, 현대 웹 개발에 필수적인 요소입니다. 이 글에서는 JavaScript의 기본 개념에 대해 알아보겠습니다.
-
-## 변수와 데이터 타입
-
-JavaScript에서는 \`var\`, \`let\`, \`const\` 키워드를 사용하여 변수를 선언합니다.
-
-\`\`\`javascript
-// 변수 선언
-let name = "홍길동";
-const age = 30;
-var isActive = true;
-\`\`\`
-
-## 함수
-
-JavaScript에서 함수는 다음과 같이 선언합니다:
-
-\`\`\`javascript
-// 함수 선언
-function greet(name) {
-  return "안녕하세요, " + name + "님!";
-}
-
-// 화살표 함수
-const greet2 = (name) => {
-  return "안녕하세요, " + name + "님!";
-};
-\`\`\`
-
-## 배열과 객체
-
-JavaScript에서 데이터 구조로 배열과 객체를 사용합니다:
-
-\`\`\`javascript
-// 배열
-const fruits = ["사과", "바나나", "오렌지"];
-
-// 객체
-const person = {
-  name: "홍길동",
-  age: 30,
-  isActive: true
-};
-\`\`\`
-
-## 마무리
-
-이것은 JavaScript의 아주 기본적인 소개입니다. 더 많은 내용은 추후 포스트에서 다루겠습니다.`;
-        } else if (filename === 'networking_basic.md') {
-            return `# 네트워킹 기초
-<!-- category: 네트워크 -->
-<!-- date: 2024-05-10 -->
-<!-- featured: false -->
-
-## 소개
-
-네트워킹은 컴퓨터 시스템과 장치들이 서로 통신하는 방법을 다루는 분야입니다. 이 글에서는 네트워킹의 기본 개념을 알아보겠습니다.
-
-## OSI 7계층 모델
-
-OSI 모델은 네트워크 통신을 7개의 계층으로 나눕니다:
-
-1. 물리 계층
-2. 데이터 링크 계층
-3. 네트워크 계층
-4. 전송 계층
-5. 세션 계층
-6. 표현 계층
-7. 응용 계층
-
-## IP 주소
-
-IP 주소는 네트워크 상의 장치를 식별하는 고유한 주소입니다.
-
-\`\`\`
-IPv4: 192.168.1.1
-IPv6: 2001:0db8:85a3:0000:0000:8a2e:0370:7334
-\`\`\`
-
-## TCP와 UDP
-
-TCP(Transmission Control Protocol)와 UDP(User Datagram Protocol)는 전송 계층의 주요 프로토콜입니다.
-
-### TCP 특징
-- 연결 지향적
-- 신뢰성 있는 전송
-- 순서 보장
-
-### UDP 특징
-- 비연결성
-- 신뢰성 없음
-- 빠른 속도
-
-## 마무리
-
-네트워킹의 기본 개념을 간략하게 살펴보았습니다. 다음 포스트에서는 더 깊이 있는 내용을 다루겠습니다.`;
-        } else {
-            // 기본 샘플 콘텐츠
-            return `# ${filename.replace('.md', '')}
-<!-- category: 미분류 -->
-<!-- date: ${new Date().toISOString().split('T')[0]} -->
-<!-- featured: false -->
-
-## 샘플 콘텐츠
-
-이 콘텐츠는 로컬 테스트를 위해 생성된 샘플입니다.
-
-## 마크다운 지원
-
-마크다운 문법이 지원됩니다:
-
-- 목록 항목 1
-- 목록 항목 2
-- 목록 항목 3
-
-\`\`\`
-코드 블록도 지원됩니다.
-\`\`\`
-
-> 인용문도 지원됩니다.
-
-## 마무리
-
-이것은 테스트용 샘플 콘텐츠입니다.`;
-        }
     }
     
     // 초기화 실행
