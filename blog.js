@@ -46,6 +46,9 @@ document.addEventListener('DOMContentLoaded', function() {
             updateMetaTag('twitter:title', '기술 블로그 - BrainDetox Utility Box | Technical Blog');
             updateMetaTag('twitter:description', '프로그래밍, 네트워크, 클라우드, 보안 등 IT 관련 유용한 정보를 제공합니다.');
             
+            // 소셜 미디어 공유 버튼 기본 정보 설정
+            updateSocialShareButtons(null);
+            
             return;
         }
         
@@ -85,7 +88,152 @@ document.addEventListener('DOMContentLoaded', function() {
         updateMetaTag('twitter:title', post.englishTitle || englishTitle);
         updateMetaTag('twitter:description', description);
         
+        // 소셜 미디어 공유 버튼 업데이트
+        updateSocialShareButtons(post);
+        
         debugLog('메타 태그 업데이트 완료:', postTitle);
+    }
+    
+    // 소셜 미디어 공유 버튼 업데이트 함수
+    function updateSocialShareButtons(post) {
+        // 카카오톡 공유 버튼 이벤트 업데이트
+        const kakaoShareBtn = document.getElementById('kakao-share');
+        if (kakaoShareBtn) {
+            kakaoShareBtn.onclick = function() {
+                // SDK 초기화 확인
+                if (!window.Kakao) {
+                    console.error('카카오톡 SDK를 불러올 수 없습니다.');
+                    alert('카카오톡 SDK를 불러올 수 없습니다. 다른 방법으로 공유해 주세요.');
+                    return;
+                }
+                
+                // SDK 초기화 확인 및 재시도
+                if (!window.Kakao.isInitialized()) {
+                    try {
+                        window.Kakao.init('e06d0ee93e450a11bc6451d46e09cd88');
+                    } catch (error) {
+                        console.error('카카오톡 SDK 초기화 실패:', error);
+                        alert('카카오톡 SDK 초기화에 실패했습니다. 다른 방법으로 공유해 주세요.');
+                        return;
+                    }
+                }
+                
+                // 공유 정보 설정
+                const url = post ? `${window.location.origin}${window.location.pathname}?post=${post.id}` : window.location.href;
+                const title = post ? `${post.title} - BrainDetox 기술 블로그` : '기술 블로그 - BrainDetox Utility Box';
+                const description = post ? (post.description || `${post.title} - ${post.category} 카테고리의 기술 블로그 글입니다.`) : 
+                    '프로그래밍, 네트워크, 클라우드, 보안 등 다양한 IT 기술에 대한 정보와 시사와 경제 등의 소식도 제공합니다.';
+                
+                // 절대 경로로 이미지 URL 설정
+                const imageUrl = `${window.location.origin}/site_logo.png`;
+                
+                try {
+                    // 이미지 없이도 기본 공유 기능 실행
+                    if (window.Kakao.Share) {
+                        window.Kakao.Share.sendDefault({
+                            objectType: 'feed',
+                            content: {
+                                title: title,
+                                description: description,
+                                imageUrl: imageUrl,
+                                link: {
+                                    mobileWebUrl: url,
+                                    webUrl: url
+                                }
+                            },
+                            buttons: [
+                                {
+                                    title: '웹으로 보기',
+                                    link: {
+                                        mobileWebUrl: url,
+                                        webUrl: url
+                                    }
+                                }
+                            ]
+                        });
+                    } else if (window.Kakao.Link) {
+                        window.Kakao.Link.sendDefault({
+                            objectType: 'feed',
+                            content: {
+                                title: title,
+                                description: description,
+                                imageUrl: imageUrl,
+                                link: {
+                                    mobileWebUrl: url,
+                                    webUrl: url
+                                }
+                            },
+                            buttons: [
+                                {
+                                    title: '웹으로 보기',
+                                    link: {
+                                        mobileWebUrl: url,
+                                        webUrl: url
+                                    }
+                                }
+                            ]
+                        });
+                    } else {
+                        window.open(`https://sharer.kakao.com/talk/friends/picker/link?url=${encodeURIComponent(url)}&text=${encodeURIComponent(title)}`, 'kakaotalk_share', 'width=350, height=650');
+                    }
+                } catch (error) {
+                    console.error('카카오톡 공유 중 오류 발생:', error);
+                    alert('카카오톡 공유 기능을 사용할 수 없습니다. 다른 방법으로 공유해 주세요.');
+                }
+            };
+        }
+        
+        // 페이스북 공유 버튼
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) {
+            facebookShareBtn.onclick = function() {
+                const url = post ? `${window.location.origin}${window.location.pathname}?post=${post.id}` : window.location.href;
+                const shareUrl = `https://www.facebook.com/sharer/sharer.php?u=${encodeURIComponent(url)}`;
+                const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+                
+                if (isMobile) {
+                    window.location.href = shareUrl;
+                } else {
+                    window.open(shareUrl, 'facebook-share-dialog', 'width=626,height=436');
+                }
+            };
+        }
+        
+        // 트위터 공유 버튼
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) {
+            twitterShareBtn.onclick = function() {
+                const url = post ? `${window.location.origin}${window.location.pathname}?post=${post.id}` : window.location.href;
+                const text = post ? `${post.title} - BrainDetox 기술 블로그` : '기술 블로그 - BrainDetox Utility Box';
+                window.open(`https://twitter.com/intent/tweet?text=${encodeURIComponent(text)}&url=${encodeURIComponent(url)}`, '_blank');
+            };
+        }
+        
+        // 링크 복사 버튼
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) {
+            linkCopyBtn.onclick = function() {
+                const url = post ? `${window.location.origin}${window.location.pathname}?post=${post.id}` : window.location.href;
+                navigator.clipboard.writeText(url).then(() => {
+                    alert('링크가 클립보드에 복사되었습니다.');
+                }).catch(err => {
+                    console.error('클립보드 복사 중 오류 발생:', err);
+                });
+            };
+        }
+        
+        // 쓰레드 공유 버튼
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.onclick = function() {
+                const url = post ? `${window.location.origin}${window.location.pathname}?post=${post.id}` : window.location.href;
+                navigator.clipboard.writeText(url).then(() => {
+                    alert('링크가 클립보드에 복사되었습니다.\n쓰레드 앱에 붙여넣기 해주세요.');
+                }).catch(err => {
+                    console.error('클립보드 복사 중 오류 발생:', err);
+                });
+            };
+        }
     }
     
     // 메타 태그 업데이트 헬퍼 함수
@@ -696,84 +844,6 @@ document.addEventListener('DOMContentLoaded', function() {
     document.getElementById('refreshBtn')?.addEventListener('click', function() {
         debugLog('새로고침 버튼 클릭됨');
         fetchPostList();
-    });
-    
-    // 공유 기능
-    document.getElementById('kakao-share')?.addEventListener('click', function() {
-        if (window.Kakao && window.Kakao.Link) {
-            const postParam = currentPost ? `?post=${currentPost.id}` : '';
-            const shareUrl = `${window.location.origin}${window.location.pathname}${postParam}`;
-            
-            window.Kakao.Link.sendDefault({
-                objectType: 'feed',
-                content: {
-                    title: currentPost ? currentPost.title : '기술 블로그 - BrainDetox Utility Box',
-                    description: '프로그래밍, 네트워크, 클라우드, 보안 등 다양한 IT 기술에 대한 정보와 시사와 경제 등의 소식도 제공합니다.',
-                    imageUrl: 'https://braindetox.kr/images/utility-warehouse-preview.jpg',
-                    link: {
-                        mobileWebUrl: shareUrl,
-                        webUrl: shareUrl
-                    }
-                },
-                buttons: [
-                    {
-                        title: '웹으로 보기',
-                        link: {
-                            mobileWebUrl: shareUrl,
-                            webUrl: shareUrl
-                        }
-                    }
-                ]
-            });
-        } else {
-            alert('카카오톡 공유 기능을 사용할 수 없습니다.');
-        }
-    });
-    
-    // 페이스북 공유 버튼
-    document.getElementById('facebook-share')?.addEventListener('click', function() {
-        const postParam = currentPost ? `?post=${currentPost.id}` : '';
-        const shareUrl = `${window.location.origin}${window.location.pathname}${postParam}`;
-        const url = encodeURIComponent(shareUrl);
-        window.open(`https://www.facebook.com/sharer/sharer.php?u=${url}`, '_blank');
-    });
-    
-    // 트위터 공유 버튼
-    document.getElementById('twitter-share')?.addEventListener('click', function() {
-        const postParam = currentPost ? `?post=${currentPost.id}` : '';
-        const shareUrl = `${window.location.origin}${window.location.pathname}${postParam}`;
-        const url = encodeURIComponent(shareUrl);
-        const text = currentPost ? encodeURIComponent(currentPost.title) : encodeURIComponent('기술 블로그 - BrainDetox Utility Box');
-        window.open(`https://twitter.com/intent/tweet?text=${text}&url=${url}`, '_blank');
-    });
-    
-    // 쓰레드 공유 버튼
-    document.getElementById('threads-share')?.addEventListener('click', function() {
-        const postParam = currentPost ? `?post=${currentPost.id}` : '';
-        const shareUrl = `${window.location.origin}${window.location.pathname}${postParam}`;
-        // 쓰레드는 공유 API가 없으므로 URL을 클립보드에 복사
-        navigator.clipboard.writeText(shareUrl)
-            .then(() => {
-                alert('URL이 클립보드에 복사되었습니다. 쓰레드 앱에 붙여넣기 하세요.');
-            })
-            .catch(err => {
-                console.error('클립보드 복사 실패:', err);
-                alert('URL 복사에 실패했습니다. 수동으로 복사해주세요.');
-            });
-    });
-    
-    // 링크 복사 버튼
-    document.getElementById('link-copy')?.addEventListener('click', function() {
-        const postParam = currentPost ? `?post=${currentPost.id}` : '';
-        const shareUrl = `${window.location.origin}${window.location.pathname}${postParam}`;
-        navigator.clipboard.writeText(shareUrl)
-            .then(() => {
-                alert('URL이 클립보드에 복사되었습니다.');
-            })
-            .catch(err => {
-                console.error('클립보드 복사 실패:', err);
-                alert('URL 복사에 실패했습니다. 수동으로 복사해주세요.');
-            });
     });
     
     // 초기화
