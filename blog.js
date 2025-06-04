@@ -23,8 +23,8 @@ document.addEventListener('DOMContentLoaded', function() {
     // 디버깅 플래그
     const DEBUG = true;
     
-    // 기본 도메인 설정 (www 포함)
-    const baseDomain = 'https://www.braindetox.kr';
+    // 기본 도메인 설정 (www 제거)
+    const baseDomain = 'https://braindetox.kr';
     
     // 디버깅 로그 함수
     function debugLog(...args) {

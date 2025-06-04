@@ -26,8 +26,8 @@ function fixHtmlFile(filePath, postId) {
         // 파일 내용 읽기
         const content = fs.readFileSync(filePath, 'utf8');
         
-        // 표준 URL 형식 - www 포함
-        const canonicalUrl = `https://www.braindetox.kr/blog.html?post=${postId}`;
+        // 표준 URL 형식 - www 없음
+        const canonicalUrl = `https://braindetox.kr/blog.html?post=${postId}`;
         
         // 이미 수정된 파일인지 확인 (canonical 태그가 있고 og:url이 올바른 값을 가지는지)
         const hasCanonical = content.includes(`<link rel="canonical" href="${canonicalUrl}">`);
