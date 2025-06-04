@@ -33,12 +33,6 @@ function fixHtmlFile(filePath, postId) {
         const hasCanonical = content.includes(`<link rel="canonical" href="${canonicalUrl}">`);
         const hasCorrectOgUrl = content.includes(`<meta property="og:url" content="${canonicalUrl}">`);
         
-        // 이미 수정된 파일이면 건너뛰기
-        if (hasCanonical && hasCorrectOgUrl) {
-            console.log(`이미 수정된 파일입니다: ${path.basename(filePath)}`);
-            return false;
-        }
-        
         let newContent = content;
         
         // canonical 태그 추가 또는 수정
@@ -68,34 +62,43 @@ function fixHtmlFile(filePath, postId) {
             );
         }
         
+        // www.braindetox.kr를 braindetox.kr로 일관되게 변경 (모든 URL 패턴에 대해)
+        newContent = newContent.replace(
+            /https:\/\/www\.braindetox\.kr/g,
+            'https://braindetox.kr'
+        );
+        
+        // JSON-LD의 구문 오류 수정 ("mainEntityOfPage",,: 형태 수정)
+        newContent = newContent.replace(
+            /"mainEntityOfPage",,:\s*"[^"]*"/g,
+            (match) => {
+                // 원래 URL 값 추출
+                const urlMatch = match.match(/"mainEntityOfPage",,:\s*"([^"]*)"/);
+                const url = urlMatch ? urlMatch[1] : canonicalUrl;
+                return `"mainEntityOfPage": "${url}"`;
+            }
+        );
+        
         // JSON-LD의 mainEntityOfPage 추가 또는 수정
         if (!newContent.includes(`"mainEntityOfPage": "${canonicalUrl}"`)) {
             // 기존 mainEntityOfPage가 있는지 확인
             if (newContent.includes('"mainEntityOfPage":')) {
                 // 기존 mainEntityOfPage 수정
                 newContent = newContent.replace(
-                    /"mainEntityOfPage": "[^"]*"/,
+                    /"mainEntityOfPage":\s*"[^"]*"/,
                     `"mainEntityOfPage": "${canonicalUrl}"`
                 );
             } else {
-                // JSON-LD 스크립트에서 닫는 중괄호 바로 앞에 mainEntityOfPage 추가
+                // image 객체 다음에 mainEntityOfPage 추가
                 newContent = newContent.replace(
-                    /}(\s*)<\/script>/,
-                    `  "mainEntityOfPage": "${canonicalUrl}"\n}$1</script>`
-                );
-                
-                // 쉼표 이슈 해결 (이미 항목이 있는 경우 쉼표 추가)
-                newContent = newContent.replace(
-                    /"url": "[^"]*"\s*\n\s*"mainEntityOfPage"/,
-                    '"url": "$&",\n  "mainEntityOfPage"'
-                );
-                
-                newContent = newContent.replace(
-                    /"image": \{\s*\n\s*"@type": "ImageObject",\s*\n\s*"url": "[^"]*"\s*\n\s*\}\s*\n\s*"mainEntityOfPage"/,
-                    '$&,'
+                    /"image":\s*\{\s*\n\s*"@type":\s*"ImageObject",\s*\n\s*"url":\s*"[^"]*"\s*\n\s*\}(\s*)\n/,
+                    `"image": {\n        "@type": "ImageObject",\n        "url": "https://braindetox.kr/site_logo.png"\n      },\n      "mainEntityOfPage": "${canonicalUrl}"$1\n`
                 );
             }
         }
+        
+        // JSON-LD 닫는 괄호 수정 (,} 형태의 잘못된 JSON 수정)
+        newContent = newContent.replace(/,(\s*)\}/g, '$1}');
         
         // 변경된 내용이 있으면 파일 저장
         if (content !== newContent) {
