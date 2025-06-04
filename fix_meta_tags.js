@@ -26,9 +26,12 @@ function fixHtmlFile(filePath, postId) {
         // 파일 내용 읽기
         const content = fs.readFileSync(filePath, 'utf8');
         
+        // 표준 URL 형식 - www 포함
+        const canonicalUrl = `https://www.braindetox.kr/blog.html?post=${postId}`;
+        
         // 이미 수정된 파일인지 확인 (canonical 태그가 있고 og:url이 올바른 값을 가지는지)
-        const hasCanonical = content.includes(`<link rel="canonical" href="https://braindetox.kr/blog.html?post=${postId}">`);
-        const hasCorrectOgUrl = content.includes(`<meta property="og:url" content="https://braindetox.kr/blog.html?post=${postId}">`);
+        const hasCanonical = content.includes(`<link rel="canonical" href="${canonicalUrl}">`);
+        const hasCorrectOgUrl = content.includes(`<meta property="og:url" content="${canonicalUrl}">`);
         
         // 이미 수정된 파일이면 건너뛰기
         if (hasCanonical && hasCorrectOgUrl) {
@@ -40,11 +43,20 @@ function fixHtmlFile(filePath, postId) {
         
         // canonical 태그 추가 또는 수정
         if (!hasCanonical) {
-            // viewport 메타 태그 다음에 canonical 태그 추가
-            newContent = newContent.replace(
-                /<meta name="viewport".*?>/i,
-                `$&\n    <!-- canonical URL -->\n    <link rel="canonical" href="https://braindetox.kr/blog.html?post=${postId}">`
-            );
+            // 기존 canonical 태그가 있는지 확인
+            if (newContent.includes('<link rel="canonical"')) {
+                // 기존 canonical 태그 수정
+                newContent = newContent.replace(
+                    /<link rel="canonical" href="[^"]*">/i,
+                    `<link rel="canonical" href="${canonicalUrl}">`
+                );
+            } else {
+                // viewport 메타 태그 다음에 canonical 태그 추가
+                newContent = newContent.replace(
+                    /<meta name="viewport".*?>/i,
+                    `$&\n    <!-- canonical URL -->\n    <link rel="canonical" href="${canonicalUrl}">`
+                );
+            }
         }
         
         // og:url 태그 수정
@@ -52,28 +64,37 @@ function fixHtmlFile(filePath, postId) {
             // 잘못된 og:url 태그를 찾아 수정
             newContent = newContent.replace(
                 /<meta property="og:url" content="[^"]*">/i,
-                `<meta property="og:url" content="https://braindetox.kr/blog.html?post=${postId}">`
+                `<meta property="og:url" content="${canonicalUrl}">`
             );
         }
         
         // JSON-LD의 mainEntityOfPage 추가 또는 수정
-        if (!newContent.includes(`"mainEntityOfPage": "https://braindetox.kr/blog.html?post=${postId}"`)) {
-            // JSON-LD 스크립트에서 닫는 중괄호 바로 앞에 mainEntityOfPage 추가
-            newContent = newContent.replace(
-                /}(\s*)<\/script>/,
-                `  "mainEntityOfPage": "https://braindetox.kr/blog.html?post=${postId}"\n}$1</script>`
-            );
-            
-            // 쉼표 이슈 해결 (이미 항목이 있는 경우 쉼표 추가)
-            newContent = newContent.replace(
-                /"url": "[^"]*"\s*\n\s*"mainEntityOfPage"/,
-                '"url": "$&",\n  "mainEntityOfPage"'
-            );
-            
-            newContent = newContent.replace(
-                /"image": \{\s*\n\s*"@type": "ImageObject",\s*\n\s*"url": "[^"]*"\s*\n\s*\}\s*\n\s*"mainEntityOfPage"/,
-                '$&,'
-            );
+        if (!newContent.includes(`"mainEntityOfPage": "${canonicalUrl}"`)) {
+            // 기존 mainEntityOfPage가 있는지 확인
+            if (newContent.includes('"mainEntityOfPage":')) {
+                // 기존 mainEntityOfPage 수정
+                newContent = newContent.replace(
+                    /"mainEntityOfPage": "[^"]*"/,
+                    `"mainEntityOfPage": "${canonicalUrl}"`
+                );
+            } else {
+                // JSON-LD 스크립트에서 닫는 중괄호 바로 앞에 mainEntityOfPage 추가
+                newContent = newContent.replace(
+                    /}(\s*)<\/script>/,
+                    `  "mainEntityOfPage": "${canonicalUrl}"\n}$1</script>`
+                );
+                
+                // 쉼표 이슈 해결 (이미 항목이 있는 경우 쉼표 추가)
+                newContent = newContent.replace(
+                    /"url": "[^"]*"\s*\n\s*"mainEntityOfPage"/,
+                    '"url": "$&",\n  "mainEntityOfPage"'
+                );
+                
+                newContent = newContent.replace(
+                    /"image": \{\s*\n\s*"@type": "ImageObject",\s*\n\s*"url": "[^"]*"\s*\n\s*\}\s*\n\s*"mainEntityOfPage"/,
+                    '$&,'
+                );
+            }
         }
         
         // 변경된 내용이 있으면 파일 저장

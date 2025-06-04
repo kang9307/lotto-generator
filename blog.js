@@ -23,6 +23,9 @@ document.addEventListener('DOMContentLoaded', function() {
     // 디버깅 플래그
     const DEBUG = true;
     
+    // 기본 도메인 설정 (www 포함)
+    const baseDomain = 'https://www.braindetox.kr';
+    
     // 디버깅 로그 함수
     function debugLog(...args) {
         if (DEBUG) {
@@ -41,7 +44,7 @@ document.addEventListener('DOMContentLoaded', function() {
             // Open Graph 및 Twitter 카드 업데이트
             updateMetaTag('og:title', '기술 블로그 - BrainDetox Utility Box | Technical Blog', 'property');
             updateMetaTag('og:description', '프로그래밍, 네트워크, 클라우드, 보안 등 IT 관련 유용한 정보를 제공합니다.', 'property');
-            updateMetaTag('og:url', window.location.href, 'property');
+            updateMetaTag('og:url', `${baseDomain}${window.location.pathname}`, 'property');
             
             updateMetaTag('twitter:title', '기술 블로그 - BrainDetox Utility Box | Technical Blog');
             updateMetaTag('twitter:description', '프로그래밍, 네트워크, 클라우드, 보안 등 IT 관련 유용한 정보를 제공합니다.');
@@ -72,12 +75,12 @@ document.addEventListener('DOMContentLoaded', function() {
         updateMetaTag('keywords', post.keywords || `${post.category}, 기술 블로그, ${post.title}`);
         
         // 정규화된 URL (canonical) 업데이트
-        updateMetaTag('canonical', `${window.location.origin}${window.location.pathname}?post=${post.id}`, 'link');
+        updateMetaTag('canonical', `${baseDomain}${window.location.pathname}?post=${post.id}`, 'link');
         
         // Open Graph 및 Twitter 카드 업데이트
         updateMetaTag('og:title', postTitle, 'property');
         updateMetaTag('og:description', description, 'property');
-        updateMetaTag('og:url', `${window.location.origin}${window.location.pathname}?post=${post.id}`, 'property');
+        updateMetaTag('og:url', `${baseDomain}${window.location.pathname}?post=${post.id}`, 'property');
         updateMetaTag('og:type', 'article', 'property');
         if (post.category) {
             updateMetaTag('article:section', post.category, 'property');
@@ -119,13 +122,13 @@ document.addEventListener('DOMContentLoaded', function() {
                 }
                 
                 // 공유 정보 설정
-                const url = post ? `${window.location.origin}${window.location.pathname}?post=${post.id}` : window.location.href;
+                const url = post ? `${baseDomain}${window.location.pathname}?post=${post.id}` : `${baseDomain}${window.location.pathname}`;
                 const title = post ? `${post.title} - BrainDetox 기술 블로그` : '기술 블로그 - BrainDetox Utility Box';
                 const description = post ? (post.description || `${post.title} - ${post.category} 카테고리의 기술 블로그 글입니다.`) : 
                     '프로그래밍, 네트워크, 클라우드, 보안 등 다양한 IT 기술에 대한 정보와 시사와 경제 등의 소식도 제공합니다.';
                 
                 // 절대 경로로 이미지 URL 설정
-                const imageUrl = `${window.location.origin}/site_logo.png`;
+                const imageUrl = `${baseDomain}/site_logo.png`;
                 
                 try {
                     // 이미지 없이도 기본 공유 기능 실행
@@ -187,7 +190,7 @@ document.addEventListener('DOMContentLoaded', function() {
         const facebookShareBtn = document.getElementById('facebook-share');
         if (facebookShareBtn) {
             facebookShareBtn.onclick = function() {
-                const url = post ? `${window.location.origin}${window.location.pathname}?post=${post.id}` : window.location.href;
+                const url = post ? `${baseDomain}${window.location.pathname}?post=${post.id}` : `${baseDomain}${window.location.pathname}`;
                 const shareUrl = `https://www.facebook.com/sharer/sharer.php?u=${encodeURIComponent(url)}`;
                 const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
                 
@@ -203,9 +206,11 @@ document.addEventListener('DOMContentLoaded', function() {
         const twitterShareBtn = document.getElementById('twitter-share');
         if (twitterShareBtn) {
             twitterShareBtn.onclick = function() {
-                const url = post ? `${window.location.origin}${window.location.pathname}?post=${post.id}` : window.location.href;
-                const text = post ? `${post.title} - BrainDetox 기술 블로그` : '기술 블로그 - BrainDetox Utility Box';
-                window.open(`https://twitter.com/intent/tweet?text=${encodeURIComponent(text)}&url=${encodeURIComponent(url)}`, '_blank');
+                const url = post ? `${baseDomain}${window.location.pathname}?post=${post.id}` : `${baseDomain}${window.location.pathname}`;
+                const title = post ? `${post.title} - BrainDetox 기술 블로그` : '기술 블로그 - BrainDetox Utility Box';
+                const shareUrl = `https://twitter.com/intent/tweet?text=${encodeURIComponent(title)}&url=${encodeURIComponent(url)}`;
+                
+                window.open(shareUrl, 'twitter-share-dialog', 'width=626,height=436');
             };
         }
         
@@ -213,7 +218,7 @@ document.addEventListener('DOMContentLoaded', function() {
         const linkCopyBtn = document.getElementById('link-copy');
         if (linkCopyBtn) {
             linkCopyBtn.onclick = function() {
-                const url = post ? `${window.location.origin}${window.location.pathname}?post=${post.id}` : window.location.href;
+                const url = post ? `${baseDomain}${window.location.pathname}?post=${post.id}` : `${baseDomain}${window.location.pathname}`;
                 navigator.clipboard.writeText(url).then(() => {
                     alert('링크가 클립보드에 복사되었습니다.');
                 }).catch(err => {
@@ -226,7 +231,7 @@ document.addEventListener('DOMContentLoaded', function() {
         const threadsShareBtn = document.getElementById('threads-share');
         if (threadsShareBtn) {
             threadsShareBtn.onclick = function() {
-                const url = post ? `${window.location.origin}${window.location.pathname}?post=${post.id}` : window.location.href;
+                const url = post ? `${baseDomain}${window.location.pathname}?post=${post.id}` : `${baseDomain}${window.location.pathname}`;
                 navigator.clipboard.writeText(url).then(() => {
                     alert('링크가 클립보드에 복사되었습니다.\n쓰레드 앱에 붙여넣기 해주세요.');
                 }).catch(err => {
