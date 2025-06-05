@@ -93,4 +93,35 @@ document.addEventListener('DOMContentLoaded', function() {
             }
         });
     }
+    
+    // 모바일 환경에서 탭 레이아웃 최적화 함수
+    function optimizeTabsForMobile() {
+        const tabsContainers = document.querySelectorAll('.tabs');
+        if (tabsContainers.length > 0) {
+            // 모바일 환경에서 탭 최적화
+            const isMobile = window.innerWidth <= 768;
+            tabsContainers.forEach(tabsContainer => {
+                if (isMobile) {
+                    // 모바일 최적화 스타일
+                    tabsContainer.style.justifyContent = 'center';
+                    tabsContainer.style.display = 'flex';
+                    tabsContainer.style.flexWrap = 'wrap';
+                    tabsContainer.style.gap = '5px';
+                    tabsContainer.style.overflowX = 'visible';
+                    
+                    // 각 탭에 대한 스타일 적용
+                    const tabs = tabsContainer.querySelectorAll('.tab');
+                    tabs.forEach(tab => {
+                        tab.style.flex = '1 0 auto';
+                        tab.style.minWidth = '80px';
+                        tab.style.maxWidth = 'none';
+                    });
+                }
+            });
+        }
+    }
+    
+    // 페이지 로드 시와 리사이즈 시 최적화 적용
+    optimizeTabsForMobile();
+    window.addEventListener('resize', optimizeTabsForMobile);
 }); 
