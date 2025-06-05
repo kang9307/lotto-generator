@@ -159,4 +159,8 @@ QR 코드 생성기는 다음 주요 기능을 포함합니다:
 
 ## 라이센스 (License)
 
-Copyright (c) 2025 braindetox.kr. All rights reserved. 
+Copyright (c) 2025 braindetox.kr. All rights reserved.
+
+## 배포 정보
+- 마지막 배포: 2025년 최신 버전
+- 배포 트리거 타임스탬프: 2025-06-30 12:00:00 
