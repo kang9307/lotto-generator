@@ -95,6 +95,9 @@ document.addEventListener('DOMContentLoaded', function() {
         const numbersDiv = document.createElement('div');
         numbersDiv.classList.add('numbers');
         
+        // 모바일 화면 체크
+        const isMobile = window.innerWidth <= 768;
+        
         // 각 번호를 span으로 생성하고 색상 적용
         numbers.forEach((num, index) => {
             const numberSpan = document.createElement('span');
@@ -115,10 +118,21 @@ document.addEventListener('DOMContentLoaded', function() {
                 numberSpan.classList.add('green');
             }
             
+            // 숫자 애니메이션 효과를 위한 지연 시간 설정
+            setTimeout(() => {
+                numberSpan.style.opacity = '1';
+                numberSpan.style.transform = 'scale(1)';
+            }, index * 100);
+            
             numbersDiv.appendChild(numberSpan);
         });
         
         gameDiv.appendChild(numbersDiv);
         resultsContainer.appendChild(gameDiv);
+        
+        // 결과 영역으로 스크롤
+        setTimeout(() => {
+            resultsContainer.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }, 300);
     }
 }); 
