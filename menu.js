@@ -22,6 +22,30 @@ const menuItems = [
         name: '서브넷 계산기',
         url: 'subnet.html',
         isActive: false
+    },
+    {
+        id: 'password',
+        name: '비밀번호 생성기',
+        url: 'password.html',
+        isActive: false
+    },
+    {
+        id: 'qrcode',
+        name: 'QR코드 생성기',
+        url: 'qrcode.html',
+        isActive: false
+    },
+    {
+        id: 'datetime',
+        name: '시간/날짜 계산기',
+        url: 'datetime.html',
+        isActive: false
+    },
+    {
+        id: 'blog',
+        name: '블로그',
+        url: 'blog.html',
+        isActive: false
     }
     // 추가 메뉴는 여기에 계속 추가할 수 있습니다
 ];

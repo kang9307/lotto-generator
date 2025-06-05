@@ -33,6 +33,9 @@ document.addEventListener('DOMContentLoaded', function() {
                         <li class="nav-item">
                             <a href="qrcode.html" class="nav-link">QR 코드 생성기</a>
                         </li>
+                        <li class="nav-item">
+                            <a href="datetime.html" class="nav-link">시간/날짜 계산기</a>
+                        </li>
                     </ul>
                 </nav>
             </div>
