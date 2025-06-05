@@ -12,9 +12,9 @@ document.addEventListener('DOMContentLoaded', function() {
         const headerHTML = `
         <header class="main-header">
             <div class="header-container">
-                <h1 class="site-title" style="margin-bottom: 8px;"><a href="index.html" style="color: inherit; text-decoration: none;">BrainDetox Utility Box</a></h1>
-                <nav class="main-nav" style="margin-top: 5px;">
-                    <ul class="nav-list" style="gap: 10px;">
+                <h1 class="site-title"><a href="index.html" style="color: inherit; text-decoration: none;">BrainDetox Utility Box</a></h1>
+                <nav class="main-nav">
+                    <ul class="nav-list">
                         <li class="nav-item">
                             <a href="index.html" class="nav-link">홈</a>
                         </li>
@@ -43,14 +43,14 @@ document.addEventListener('DOMContentLoaded', function() {
 
         const footerHTML = `
         <footer class="main-footer">
-            <div class="footer-container" style="gap: 5px;">
-                <p class="footer-text" style="margin: 5px 0;">
+            <div class="footer-container">
+                <p class="footer-text">
                     &copy; 2025 BrainDetox Utility Box. 모든 권리 보유.
                 </p>
-                <p class="footer-text" style="margin: 5px 0;">
+                <p class="footer-text">
                     사이트 내 모든 도구는 무료로 제공되며, 문의사항은 이메일(<a href="mailto:jhtoka@gmail.com" class="footer-link">jhtoka@gmail.com</a>)로 연락 바랍니다.
                 </p>
-                <p class="footer-text" style="margin: 5px 0;">
+                <p class="footer-text">
                     <a href="privacy.html" class="footer-link">개인정보 처리방침</a> | <a href="privacy.html" class="footer-link">Privacy Policy</a>
                 </p>
             </div>
