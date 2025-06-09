@@ -25,7 +25,7 @@ document.addEventListener('DOMContentLoaded', function() {
     
     // 기본 도메인 설정 (www 제거)
     const baseDomain = 'https://braindetox.kr';
-    const baseUrl = '/blog/';
+    const baseUrl = '/blog.html?post='; // 다시 파라미터 방식으로 변경
     
     // 디버깅 로그 함수
     function debugLog(...args) {
@@ -515,6 +515,9 @@ document.addEventListener('DOMContentLoaded', function() {
             filteredPosts = posts.filter(post => post.category === filterCategory);
         }
         
+        // 날짜 최신순으로 정렬
+        filteredPosts.sort((a, b) => new Date(b.date) - new Date(a.date));
+        
         // 결과가 없는 경우
         if (filteredPosts.length === 0) {
             postList.innerHTML = '<li class="post-item no-results">검색 결과가 없습니다.</li>';
@@ -525,14 +528,14 @@ document.addEventListener('DOMContentLoaded', function() {
         filteredPosts.forEach(post => {
             const listItem = document.createElement('li');
             listItem.className = 'post-item';
+            listItem.setAttribute('data-id', post.id);
             
             const postLink = document.createElement('a');
-            // 새 URL 구조 적용
-            postLink.href = baseUrl + post.id;
+            // 원래 URL 구조로 변경
+            postLink.href = `${baseUrl}${post.id}`;
             postLink.textContent = post.title;
-            postLink.setAttribute('data-id', post.id);
             
-            // History API를 사용하는 클릭 이벤트 핸들러 추가
+            // 클릭 이벤트 핸들러 - 기본 이벤트 방지
             postLink.addEventListener('click', function(e) {
                 e.preventDefault();
                 loadPost(post.id);
@@ -564,6 +567,11 @@ document.addEventListener('DOMContentLoaded', function() {
         
         // 현재 포스트 강조 표시
         highlightCurrentPost();
+        
+        // 총 포스트 수 업데이트
+        if (totalPostsEl) {
+            totalPostsEl.textContent = posts.length;
+        }
     }
     
     // 추천 글 목록 렌더링
@@ -767,43 +775,39 @@ document.addEventListener('DOMContentLoaded', function() {
         // 같은 카테고리의 다른 게시물 찾기 (최대 5개)
         const relatedPosts = posts
             .filter(post => post.category === currentPost.category && post.id !== currentPost.id)
+            .sort((a, b) => new Date(b.date) - new Date(a.date))
             .slice(0, 5);
         
         if (relatedPosts.length === 0) return;
         
-        // 관련 게시물 섹션 생성
-        const relatedSection = document.createElement('div');
-        relatedSection.className = 'related-posts';
+        // 관련 게시물 HTML 생성
+        const relatedPostsHTML = `
+            <div class="related-posts">
+                <h3>관련 게시물</h3>
+                <ul>
+                    ${relatedPosts.map(post => `
+                        <li>
+                            <a href="${baseUrl}${post.id}" class="related-post-link" data-id="${post.id}">
+                                ${post.title}
+                            </a>
+                            <span class="post-date">${formatDate(post.date)}</span>
+                        </li>
+                    `).join('')}
+                </ul>
+            </div>
+        `;
         
-        const sectionTitle = document.createElement('h3');
-        sectionTitle.textContent = '관련 게시물';
-        relatedSection.appendChild(sectionTitle);
+        // 관련 게시물 추가
+        markdownContent.insertAdjacentHTML('beforeend', relatedPostsHTML);
         
-        const postsList = document.createElement('ul');
-        
-        relatedPosts.forEach(post => {
-            const listItem = document.createElement('li');
-            
-            const postLink = document.createElement('a');
-            // 새 URL 구조 적용
-            postLink.href = baseUrl + post.id;
-            postLink.textContent = post.title;
-            postLink.setAttribute('data-id', post.id);
-            
-            // History API를 사용하는 클릭 이벤트 핸들러 추가
-            postLink.addEventListener('click', function(e) {
+        // 관련 게시물 링크에 이벤트 리스너 추가
+        document.querySelectorAll('.related-post-link').forEach(link => {
+            link.addEventListener('click', function(e) {
                 e.preventDefault();
-                loadPost(post.id);
+                const postId = this.getAttribute('data-id');
+                loadPost(postId);
             });
-            
-            listItem.appendChild(postLink);
-            postsList.appendChild(listItem);
         });
-        
-        relatedSection.appendChild(postsList);
-        
-        // 마크다운 콘텐츠 뒤에 관련 게시물 섹션 추가
-        markdownContent.appendChild(relatedSection);
     }
     
     // 업데이트된 URL 상태 관리 함수
@@ -814,41 +818,23 @@ document.addEventListener('DOMContentLoaded', function() {
         const currentPost = posts.find(post => post.id === postId);
         if (!currentPost) return;
         
-        const postUrl = baseUrl + postId;
-        const postTitle = currentPost.title + ' - BrainDetox 기술 블로그';
-        
-        // 현재 URL과 새 URL 비교
-        const currentPath = window.location.pathname;
-        const targetPath = postUrl;
-        
-        // URL이 이미 올바른 형식이면 업데이트하지 않음
-        if (currentPath === targetPath) return;
-        
-        // History API로 URL 업데이트
-        window.history.pushState({postId: postId}, postTitle, postUrl);
-        
-        // 메타 태그 업데이트
-        updateMetaTags(currentPost);
-        
-        debugLog('URL 상태 업데이트됨:', postUrl);
+        // URL 업데이트 (파라미터 방식으로 변경)
+        if (history.pushState) {
+            const newUrl = new URL(window.location.href);
+            newUrl.searchParams.set('post', postId);
+            window.history.pushState({ path: newUrl.href, postId: postId }, currentPost.title, newUrl.href);
+            
+            // 메타 태그 업데이트
+            updateMetaTags(currentPost);
+            
+            debugLog('URL 상태 업데이트됨:', newUrl.href);
+        }
     }
     
     // 업데이트된 URL에서 포스트 ID 가져오기 함수
     function getPostIdFromUrl() {
-        const urlPath = window.location.pathname;
-        
-        // 기존 파라미터 방식 URL 체크 (이전 URL 형식 지원)
         const urlParams = new URLSearchParams(window.location.search);
-        const paramPostId = urlParams.get('post');
-        if (paramPostId) return paramPostId;
-        
-        // 새로운 URL 패턴 체크 (/blog/post-id 형식)
-        if (urlPath.startsWith(baseUrl)) {
-            const postId = urlPath.slice(baseUrl.length);
-            return postId || null;
-        }
-        
-        return null;
+        return urlParams.get('post');
     }
     
     // History API의 popstate 이벤트 리스너 추가
@@ -873,24 +859,48 @@ document.addEventListener('DOMContentLoaded', function() {
         fetchPostList();
     });
     
+    // 포스트 목록에 현재 포스트 강조 표시
+    function highlightCurrentPost() {
+        const postId = getPostIdFromUrl();
+        if (!postId) return;
+        
+        // 모든 포스트 항목에서 active 클래스 제거
+        document.querySelectorAll('.post-item').forEach(item => {
+            item.classList.remove('active');
+        });
+        
+        // 현재 포스트에 active 클래스 추가
+        const activeItem = document.querySelector(`.post-item[data-id="${postId}"]`);
+        if (activeItem) {
+            activeItem.classList.add('active');
+        }
+    }
+    
     // 초기화
     async function init() {
         debugLog('블로그 초기화 중...');
-        await fetchPostList();
         
-        // URL에서 포스트 ID 가져오기
-        const postId = getPostIdFromUrl();
-        
-        if (postId) {
-            // 특정 포스트 로드
-            await loadPost(postId);
-        } else {
-            // 최신 포스트 로드
-            loadLatestPost();
+        try {
+            // 포스트 목록 가져오기
+            await fetchPostList();
+            
+            // URL에서 포스트 ID 가져오기
+            const postId = getPostIdFromUrl();
+            
+            if (postId) {
+                // 특정 포스트 로드
+                await loadPost(postId);
+            } else {
+                // 최신 포스트 로드
+                loadLatestPost();
+            }
+            
+            // 5분마다 목록 새로고침 (자동 업데이트)
+            setInterval(fetchPostList, 5 * 60 * 1000);
+        } catch (error) {
+            console.error('초기화 중 오류 발생:', error);
+            debugLog('초기화 중 예외 발생:', error);
         }
-        
-        // 5분마다 목록 새로고침 (자동 업데이트)
-        setInterval(fetchPostList, 5 * 60 * 1000);
     }
     
     // 초기화 실행
