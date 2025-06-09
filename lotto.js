@@ -8,6 +8,9 @@ document.addEventListener('DOMContentLoaded', function() {
     const generateBtn = document.getElementById('generate-btn');
     const gameCountSelect = document.getElementById('game-count');
     const resultsContainer = document.getElementById('results');
+    const kakaoShareBtn = document.getElementById('kakao-share');
+    const resultShareSection = document.getElementById('result-share-section');
+    const resultKakaoShareBtn = document.getElementById('result-kakao-share');
     
     // 탭 관련 요소
     const tabs = document.querySelectorAll('.tab');
@@ -15,6 +18,9 @@ document.addEventListener('DOMContentLoaded', function() {
     
     // 연속된 번호 제한 확률 - 70%에서 50%로 감소시켜 다양성 향상
     const CONSECUTIVE_LIMIT_PROBABILITY = 0.5;
+    
+    // 생성된 로또 번호를 저장할 전역 변수
+    let generatedLottoNumbers = [];
     
     // 탭 전환 이벤트 설정
     if (tabs.length > 0) {
@@ -47,6 +53,20 @@ document.addEventListener('DOMContentLoaded', function() {
         generateBtn.addEventListener('click', generateLottoNumbers);
     }
     
+    // 카카오톡 공유 버튼에 이벤트 추가
+    if (kakaoShareBtn) {
+        kakaoShareBtn.addEventListener('click', function() {
+            shareToKakao(false); // 사이트 공유
+        });
+    }
+    
+    // 로또 결과 공유 버튼에 이벤트 추가
+    if (resultKakaoShareBtn) {
+        resultKakaoShareBtn.addEventListener('click', function() {
+            shareToKakao(true); // 결과 공유
+        });
+    }
+    
     // 로또 번호 생성 함수
     function generateLottoNumbers() {
         // 게임 수 가져오기
@@ -55,10 +75,19 @@ document.addEventListener('DOMContentLoaded', function() {
         // 결과 컨테이너 초기화
         resultsContainer.innerHTML = '';
         
+        // 생성된 로또 번호 배열 초기화
+        generatedLottoNumbers = [];
+        
         // 각 게임마다 번호 생성
         for (let i = 0; i < gameCount; i++) {
             const numbers = generateRandomNumbers();
+            generatedLottoNumbers.push(numbers); // 생성된 번호 저장
             displayNumbers(numbers, i + 1);
+        }
+        
+        // 로또 번호가 생성되었으므로 공유 섹션 표시
+        if (resultShareSection) {
+            resultShareSection.style.display = 'block';
         }
     }
     
@@ -175,5 +204,102 @@ document.addEventListener('DOMContentLoaded', function() {
         setTimeout(() => {
             resultsContainer.scrollIntoView({ behavior: 'smooth', block: 'start' });
         }, 300);
+    }
+    
+    // 카카오톡으로 로또 번호 공유 함수
+    function shareToKakao(isResultShare) {
+        if (!window.Kakao) {
+            alert('카카오톡 SDK를 불러올 수 없습니다.');
+            return;
+        }
+        
+        // 결과 공유인 경우, 생성된 번호가 있는지 확인
+        if (isResultShare && generatedLottoNumbers.length === 0) {
+            alert('먼저 로또 번호를 생성해주세요!');
+            return;
+        }
+        
+        // SDK 초기화 확인 및 재시도
+        if (!window.Kakao.isInitialized()) {
+            window.Kakao.init('e06d0ee93e450a11bc6451d46e09cd88');
+        }
+        
+        // 공유 데이터 설정
+        let title, description;
+        
+        if (isResultShare) {
+            // 로또 결과 공유
+            title = '행운의 로또 번호를 공유합니다!';
+            
+            // 공유할 메시지 생성
+            description = '내가 생성한 로또 번호:\n';
+            generatedLottoNumbers.forEach((numbers, index) => {
+                description += `게임 ${index + 1}: ${numbers.join(', ')}\n`;
+            });
+        } else {
+            // 사이트 공유
+            title = '로또 번호 생성기 - BrainDetox Utility Box';
+            description = '무료 로또 번호 생성기로 나만의 로또 번호를 뽑아보세요.';
+        }
+        
+        try {
+            if (window.Kakao.Share) {
+                // 최신 SDK Share 객체 사용
+                window.Kakao.Share.sendDefault({
+                    objectType: 'feed',
+                    content: {
+                        title: title,
+                        description: description,
+                        imageUrl: 'https://braindetox.kr/site_logo.png',
+                        link: {
+                            mobileWebUrl: window.location.href,
+                            webUrl: window.location.href
+                        }
+                    },
+                    buttons: [
+                        {
+                            title: '나도 번호 생성하기',
+                            link: {
+                                mobileWebUrl: window.location.href,
+                                webUrl: window.location.href
+                            }
+                        }
+                    ]
+                });
+            } else if (window.Kakao.Link) {
+                // 구 버전 호환성 유지
+                window.Kakao.Link.sendDefault({
+                    objectType: 'feed',
+                    content: {
+                        title: title,
+                        description: description,
+                        imageUrl: 'https://braindetox.kr/site_logo.png',
+                        link: {
+                            mobileWebUrl: window.location.href,
+                            webUrl: window.location.href
+                        }
+                    },
+                    buttons: [
+                        {
+                            title: '나도 번호 생성하기',
+                            link: {
+                                mobileWebUrl: window.location.href,
+                                webUrl: window.location.href
+                            }
+                        }
+                    ]
+                });
+            } else {
+                // 모바일이 아니거나 카카오톡 미설치 시 웹 공유 사용
+                if (isResultShare) {
+                    alert('생성된 로또 번호를 카카오톡으로 공유할 수 없습니다. 다른 방법으로 공유해 주세요.');
+                } else {
+                    alert('카카오톡 공유 기능을 사용할 수 없습니다. 다른 방법으로 공유해 주세요.');
+                }
+            }
+        } catch (error) {
+            console.error('카카오톡 공유 중 오류 발생:', error);
+            alert('카카오톡 공유 기능을 사용할 수 없습니다. 다른 방법으로 공유해 주세요.');
+        }
     }
 }); 
