@@ -13,6 +13,13 @@ document.addEventListener('DOMContentLoaded', function() {
     const resultKakaoShareBtn = document.getElementById('result-kakao-share');
     const copyToClipboardBtn = document.getElementById('copy-to-clipboard');
     const copyResultMsg = document.getElementById('copy-result');
+    const numberPickerContainer = document.querySelector('.number-picker-container');
+    const selectedCountElement = document.getElementById('selected-count');
+    const clearSelectedBtn = document.getElementById('clear-selected');
+    const randomPickBtn = document.getElementById('random-pick');
+    
+    // 선택 방식 라디오 버튼
+    const pickTypeOptions = document.querySelectorAll('input[name="pick-type"]');
     
     // 탭 관련 요소
     const tabs = document.querySelectorAll('.tab');
@@ -24,54 +31,213 @@ document.addEventListener('DOMContentLoaded', function() {
     // 생성된 로또 번호를 저장할 전역 변수
     let generatedLottoNumbers = [];
     
+    // 사용자가 선택한 번호를 저장할 배열
+    let selectedNumbers = [];
+    
+    // 현재 선택된 생성 방식 (auto, manual, semi-auto)
+    let currentPickType = 'auto';
+    
+    // 색상별 번호 그룹 정의
+    const colorGroups = [
+        { color: 'yellow', range: [1, 10] },
+        { color: 'blue', range: [11, 20] },
+        { color: 'red', range: [21, 30] },
+        { color: 'gray', range: [31, 40] },
+        { color: 'green', range: [41, 45] }
+    ];
+    
+    // 초기화 함수
+    function init() {
+        // 탭 이벤트 설정
+        initTabs();
+        
+        // 번호 선택 UI 초기화
+        initNumberPicker();
+        
+        // 이벤트 리스너 설정
+        initEventListeners();
+    }
+    
     // 탭 전환 이벤트 설정
-    if (tabs.length > 0) {
-        tabs.forEach(tab => {
-            tab.addEventListener('click', function() {
-                const tabId = this.getAttribute('data-tab');
+    function initTabs() {
+        if (tabs.length > 0) {
+            tabs.forEach(tab => {
+                tab.addEventListener('click', function() {
+                    const tabId = this.getAttribute('data-tab');
+                    
+                    // 모든 탭 비활성화
+                    tabs.forEach(t => t.classList.remove('active'));
+                    
+                    // 클릭한 탭 활성화
+                    this.classList.add('active');
+                    
+                    // 모든 탭 컨텐츠 숨기기
+                    tabContents.forEach(content => {
+                        content.classList.remove('active');
+                    });
+                    
+                    // 해당 탭 컨텐츠 표시
+                    const activeContent = document.getElementById(tabId);
+                    if (activeContent) {
+                        activeContent.classList.add('active');
+                    }
+                });
+            });
+        }
+    }
+    
+    // 번호 선택 UI 초기화
+    function initNumberPicker() {
+        // 각 색상 그룹별로 번호 버튼 생성
+        colorGroups.forEach(group => {
+            const groupElement = document.querySelector(`.${group.color}-group .number-buttons`);
+            if (!groupElement) return;
+            
+            // 해당 범위의 번호 버튼 생성
+            for (let i = group.range[0]; i <= group.range[1]; i++) {
+                const button = document.createElement('button');
+                button.classList.add('number-btn', group.color);
+                button.textContent = i;
+                button.dataset.number = i;
                 
-                // 모든 탭 비활성화
-                tabs.forEach(t => t.classList.remove('active'));
-                
-                // 클릭한 탭 활성화
-                this.classList.add('active');
-                
-                // 모든 탭 컨텐츠 숨기기
-                tabContents.forEach(content => {
-                    content.classList.remove('active');
+                // 클릭 이벤트 추가
+                button.addEventListener('click', function() {
+                    toggleNumberSelection(this);
                 });
                 
-                // 해당 탭 컨텐츠 표시
-                const activeContent = document.getElementById(tabId);
-                if (activeContent) {
-                    activeContent.classList.add('active');
-                }
+                groupElement.appendChild(button);
+            }
+        });
+        
+        // 버튼 텍스트와 아이콘 명확히 구성
+        if (clearSelectedBtn) {
+            clearSelectedBtn.innerHTML = '<i class="fas fa-times" style="margin-right:5px;"></i><span>선택 초기화</span>';
+            clearSelectedBtn.addEventListener('click', clearSelectedNumbers);
+        }
+        
+        // 랜덤 선택 버튼 이벤트
+        if (randomPickBtn) {
+            randomPickBtn.innerHTML = '<i class="fas fa-random" style="margin-right:5px;"></i><span>랜덤 선택</span>';
+            randomPickBtn.addEventListener('click', randomSelectNumbers);
+        }
+    }
+    
+    // 이벤트 리스너 초기화
+    function initEventListeners() {
+        // 버튼에 클릭 이벤트 추가
+        if (generateBtn) {
+            generateBtn.addEventListener('click', generateLottoNumbers);
+        }
+        
+        // 카카오톡 공유 버튼에 이벤트 추가
+        if (kakaoShareBtn) {
+            kakaoShareBtn.addEventListener('click', function() {
+                shareToKakao(false); // 사이트 공유
+            });
+        }
+        
+        // 로또 결과 공유 버튼에 이벤트 추가
+        if (resultKakaoShareBtn) {
+            resultKakaoShareBtn.addEventListener('click', function() {
+                shareToKakao(true); // 결과 공유
+            });
+        }
+        
+        // 클립보드 복사 버튼에 이벤트 추가
+        if (copyToClipboardBtn) {
+            copyToClipboardBtn.addEventListener('click', copyAllNumbersToClipboard);
+        }
+        
+        // 선택 방식 변경 이벤트
+        pickTypeOptions.forEach(option => {
+            option.addEventListener('change', function() {
+                currentPickType = this.value;
+                toggleNumberPickerVisibility();
             });
         });
     }
     
-    // 버튼에 클릭 이벤트 추가
-    if (generateBtn) {
-        generateBtn.addEventListener('click', generateLottoNumbers);
+    // 번호 선택/해제 토글 함수
+    function toggleNumberSelection(button) {
+        const number = parseInt(button.dataset.number);
+        
+        // 이미 선택된 번호인 경우 선택 해제
+        if (selectedNumbers.includes(number)) {
+            selectedNumbers = selectedNumbers.filter(n => n !== number);
+            button.classList.remove('selected');
+        } 
+        // 새로운 번호 선택 (최대 5개까지)
+        else if (selectedNumbers.length < 5) {
+            selectedNumbers.push(number);
+            button.classList.add('selected');
+        } else {
+            alert('최대 5개까지 선택 가능합니다.');
+            return;
+        }
+        
+        // 선택된 번호 개수 표시 업데이트
+        updateSelectedCount();
     }
     
-    // 카카오톡 공유 버튼에 이벤트 추가
-    if (kakaoShareBtn) {
-        kakaoShareBtn.addEventListener('click', function() {
-            shareToKakao(false); // 사이트 공유
+    // 선택된 번호 개수 표시 업데이트
+    function updateSelectedCount() {
+        if (selectedCountElement) {
+            selectedCountElement.textContent = selectedNumbers.length;
+        }
+    }
+    
+    // 선택된 번호 초기화
+    function clearSelectedNumbers() {
+        selectedNumbers = [];
+        
+        // 모든 선택 버튼 클래스 제거
+        document.querySelectorAll('.number-btn.selected').forEach(btn => {
+            btn.classList.remove('selected');
         });
+        
+        // 카운트 업데이트
+        updateSelectedCount();
     }
     
-    // 로또 결과 공유 버튼에 이벤트 추가
-    if (resultKakaoShareBtn) {
-        resultKakaoShareBtn.addEventListener('click', function() {
-            shareToKakao(true); // 결과 공유
-        });
+    // 랜덤으로 번호 선택 (최대 5개)
+    function randomSelectNumbers() {
+        // 기존 선택 초기화
+        clearSelectedNumbers();
+        
+        // 랜덤으로 1-5개 번호 선택
+        const count = Math.floor(Math.random() * 5) + 1; // 1~5개
+        
+        while (selectedNumbers.length < count) {
+            const randomNum = getSecureRandomNumber(1, 45);
+            
+            // 중복 방지
+            if (selectedNumbers.includes(randomNum)) {
+                continue;
+            }
+            
+            selectedNumbers.push(randomNum);
+            
+            // 해당 버튼 선택 상태로 변경
+            const button = document.querySelector(`.number-btn[data-number="${randomNum}"]`);
+            if (button) {
+                button.classList.add('selected');
+            }
+        }
+        
+        // 카운트 업데이트
+        updateSelectedCount();
     }
     
-    // 클립보드 복사 버튼에 이벤트 추가
-    if (copyToClipboardBtn) {
-        copyToClipboardBtn.addEventListener('click', copyAllNumbersToClipboard);
+    // 번호 선택 UI 표시/숨김 전환
+    function toggleNumberPickerVisibility() {
+        if (numberPickerContainer) {
+            // 반자동 모드일 때만 번호 선택 UI 표시
+            if (currentPickType === 'semi-auto') {
+                numberPickerContainer.style.display = 'block';
+            } else {
+                numberPickerContainer.style.display = 'none';
+            }
+        }
     }
     
     // 로또 번호 생성 함수
@@ -87,7 +253,17 @@ document.addEventListener('DOMContentLoaded', function() {
         
         // 각 게임마다 번호 생성
         for (let i = 0; i < gameCount; i++) {
-            const numbers = generateRandomNumbers();
+            let numbers;
+            
+            // 선택 방식에 따른 번호 생성
+            if (currentPickType === 'semi-auto') {
+                // 반자동: 선택된 번호를 포함하여 생성
+                numbers = generateSemiAutoNumbers();
+            } else {
+                // 자동: 완전 랜덤 생성
+                numbers = generateRandomNumbers();
+            }
+            
             generatedLottoNumbers.push(numbers); // 생성된 번호 저장
             displayNumbers(numbers, i + 1);
         }
@@ -101,6 +277,48 @@ document.addEventListener('DOMContentLoaded', function() {
         if (copyResultMsg) {
             copyResultMsg.style.display = 'none';
         }
+    }
+    
+    // 반자동 번호 생성 함수 (사용자 선택 번호 포함)
+    function generateSemiAutoNumbers() {
+        // 선택된 번호가 없으면 완전 랜덤 생성
+        if (selectedNumbers.length === 0) {
+            return generateRandomNumbers();
+        }
+        
+        // 선택된 번호를 복사 (원본 배열 변경 방지)
+        const numbers = [...selectedNumbers];
+        
+        // 필요한 추가 번호 개수
+        const remainingCount = 6 - numbers.length;
+        
+        // 나머지 번호 생성
+        while (numbers.length < 6) {
+            // 암호학적으로 안전한 난수 생성 함수 사용
+            const randomNum = getSecureRandomNumber(1, 45);
+            
+            // 이미 선택되거나 포함된 번호면 건너뛰기
+            if (numbers.includes(randomNum)) {
+                continue;
+            }
+            
+            // 연속된 번호 제한 검사 (기존 로직 유지)
+            if (numbers.length > 0 && Math.random() < CONSECUTIVE_LIMIT_PROBABILITY) {
+                // 기존 번호들과 연속된 번호인지 확인
+                const isConsecutive = numbers.some(num => 
+                    Math.abs(num - randomNum) === 1
+                );
+                
+                if (isConsecutive) {
+                    continue; // 연속된 번호면 다시 뽑기
+                }
+            }
+            
+            numbers.push(randomNum);
+        }
+        
+        // 오름차순 정렬
+        return numbers.sort((a, b) => a - b);
     }
     
     // 암호학적으로 안전한 난수 생성 함수
@@ -198,6 +416,11 @@ document.addEventListener('DOMContentLoaded', function() {
                 numberSpan.classList.add('gray');
             } else {
                 numberSpan.classList.add('green');
+            }
+            
+            // 사용자가 선택한 번호인 경우 특별 표시
+            if (currentPickType === 'semi-auto' && selectedNumbers.includes(num)) {
+                numberSpan.classList.add('user-selected');
             }
             
             // 숫자 애니메이션 효과를 위한 지연 시간 설정
@@ -456,4 +679,7 @@ document.addEventListener('DOMContentLoaded', function() {
             alert('카카오톡 공유 기능을 사용할 수 없습니다. 다른 방법으로 공유해 주세요.');
         }
     }
+    
+    // 초기화 함수 호출
+    init();
 }); 
