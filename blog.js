@@ -25,6 +25,7 @@ document.addEventListener('DOMContentLoaded', function() {
     
     // 기본 도메인 설정 (www 제거)
     const baseDomain = 'https://braindetox.kr';
+    const baseUrl = '/blog/';
     
     // 디버깅 로그 함수
     function debugLog(...args) {
@@ -33,68 +34,46 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     }
     
-    // SEO용 메타 태그 업데이트 함수
+    // 메타 태그 업데이트 함수
     function updateMetaTags(post) {
-        // post가 없으면 기본 메타 태그 사용
-        if (!post) {
-            document.title = '기술 블로그 - BrainDetox Utility Box | Technical Blog';
-            updateMetaTag('description', '프로그래밍, 네트워크, 클라우드, 보안 등 IT 관련 유용한 정보를 제공합니다. Technical blog providing useful information about programming, networking, cloud, security and other IT topics.');
-            updateMetaTag('keywords', '기술 블로그, 개발, 프로그래밍, IT, 시사, 경제, technical blog, development, programming, IT, current affairs, economy');
-            
-            // Open Graph 및 Twitter 카드 업데이트
-            updateMetaTag('og:title', '기술 블로그 - BrainDetox Utility Box | Technical Blog', 'property');
-            updateMetaTag('og:description', '프로그래밍, 네트워크, 클라우드, 보안 등 IT 관련 유용한 정보를 제공합니다.', 'property');
-            updateMetaTag('og:url', `${baseDomain}${window.location.pathname}`, 'property');
-            
-            updateMetaTag('twitter:title', '기술 블로그 - BrainDetox Utility Box | Technical Blog');
-            updateMetaTag('twitter:description', '프로그래밍, 네트워크, 클라우드, 보안 등 IT 관련 유용한 정보를 제공합니다.');
-            
-            // 소셜 미디어 공유 버튼 기본 정보 설정
-            updateSocialShareButtons(null);
-            
-            return;
+        if (!post) return;
+        
+        // 페이지 제목 업데이트
+        document.title = `${post.title} - BrainDetox 기술 블로그`;
+        
+        // 메타 태그 업데이트 또는 생성
+        updateOrCreateMetaTag('description', post.description || `${post.title} - BrainDetox 기술 블로그의 포스트입니다.`);
+        updateOrCreateMetaTag('keywords', `${post.category}, ${post.tags?.join(', ') || ''}, 브레인디톡스, 기술블로그`);
+        
+        // Open Graph 태그 업데이트
+        updateOrCreateMetaTag('og:title', post.title, 'property');
+        updateOrCreateMetaTag('og:description', post.description || `${post.title} - BrainDetox 기술 블로그의 포스트입니다.`, 'property');
+        updateOrCreateMetaTag('og:url', `${baseDomain}${baseUrl}${post.id}`, 'property');
+        updateOrCreateMetaTag('og:type', 'article', 'property');
+        
+        // 표준 URL 태그 설정
+        let canonicalLink = document.querySelector('link[rel="canonical"]');
+        if (!canonicalLink) {
+            canonicalLink = document.createElement('link');
+            canonicalLink.rel = 'canonical';
+            document.head.appendChild(canonicalLink);
+        }
+        canonicalLink.href = `${baseDomain}${baseUrl}${post.id}`;
+        
+        debugLog('메타 태그 업데이트됨:', post.title);
+    }
+    
+    // 메타 태그 업데이트 또는 생성 헬퍼 함수
+    function updateOrCreateMetaTag(name, content, attributeName = 'name') {
+        let metaTag = document.querySelector(`meta[${attributeName}="${name}"]`);
+        
+        if (!metaTag) {
+            metaTag = document.createElement('meta');
+            metaTag.setAttribute(attributeName, name);
+            document.head.appendChild(metaTag);
         }
         
-        // 포스트 정보 기반 메타 태그 생성
-        const postTitle = `${post.title} - BrainDetox 기술 블로그`;
-        
-        // 설명 생성 - 첫 100자 정도의 텍스트 추출 (태그 제거)
-        let description = '';
-        if (post.description) {
-            description = post.description;
-        } else {
-            description = `${post.title} - ${post.category} 카테고리의 기술 블로그 글입니다.`;
-        }
-        
-        // 영어 설명 추가
-        const englishTitle = post.englishTitle || (post.title.includes('(') ? post.title : `${post.title} | Technical Blog Article`);
-        
-        // 메타 태그 업데이트
-        document.title = postTitle;
-        updateMetaTag('description', `${description} | Technical blog article about ${post.category}.`);
-        updateMetaTag('keywords', post.keywords || `${post.category}, 기술 블로그, ${post.title}`);
-        
-        // 정규화된 URL (canonical) 업데이트
-        updateMetaTag('canonical', `${baseDomain}${window.location.pathname}?post=${post.id}`, 'link');
-        
-        // Open Graph 및 Twitter 카드 업데이트
-        updateMetaTag('og:title', postTitle, 'property');
-        updateMetaTag('og:description', description, 'property');
-        updateMetaTag('og:url', `${baseDomain}${window.location.pathname}?post=${post.id}`, 'property');
-        updateMetaTag('og:type', 'article', 'property');
-        if (post.category) {
-            updateMetaTag('article:section', post.category, 'property');
-        }
-        updateMetaTag('article:published_time', post.date, 'property');
-        updateMetaTag('article:modified_time', post.modifiedDate || post.date, 'property');
-        
-        updateMetaTag('twitter:title', post.englishTitle || englishTitle);
-        updateMetaTag('twitter:description', description);
-        
-        // 소셜 미디어 공유 버튼 업데이트
-        updateSocialShareButtons(post);
-        
-        debugLog('메타 태그 업데이트 완료:', postTitle);
+        metaTag.setAttribute('content', content);
     }
     
     // 소셜 미디어 공유 버튼 업데이트 함수
@@ -238,33 +217,6 @@ document.addEventListener('DOMContentLoaded', function() {
                     console.error('클립보드 복사 중 오류 발생:', err);
                 });
             };
-        }
-    }
-    
-    // 메타 태그 업데이트 헬퍼 함수
-    function updateMetaTag(name, content, attr = 'name') {
-        if (!name || !content) return;
-        
-        // 기존 태그 찾기
-        let meta;
-        if (attr === 'link') {
-            meta = document.querySelector(`link[rel="${name}"]`);
-            // 없으면 생성
-            if (!meta) {
-                meta = document.createElement('link');
-                meta.setAttribute('rel', name);
-                document.head.appendChild(meta);
-            }
-            meta.setAttribute('href', content);
-        } else {
-            meta = document.querySelector(`meta[${attr}="${name}"]`);
-            // 없으면 생성
-            if (!meta) {
-                meta = document.createElement('meta');
-                meta.setAttribute(attr, name);
-                document.head.appendChild(meta);
-            }
-            meta.setAttribute('content', content);
         }
     }
     
@@ -552,45 +504,66 @@ document.addEventListener('DOMContentLoaded', function() {
     
     // 포스트 목록 렌더링
     function renderPostList(filterCategory = 'all') {
-        let filteredPosts = posts;
+        if (!postList) return;
         
+        // 포스트 목록 비우기
+        postList.innerHTML = '';
+        
+        // 카테고리 필터링
+        let filteredPosts = posts;
         if (filterCategory !== 'all') {
             filteredPosts = posts.filter(post => post.category === filterCategory);
         }
         
+        // 결과가 없는 경우
         if (filteredPosts.length === 0) {
-            postList.innerHTML = '<li class="post-item">이 카테고리에 포스트가 없습니다.</li>';
+            postList.innerHTML = '<li class="post-item no-results">검색 결과가 없습니다.</li>';
             return;
         }
         
-        // 날짜 최신순으로 정렬
-        filteredPosts.sort((a, b) => new Date(b.date) - new Date(a.date));
-        
-        // 목록 렌더링
-        postList.innerHTML = '';
+        // 포스트 항목을 목록에 추가
         filteredPosts.forEach(post => {
-            const li = document.createElement('li');
-            li.className = 'post-item';
-            li.setAttribute('data-id', post.id);
+            const listItem = document.createElement('li');
+            listItem.className = 'post-item';
             
-            // 카테고리 배지
-            const categorySpan = post.category ? 
-                `<span class="post-category">${post.category}</span>` : '';
+            const postLink = document.createElement('a');
+            // 새 URL 구조 적용
+            postLink.href = baseUrl + post.id;
+            postLink.textContent = post.title;
+            postLink.setAttribute('data-id', post.id);
             
-            li.innerHTML = `
-                ${categorySpan}
-                ${post.title}
-                <span class="post-date">${formatDate(post.date)}</span>
-            `;
+            // History API를 사용하는 클릭 이벤트 핸들러 추가
+            postLink.addEventListener('click', function(e) {
+                e.preventDefault();
+                loadPost(post.id);
+            });
             
-            li.addEventListener('click', () => loadPost(post.id));
-            postList.appendChild(li);
+            const postDate = document.createElement('span');
+            postDate.className = 'post-date';
+            postDate.textContent = formatDate(post.date);
+            
+            const postCategory = document.createElement('span');
+            postCategory.className = 'post-category';
+            postCategory.textContent = post.category;
+            
+            // 리스트 아이템에 요소 추가
+            listItem.appendChild(postLink);
+            listItem.appendChild(postDate);
+            listItem.appendChild(postCategory);
+            
+            // 포스트가 추천된 경우 표시
+            if (post.featured) {
+                const featuredBadge = document.createElement('span');
+                featuredBadge.className = 'featured-badge';
+                featuredBadge.textContent = '추천';
+                listItem.appendChild(featuredBadge);
+            }
+            
+            postList.appendChild(listItem);
         });
         
-        // 총 포스트 수 업데이트
-        if (totalPostsEl) {
-            totalPostsEl.textContent = posts.length;
-        }
+        // 현재 포스트 강조 표시
+        highlightCurrentPost();
     }
     
     // 추천 글 목록 렌더링
@@ -652,6 +625,11 @@ document.addEventListener('DOMContentLoaded', function() {
     
     // 포스트 로드 및 표시
     async function loadPost(postId) {
+        if (!postId) return;
+        
+        // 로딩 표시
+        markdownContent.innerHTML = '<div class="loading-spinner">포스트를 불러오는 중...</div>';
+        
         try {
             // 활성 포스트 표시
             document.querySelectorAll('.post-item').forEach(item => {
@@ -671,9 +649,6 @@ document.addEventListener('DOMContentLoaded', function() {
                 updateMetaTags(null); // 기본 메타태그로 복원
                 return;
             }
-            
-            // 로딩 표시
-            markdownContent.innerHTML = '<div class="loading-spinner">포스트를 불러오는 중...</div>';
             
             // HTML 파일 내용 가져오기
             try {
@@ -757,8 +732,8 @@ document.addEventListener('DOMContentLoaded', function() {
                     updateMetaTags(currentPost);
                 }
                 
-                // URL 파라미터 업데이트
-                updateUrlParam(postId);
+                // URL 상태 업데이트 (History API 사용)
+                updateUrlState(postId);
                 
                 // 관련 게시물 표시 (같은 카테고리의 다른 글)
                 renderRelatedPosts(currentPost);
@@ -787,63 +762,110 @@ document.addEventListener('DOMContentLoaded', function() {
     
     // 관련 게시물 표시 함수 (SEO 개선)
     function renderRelatedPosts(currentPost) {
-        if (!currentPost || !currentPost.category || posts.length <= 1) return;
+        if (!currentPost || !currentPost.category) return;
         
-        // 같은 카테고리의 다른 포스트 찾기 (최대 3개)
+        // 같은 카테고리의 다른 게시물 찾기 (최대 5개)
         const relatedPosts = posts
             .filter(post => post.category === currentPost.category && post.id !== currentPost.id)
-            .sort((a, b) => new Date(b.date) - new Date(a.date))
-            .slice(0, 3);
+            .slice(0, 5);
         
         if (relatedPosts.length === 0) return;
         
-        // 관련 게시물 HTML 생성
-        const relatedPostsHTML = `
-            <div class="related-posts">
-                <h3>관련 게시물 (Related Posts)</h3>
-                <ul>
-                    ${relatedPosts.map(post => `
-                        <li>
-                            <a href="?post=${post.id}" class="related-post-link" data-id="${post.id}">
-                                ${post.title}
-                            </a>
-                            <span class="post-date">${formatDate(post.date)}</span>
-                        </li>
-                    `).join('')}
-                </ul>
-            </div>
-        `;
+        // 관련 게시물 섹션 생성
+        const relatedSection = document.createElement('div');
+        relatedSection.className = 'related-posts';
         
-        // 관련 게시물 추가
-        const articleElement = markdownContent.querySelector('article');
-        if (articleElement) {
-            articleElement.insertAdjacentHTML('beforeend', relatedPostsHTML);
+        const sectionTitle = document.createElement('h3');
+        sectionTitle.textContent = '관련 게시물';
+        relatedSection.appendChild(sectionTitle);
+        
+        const postsList = document.createElement('ul');
+        
+        relatedPosts.forEach(post => {
+            const listItem = document.createElement('li');
             
-            // 관련 게시물 링크에 이벤트 리스너 추가
-            document.querySelectorAll('.related-post-link').forEach(link => {
-                link.addEventListener('click', function(e) {
-                    e.preventDefault();
-                    const postId = this.getAttribute('data-id');
-                    loadPost(postId);
-                });
+            const postLink = document.createElement('a');
+            // 새 URL 구조 적용
+            postLink.href = baseUrl + post.id;
+            postLink.textContent = post.title;
+            postLink.setAttribute('data-id', post.id);
+            
+            // History API를 사용하는 클릭 이벤트 핸들러 추가
+            postLink.addEventListener('click', function(e) {
+                e.preventDefault();
+                loadPost(post.id);
             });
-        }
+            
+            listItem.appendChild(postLink);
+            postsList.appendChild(listItem);
+        });
+        
+        relatedSection.appendChild(postsList);
+        
+        // 마크다운 콘텐츠 뒤에 관련 게시물 섹션 추가
+        markdownContent.appendChild(relatedSection);
     }
     
-    // URL 파라미터 업데이트
-    function updateUrlParam(postId) {
-        if (history.pushState) {
-            const newUrl = new URL(window.location.href);
-            newUrl.searchParams.set('post', postId);
-            window.history.pushState({ path: newUrl.href }, '', newUrl.href);
-        }
+    // 업데이트된 URL 상태 관리 함수
+    function updateUrlState(postId) {
+        if (!postId) return;
+        
+        // 현재 포스트 찾기
+        const currentPost = posts.find(post => post.id === postId);
+        if (!currentPost) return;
+        
+        const postUrl = baseUrl + postId;
+        const postTitle = currentPost.title + ' - BrainDetox 기술 블로그';
+        
+        // 현재 URL과 새 URL 비교
+        const currentPath = window.location.pathname;
+        const targetPath = postUrl;
+        
+        // URL이 이미 올바른 형식이면 업데이트하지 않음
+        if (currentPath === targetPath) return;
+        
+        // History API로 URL 업데이트
+        window.history.pushState({postId: postId}, postTitle, postUrl);
+        
+        // 메타 태그 업데이트
+        updateMetaTags(currentPost);
+        
+        debugLog('URL 상태 업데이트됨:', postUrl);
     }
     
-    // URL에서 포스트 ID 가져오기
+    // 업데이트된 URL에서 포스트 ID 가져오기 함수
     function getPostIdFromUrl() {
+        const urlPath = window.location.pathname;
+        
+        // 기존 파라미터 방식 URL 체크 (이전 URL 형식 지원)
         const urlParams = new URLSearchParams(window.location.search);
-        return urlParams.get('post');
+        const paramPostId = urlParams.get('post');
+        if (paramPostId) return paramPostId;
+        
+        // 새로운 URL 패턴 체크 (/blog/post-id 형식)
+        if (urlPath.startsWith(baseUrl)) {
+            const postId = urlPath.slice(baseUrl.length);
+            return postId || null;
+        }
+        
+        return null;
     }
+    
+    // History API의 popstate 이벤트 리스너 추가
+    window.addEventListener('popstate', function(event) {
+        if (event.state && event.state.postId) {
+            loadPost(event.state.postId);
+        } else {
+            // URL에서 포스트 ID 추출 시도
+            const postId = getPostIdFromUrl();
+            if (postId) {
+                loadPost(postId);
+            } else {
+                // 포스트 ID가 없으면 최신 포스트 로드
+                loadLatestPost();
+            }
+        }
+    });
     
     // 새로고침 버튼 이벤트 리스너
     document.getElementById('refreshBtn')?.addEventListener('click', function() {
@@ -856,10 +878,15 @@ document.addEventListener('DOMContentLoaded', function() {
         debugLog('블로그 초기화 중...');
         await fetchPostList();
         
-        // URL에서 포스트 ID 확인
+        // URL에서 포스트 ID 가져오기
         const postId = getPostIdFromUrl();
+        
         if (postId) {
-            loadPost(postId);
+            // 특정 포스트 로드
+            await loadPost(postId);
+        } else {
+            // 최신 포스트 로드
+            loadLatestPost();
         }
         
         // 5분마다 목록 새로고침 (자동 업데이트)
