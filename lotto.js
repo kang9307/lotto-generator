@@ -13,6 +13,9 @@ document.addEventListener('DOMContentLoaded', function() {
     const tabs = document.querySelectorAll('.tab');
     const tabContents = document.querySelectorAll('.tab-content');
     
+    // 연속된 번호 제한 확률 - 70%에서 50%로 감소시켜 다양성 향상
+    const CONSECUTIVE_LIMIT_PROBABILITY = 0.5;
+    
     // 탭 전환 이벤트 설정
     if (tabs.length > 0) {
         tabs.forEach(tab => {
@@ -59,17 +62,55 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     }
     
+    // 암호학적으로 안전한 난수 생성 함수
+    function getSecureRandomNumber(min, max) {
+        // crypto.getRandomValues 지원 여부 확인
+        if (window.crypto && window.crypto.getRandomValues) {
+            const range = max - min + 1;
+            const byteCount = Math.ceil(Math.log2(range) / 8);
+            const maxValidNumber = Math.floor((256 ** byteCount) / range) * range - 1;
+            const array = new Uint8Array(byteCount);
+            let randomNumber;
+            
+            do {
+                window.crypto.getRandomValues(array);
+                randomNumber = 0;
+                for (let i = 0; i < byteCount; i++) {
+                    randomNumber = (randomNumber << 8) | array[i];
+                }
+            } while (randomNumber > maxValidNumber);
+            
+            return min + (randomNumber % range);
+        } else {
+            // 폴백: 기존 Math.random() 사용
+            return Math.floor(Math.random() * (max - min + 1)) + min;
+        }
+    }
+    
     // 랜덤 번호 생성 함수
     function generateRandomNumbers() {
         // 1부터 45까지의 숫자 중 중복 없이 6개 선택
         const numbers = [];
         
         while (numbers.length < 6) {
-            const randomNum = Math.floor(Math.random() * 45) + 1;
+            // 암호학적으로 안전한 난수 생성 함수 사용
+            const randomNum = getSecureRandomNumber(1, 45);
             
             // 이미 선택된 번호인 경우 건너뛰기
             if (numbers.includes(randomNum)) {
                 continue;
+            }
+            
+            // 연속된 번호 제한 검사 (예: 1,2 또는 44,45와 같은 연속 번호)
+            if (numbers.length > 0 && Math.random() < CONSECUTIVE_LIMIT_PROBABILITY) {
+                // 기존 번호들과 연속된 번호인지 확인
+                const isConsecutive = numbers.some(num => 
+                    Math.abs(num - randomNum) === 1
+                );
+                
+                if (isConsecutive) {
+                    continue; // 연속된 번호면 다시 뽑기
+                }
             }
             
             numbers.push(randomNum);
