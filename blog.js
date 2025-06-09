@@ -871,6 +871,9 @@ document.addEventListener('DOMContentLoaded', function() {
                 // 관련 게시물 표시 (같은 카테고리의 다른 글)
                 renderRelatedPosts(currentPost);
                 
+                // 소셜 공유 버튼 업데이트
+                updateSocialShareButtons(currentPost);
+                
             } catch (error) {
                 debugLog(`HTML 파일 콘텐츠 로드 실패:`, error);
                 
@@ -1011,6 +1014,9 @@ document.addEventListener('DOMContentLoaded', function() {
             
             // URL에서 포스트 ID 가져오기
             const postId = getPostIdFromUrl();
+            
+            // 소셜 공유 버튼 초기화 (최초 로드 시)
+            updateSocialShareButtons(currentPost);
             
             if (postId) {
                 // 특정 포스트 로드
