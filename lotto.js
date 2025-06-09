@@ -206,95 +206,39 @@ document.addEventListener('DOMContentLoaded', function() {
         }, 300);
     }
     
-    // 로또 번호 이미지 생성 함수
-    function generateLottoImage() {
-        // Canvas 생성
-        const canvas = document.createElement('canvas');
-        const ctx = canvas.getContext('2d');
+    // 간결한 공유 메시지 생성 함수
+    function createCompactShareMessage() {
+        if (generatedLottoNumbers.length === 0) {
+            return null;
+        }
         
-        // 게임 수에 따라 캔버스 크기 조정
-        const gameCount = generatedLottoNumbers.length;
-        const width = 800;
-        const height = Math.max(600, 150 + gameCount * 70); // 게임 수에 따라 높이 조정
-        
-        canvas.width = width;
-        canvas.height = height;
-        
-        // 배경 그리기
-        ctx.fillStyle = '#2c3e50';
-        ctx.fillRect(0, 0, width, height);
-        
-        // 상단 그라데이션 배경
-        const gradient = ctx.createLinearGradient(0, 0, width, 100);
-        gradient.addColorStop(0, '#3498db');
-        gradient.addColorStop(1, '#2980b9');
-        ctx.fillStyle = gradient;
-        ctx.fillRect(0, 0, width, 100);
-        
-        // 제목 그리기
-        ctx.fillStyle = '#fff';
-        ctx.font = 'bold 36px Noto Sans KR, sans-serif';
-        ctx.textAlign = 'center';
-        ctx.fillText('행운의 로또 번호', width/2, 60);
-        
-        // 생성 날짜 표시
+        // 생성 날짜 추가
         const now = new Date();
-        const dateStr = `${now.getFullYear()}-${(now.getMonth()+1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`;
-        ctx.font = '16px Noto Sans KR, sans-serif';
-        ctx.fillText(`생성일: ${dateStr}`, width/2, 90);
+        const dateStr = `${now.getFullYear()}.${(now.getMonth()+1).toString().padStart(2, '0')}.${now.getDate().toString().padStart(2, '0')}`;
         
-        // 각 게임 번호 그리기
-        let y = 140;
+        // 메시지 시작
+        let message = `🍀 행운의 로또 번호 (${dateStr})\n\n`;
         
-        generatedLottoNumbers.forEach((numbers, gameIndex) => {
-            // 게임 번호 표시
-            ctx.fillStyle = '#fff';
-            ctx.font = 'bold 22px Noto Sans KR, sans-serif';
-            ctx.textAlign = 'left';
-            ctx.fillText(`게임 ${gameIndex + 1}`, 50, y);
+        // 게임 수에 따라 최적화
+        const gameCount = generatedLottoNumbers.length;
+        
+        // 모든 게임을 추가 (카카오톡 텍스트 길이 제한 고려)
+        for (let i = 0; i < gameCount; i++) {
+            const gameNumbers = generatedLottoNumbers[i];
+            // 간결한 형식으로 게임 번호 추가
+            message += `${i+1}게임: ${gameNumbers.join(', ')}\n`;
             
-            // 로또 번호 그리기
-            let x = 150;
-            
-            numbers.forEach(num => {
-                // 원 배경 색상 설정
-                if (num >= 1 && num <= 10) {
-                    ctx.fillStyle = '#f39c12'; // 노란색
-                } else if (num >= 11 && num <= 20) {
-                    ctx.fillStyle = '#3498db'; // 파란색
-                } else if (num >= 21 && num <= 30) {
-                    ctx.fillStyle = '#e74c3c'; // 빨간색
-                } else if (num >= 31 && num <= 40) {
-                    ctx.fillStyle = '#95a5a6'; // 회색
-                } else {
-                    ctx.fillStyle = '#27ae60'; // 녹색
-                }
-                
-                // 원 그리기
-                ctx.beginPath();
-                ctx.arc(x, y - 8, 22, 0, Math.PI * 2);
-                ctx.fill();
-                
-                // 숫자 그리기
-                ctx.fillStyle = '#fff';
-                ctx.font = 'bold 20px Noto Sans KR, sans-serif';
-                ctx.textAlign = 'center';
-                ctx.fillText(num.toString(), x, y);
-                
-                x += 60;
-            });
-            
-            y += 70;
-        });
+            // 카카오톡 메시지 길이 제한을 고려해 일정 수 이상이면 줄임
+            if (i >= 4 && gameCount > 5) {
+                message += `\n... 외 ${gameCount - (i+1)}개 게임\n`;
+                break;
+            }
+        }
         
-        // 하단에 브랜딩 추가
-        ctx.fillStyle = 'rgba(255, 255, 255, 0.8)';
-        ctx.font = '16px Noto Sans KR, sans-serif';
-        ctx.textAlign = 'center';
-        ctx.fillText('BrainDetox Utility Box - braindetox.kr', width/2, height - 20);
+        // 출처 추가
+        message += `\nBrainDetox Utility Box에서 생성`;
         
-        // Canvas를 이미지 URL로 변환
-        return canvas.toDataURL('image/png');
+        return message;
     }
     
     // 카카오톡으로 로또 번호 공유 함수
@@ -317,85 +261,41 @@ document.addEventListener('DOMContentLoaded', function() {
         
         try {
             if (isResultShare) {
-                // 이미지 생성 시작
-                const loadingMsg = document.createElement('div');
-                loadingMsg.textContent = '이미지 생성 중...';
-                loadingMsg.style.position = 'fixed';
-                loadingMsg.style.top = '50%';
-                loadingMsg.style.left = '50%';
-                loadingMsg.style.transform = 'translate(-50%, -50%)';
-                loadingMsg.style.padding = '10px 20px';
-                loadingMsg.style.backgroundColor = 'rgba(0,0,0,0.7)';
-                loadingMsg.style.color = 'white';
-                loadingMsg.style.borderRadius = '5px';
-                loadingMsg.style.zIndex = '9999';
-                document.body.appendChild(loadingMsg);
+                // 로또 결과 공유 (간결한 텍스트 형식)
+                const shareMessage = createCompactShareMessage();
+                if (!shareMessage) {
+                    alert('공유할 로또 번호가 없습니다.');
+                    return;
+                }
                 
-                // 약간의 딜레이를 주어 UI 업데이트가 반영되도록 함
-                setTimeout(() => {
-                    try {
-                        // 로또 번호 이미지 생성
-                        const imageUrl = generateLottoImage();
-                        
-                        // 이미지 파일로 공유 설정
-                        if (window.Kakao.Share) {
-                            window.Kakao.Share.sendDefault({
-                                objectType: 'feed',
-                                content: {
-                                    title: '행운의 로또 번호를 공유합니다!',
-                                    description: `${generatedLottoNumbers.length}개의 게임 번호가 생성되었습니다.`,
-                                    imageUrl: imageUrl,
-                                    link: {
-                                        mobileWebUrl: window.location.href,
-                                        webUrl: window.location.href
-                                    }
-                                },
-                                buttons: [
-                                    {
-                                        title: '나도 번호 생성하기',
-                                        link: {
-                                            mobileWebUrl: window.location.href,
-                                            webUrl: window.location.href
-                                        }
-                                    }
-                                ]
-                            });
-                        } else if (window.Kakao.Link) {
-                            window.Kakao.Link.sendDefault({
-                                objectType: 'feed',
-                                content: {
-                                    title: '행운의 로또 번호를 공유합니다!',
-                                    description: `${generatedLottoNumbers.length}개의 게임 번호가 생성되었습니다.`,
-                                    imageUrl: imageUrl,
-                                    link: {
-                                        mobileWebUrl: window.location.href,
-                                        webUrl: window.location.href
-                                    }
-                                },
-                                buttons: [
-                                    {
-                                        title: '나도 번호 생성하기',
-                                        link: {
-                                            mobileWebUrl: window.location.href,
-                                            webUrl: window.location.href
-                                        }
-                                    }
-                                ]
-                            });
-                        } else {
-                            alert('생성된 로또 번호를 카카오톡으로 공유할 수 없습니다. 다른 방법으로 공유해 주세요.');
+                if (window.Kakao.Share) {
+                    window.Kakao.Share.sendDefault({
+                        objectType: 'text',
+                        text: shareMessage,
+                        link: {
+                            mobileWebUrl: window.location.href,
+                            webUrl: window.location.href
                         }
-                    } catch (error) {
-                        console.error('이미지 생성 중 오류 발생:', error);
-                        alert('이미지 생성 중 오류가 발생했습니다. 텍스트로 공유합니다.');
-                        
-                        // 이미지 생성 실패 시 텍스트로 대체
-                        shareTextResult();
-                    } finally {
-                        // 로딩 메시지 제거
-                        document.body.removeChild(loadingMsg);
-                    }
-                }, 100);
+                    });
+                } else if (window.Kakao.Link) {
+                    window.Kakao.Link.sendDefault({
+                        objectType: 'text',
+                        text: shareMessage,
+                        link: {
+                            mobileWebUrl: window.location.href,
+                            webUrl: window.location.href
+                        }
+                    });
+                } else {
+                    // 클립보드에 복사 대체 방법
+                    const tempTextArea = document.createElement('textarea');
+                    tempTextArea.value = shareMessage;
+                    document.body.appendChild(tempTextArea);
+                    tempTextArea.select();
+                    document.execCommand('copy');
+                    document.body.removeChild(tempTextArea);
+                    alert('카카오톡 공유를 지원하지 않는 환경입니다.\n로또 번호가 클립보드에 복사되었습니다.');
+                }
             } else {
                 // 사이트 공유 (기존 방식 유지)
                 if (window.Kakao.Share) {
@@ -449,61 +349,6 @@ document.addEventListener('DOMContentLoaded', function() {
         } catch (error) {
             console.error('카카오톡 공유 중 오류 발생:', error);
             alert('카카오톡 공유 기능을 사용할 수 없습니다. 다른 방법으로 공유해 주세요.');
-        }
-    }
-    
-    // 텍스트로 결과 공유 (이미지 생성 실패 시 폴백)
-    function shareTextResult() {
-        // 공유할 메시지 생성
-        let description = '내가 생성한 로또 번호:\n';
-        generatedLottoNumbers.forEach((numbers, index) => {
-            description += `게임 ${index + 1}: ${numbers.join(', ')}\n`;
-        });
-        
-        if (window.Kakao.Share) {
-            window.Kakao.Share.sendDefault({
-                objectType: 'feed',
-                content: {
-                    title: '행운의 로또 번호를 공유합니다!',
-                    description: description,
-                    imageUrl: 'https://braindetox.kr/site_logo.png',
-                    link: {
-                        mobileWebUrl: window.location.href,
-                        webUrl: window.location.href
-                    }
-                },
-                buttons: [
-                    {
-                        title: '나도 번호 생성하기',
-                        link: {
-                            mobileWebUrl: window.location.href,
-                            webUrl: window.location.href
-                        }
-                    }
-                ]
-            });
-        } else if (window.Kakao.Link) {
-            window.Kakao.Link.sendDefault({
-                objectType: 'feed',
-                content: {
-                    title: '행운의 로또 번호를 공유합니다!',
-                    description: description,
-                    imageUrl: 'https://braindetox.kr/site_logo.png',
-                    link: {
-                        mobileWebUrl: window.location.href,
-                        webUrl: window.location.href
-                    }
-                },
-                buttons: [
-                    {
-                        title: '나도 번호 생성하기',
-                        link: {
-                            mobileWebUrl: window.location.href,
-                            webUrl: window.location.href
-                        }
-                    }
-                ]
-            });
         }
     }
 }); 
