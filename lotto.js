@@ -11,6 +11,8 @@ document.addEventListener('DOMContentLoaded', function() {
     const kakaoShareBtn = document.getElementById('kakao-share');
     const resultShareSection = document.getElementById('result-share-section');
     const resultKakaoShareBtn = document.getElementById('result-kakao-share');
+    const copyToClipboardBtn = document.getElementById('copy-to-clipboard');
+    const copyResultMsg = document.getElementById('copy-result');
     
     // 탭 관련 요소
     const tabs = document.querySelectorAll('.tab');
@@ -67,6 +69,11 @@ document.addEventListener('DOMContentLoaded', function() {
         });
     }
     
+    // 클립보드 복사 버튼에 이벤트 추가
+    if (copyToClipboardBtn) {
+        copyToClipboardBtn.addEventListener('click', copyAllNumbersToClipboard);
+    }
+    
     // 로또 번호 생성 함수
     function generateLottoNumbers() {
         // 게임 수 가져오기
@@ -88,6 +95,11 @@ document.addEventListener('DOMContentLoaded', function() {
         // 로또 번호가 생성되었으므로 공유 섹션 표시
         if (resultShareSection) {
             resultShareSection.style.display = 'block';
+        }
+        
+        // 복사 성공 메시지 초기화
+        if (copyResultMsg) {
+            copyResultMsg.style.display = 'none';
         }
     }
     
@@ -239,6 +251,99 @@ document.addEventListener('DOMContentLoaded', function() {
         message += `\nBrainDetox Utility Box에서 생성`;
         
         return message;
+    }
+    
+    // 전체 로또 번호 메시지 생성 함수 (클립보드 복사용)
+    function createFullLottoMessage() {
+        if (generatedLottoNumbers.length === 0) {
+            return null;
+        }
+        
+        // 생성 날짜 추가
+        const now = new Date();
+        const dateStr = `${now.getFullYear()}.${(now.getMonth()+1).toString().padStart(2, '0')}.${now.getDate().toString().padStart(2, '0')}`;
+        
+        // 메시지 시작
+        let message = `🍀 행운의 로또 번호 (${dateStr})\n\n`;
+        
+        // 모든 게임 추가 (제한 없이 전체 게임 포함)
+        generatedLottoNumbers.forEach((numbers, index) => {
+            message += `${index+1}게임: ${numbers.join(', ')}\n`;
+        });
+        
+        // 출처 추가
+        message += `\nBrainDetox Utility Box에서 생성`;
+        
+        return message;
+    }
+    
+    // 전체 로또 번호를 클립보드에 복사하는 함수
+    function copyAllNumbersToClipboard() {
+        if (generatedLottoNumbers.length === 0) {
+            alert('먼저 로또 번호를 생성해주세요!');
+            return;
+        }
+        
+        // 전체 로또 번호 메시지 생성
+        const fullMessage = createFullLottoMessage();
+        
+        try {
+            // 최신 Clipboard API 사용 시도
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(fullMessage)
+                    .then(() => {
+                        showCopySuccess();
+                    })
+                    .catch(err => {
+                        console.error('클립보드 복사 중 오류 발생:', err);
+                        copyUsingFallback(fullMessage);
+                    });
+            } else {
+                // 구 버전 방식으로 복사
+                copyUsingFallback(fullMessage);
+            }
+        } catch (err) {
+            console.error('클립보드 복사 중 오류 발생:', err);
+            copyUsingFallback(fullMessage);
+        }
+    }
+    
+    // 구 버전 방식의 클립보드 복사 기능
+    function copyUsingFallback(text) {
+        const tempTextArea = document.createElement('textarea');
+        tempTextArea.value = text;
+        tempTextArea.style.position = 'fixed'; // 화면에서 보이지 않게 설정
+        tempTextArea.style.opacity = '0';
+        document.body.appendChild(tempTextArea);
+        tempTextArea.select();
+        
+        try {
+            const successful = document.execCommand('copy');
+            if (successful) {
+                showCopySuccess();
+            } else {
+                alert('클립보드 복사에 실패했습니다. 브라우저 설정을 확인해주세요.');
+            }
+        } catch (err) {
+            console.error('클립보드 복사 중 오류 발생:', err);
+            alert('클립보드 복사에 실패했습니다. 브라우저 설정을 확인해주세요.');
+        }
+        
+        document.body.removeChild(tempTextArea);
+    }
+    
+    // 복사 성공 메시지 표시
+    function showCopySuccess() {
+        if (copyResultMsg) {
+            copyResultMsg.style.display = 'block';
+            
+            // 3초 후 메시지 숨기기
+            setTimeout(() => {
+                copyResultMsg.style.display = 'none';
+            }, 3000);
+        } else {
+            alert('클립보드에 복사되었습니다!');
+        }
     }
     
     // 카카오톡으로 로또 번호 공유 함수
