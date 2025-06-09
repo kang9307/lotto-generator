@@ -36,31 +36,72 @@ document.addEventListener('DOMContentLoaded', function() {
     
     // 메타 태그 업데이트 함수
     function updateMetaTags(post) {
-        if (!post) return;
+        // 기본 메타 태그 (포스트가 없는 경우)
+        if (!post) {
+            document.title = '기술 블로그 - BrainDetox Utility Box';
+            
+            // 기본 메타 태그 업데이트
+            updateOrCreateMetaTag('description', '프로그래밍, 네트워크, 클라우드, 보안 등 IT 관련 유용한 정보를 제공하는 기술 블로그입니다.');
+            updateOrCreateMetaTag('keywords', '기술 블로그, 개발, 프로그래밍, IT, 네트워크, 클라우드, 보안');
+            
+            // Open Graph 태그 업데이트
+            updateOrCreateMetaTag('og:title', '기술 블로그 - BrainDetox', 'property');
+            updateOrCreateMetaTag('og:description', '프로그래밍, 네트워크, 클라우드 등 IT 관련 유용한 정보를 제공합니다.', 'property');
+            updateOrCreateMetaTag('og:url', `${baseDomain}/blog.html`, 'property');
+            updateOrCreateMetaTag('og:type', 'website', 'property');
+            
+            // 기본 canonical URL 설정
+            let canonicalLink = document.querySelector('link[rel="canonical"]');
+            if (!canonicalLink) {
+                canonicalLink = document.createElement('link');
+                canonicalLink.rel = 'canonical';
+                document.head.appendChild(canonicalLink);
+            }
+            canonicalLink.href = `${baseDomain}/blog.html`;
+            
+            return;
+        }
         
-        // 페이지 제목 업데이트
-        document.title = `${post.title} - BrainDetox 기술 블로그`;
+        // 포스트 정보가 있는 경우 메타 태그 업데이트
+        const postTitle = `${post.title} - BrainDetox 기술 블로그`;
+        document.title = postTitle;
+        
+        // 포스트 설명 생성
+        const description = post.description || `${post.title} - BrainDetox 기술 블로그의 ${post.category} 카테고리 포스트입니다.`;
         
         // 메타 태그 업데이트 또는 생성
-        updateOrCreateMetaTag('description', post.description || `${post.title} - BrainDetox 기술 블로그의 포스트입니다.`);
+        updateOrCreateMetaTag('description', description);
         updateOrCreateMetaTag('keywords', `${post.category}, ${post.tags?.join(', ') || ''}, 브레인디톡스, 기술블로그`);
         
         // Open Graph 태그 업데이트
         updateOrCreateMetaTag('og:title', post.title, 'property');
-        updateOrCreateMetaTag('og:description', post.description || `${post.title} - BrainDetox 기술 블로그의 포스트입니다.`, 'property');
-        updateOrCreateMetaTag('og:url', `${baseDomain}${baseUrl}${post.id}`, 'property');
+        updateOrCreateMetaTag('og:description', description, 'property');
+        
+        // 표준 URL 형식의 canonical URL
+        const canonicalUrl = `${baseDomain}${baseUrl}${post.id}`;
+        updateOrCreateMetaTag('og:url', canonicalUrl, 'property');
         updateOrCreateMetaTag('og:type', 'article', 'property');
         
-        // 표준 URL 태그 설정
+        // 포스트 메타 정보 추가
+        updateOrCreateMetaTag('article:published_time', post.date, 'property');
+        if (post.modifiedDate) {
+            updateOrCreateMetaTag('article:modified_time', post.modifiedDate, 'property');
+        }
+        updateOrCreateMetaTag('article:section', post.category, 'property');
+        
+        // 표준 URL 태그 설정 (중요: 검색 엔진이 이 URL을 기준으로 인덱싱)
         let canonicalLink = document.querySelector('link[rel="canonical"]');
         if (!canonicalLink) {
             canonicalLink = document.createElement('link');
             canonicalLink.rel = 'canonical';
             document.head.appendChild(canonicalLink);
         }
-        canonicalLink.href = `${baseDomain}${baseUrl}${post.id}`;
+        canonicalLink.href = canonicalUrl;
         
-        debugLog('메타 태그 업데이트됨:', post.title);
+        // 구조화된 데이터 업데이트 (JSON-LD)
+        updateStructuredData(post);
+        
+        debugLog('메타 태그 업데이트됨:', post.title, 'Canonical URL:', canonicalUrl);
     }
     
     // 메타 태그 업데이트 또는 생성 헬퍼 함수
@@ -74,6 +115,67 @@ document.addEventListener('DOMContentLoaded', function() {
         }
         
         metaTag.setAttribute('content', content);
+    }
+    
+    // 구조화된 데이터 업데이트 함수 추가
+    function updateStructuredData(post) {
+        // 기존 JSON-LD 스크립트 제거
+        const existingScript = document.querySelector('script[type="application/ld+json"]');
+        if (existingScript) {
+            existingScript.remove();
+        }
+        
+        // 새 구조화 데이터 생성
+        let jsonLdData;
+        
+        if (!post) {
+            // 블로그 목록 페이지용 구조화 데이터
+            jsonLdData = {
+                "@context": "https://schema.org",
+                "@type": "Blog",
+                "name": "BrainDetox 기술 블로그",
+                "url": `${baseDomain}/blog.html`,
+                "description": "프로그래밍, 네트워크, 클라우드, 보안 등 IT 관련 유용한 정보를 제공하는 기술 블로그입니다.",
+                "potentialAction": {
+                    "@type": "SearchAction",
+                    "target": `${baseDomain}/blog.html?search={search_term_string}`,
+                    "query-input": "required name=search_term_string"
+                }
+            };
+        } else {
+            // 블로그 포스트용 구조화 데이터
+            jsonLdData = {
+                "@context": "https://schema.org",
+                "@type": "BlogPosting",
+                "mainEntityOfPage": {
+                    "@type": "WebPage",
+                    "@id": `${baseDomain}${baseUrl}${post.id}`
+                },
+                "headline": post.title,
+                "description": post.description || `${post.title} - ${post.category} 카테고리의 기술 블로그 글입니다.`,
+                "datePublished": post.date,
+                "dateModified": post.modifiedDate || post.date,
+                "author": {
+                    "@type": "Person",
+                    "name": "BrainDetox"
+                },
+                "publisher": {
+                    "@type": "Organization",
+                    "name": "BrainDetox",
+                    "logo": {
+                        "@type": "ImageObject",
+                        "url": `${baseDomain}/site_logo.png`
+                    }
+                },
+                "articleSection": post.category
+            };
+        }
+        
+        // 새 JSON-LD 스크립트 추가
+        const script = document.createElement('script');
+        script.type = 'application/ld+json';
+        script.textContent = JSON.stringify(jsonLdData);
+        document.head.appendChild(script);
     }
     
     // 소셜 미디어 공유 버튼 업데이트 함수
