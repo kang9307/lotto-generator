@@ -399,7 +399,8 @@ document.addEventListener('DOMContentLoaded', function() {
                             thumbnailUrl: post.thumbnailUrl || '',
                             date: post.date || '',
                             modifiedDate: post.modifiedDate || '',
-                            filename: post.filename || `${post.id}.html`
+                            filename: post.filename || `${post.id}.html`,
+                            featured: post.featured || false  // featured 속성이 true인 포스트만 추천글로 표시
                         }));
                         
                         debugLog('인덱스 파일에서 포스트 목록 로드 성공:', posts.length);
@@ -420,27 +421,18 @@ document.addEventListener('DOMContentLoaded', function() {
                         updateMetaInfo();
                         
                         return posts;
+                    } else {
+                        debugLog('인덱스 파일의 형식이 잘못되었거나 비어 있습니다. 디렉토리 스캔으로 대체합니다.');
+                        return await fetchPostsFromDirectory();
                     }
                 } else {
                     debugLog('인덱스 파일 로드 실패, 상태 코드:', indexResponse.status);
+                    return await fetchPostsFromDirectory();
                 }
             } catch (indexError) {
                 console.error('인덱스 파일 로드 실패, 디렉토리 스캔으로 대체:', indexError);
+                return await fetchPostsFromDirectory();
             }
-
-            // 인덱스 파일 로드 실패 시 정적 포스트 데이터 사용
-            debugLog('정적 포스트 데이터 사용');
-            posts = getStaticPostsData();
-            
-            // 카테고리 목록 업데이트
-            updateCategories();
-            
-            // 상태 업데이트
-            renderPostList();
-            renderFeaturedPosts();
-            updateMetaInfo();
-            
-            return posts;
         } catch (error) {
             console.error('포스트 목록 가져오기 실패:', error);
             
@@ -469,6 +461,125 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     }
     
+    // 디렉토리에서 HTML 파일 목록을 가져와 포스트 배열로 변환하는 함수
+    async function fetchPostsFromDirectory() {
+        try {
+            // posts 디렉토리의 모든 HTML 파일 목록을 가져오는 시도
+            const allPosts = [];
+            
+            // 정적 데이터를 기본으로 사용
+            const staticPosts = getStaticPostsData();
+            
+            // 실제 파일 목록을 가져올 수 없으므로, 미리 알고 있는 파일 목록을 사용
+            const knownFiles = [
+                "zinc_intake_guide.html", "yeonggwang_population_trend.html", "vitamin_d_benefits.html",
+                "udca_guide.html", "tofu_health_benefits.html", "stress_management_meditation.html",
+                "squid_game_season3_analysis_complete.html", "skt_usim_hacking_reauth_guide.html",
+                "skt-usim-hacking-precautions.html", "sitemap_importance.html", "robots_txt_guide.html",
+                "php_language_guide_part5.html", "php_language_guide_part4.html", "php_language_guide_part3.html",
+                "php_language_guide_part2.html", "php_language_guide_part1.html", "networking_basic.html",
+                "meta_tags_seo_guide.html", "meditation_benefits.html", "linux_grep_awk.html",
+                "korea_presidential_election_2025.html", "korea_esg_corporate_trends.html",
+                "korea_economic_social_challenges_2025.html", "korea_ai_technology_future.html",
+                "korea_21st_president_inauguration.html", "korean_traditional_herbs.html",
+                "knee_joint_health.html", "jeonse_fraud_comprehensive_report.html", "javascript_basic.html",
+                "insomnia_solutions.html", "immunity_boost_lifestyle.html", "immune_system_overview.html",
+                "home_office_productivity.html", "healthy_diet_nutrition.html", "fatty_liver_diet.html",
+                "digital_detox_guide.html", "dash_diet_guide.html", "coffee_fatty_liver.html",
+                "cheonggukjang_benefits.html", "ceph_storage_intro.html", "ceph_rados_crush_deep_dive.html",
+                "artificial_intelligence_intro.html", "anemia_breathlessness.html", 
+                "android_version_security.html", "ai_future_social_impact.html", "ai_future_jobs_career_skills.html"
+            ];
+            
+            // 각 파일에 대해 처리
+            for (const filename of knownFiles) {
+                try {
+                    // 파일명에서 ID 추출 (확장자 제거)
+                    const id = filename.replace('.html', '');
+                    
+                    // 이미 정적 데이터에 있는 항목인지 확인
+                    const existingPost = staticPosts.find(post => post.id === id);
+                    
+                    if (existingPost) {
+                        // 기존 정적 데이터 사용
+                        allPosts.push(existingPost);
+                        continue;
+                    }
+                    
+                    // HTML 파일 내용 가져오기
+                    const htmlResponse = await fetch(`${postsDir}${filename}`);
+                    if (htmlResponse.ok) {
+                        const htmlContent = await htmlResponse.text();
+                        
+                        // HTML에서 메타데이터 추출 (제목, 날짜, 카테고리 등)
+                        const titleMatch = htmlContent.match(/<title>(.*?)<\/title>/);
+                        let title = id; // 기본값으로 ID 사용
+                        
+                        if (titleMatch) {
+                            title = titleMatch[1].replace(' - BrainDetox 기술 블로그', '');
+                        }
+                        
+                        // 메타 정보 추출
+                        const categoryMatch = htmlContent.match(/<meta\s+name="category"\s+content="(.*?)"\s*\/?>/);
+                        const dateMatch = htmlContent.match(/<meta\s+name="date"\s+content="(.*?)"\s*\/?>/);
+                        const descriptionMatch = htmlContent.match(/<meta\s+name="description"\s+content="(.*?)"\s*\/?>/);
+                        
+                        // ID와 제목에서 자동으로 추천 여부 판단 (ID에 특정 키워드가 있으면 추천글로 설정)
+                        const isFeatured = id.includes('featured') || 
+                                           title.toLowerCase().includes('추천') ||
+                                           Math.random() < 0.3; // 30% 확률로 추천글로 설정
+                        
+                        allPosts.push({
+                            id: id,
+                            title: title,
+                            description: descriptionMatch ? descriptionMatch[1] : '',
+                            category: categoryMatch ? categoryMatch[1] : 
+                                     (id.includes('ceph') ? '기술/IT' : 
+                                     id.includes('health') || id.includes('diet') ? '건강' : 
+                                     id.includes('korea') ? '시사/경제' : '미분류'),
+                            date: dateMatch ? dateMatch[1] : 
+                                  (new Date(Date.now() - Math.random() * 30 * 24 * 60 * 60 * 1000)).toISOString().split('T')[0],
+                            filename: filename,
+                            featured: isFeatured
+                        });
+                    }
+                } catch (fileError) {
+                    console.error(`파일 처리 중 오류: ${filename}`, fileError);
+                }
+            }
+            
+            // 모든 파일을 처리한 후 중복 제거 (ID 기준)
+            const uniquePosts = [];
+            const seenIds = new Set();
+            
+            for (const post of allPosts) {
+                if (!seenIds.has(post.id)) {
+                    seenIds.add(post.id);
+                    uniquePosts.push(post);
+                }
+            }
+            
+            // 날짜 기준 내림차순 정렬
+            uniquePosts.sort((a, b) => new Date(b.date) - new Date(a.date));
+            
+            posts = uniquePosts;
+            
+            // 카테고리 목록 업데이트
+            updateCategories();
+            
+            // 포스트 목록 렌더링 등 업데이트
+            renderPostList();
+            renderFeaturedPosts();
+            updateMetaInfo();
+            
+            return posts;
+        } catch (error) {
+            console.error('디렉토리에서 포스트 목록 가져오기 실패:', error);
+            // 오류 발생 시 정적 데이터 반환
+            return getStaticPostsData();
+        }
+    }
+    
     // 정적 포스트 데이터 반환 (인덱스 파일 로드 실패 시 사용)
     function getStaticPostsData() {
         // 기본 정적 포스트 데이터
@@ -480,7 +591,8 @@ document.addEventListener('DOMContentLoaded', function() {
                 category: "기술/IT",
                 date: "2025-06-08",
                 tags: ["AI", "인공지능", "미래", "직업", "경력", "기술", "역량"],
-                filename: "ai_future_jobs_career_skills.html"
+                filename: "ai_future_jobs_career_skills.html",
+                featured: true
             },
             {
                 id: "ai_future_social_impact",
@@ -489,7 +601,8 @@ document.addEventListener('DOMContentLoaded', function() {
                 category: "기술/IT",
                 date: "2025-06-07",
                 tags: ["AI", "인공지능", "사회", "미래", "기술 영향", "윤리"],
-                filename: "ai_future_social_impact.html"
+                filename: "ai_future_social_impact.html",
+                featured: true
             },
             {
                 id: "android_version_security",
@@ -498,7 +611,8 @@ document.addEventListener('DOMContentLoaded', function() {
                 category: "보안",
                 date: "2025-06-06",
                 tags: ["안드로이드", "보안", "운영체제", "취약점", "대응방법"],
-                filename: "android_version_security.html"
+                filename: "android_version_security.html",
+                featured: true
             },
             {
                 id: "ceph_storage_intro",
@@ -507,7 +621,8 @@ document.addEventListener('DOMContentLoaded', function() {
                 category: "기술/IT",
                 date: "2025-06-02",
                 tags: ["Ceph", "스토리지", "분산시스템", "오픈소스", "클라우드"],
-                filename: "ceph_storage_intro.html"
+                filename: "ceph_storage_intro.html",
+                featured: true
             },
             {
                 id: "healthy_diet_nutrition",
@@ -516,7 +631,28 @@ document.addEventListener('DOMContentLoaded', function() {
                 category: "건강",
                 date: "2025-05-25",
                 tags: ["건강", "식단", "영양", "다이어트", "웰빙"],
-                filename: "healthy_diet_nutrition.html"
+                filename: "healthy_diet_nutrition.html",
+                featured: true
+            },
+            {
+                id: "squid_game_season3_analysis_complete",
+                title: "'오징어 게임' 시즌 3 완벽 분석",
+                description: "돌아온 거물급 시리즈, 무엇을 기대하고 주목해야 하는가?",
+                category: "시사/연예",
+                date: "2025-06-08",
+                tags: ["오징어 게임", "넷플릭스", "시즌3", "분석", "리뷰"],
+                filename: "squid_game_season3_analysis_complete.html",
+                featured: true
+            },
+            {
+                id: "korea_esg_corporate_trends",
+                title: "한국 주요 기업의 ESG 경영 현황과 미래 전망",
+                description: "대한민국 기업들의 환경, 사회, 지배구조 측면의 경영 현황을 분석합니다.",
+                category: "시사/경제",
+                date: "2025-06-05",
+                tags: ["ESG", "기업경영", "지속가능성", "투자", "경제"],
+                filename: "korea_esg_corporate_trends.html",
+                featured: true
             }
         ];
     }
@@ -601,7 +737,7 @@ document.addEventListener('DOMContentLoaded', function() {
     function renderFeaturedPosts() {
         if (!featuredList) return;
         
-        const featuredPosts = posts.filter(post => post.featured);
+        const featuredPosts = posts.filter(post => post.featured === true);
         
         if (featuredPosts.length === 0) {
             featuredList.innerHTML = '<li>추천 글이 없습니다.</li>';
