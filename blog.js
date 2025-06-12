@@ -524,191 +524,6 @@ document.addEventListener('DOMContentLoaded', function() {
         updateCategoryFilter();
     }
     
-    // 특정 ID의 글 로드
-    async function loadPost(postId) {
-        try {
-            if (!postId) {
-                throw new Error('포스트 ID가 제공되지 않았습니다.');
-            }
-            
-            // 마크다운 컨텐츠 영역 초기화
-            if (markdownContent) {
-                markdownContent.innerHTML = '<div class="loading-spinner">글을 불러오는 중...</div>';
-            }
-            
-            // 이미 로드된 포스트 목록이 있는지 확인
-            if (posts.length === 0) {
-                // 포스트 목록이 없으면 먼저 로드
-                await fetchPostList();
-            }
-            
-            // 현재 포스트 찾기
-            currentPost = posts.find(post => post.id === postId);
-            
-            // 포스트가 없으면 404 표시
-            if (!currentPost) {
-                if (markdownContent) {
-                    markdownContent.innerHTML = `
-                    <div class="error-message">
-                        <h2>존재하지 않는 글입니다</h2>
-                        <p>요청하신 ID "${postId}"에 해당하는 글을 찾을 수 없습니다.</p>
-                        <p><a href="blog.html">블로그 홈으로 돌아가기</a></p>
-                    </div>`;
-                }
-                return;
-            }
-            
-            try {
-                // 포스트 HTML 가져오기
-                debugLog('포스트 파일 로드 시도:', `${postsDir}${currentPost.filename}`);
-                const response = await fetch(`${postsDir}${currentPost.filename}`);
-                
-                if (!response.ok) {
-                    throw new Error(`포스트 로드 실패: HTTP 오류 ${response.status}`);
-                }
-                
-                const html = await response.text();
-                
-                // HTML 파싱
-                const parser = new DOMParser();
-                const doc = parser.parseFromString(html, 'text/html');
-                
-                // 포스트 컨텐츠 추출
-                const postContent = doc.querySelector('article.post-content');
-                if (!postContent) {
-                    throw new Error('포스트 컨텐츠를 찾을 수 없습니다.');
-                }
-                
-                // 메타 정보 추출 및 업데이트
-                const postTitle = doc.querySelector('meta[property="og:title"]')?.content || 
-                                doc.querySelector('title')?.textContent || 
-                                currentPost.title;
-                
-                // 날짜 형식 변환
-                const publishDate = formatDate(currentPost.date);
-                const modifiedDate = currentPost.modifiedDate ? formatDate(currentPost.modifiedDate) : null;
-                
-                // 마크다운 컨텐츠 영역에 포스트 출력
-                if (markdownContent) {
-                    markdownContent.innerHTML = `
-                    <article class="post">
-                        <header class="post-header">
-                            <h1 class="post-title">${postTitle}</h1>
-                            <div class="post-meta">
-                                <span class="post-date"><i class="fas fa-calendar-alt"></i> ${publishDate}</span>
-                                ${modifiedDate ? `<span class="post-updated"><i class="fas fa-edit"></i> 수정: ${modifiedDate}</span>` : ''}
-                                <span class="post-category"><i class="fas fa-folder"></i> ${currentPost.category}</span>
-                            </div>
-                        </header>
-                        <div class="post-content">
-                            ${postContent.innerHTML}
-                        </div>
-                        <footer class="post-footer">
-                            <div class="post-tags">
-                                ${currentPost.tags.map(tag => `<span class="post-tag">${tag}</span>`).join('')}
-                            </div>
-                            <div class="post-share">
-                                <h4>이 글 공유하기</h4>
-                                <div class="social-share">
-                                    <button id="post-kakao-share" class="share-btn kakao-btn">
-                                        <img src="https://developers.kakao.com/assets/img/about/logos/kakaolink/kakaolink_btn_small.png" alt="카카오톡 공유">
-                                        카카오톡
-                                    </button>
-                                    <button id="post-facebook-share" class="share-btn facebook-btn">
-                                        <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA1MTIgNTEyIj48cGF0aCBmaWxsPSJ3aGl0ZSIgZD0iTTUwNCAxNTYuNmMwLTM2LjQtMjkuNi02Ni02Ni02NmgtMzY0Yy0zNi40IDAtNjYgMjkuNi02NiA2NnYxOTguOGMwIDM2LjQgMjkuNiA2NiA2NiA2Nmg3NnYtMTQxLjFoLTQ2LjJjLTYuNyAwLTEyLjEtNS40LTEyLjEtMTIuMXYtNDMuMmMwLTYuNyA1LjQtMTIuMSAxMi4xLTEyLjFoNDYuMnYtNDAuNmMwLTUwLjkgMzAuMy04Ni4yIDgzLjctODYuMmgyNy43YzYuNyAwIDEyLjEgNS40IDEyLjEgMTIuMXY0My4yYzAgNi43LTUuNSAxMi4xLTEyLjIgMTIuMWgtMTdDMjY3IDEwNS40IDI2NCAxMTguMyAyNjQgMTMyLjF2MzUuMmg0NS4xYzcuOCAwIDEzLjggNi44IDEyLjMgMTQuNWwtNS4zIDQzLjJjLTEuMSA2LjEtNi40IDEwLjYtMTIuNiAxMC42SDI2NFYzNTVjMTMxLjEtMTkuMSAxOTguMy0xNTUuNSAxNDAuNS0yNzQuN2ExOTMuOCAxOTMuOCAwIDAgMCA5OS41IDc2LjN6Ii8+PC9zdmc+" alt="페이스북 공유">
-                                        페이스북
-                                    </button>
-                                    <button id="post-twitter-share" class="share-btn twitter-btn">
-                                        <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0id2hpdGUiIGQ9Ik0yMS45MyA0LjM2YTguNjkgOC42OSAwIDAgMC0yLjQ4LjY4IDguMzMgOC4zMyAwIDAxLjY5LTIuMTIgOC42NyA4LjY3IDAgMDEtMi43NCAxLjA2IDQuNDc4IDQuNDc4IDAgMDAtNy44NiAzLjA3IDEyLjQ4IDEyLjQ4IDAgMDEtOC4xMy00LjEyIDQuNTEgNC41MSAwIDAwMS40MyA1Ljk4IDQuNTMgNC41MyAwIDAxLTIuMDYtLjU2djAuMDVhNC40OTggNC40OTggMCAwMDMuNjEgNC40MiA0LjU3IDQuNTcgMCAwMS0yLjA1LjA4YTQuNDcgNC40NyAwIDAwNC4yNyAzLjEgOS4wNCA5LjA0IDAgMDEtNS41NiAxLjkgOC45OSA4Ljk5IDAgMDEtMS4wNy0uMDYgMTIuNzYgMTIuNzYgMCAwMDYuOCAyIiBzdHJva2U9IndoaXRlIi8+PC9zdmc+" alt="X(트위터) 공유">
-                                        X(트위터)
-                                    </button>
-                                    <button id="post-link-copy" class="share-btn link-btn">
-                                        <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9IndoaXRlIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIgY2xhc3M9ImZlYXRoZXIgZmVhdGhlci1saW5rIj48cGF0aCBkPSJNMTAgMTNhNSA1IDAgMCAwIDcuNTQuNTRsMyAzYTUgNSAwIDAgMC03LjA3LTcuMDdsLTEuNzIgMS43MSI+PC9wYXRoPjxwYXRoIGQ9Ik0xNCAxMWE1IDUgMCAwIDAtNy41NC0uNTRsLTMgM2E1IDUgMCAwIDAgNy4wNyA3LjA3bDEuNzEtMS43MSI+PC9wYXRoPjwvc3ZnPg==" alt="링크 복사">
-                                        링크 복사
-                                    </button>
-                                </div>
-                            </div>
-                            <div class="back-to-list">
-                                <a href="blog.html" class="back-link">← 목록으로 돌아가기</a>
-                            </div>
-                        </footer>
-                    </article>`;
-                    
-                    // 관련 포스트 렌더링
-                    renderRelatedPosts(currentPost);
-                    
-                    // 포스트 내 코드 블록에 구문 강조 적용
-                    document.querySelectorAll('pre code').forEach(block => {
-                        hljs.highlightBlock(block);
-                    });
-                    
-                    // 공유 버튼 이벤트 연결
-                    setupPostShareButtons();
-                }
-                
-                // 메타 태그 업데이트
-                updateMetaTags(currentPost);
-                
-                // 현재 포스트 강조 표시
-                highlightCurrentPost();
-                
-                debugLog('포스트 로드 완료:', currentPost.title);
-            } catch (fetchError) {
-                console.error('포스트 파일 로드 실패:', fetchError);
-                
-                // 포스트 파일 로드 실패시 대체 콘텐츠 표시
-                if (markdownContent) {
-                    // 포스트 기본 정보로 간략한 내용 표시
-                    markdownContent.innerHTML = `
-                    <article class="post">
-                        <header class="post-header">
-                            <h1 class="post-title">${currentPost.title}</h1>
-                            <div class="post-meta">
-                                <span class="post-date"><i class="fas fa-calendar-alt"></i> ${formatDate(currentPost.date)}</span>
-                                <span class="post-category"><i class="fas fa-folder"></i> ${currentPost.category}</span>
-                            </div>
-                        </header>
-                        <div class="post-content">
-                            <div class="post-summary">
-                                <p>${currentPost.description || '이 포스트의 내용을 불러올 수 없습니다.'}</p>
-                                <p>죄송합니다. 현재 포스트 내용을 불러오는 데 문제가 발생했습니다.</p>
-                            </div>
-                        </div>
-                        <footer class="post-footer">
-                            <div class="post-tags">
-                                ${currentPost.tags.map(tag => `<span class="post-tag">${tag}</span>`).join('')}
-                            </div>
-                            <div class="back-to-list">
-                                <a href="blog.html" class="back-link">← 목록으로 돌아가기</a>
-                            </div>
-                        </footer>
-                    </article>`;
-                    
-                    // 관련 포스트 렌더링
-                    renderRelatedPosts(currentPost);
-                }
-                
-                // 메타 태그는 포스트 기본 정보로 업데이트
-                updateMetaTags(currentPost);
-                
-                // 현재 포스트 강조 표시
-                highlightCurrentPost();
-            }
-        } catch (error) {
-            console.error('포스트 로드 실패:', error);
-            
-            // 오류 메시지 표시
-            if (markdownContent) {
-                markdownContent.innerHTML = `
-                <div class="error-message">
-                    <h2>글을 불러오는 중 오류가 발생했습니다</h2>
-                    <p>오류 메시지: ${error.message}</p>
-                    <p><a href="blog.html">블로그 홈으로 돌아가기</a></p>
-                </div>`;
-            }
-        }
-    }
-    
     // 포스트 목록 렌더링
     function renderPostList(filterCategory = 'all') {
         if (!postList) return;
@@ -738,15 +553,11 @@ document.addEventListener('DOMContentLoaded', function() {
             listItem.setAttribute('data-id', post.id);
             
             const postLink = document.createElement('a');
-            // 원래 URL 구조로 변경
-            postLink.href = `${baseUrl}${post.id}`;
+            // 정적 HTML 페이지 경로로 변경
+            postLink.href = `posts/${post.id}.html`;
             postLink.textContent = post.title;
             
-            // 클릭 이벤트 핸들러 - 기본 이벤트 방지
-            postLink.addEventListener('click', function(e) {
-                e.preventDefault();
-                loadPost(post.id);
-            });
+            // 클릭 이벤트 핸들러 제거 (정적 페이지로 직접 이동)
             
             const postDate = document.createElement('span');
             postDate.className = 'post-date';
@@ -773,9 +584,6 @@ document.addEventListener('DOMContentLoaded', function() {
             
             postList.appendChild(listItem);
         });
-        
-        // 현재 포스트 강조 표시
-        highlightCurrentPost();
         
         // 총 포스트 수 업데이트
         if (totalPostsEl) {
@@ -924,100 +732,59 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     }
     
-    // History API의 popstate 이벤트 리스너 추가
-    window.addEventListener('popstate', function(event) {
-        if (event.state && event.state.postId) {
-            loadPost(event.state.postId);
-        } else {
-            // URL에서 포스트 ID 추출 시도
-            const postId = getPostIdFromUrl();
-            if (postId) {
-                loadPost(postId);
-            } else {
-                // 포스트 ID가 없으면 최신 포스트 로드
-                loadLatestPost();
-            }
-        }
-    });
-    
-    // 새로고침 버튼 이벤트 리스너
-    document.getElementById('refreshBtn')?.addEventListener('click', function() {
-        debugLog('새로고침 버튼 클릭됨');
-        fetchPostList();
-    });
-    
-    // 포스트 목록에 현재 포스트 강조 표시
-    function highlightCurrentPost() {
-        const postId = getPostIdFromUrl();
-        if (!postId) return;
-        
-        // 모든 포스트 항목에서 active 클래스 제거
-        document.querySelectorAll('.post-item').forEach(item => {
-            item.classList.remove('active');
-        });
-        
-        // 현재 포스트에 active 클래스 추가
-        const activeItem = document.querySelector(`.post-item[data-id="${postId}"]`);
-        if (activeItem) {
-            activeItem.classList.add('active');
-        }
-    }
-    
     // 초기화 함수
     async function init() {
         try {
-            debugLog('블로그 초기화 시작');
-            
-            // 포스트 ID 확인
-            const postId = getPostIdFromUrl();
+            // DOM 요소 참조 설정
+            setupDOMReferences();
             
             // 이벤트 리스너 설정
             setupEventListeners();
             
-            // 포스트가 지정된 경우 해당 포스트 로드
-            if (postId) {
-                debugLog('URL에서 포스트 ID 발견:', postId);
+            // 카테고리 필터 업데이트
+            updateCategoryFilter();
+            
+            // 포스트 목록 가져오기
+            const postData = await fetchPostList();
+            
+            if (postData && postData.length > 0) {
+                posts = postData;
                 
-                // 포스트 목록 불러오기
-                await fetchPostList();
+                // 카테고리 목록 업데이트
+                updateCategories();
                 
-                // 해당 포스트 로드
-                await loadPost(postId);
+                // 포스트 목록 렌더링
+                renderPostList();
                 
-                // 블로그 포스트 UI 표시
-                toggleBlogLayout(true);
+                // 메타 정보 업데이트
+                updateMetaInfo();
+                
+                // 포스트 로딩 (필요 없으므로 제거)
+                // URL에서 postId를 가져와서 해당 포스트 로드
+                
+                debugLog('블로그 초기화 완료');
             } else {
-                // 기본 메타 태그 설정
-                updateMetaTags(null);
+                console.error('포스트 데이터를 불러오는데 실패했습니다.');
                 
-                // 포스트 목록만 표시
-                toggleBlogLayout(false);
+                // 오류 메시지 표시
+                if (postList) {
+                    postList.innerHTML = '<li class="error">포스트 목록을 불러오는데 실패했습니다.</li>';
+                }
                 
-                // 포스트 목록 불러오기
-                await fetchPostList();
+                if (markdownContent) {
+                    markdownContent.innerHTML = '<div class="error-message"><h2>포스트를 불러오는데 실패했습니다</h2><p>잠시 후 다시 시도해주세요.</p></div>';
+                }
             }
-            
-            debugLog('블로그 초기화 완료');
         } catch (error) {
-            console.error('블로그 초기화 오류:', error);
-            
-            // 오류 발생 시 기본 메타 태그 설정
-            updateMetaTags(null);
+            console.error('초기화 중 오류 발생:', error);
             
             // 오류 메시지 표시
+            if (postList) {
+                postList.innerHTML = `<li class="error">초기화 중 오류가 발생했습니다: ${error.message}</li>`;
+            }
+            
             if (markdownContent) {
-                markdownContent.innerHTML = `
-                <div class="error-message">
-                    <h2>블로그 초기화 중 오류가 발생했습니다</h2>
-                    <p>오류 메시지: ${error.message}</p>
-                    <p><button id="retryInitBtn" class="retry-btn">다시 시도</button></p>
-                </div>`;
-                
-                // 다시 시도 버튼에 이벤트 연결
-                const retryBtn = document.getElementById('retryInitBtn');
-                if (retryBtn) {
-                    retryBtn.addEventListener('click', init);
-                }
+                markdownContent.innerHTML = `<div class="error-message"><h2>초기화 중 오류가 발생했습니다</h2><p>오류 메시지: ${error.message}</p></div>`;
             }
         }
     }
@@ -1025,55 +792,102 @@ document.addEventListener('DOMContentLoaded', function() {
     // 블로그 레이아웃 전환 (목록/포스트)
     function toggleBlogLayout(isPostView) {
         const blogLayout = document.querySelector('.blog-layout');
-        const contentArea = document.querySelector('.blog-content-area');
         const sidebar = document.querySelector('.blog-sidebar');
+        const content = document.querySelector('.blog-content');
         
-        if (!blogLayout || !contentArea || !sidebar) {
-            return;
-        }
+        if (!blogLayout || !sidebar || !content) return;
         
-        if (isPostView) {
-            // 포스트 보기 모드
-            blogLayout.classList.add('post-view');
-            contentArea.classList.add('active');
-            sidebar.classList.add('collapsed');
+        // 이제 항상 목록 보기 모드 (포스트는 정적 페이지에서 보임)
+        sidebar.style.display = '';
+        content.style.display = '';
+        blogLayout.classList.remove('post-view-mode');
+        
+        // 기본 콘텐츠 표시
+        if (markdownContent) {
+            markdownContent.innerHTML = `
+            <div class="welcome-message">
+                <h2>기술 블로그에 오신 것을 환영합니다</h2>
+                <p>왼쪽 목록에서 관심있는 글을 선택하세요.</p>
+                <div class="featured-posts">
+                    <h3>추천 글</h3>
+                    <ul id="featuredList">
+                        <!-- 추천 글 목록이 여기에 동적으로 로드됨 -->
+                        <li>추천 글을 불러오는 중...</li>
+                    </ul>
+                </div>
+            </div>`;
             
-            // 모바일에서는 사이드바 숨김
-            if (window.innerWidth <= 768) {
-                sidebar.style.display = 'none';
-            }
-        } else {
-            // 목록 보기 모드
-            blogLayout.classList.remove('post-view');
-            contentArea.classList.remove('active');
-            sidebar.classList.remove('collapsed');
-            
-            // 모바일에서도 사이드바 표시
-            sidebar.style.display = 'block';
-            
-            // 컨텐츠 영역 초기화
-            if (markdownContent) {
-                markdownContent.innerHTML = '<div class="welcome-message">왼쪽 목록에서 글을 선택하세요.</div>';
-            }
+            // 추천 글 목록 렌더링
+            renderFeaturedPosts();
         }
     }
     
     // 이벤트 리스너 설정
     function setupEventListeners() {
-        // 새로고침 버튼
-        const refreshBtn = document.getElementById('refreshBtn');
-        if (refreshBtn) {
-            refreshBtn.addEventListener('click', fetchPostList);
-        }
-        
-        // 카테고리 필터
+        // 카테고리 필터 이벤트 리스너
+        const categoryFilter = document.getElementById('categoryFilter');
         if (categoryFilter) {
             categoryFilter.addEventListener('change', function() {
                 renderPostList(this.value);
             });
         }
+        
+        // 새로고침 버튼 이벤트 리스너
+        const refreshBtn = document.getElementById('refreshBtn');
+        if (refreshBtn) {
+            refreshBtn.addEventListener('click', async function() {
+                try {
+                    // 포스트 목록 새로고침
+                    this.classList.add('refreshing');
+                    
+                    // 포스트 목록 다시 가져오기
+                    const updatedPosts = await fetchPostList();
+                    if (updatedPosts && updatedPosts.length > 0) {
+                        posts = updatedPosts;
+                        
+                        // 카테고리 필터 현재 값 유지
+                        const currentCategory = categoryFilter ? categoryFilter.value : 'all';
+                        
+                        // 카테고리 목록 업데이트
+                        updateCategories();
+                        
+                        // 포스트 목록 다시 렌더링
+                        renderPostList(currentCategory);
+                        
+                        // 메타 정보 업데이트
+                        updateMetaInfo();
+                    }
+                } catch (error) {
+                    console.error('포스트 목록 새로고침 실패:', error);
+                    
+                    // 오류 메시지 표시
+                    if (postList) {
+                        postList.innerHTML = `<li class="error">새로고침 실패: ${error.message}</li>`;
+                    }
+                } finally {
+                    this.classList.remove('refreshing');
+                }
+            });
+        }
+        
+        // 공유 버튼 이벤트 리스너
+        setupShareButtons();
     }
     
-    // 초기화 실행
+    // 블로그 스타일 조정 - 스크롤 지원
+    const blogSidebar = document.querySelector('.blog-sidebar');
+    const postListContainer = document.querySelector('.post-list-container');
+    
+    if (blogSidebar && postListContainer) {
+        // 사이드바 높이 조정
+        blogSidebar.style.maxHeight = 'calc(100vh - 200px)';
+        
+        // 포스트 목록 스크롤 지원
+        postListContainer.style.maxHeight = 'calc(100vh - 300px)';
+        postListContainer.style.overflowY = 'auto';
+        postListContainer.style.paddingRight = '10px';
+    }
+    
+    // 초기화 시작
     init();
 }); 
