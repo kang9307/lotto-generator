@@ -908,14 +908,14 @@ document.addEventListener('DOMContentLoaded', function() {
         
         if (relatedPosts.length === 0) return;
         
-        // 관련 게시물 HTML 생성
+        // 관련 게시물 HTML 생성 (독립 HTML 파일 방식으로 변경)
         const relatedPostsHTML = `
             <div class="related-posts">
                 <h3>관련 게시물</h3>
                 <ul>
                     ${relatedPosts.map(post => `
                         <li>
-                            <a href="${baseUrl}${post.id}" class="related-post-link" data-id="${post.id}">
+                            <a href="./posts/${post.id}.html" class="related-post-link" data-id="${post.id}">
                                 ${post.title}
                             </a>
                             <span class="post-date">${formatDate(post.date)}</span>
