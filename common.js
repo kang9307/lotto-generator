@@ -8,8 +8,11 @@ document.addEventListener('DOMContentLoaded', function() {
     const isLocalFileSystem = window.location.protocol === 'file:';
     
     // 현재 경로 감지 (루트 디렉토리인지 하위 디렉토리인지)
-    const isSubDirectory = window.location.pathname.includes('/posts/') || 
-                           window.location.pathname.match(/\/[^\/]+\/[^\/]+\.html$/);
+    // 경로 감지 수정 - 보다 정확한 경로 감지를 위해 정규식 개선
+    const pathName = window.location.pathname;
+    const isSubDirectory = pathName.includes('/posts/') || 
+                           pathName.match(/\/[^\/]+\/[^\/]+\.html$/) ||
+                           pathName.includes('post_');
     
     // 컴포넌트 경로 결정
     const headerFile = isSubDirectory ? 'components/header.html' : 'components/root-header.html';
@@ -181,13 +184,17 @@ document.addEventListener('DOMContentLoaded', function() {
         const menuLinks = document.querySelectorAll('.nav-link');
         
         menuLinks.forEach(link => {
-            // 기본 페이지 체크
-            if (link.getAttribute('href').split('/').pop() === currentPage) {
+            // 링크 URL 파싱
+            const linkUrl = link.getAttribute('href');
+            const linkPage = linkUrl.split('/').pop();
+            
+            // 현재 페이지와 링크 페이지 비교
+            if (linkPage === currentPage) {
                 link.classList.add('active');
             }
             
             // 블로그 포스트 페이지 특별 처리
-            if (currentPage.startsWith('post_') && link.getAttribute('href').includes('blog.html')) {
+            if (currentPage.startsWith('post_') && linkUrl.includes('blog.html')) {
                 link.classList.add('active');
             }
         });

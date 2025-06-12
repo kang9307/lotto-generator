@@ -364,264 +364,358 @@ document.addEventListener('DOMContentLoaded', function() {
         return filename.replace(/\.[^/.]+$/, "");
     }
     
-    // 포스트 목록 가져오기
+    // 글 목록 가져오기
     async function fetchPostList() {
         try {
-            debugLog('포스트 목록 가져오기 시작...');
-            postList.innerHTML = '<li class="post-item loading">포스트 목록을 불러오는 중...</li>';
-            
-            // 실제 파일 목록 확인
-            const availablePosts = [];
-            
+            // 로딩 상태 표시
+            if (postList) {
+                postList.innerHTML = '<div class="loading-spinner">글 목록을 불러오는 중...</div>';
+            }
+
+            // 먼저 미리 정의된 포스트 인덱스 파일 시도
             try {
-                // 디렉토리 인덱스 파일을 통해 파일 목록 가져오기 시도
-                const response = await fetch(`${postsDir}index.json`, {
-                    cache: 'no-store'
-                });
-                
-                if (response.ok) {
-                    // index.json 파일이 있는 경우
-                    debugLog('디렉토리 인덱스 파일 발견');
-                    const indexData = await response.json();
+                const indexResponse = await fetch(`${postsDir}index.json`);
+                if (indexResponse.ok) {
+                    const indexData = await indexResponse.json();
                     
-                    // HTML 파일 목록 및 포스트 메타데이터 가져오기
-                    if (indexData.posts && Array.isArray(indexData.posts)) {
-                        // posts 배열이 있는 경우 (새로운 방식)
-                        debugLog(`index.json에서 ${indexData.posts.length}개 포스트 메타데이터 로드`);
+                    // 유효한 JSON 데이터가 있는지 확인
+                    if (Array.isArray(indexData) && indexData.length > 0) {
+                        posts = indexData.map(post => ({
+                            id: post.id,
+                            title: post.title,
+                            description: post.description || '',
+                            excerpt: post.excerpt || post.description || '',
+                            category: post.category || '미분류',
+                            tags: post.tags || [],
+                            thumbnailUrl: post.thumbnailUrl || '',
+                            date: post.date || '',
+                            modifiedDate: post.modifiedDate || '',
+                            filename: post.filename || `${post.id}.html`
+                        }));
                         
-                        for (const post of indexData.posts) {
-                            availablePosts.push({
-                                id: post.id,
-                                title: post.title,
-                                date: post.date,
-                                modifiedDate: post.modifiedDate || post.date,
-                                category: post.category,
-                                featured: post.featured,
-                                filename: post.filename
-                            });
-                            
-                            // 카테고리 추가
-                            if (post.category) {
-                                categories.add(post.category);
-                            }
-                        }
-                    } else if (indexData.files && Array.isArray(indexData.files)) {
-                        // files 배열만 있는 경우 (기존 방식)
-                        const fileList = indexData.files;
-                        debugLog(`index.json에서 ${fileList.length}개 파일 목록 로드`);
+                        debugLog('인덱스 파일에서 포스트 목록 로드 성공:', posts.length);
                         
-                        // 각 파일에 대해 처리
-                        for (const filename of fileList) {
-                            // 파일명에서 확장자 확인
-                            if (!filename.toLowerCase().endsWith('.html')) {
-                                debugLog(`HTML 파일이 아님, 건너뜀: ${filename}`);
-                                continue; // HTML 파일만 처리
-                            }
-                            
-                            const filePath = `${postsDir}${filename}`;
-                            debugLog(`파일 로드 시도: ${filePath}`);
-                            
-                            try {
-                                // fetch API를 사용하여 파일 로드 시도
-                                const response = await fetch(filePath, { 
-                                    cache: 'no-store',
-                                    headers: {
-                                        'Cache-Control': 'no-cache',
-                                        'Pragma': 'no-cache'
-                                    }
-                                });
-                                
-                                if (response.ok) {
-                                    debugLog(`파일 로드 성공: ${filename}`);
-                                    const htmlContent = await response.text();
-                                    
-                                    // HTML에서 메타데이터 추출
-                                    const parser = new DOMParser();
-                                    const doc = parser.parseFromString(htmlContent, 'text/html');
-                                    
-                                    // 제목 추출
-                                    const titleEl = doc.querySelector('meta[property="og:title"]') || doc.querySelector('title');
-                                    const title = titleEl ? titleEl.getAttribute('content') || titleEl.textContent : filename;
-                                    
-                                    // 날짜 추출
-                                    const dateEl = doc.querySelector('meta[property="article:published_time"]') || doc.querySelector('meta[itemprop="datePublished"]');
-                                    const date = dateEl ? dateEl.getAttribute('content') : new Date().toISOString().split('T')[0];
-                                    
-                                    // 카테고리 추출
-                                    const categoryEl = doc.querySelector('meta[property="article:section"]') || doc.querySelector('meta[itemprop="articleSection"]');
-                                    const category = categoryEl ? categoryEl.getAttribute('content') : '미분류';
-                                    
-                                    // 파일 이름에서 ID 추출
-                                    const id = getIdFromFilename(filename);
-                                    
-                                    // 포스트 정보 저장
-                                    availablePosts.push({
-                                        id,
-                                        title,
-                                        date,
-                                        modifiedDate: date,
-                                        category,
-                                        featured: false,
-                                        filename
-                                    });
-                                    
-                                    // 카테고리 추가
-                                    if (category) {
-                                        categories.add(category);
-                                    }
-                                } else {
-                                    console.warn(`파일을 찾을 수 없음: ${filename}, 상태 코드: ${response.status}`);
-                                }
-                            } catch (error) {
-                                console.error(`파일 ${filename} 처리 중 오류:`, error);
-                            }
-                        }
-                    }
-                } else {
-                    // index.json 파일이 없는 경우 디렉토리 목록 페이지 파싱 시도
-                    debugLog('인덱스 파일 없음. 디렉토리 탐색을 시도합니다.');
-                    
-                    // 포스트 디렉토리 탐색 시도
-                    const dirResponse = await fetch(postsDir, {
-                        cache: 'no-store'
-                    });
-                    
-                    if (dirResponse.ok) {
-                        const html = await dirResponse.text();
-                        // HTML 디렉토리 목록에서 .html 파일 추출
-                        const parser = new DOMParser();
-                        const doc = parser.parseFromString(html, 'text/html');
-                        const links = doc.querySelectorAll('a');
-                        
-                        // HTML 파일 목록 추출
-                        const fileList = [];
-                        links.forEach(link => {
-                            const href = link.getAttribute('href');
-                            if (href && href.endsWith('.html')) {
-                                fileList.push(href);
-                            }
+                        // 날짜 기준 내림차순 정렬 (최신 글이 먼저)
+                        posts.sort((a, b) => {
+                            const dateA = new Date(a.date);
+                            const dateB = new Date(b.date);
+                            return dateB - dateA;
                         });
                         
-                        debugLog(`디렉토리 탐색에서 ${fileList.length}개 HTML 파일 발견`);
+                        // 카테고리 목록 업데이트
+                        updateCategories();
                         
-                        // 각 HTML 파일 처리
-                        for (const filename of fileList) {
-                            const filePath = `${postsDir}${filename}`;
-                            const response = await fetch(filePath);
-                            
-                            if (response.ok) {
-                                const htmlContent = await response.text();
-                                
-                                // HTML에서 메타데이터 추출
-                                const parser = new DOMParser();
-                                const doc = parser.parseFromString(htmlContent, 'text/html');
-                                
-                                // 제목 추출
-                                const titleEl = doc.querySelector('meta[property="og:title"]') || doc.querySelector('title');
-                                const title = titleEl ? titleEl.getAttribute('content') || titleEl.textContent : filename;
-                                
-                                // 날짜 추출
-                                const dateEl = doc.querySelector('meta[property="article:published_time"]') || doc.querySelector('meta[itemprop="datePublished"]');
-                                const date = dateEl ? dateEl.getAttribute('content') : new Date().toISOString().split('T')[0];
-                                
-                                // 카테고리 추출
-                                const categoryEl = doc.querySelector('meta[property="article:section"]') || doc.querySelector('meta[itemprop="articleSection"]');
-                                const category = categoryEl ? categoryEl.getAttribute('content') : '미분류';
-                                
-                                // 포스트 정보 저장
-                                const id = getIdFromFilename(filename);
-                                availablePosts.push({
-                                    id,
-                                    title,
-                                    date,
-                                    modifiedDate: date,
-                                    category,
-                                    featured: false,
-                                    filename
-                                });
-                                
-                                // 카테고리 추가
-                                if (category) {
-                                    categories.add(category);
-                                }
-                            }
-                        }
-                    } else {
-                        // 디렉토리 탐색도 실패한 경우 오류 메시지 표시
-                        debugLog('디렉토리 탐색 실패. 파일 목록을 가져올 수 없습니다.');
-                        throw new Error('HTML 파일 목록을 가져올 수 없습니다. posts/index.json 파일이 필요합니다.');
+                        // 포스트 목록 렌더링 등 업데이트
+                        renderPostList();
+                        renderFeaturedPosts();
+                        updateMetaInfo();
+                        
+                        return posts;
                     }
                 }
-                
-            } catch (error) {
-                console.error('파일 목록 가져오기 실패:', error);
-                debugLog('파일 목록 가져오기 실패:', error);
-                
-                // 오류 메시지 표시
-                postList.innerHTML = '<li class="post-item error">파일 목록을 불러올 수 없습니다. posts/index.json 파일을 확인해주세요.</li>';
-                markdownContent.innerHTML = `
-                    <div class="error-message">
-                        <p>포스트 목록을 불러올 수 없습니다.</p>
-                        <p>posts/index.json 파일이 있는지 확인하세요.</p>
-                        <p>오류 메시지: ${error.message}</p>
-                    </div>`;
-                return [];
+            } catch (indexError) {
+                console.error('인덱스 파일 로드 실패, 디렉토리 스캔으로 대체:', indexError);
+            }
+
+            // 인덱스 파일 로드 실패 시 디렉토리 스캔 방식으로 대체
+            // posts 디렉토리의 파일 목록 가져오기
+            const response = await fetch(postsDir);
+            if (!response.ok) {
+                throw new Error(`서버 응답 오류: ${response.status}`);
             }
             
-            debugLog(`총 ${availablePosts.length}개의 포스트를 로드했습니다.`);
-            posts = availablePosts;
+            // HTML 파싱
+            const html = await response.text();
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(html, 'text/html');
             
-            if (posts.length === 0) {
-                console.warn('로드된 포스트가 없습니다.');
-                postList.innerHTML = '<li class="post-item">등록된 글이 없습니다.</li>';
-                markdownContent.innerHTML = `
-                    <div class="error-message">
-                        <p>등록된 글이 없습니다.</p>
-                        <p>posts 디렉토리에 HTML 파일이 있는지 확인하세요.</p>
-                    </div>`;
+            // posts 디렉토리 내 파일 목록 추출
+            const fileList = Array.from(doc.querySelectorAll('a'))
+                .map(a => a.href)
+                .filter(href => href.includes('/posts/') && getFileExtension(href) === 'html')
+                .map(href => {
+                    // URL에서 파일명 추출
+                    const parts = href.split('/');
+                    return parts[parts.length - 1];
+                });
+            
+            debugLog('디렉토리 스캔으로 파일 목록 가져옴:', fileList);
+            
+            // 각 파일의 메타데이터 추출
+            posts = [];
+            const promises = fileList.map(async filename => {
+                if (filename === 'index.json') return null;
                 
-                // 파일 로드 실패 시 디버깅 정보 표시
-                debugLog('파일 로드 디버깅 정보:');
-                debugLog('- 포스트 디렉토리:', postsDir);
-                debugLog('- 환경:', window.location.protocol === 'file:' ? '로컬 파일 시스템' : '웹 서버');
-            } else {
-                // 카테고리 필터 업데이트
-                updateCategoryFilter();
-                
-                // 포스트 목록 렌더링
-                renderPostList();
-                
-                // 추천 글 렌더링
-                renderFeaturedPosts();
-                
-                // 메타 정보 업데이트
-                updateMetaInfo();
-                
-                // 최신 글 바로 표시
-                loadLatestPost();
-                
-                debugLog('로드된 포스트:', posts);
-            }
+                try {
+                    // 파일 내용 가져오기
+                    const fileUrl = `${postsDir}${filename}`;
+                    const fileResponse = await fetch(fileUrl);
+                    if (!fileResponse.ok) {
+                        console.error(`파일 로드 실패: ${filename}`);
+                        return null;
+                    }
+                    
+                    const content = await fileResponse.text();
+                    
+                    // HTML 파싱
+                    const postDoc = parser.parseFromString(content, 'text/html');
+                    
+                    // 메타데이터 추출
+                    const title = postDoc.querySelector('meta[property="og:title"]')?.content || 
+                                 postDoc.querySelector('title')?.textContent || 
+                                 '제목 없음';
+                    
+                    const description = postDoc.querySelector('meta[name="description"]')?.content || '';
+                    const category = postDoc.querySelector('meta[name="category"]')?.content || '미분류';
+                    const datePublished = postDoc.querySelector('meta[property="article:published_time"]')?.content || '';
+                    const dateModified = postDoc.querySelector('meta[property="article:modified_time"]')?.content || '';
+                    
+                    // 태그 추출
+                    const tags = postDoc.querySelector('meta[name="keywords"]')?.content?.split(',').map(tag => tag.trim()) || [];
+                    
+                    // 썸네일 이미지 URL 추출
+                    let thumbnailUrl = postDoc.querySelector('meta[property="og:image"]')?.content || '';
+                    
+                    // 썸네일이 상대 경로인 경우 절대 경로로 변환
+                    if (thumbnailUrl && !thumbnailUrl.startsWith('http')) {
+                        thumbnailUrl = new URL(thumbnailUrl, window.location.origin).href;
+                    }
+                    
+                    // 강제 썸네일 제거 (옵션 메타 태그)
+                    const hideThumbnail = postDoc.querySelector('meta[name="hide-thumbnail"]')?.content === 'true';
+                    
+                    // 요약 내용 추출
+                    let excerpt = '';
+                    const contentElement = postDoc.querySelector('article.post-content');
+                    if (contentElement) {
+                        // 첫 번째 단락 추출
+                        const firstParagraph = contentElement.querySelector('p');
+                        if (firstParagraph) {
+                            excerpt = firstParagraph.textContent.trim();
+                            if (excerpt.length > 150) {
+                                excerpt = excerpt.substring(0, 150) + '...';
+                            }
+                        }
+                    }
+                    
+                    // ID 추출
+                    const id = getIdFromFilename(filename);
+                    
+                    // 주요 정보만 포함하는 글 객체 생성
+                    const post = {
+                        id,
+                        title,
+                        description,
+                        excerpt,
+                        category,
+                        tags,
+                        thumbnailUrl: hideThumbnail ? '' : thumbnailUrl,
+                        date: datePublished,
+                        modifiedDate: dateModified,
+                        filename
+                    };
+                    
+                    return post;
+                } catch (error) {
+                    console.error(`${filename} 파일 처리 중 오류:`, error);
+                    return null;
+                }
+            });
+            
+            // 모든 파일 처리 완료 대기
+            const results = await Promise.all(promises);
+            
+            // null이 아닌 유효한 포스트만 필터링
+            posts = results.filter(post => post !== null);
+            
+            // 날짜 기준 내림차순 정렬 (최신 글이 먼저)
+            posts.sort((a, b) => {
+                const dateA = new Date(a.date);
+                const dateB = new Date(b.date);
+                return dateB - dateA;
+            });
+            
+            // 카테고리 목록 업데이트
+            updateCategories();
+            
+            debugLog('포스트 목록 처리 완료, 카테고리:', Array.from(categories));
+            
+            // 상태 업데이트
+            renderPostList();
+            renderFeaturedPosts();
+            updateMetaInfo();
             
             return posts;
         } catch (error) {
-            console.error('포스트 목록을 가져오는 중 오류가 발생했습니다:', error);
-            debugLog('포스트 목록 가져오기 중 예외 발생:', error);
-            postList.innerHTML = '<li class="post-item error">포스트 목록을 불러올 수 없습니다.</li>';
+            console.error('포스트 목록 가져오기 실패:', error);
+            
+            // 오류 메시지 표시
+            if (postList) {
+                postList.innerHTML = `
+                <div class="error-message">
+                    <p>글 목록을 불러오는 중 오류가 발생했습니다.</p>
+                    <p>오류 메시지: ${error.message}</p>
+                    <button id="retryBtn" class="retry-btn">다시 시도</button>
+                </div>`;
+                
+                // 다시 시도 버튼에 이벤트 연결
+                const retryBtn = document.getElementById('retryBtn');
+                if (retryBtn) {
+                    retryBtn.addEventListener('click', fetchPostList);
+                }
+            }
+            
             return [];
         }
     }
     
-    // 최신 글 로드
-    function loadLatestPost() {
-        if (posts.length > 0) {
-            // 날짜 기준으로 정렬하여 최신 글 가져오기
-            const sortedPosts = [...posts].sort((a, b) => new Date(b.date) - new Date(a.date));
-            const latestPost = sortedPosts[0];
+    // 카테고리 목록 업데이트
+    function updateCategories() {
+        categories = new Set(posts.map(post => post.category));
+        categories.add('all'); // '전체' 카테고리 추가
+        
+        // 카테고리 필터 업데이트
+        updateCategoryFilter();
+    }
+    
+    // 특정 ID의 글 로드
+    async function loadPost(postId) {
+        try {
+            if (!postId) {
+                throw new Error('포스트 ID가 제공되지 않았습니다.');
+            }
             
-            debugLog(`최신 글 로드: ${latestPost.title}`);
-            // 최신 글 로드
-            loadPost(latestPost.id);
+            // 마크다운 컨텐츠 영역 초기화
+            if (markdownContent) {
+                markdownContent.innerHTML = '<div class="loading-spinner">글을 불러오는 중...</div>';
+            }
+            
+            // 이미 로드된 포스트 목록이 있는지 확인
+            if (posts.length === 0) {
+                // 포스트 목록이 없으면 먼저 로드
+                await fetchPostList();
+            }
+            
+            // 현재 포스트 찾기
+            currentPost = posts.find(post => post.id === postId);
+            
+            // 포스트가 없으면 404 표시
+            if (!currentPost) {
+                if (markdownContent) {
+                    markdownContent.innerHTML = `
+                    <div class="error-message">
+                        <h2>존재하지 않는 글입니다</h2>
+                        <p>요청하신 ID "${postId}"에 해당하는 글을 찾을 수 없습니다.</p>
+                        <p><a href="blog.html">블로그 홈으로 돌아가기</a></p>
+                    </div>`;
+                }
+                return;
+            }
+            
+            // 포스트 HTML 가져오기
+            const response = await fetch(`${postsDir}${currentPost.filename}`);
+            if (!response.ok) {
+                throw new Error(`포스트 로드 실패: HTTP 오류 ${response.status}`);
+            }
+            
+            const html = await response.text();
+            
+            // HTML 파싱
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(html, 'text/html');
+            
+            // 포스트 컨텐츠 추출
+            const postContent = doc.querySelector('article.post-content');
+            if (!postContent) {
+                throw new Error('포스트 컨텐츠를 찾을 수 없습니다.');
+            }
+            
+            // 메타 정보 추출 및 업데이트
+            const postTitle = doc.querySelector('meta[property="og:title"]')?.content || 
+                             doc.querySelector('title')?.textContent || 
+                             currentPost.title;
+            
+            // 날짜 형식 변환
+            const publishDate = formatDate(currentPost.date);
+            const modifiedDate = currentPost.modifiedDate ? formatDate(currentPost.modifiedDate) : null;
+            
+            // 마크다운 컨텐츠 영역에 포스트 출력
+            if (markdownContent) {
+                markdownContent.innerHTML = `
+                <article class="post">
+                    <header class="post-header">
+                        <h1 class="post-title">${postTitle}</h1>
+                        <div class="post-meta">
+                            <span class="post-date"><i class="fas fa-calendar-alt"></i> ${publishDate}</span>
+                            ${modifiedDate ? `<span class="post-updated"><i class="fas fa-edit"></i> 수정: ${modifiedDate}</span>` : ''}
+                            <span class="post-category"><i class="fas fa-folder"></i> ${currentPost.category}</span>
+                        </div>
+                    </header>
+                    <div class="post-content">
+                        ${postContent.innerHTML}
+                    </div>
+                    <footer class="post-footer">
+                        <div class="post-tags">
+                            ${currentPost.tags.map(tag => `<span class="post-tag">${tag}</span>`).join('')}
+                        </div>
+                        <div class="post-share">
+                            <h4>이 글 공유하기</h4>
+                            <div class="social-share">
+                                <button id="post-kakao-share" class="share-btn kakao-btn">
+                                    <img src="https://developers.kakao.com/assets/img/about/logos/kakaolink/kakaolink_btn_small.png" alt="카카오톡 공유">
+                                    카카오톡
+                                </button>
+                                <button id="post-facebook-share" class="share-btn facebook-btn">
+                                    <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA1MTIgNTEyIj48cGF0aCBmaWxsPSJ3aGl0ZSIgZD0iTTUwNCAxNTYuNmMwLTM2LjQtMjkuNi02Ni02Ni02NmgtMzY0Yy0zNi40IDAtNjYgMjkuNi02NiA2NnYxOTguOGMwIDM2LjQgMjkuNiA2NiA2NiA2Nmg3NnYtMTQxLjFoLTQ2LjJjLTYuNyAwLTEyLjEtNS40LTEyLjEtMTIuMXYtNDMuMmMwLTYuNyA1LjQtMTIuMSAxMi4xLTEyLjFoNDYuMnYtNDAuNmMwLTUwLjkgMzAuMy04Ni4yIDgzLjctODYuMmgyNy43YzYuNyAwIDEyLjEgNS40IDEyLjEgMTIuMXY0My4yYzAgNi43LTUuNSAxMi4xLTEyLjIgMTIuMWgtMTdDMjY3IDEwNS40IDI2NCAxMTguMyAyNjQgMTMyLjF2MzUuMmg0NS4xYzcuOCAwIDEzLjggNi44IDEyLjMgMTQuNWwtNS4zIDQzLjJjLTEuMSA2LjEtNi40IDEwLjYtMTIuNiAxMC42SDI2NFYzNTVjMTMxLjEtMTkuMSAxOTguMy0xNTUuNSAxNDAuNS0yNzQuN2ExOTMuOCAxOTMuOCAwIDAgMCA5OS41IDc2LjN6Ii8+PC9zdmc+" alt="페이스북 공유">
+                                    페이스북
+                                </button>
+                                <button id="post-twitter-share" class="share-btn twitter-btn">
+                                    <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0id2hpdGUiIGQ9Ik0yMS45MyA0LjM2YTguNjkgOC42OSAwIDAgMC0yLjQ4LjY4IDguMzMgOC4zMyAwIDAxLjY5LTIuMTIgOC42NyA4LjY3IDAgMDEtMi43NCAxLjA2IDQuNDc4IDQuNDc4IDAgMDAtNy44NiAzLjA3IDEyLjQ4IDEyLjQ4IDAgMDEtOC4xMy00LjEyIDQuNTEgNC41MSAwIDAwMS40MyA1Ljk4IDQuNTMgNC41MyAwIDAxLTIuMDYtLjU2djAuMDVhNC40OTggNC40OTggMCAwMDMuNjEgNC40MiA0LjU3IDQuNTcgMCAwMS0yLjA1LjA4YTQuNDcgNC40NyAwIDAwNC4yNyAzLjEgOS4wNCA5LjA0IDAgMDEtNS41NiAxLjkgOC45OSA4Ljk5IDAgMDEtMS4wNy0uMDYgMTIuNzYgMTIuNzYgMCAwMDYuOCAyIiBzdHJva2U9IndoaXRlIi8+PC9zdmc+" alt="X(트위터) 공유">
+                                    X(트위터)
+                                </button>
+                                <button id="post-link-copy" class="share-btn link-btn">
+                                    <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9IndoaXRlIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIgY2xhc3M9ImZlYXRoZXIgZmVhdGhlci1saW5rIj48cGF0aCBkPSJNMTAgMTNhNSA1IDAgMCAwIDcuNTQuNTRsMyAzYTUgNSAwIDAgMC03LjA3LTcuMDdsLTEuNzIgMS43MSI+PC9wYXRoPjxwYXRoIGQ9Ik0xNCAxMWE1IDUgMCAwIDAtNy41NC0uNTRsLTMgM2E1IDUgMCAwIDAgNy4wNyA3LjA3bDEuNzEtMS43MSI+PC9wYXRoPjwvc3ZnPg==" alt="링크 복사">
+                                    링크 복사
+                                </button>
+                            </div>
+                        </div>
+                        <div class="back-to-list">
+                            <a href="blog.html" class="back-link">← 목록으로 돌아가기</a>
+                        </div>
+                    </footer>
+                </article>`;
+                
+                // 관련 포스트 렌더링
+                renderRelatedPosts(currentPost);
+                
+                // 포스트 내 코드 블록에 구문 강조 적용
+                document.querySelectorAll('pre code').forEach(block => {
+                    hljs.highlightBlock(block);
+                });
+                
+                // 공유 버튼 이벤트 연결
+                setupPostShareButtons();
+            }
+            
+            // 메타 태그 업데이트
+            updateMetaTags(currentPost);
+            
+            // 현재 포스트 강조 표시
+            highlightCurrentPost();
+            
+            debugLog('포스트 로드 완료:', currentPost.title);
+        } catch (error) {
+            console.error('포스트 로드 실패:', error);
+            
+            // 오류 메시지 표시
+            if (markdownContent) {
+                markdownContent.innerHTML = `
+                <div class="error-message">
+                    <h2>글을 불러오는 중 오류가 발생했습니다</h2>
+                    <p>오류 메시지: ${error.message}</p>
+                    <p><a href="blog.html">블로그 홈으로 돌아가기</a></p>
+                </div>`;
+            }
         }
     }
     
@@ -756,146 +850,6 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     }
     
-    // 포스트 로드 및 표시
-    async function loadPost(postId) {
-        if (!postId) return;
-        
-        // 로딩 표시
-        markdownContent.innerHTML = '<div class="loading-spinner">포스트를 불러오는 중...</div>';
-        
-        try {
-            // 활성 포스트 표시
-            document.querySelectorAll('.post-item').forEach(item => {
-                item.classList.remove('active');
-            });
-            
-            const activeItem = document.querySelector(`.post-item[data-id="${postId}"]`);
-            if (activeItem) {
-                activeItem.classList.add('active');
-            }
-            
-            // 현재 포스트 찾기
-            currentPost = posts.find(post => post.id === postId);
-            
-            if (!currentPost) {
-                markdownContent.innerHTML = '<div class="error-message">포스트를 찾을 수 없습니다.</div>';
-                updateMetaTags(null); // 기본 메타태그로 복원
-                return;
-            }
-            
-            // HTML 파일 내용 가져오기
-            try {
-                const filePath = `${postsDir}${currentPost.filename}`;
-                debugLog(`HTML 파일 콘텐츠 로드 시도: ${filePath}`);
-                
-                const response = await fetch(filePath, {
-                    cache: 'no-store',
-                    headers: {
-                        'Cache-Control': 'no-cache',
-                        'Pragma': 'no-cache'
-                    }
-                });
-                
-                if (!response.ok) {
-                    throw new Error(`파일을 불러올 수 없습니다: ${response.status} ${response.statusText}`);
-                }
-                
-                const htmlContent = await response.text();
-                debugLog(`HTML 파일 콘텐츠 로드 성공: ${htmlContent.length} 바이트`);
-                
-                // HTML 파서로 문서 파싱
-                const parser = new DOMParser();
-                const doc = parser.parseFromString(htmlContent, 'text/html');
-                
-                // article 요소 추출
-                const articleContent = doc.querySelector('article');
-                
-                if (articleContent) {
-                    // 메타데이터 업데이트
-                    const metaTags = doc.querySelectorAll('meta');
-                    metaTags.forEach(meta => {
-                        const name = meta.getAttribute('name') || meta.getAttribute('property');
-                        const content = meta.getAttribute('content');
-                        
-                        if (name && content) {
-                            if (name === 'keywords') {
-                                currentPost.keywords = content;
-                            } else if (name === 'description') {
-                                currentPost.description = content;
-                            }
-                        }
-                    });
-                    
-                    // JSON-LD 스크립트 확인
-                    const jsonLdScript = doc.querySelector('script[type="application/ld+json"]');
-                    if (jsonLdScript) {
-                        try {
-                            const jsonLdData = JSON.parse(jsonLdScript.textContent);
-                            if (jsonLdData.keywords) {
-                                currentPost.keywords = jsonLdData.keywords;
-                            }
-                        } catch (e) {
-                            debugLog('JSON-LD 파싱 오류:', e);
-                        }
-                    }
-                    
-                    // SEO를 위한 메타 태그 업데이트
-                    updateMetaTags(currentPost);
-                    
-                    // 포스트 콘텐츠 표시
-                    markdownContent.innerHTML = '';
-                    markdownContent.appendChild(articleContent.cloneNode(true));
-                    
-                    // 코드 하이라이팅 적용 (이미 HTML에 포함된 경우 필요 없음)
-                    markdownContent.querySelectorAll('pre code').forEach(block => {
-                        if (window.hljs) {
-                            hljs.highlightElement(block);
-                        }
-                    });
-                } else {
-                    // article 요소가 없으면 전체 body 내용 사용
-                    const bodyContent = doc.querySelector('body');
-                    if (bodyContent) {
-                        markdownContent.innerHTML = bodyContent.innerHTML;
-                    } else {
-                        markdownContent.innerHTML = htmlContent;
-                    }
-                    
-                    // SEO를 위한 메타 태그 업데이트
-                    updateMetaTags(currentPost);
-                }
-                
-                // URL 상태 업데이트 (History API 사용)
-                updateUrlState(postId);
-                
-                // 관련 게시물 표시 (같은 카테고리의 다른 글)
-                renderRelatedPosts(currentPost);
-                
-                // 소셜 공유 버튼 업데이트
-                updateSocialShareButtons(currentPost);
-                
-            } catch (error) {
-                debugLog(`HTML 파일 콘텐츠 로드 실패:`, error);
-                
-                // 오류 메시지 표시
-                markdownContent.innerHTML = `
-                    <div class="error-message">
-                        <p>포스트를 불러올 수 없습니다.</p>
-                        <p>오류 메시지: ${error.message}</p>
-                    </div>`;
-            }
-            
-        } catch (error) {
-            console.error('포스트를 불러오는 중 오류가 발생했습니다:', error);
-            debugLog('포스트 로드 중 예외 발생:', error);
-            markdownContent.innerHTML = `
-                <div class="error-message">
-                    <p>포스트를 불러올 수 없습니다.</p>
-                    <p>오류 메시지: ${error.message}</p>
-                </div>`;
-        }
-    }
-    
     // 관련 게시물 표시 함수 (SEO 개선)
     function renderRelatedPosts(currentPost) {
         if (!currentPost || !currentPost.category) return;
@@ -938,31 +892,46 @@ document.addEventListener('DOMContentLoaded', function() {
         });
     }
     
-    // 업데이트된 URL 상태 관리 함수
-    function updateUrlState(postId) {
-        if (!postId) return;
-        
-        // 현재 포스트 찾기
-        const currentPost = posts.find(post => post.id === postId);
-        if (!currentPost) return;
-        
-        // URL 업데이트 (파라미터 방식으로 변경)
-        if (history.pushState) {
-            const newUrl = new URL(window.location.href);
-            newUrl.searchParams.set('post', postId);
-            window.history.pushState({ path: newUrl.href, postId: postId }, currentPost.title, newUrl.href);
+    // URL에서 포스트 ID 가져오기
+    function getPostIdFromUrl() {
+        try {
+            // URL 파라미터에서 post 값 추출
+            const urlParams = new URLSearchParams(window.location.search);
+            const postId = urlParams.get('post');
             
-            // 메타 태그 업데이트
-            updateMetaTags(currentPost);
+            // 유효한 포스트 ID인지 확인
+            if (postId && postId.trim() !== '') {
+                return postId.trim();
+            }
             
-            debugLog('URL 상태 업데이트됨:', newUrl.href);
+            return null;
+        } catch (error) {
+            console.error('URL에서 포스트 ID 가져오기 실패:', error);
+            return null;
         }
     }
     
-    // 업데이트된 URL에서 포스트 ID 가져오기 함수
-    function getPostIdFromUrl() {
-        const urlParams = new URLSearchParams(window.location.search);
-        return urlParams.get('post');
+    // URL 상태 업데이트
+    function updateUrlState(postId) {
+        try {
+            // 유효한 포스트 ID인지 확인
+            if (!postId) {
+                // 포스트 ID가 없으면 기본 블로그 URL로 변경
+                const baseUrl = `${window.location.pathname}`;
+                window.history.pushState({ postId: null }, '기술 블로그', baseUrl);
+                return;
+            }
+            
+            // 포스트 ID가 있으면 URL 파라미터 추가
+            const newUrl = `${window.location.pathname}?post=${postId}`;
+            
+            // 현재 URL과 다른 경우에만 URL 상태 업데이트
+            if (window.location.href !== newUrl) {
+                window.history.pushState({ postId }, '포스트 보기', newUrl);
+            }
+        } catch (error) {
+            console.error('URL 상태 업데이트 실패:', error);
+        }
     }
     
     // History API의 popstate 이벤트 리스너 추가
@@ -1004,33 +973,114 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     }
     
-    // 초기화
+    // 초기화 함수
     async function init() {
-        debugLog('블로그 초기화 중...');
-        
         try {
-            // 포스트 목록 가져오기
-            await fetchPostList();
+            debugLog('블로그 초기화 시작');
             
-            // URL에서 포스트 ID 가져오기
+            // 포스트 ID 확인
             const postId = getPostIdFromUrl();
             
-            // 소셜 공유 버튼 초기화 (최초 로드 시)
-            updateSocialShareButtons(currentPost);
+            // 이벤트 리스너 설정
+            setupEventListeners();
             
+            // 포스트가 지정된 경우 해당 포스트 로드
             if (postId) {
-                // 특정 포스트 로드
+                debugLog('URL에서 포스트 ID 발견:', postId);
+                
+                // 포스트 목록 불러오기
+                await fetchPostList();
+                
+                // 해당 포스트 로드
                 await loadPost(postId);
+                
+                // 블로그 포스트 UI 표시
+                toggleBlogLayout(true);
             } else {
-                // 최신 포스트 로드
-                loadLatestPost();
+                // 기본 메타 태그 설정
+                updateMetaTags(null);
+                
+                // 포스트 목록만 표시
+                toggleBlogLayout(false);
+                
+                // 포스트 목록 불러오기
+                await fetchPostList();
             }
             
-            // 5분마다 목록 새로고침 (자동 업데이트)
-            setInterval(fetchPostList, 5 * 60 * 1000);
+            debugLog('블로그 초기화 완료');
         } catch (error) {
-            console.error('초기화 중 오류 발생:', error);
-            debugLog('초기화 중 예외 발생:', error);
+            console.error('블로그 초기화 오류:', error);
+            
+            // 오류 발생 시 기본 메타 태그 설정
+            updateMetaTags(null);
+            
+            // 오류 메시지 표시
+            if (markdownContent) {
+                markdownContent.innerHTML = `
+                <div class="error-message">
+                    <h2>블로그 초기화 중 오류가 발생했습니다</h2>
+                    <p>오류 메시지: ${error.message}</p>
+                    <p><button id="retryInitBtn" class="retry-btn">다시 시도</button></p>
+                </div>`;
+                
+                // 다시 시도 버튼에 이벤트 연결
+                const retryBtn = document.getElementById('retryInitBtn');
+                if (retryBtn) {
+                    retryBtn.addEventListener('click', init);
+                }
+            }
+        }
+    }
+    
+    // 블로그 레이아웃 전환 (목록/포스트)
+    function toggleBlogLayout(isPostView) {
+        const blogLayout = document.querySelector('.blog-layout');
+        const contentArea = document.querySelector('.blog-content-area');
+        const sidebar = document.querySelector('.blog-sidebar');
+        
+        if (!blogLayout || !contentArea || !sidebar) {
+            return;
+        }
+        
+        if (isPostView) {
+            // 포스트 보기 모드
+            blogLayout.classList.add('post-view');
+            contentArea.classList.add('active');
+            sidebar.classList.add('collapsed');
+            
+            // 모바일에서는 사이드바 숨김
+            if (window.innerWidth <= 768) {
+                sidebar.style.display = 'none';
+            }
+        } else {
+            // 목록 보기 모드
+            blogLayout.classList.remove('post-view');
+            contentArea.classList.remove('active');
+            sidebar.classList.remove('collapsed');
+            
+            // 모바일에서도 사이드바 표시
+            sidebar.style.display = 'block';
+            
+            // 컨텐츠 영역 초기화
+            if (markdownContent) {
+                markdownContent.innerHTML = '<div class="welcome-message">왼쪽 목록에서 글을 선택하세요.</div>';
+            }
+        }
+    }
+    
+    // 이벤트 리스너 설정
+    function setupEventListeners() {
+        // 새로고침 버튼
+        const refreshBtn = document.getElementById('refreshBtn');
+        if (refreshBtn) {
+            refreshBtn.addEventListener('click', fetchPostList);
+        }
+        
+        // 카테고리 필터
+        if (categoryFilter) {
+            categoryFilter.addEventListener('change', function() {
+                renderPostList(this.value);
+            });
         }
     }
     
