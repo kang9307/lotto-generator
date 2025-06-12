@@ -7,6 +7,10 @@ document.addEventListener('DOMContentLoaded', function() {
     // 환경 감지 (로컬 파일 시스템인지 웹 서버인지)
     const isLocalFileSystem = window.location.protocol === 'file:';
     
+    // 로컬 파일 시스템에서 현재 실제 경로 구하기 (Windows와 다른 OS 호환)
+    const currentPath = window.location.pathname;
+    const projectRoot = getProjectRoot(currentPath);
+    
     // 현재 경로 감지 (루트 디렉토리인지 하위 디렉토리인지)
     // 경로 감지 수정 - 보다 정확한 경로 감지를 위해 정규식 개선
     const pathName = window.location.pathname;
@@ -21,12 +25,66 @@ document.addEventListener('DOMContentLoaded', function() {
     // 컴포넌트 기본 경로
     const componentsBasePath = isSubDirectory ? '../' : '';
     
-    if (isLocalFileSystem) {
-        // 로컬 파일 시스템에서는 하드코딩된 HTML 사용
-        loadHardcodedComponents();
-    } else {
-        // 웹 서버 환경에서는 fetch API 사용
-        loadDynamicComponents();
+    // 로컬 파일 시스템 경로 추출 함수
+    function getProjectRoot(path) {
+        // 로컬 파일 시스템이 아닌 경우 빈 문자열 반환
+        if (!isLocalFileSystem) return '';
+        
+        try {
+            // Windows 경로와 Unix 경로 모두 처리
+            let normalizedPath = path.replace(/\\/g, '/');
+            
+            // 주소에 포함된 특수 문자 처리 (%3A 등)
+            try {
+                normalizedPath = decodeURIComponent(normalizedPath);
+            } catch (e) {
+                console.error('경로 디코딩 오류:', e);
+            }
+            
+            // 프로젝트 폴더명 (수정 가능)
+            const projectFolderName = 'lotto-generator';
+            
+            // 프로젝트 폴더 찾기
+            const projectFolderIndex = normalizedPath.toLowerCase().indexOf(projectFolderName.toLowerCase());
+            
+            // 프로젝트 폴더가 경로에 있으면 해당 경로 반환
+            if (projectFolderIndex !== -1) {
+                return normalizedPath.substring(0, projectFolderIndex + projectFolderName.length + 1);
+            }
+            
+            // 파일 이름 제거 (폴더 경로만 추출)
+            const lastSlashIndex = normalizedPath.lastIndexOf('/');
+            if (lastSlashIndex === -1) return '';
+            
+            let folderPath = normalizedPath.substring(0, lastSlashIndex + 1);
+            
+            // 서브디렉토리인 경우 상위 폴더로 이동
+            if (isSubDirectory) {
+                const parentSlashIndex = folderPath.substring(0, folderPath.length - 1).lastIndexOf('/');
+                if (parentSlashIndex !== -1) {
+                    folderPath = folderPath.substring(0, parentSlashIndex + 1);
+                }
+            }
+            
+            return folderPath;
+        } catch (error) {
+            console.error('프로젝트 루트 경로 추출 오류:', error);
+            return '';
+        }
+    }
+    
+    // 초기화 - 헤더와 푸터 로드
+    loadComponents();
+    
+    // 헤더와 푸터 로드 함수
+    function loadComponents() {
+        if (isLocalFileSystem) {
+            // 로컬 파일 시스템에서는 하드코딩된 HTML 사용
+            loadHardcodedComponents();
+        } else {
+            // 웹 서버 환경에서는 fetch API 사용
+            loadDynamicComponents();
+        }
     }
     
     // 하드코딩된 헤더와 푸터 로드 (로컬 파일 시스템용)
@@ -41,29 +99,29 @@ document.addEventListener('DOMContentLoaded', function() {
                 headerPlaceholder.innerHTML = `
                 <header class="main-header">
                     <div class="header-container">
-                        <h1 class="site-title" style="text-align: center; margin-bottom: 8px;"><a href="../index.html" style="color: inherit; text-decoration: none; font-weight: 900 !important;">BrainDetox Utility Box</a></h1>
+                        <h1 class="site-title" style="text-align: center; margin-bottom: 8px;"><a href="${projectRoot}index.html" style="color: inherit; text-decoration: none; font-weight: 900 !important;">BrainDetox Utility Box</a></h1>
                         <nav class="main-nav" style="margin-top: 5px;">
                             <ul class="nav-list" style="gap: 10px; display: flex; justify-content: center; flex-wrap: wrap;">
                                 <li class="nav-item">
-                                    <a href="../index.html" class="nav-link">홈</a>
+                                    <a href="${projectRoot}index.html" class="nav-link">홈</a>
                                 </li>
                                 <li class="nav-item">
-                                    <a href="../blog.html" class="nav-link">기술 블로그</a>
+                                    <a href="${projectRoot}blog.html" class="nav-link">기술 블로그</a>
                                 </li>
                                 <li class="nav-item">
-                                    <a href="../lotto.html" class="nav-link">로또 번호 생성기</a>
+                                    <a href="${projectRoot}lotto.html" class="nav-link">로또 번호 생성기</a>
                                 </li>
                                 <li class="nav-item">
-                                    <a href="../subnet.html" class="nav-link">서브넷 계산기</a>
+                                    <a href="${projectRoot}subnet.html" class="nav-link">서브넷 계산기</a>
                                 </li>
                                 <li class="nav-item">
-                                    <a href="../password.html" class="nav-link">비밀번호 생성기</a>
+                                    <a href="${projectRoot}password.html" class="nav-link">비밀번호 생성기</a>
                                 </li>
                                 <li class="nav-item">
-                                    <a href="../qrcode.html" class="nav-link">QR 코드 생성기</a>
+                                    <a href="${projectRoot}qrcode.html" class="nav-link">QR 코드 생성기</a>
                                 </li>
                                 <li class="nav-item">
-                                    <a href="../datetime.html" class="nav-link">시간/날짜 계산기</a>
+                                    <a href="${projectRoot}datetime.html" class="nav-link">시간/날짜 계산기</a>
                                 </li>
                             </ul>
                         </nav>
@@ -74,29 +132,29 @@ document.addEventListener('DOMContentLoaded', function() {
                 headerPlaceholder.innerHTML = `
                 <header class="main-header">
                     <div class="header-container">
-                        <h1 class="site-title" style="text-align: center; margin-bottom: 8px;"><a href="index.html" style="color: inherit; text-decoration: none; font-weight: 900 !important;">BrainDetox Utility Box</a></h1>
+                        <h1 class="site-title" style="text-align: center; margin-bottom: 8px;"><a href="${projectRoot}index.html" style="color: inherit; text-decoration: none; font-weight: 900 !important;">BrainDetox Utility Box</a></h1>
                         <nav class="main-nav" style="margin-top: 5px;">
                             <ul class="nav-list" style="gap: 10px; display: flex; justify-content: center; flex-wrap: wrap;">
                                 <li class="nav-item">
-                                    <a href="index.html" class="nav-link">홈</a>
+                                    <a href="${projectRoot}index.html" class="nav-link">홈</a>
                                 </li>
                                 <li class="nav-item">
-                                    <a href="blog.html" class="nav-link">기술 블로그</a>
+                                    <a href="${projectRoot}blog.html" class="nav-link">기술 블로그</a>
                                 </li>
                                 <li class="nav-item">
-                                    <a href="lotto.html" class="nav-link">로또 번호 생성기</a>
+                                    <a href="${projectRoot}lotto.html" class="nav-link">로또 번호 생성기</a>
                                 </li>
                                 <li class="nav-item">
-                                    <a href="subnet.html" class="nav-link">서브넷 계산기</a>
+                                    <a href="${projectRoot}subnet.html" class="nav-link">서브넷 계산기</a>
                                 </li>
                                 <li class="nav-item">
-                                    <a href="password.html" class="nav-link">비밀번호 생성기</a>
+                                    <a href="${projectRoot}password.html" class="nav-link">비밀번호 생성기</a>
                                 </li>
                                 <li class="nav-item">
-                                    <a href="qrcode.html" class="nav-link">QR 코드 생성기</a>
+                                    <a href="${projectRoot}qrcode.html" class="nav-link">QR 코드 생성기</a>
                                 </li>
                                 <li class="nav-item">
-                                    <a href="datetime.html" class="nav-link">시간/날짜 계산기</a>
+                                    <a href="${projectRoot}datetime.html" class="nav-link">시간/날짜 계산기</a>
                                 </li>
                             </ul>
                         </nav>
@@ -119,7 +177,7 @@ document.addEventListener('DOMContentLoaded', function() {
                             사이트 내 모든 도구는 무료로 제공되며, 문의사항은 이메일(<a href="mailto:jhtoka@gmail.com" class="footer-link">jhtoka@gmail.com</a>)로 연락 바랍니다.
                         </p>
                         <p class="footer-text">
-                            <a href="../privacy.html" class="footer-link">개인정보 처리방침</a> | <a href="../privacy.html" class="footer-link">Privacy Policy</a>
+                            <a href="${projectRoot}privacy.html" class="footer-link">개인정보 처리방침</a> | <a href="${projectRoot}privacy.html" class="footer-link">Privacy Policy</a>
                         </p>
                     </div>
                 </footer>`;
@@ -135,7 +193,7 @@ document.addEventListener('DOMContentLoaded', function() {
                             사이트 내 모든 도구는 무료로 제공되며, 문의사항은 이메일(<a href="mailto:jhtoka@gmail.com" class="footer-link">jhtoka@gmail.com</a>)로 연락 바랍니다.
                         </p>
                         <p class="footer-text">
-                            <a href="privacy.html" class="footer-link">개인정보 처리방침</a> | <a href="privacy.html" class="footer-link">Privacy Policy</a>
+                            <a href="${projectRoot}privacy.html" class="footer-link">개인정보 처리방침</a> | <a href="${projectRoot}privacy.html" class="footer-link">Privacy Policy</a>
                         </p>
                     </div>
                 </footer>`;
@@ -180,22 +238,47 @@ document.addEventListener('DOMContentLoaded', function() {
     
     // 현재 페이지에 맞는 메뉴 활성화
     function setupActiveMenu() {
-        const currentPage = window.location.pathname.split('/').pop() || 'index.html';
+        // 현재 페이지 경로 추출
+        let currentPage = '';
+        
+        if (isLocalFileSystem) {
+            // 로컬 파일 시스템에서는 전체 경로에서 파일명만 추출
+            const pathParts = window.location.pathname.replace(/\\/g, '/').split('/');
+            currentPage = pathParts[pathParts.length - 1] || 'index.html';
+            
+            // 디버깅
+            console.log('현재 활성화할 페이지(로컬):', currentPage);
+        } else {
+            // 웹 서버에서는 URL 경로의 마지막 부분만 사용
+            currentPage = window.location.pathname.split('/').pop() || 'index.html';
+            console.log('현재 활성화할 페이지(웹):', currentPage);
+        }
+        
         const menuLinks = document.querySelectorAll('.nav-link');
         
         menuLinks.forEach(link => {
             // 링크 URL 파싱
             const linkUrl = link.getAttribute('href');
-            const linkPage = linkUrl.split('/').pop();
+            let linkPage = '';
+            
+            // 파일명 추출 - 경로에서 마지막 부분만 가져옴
+            if (linkUrl.includes('/')) {
+                linkPage = linkUrl.split('/').pop();
+            } else {
+                linkPage = linkUrl;
+            }
             
             // 현재 페이지와 링크 페이지 비교
             if (linkPage === currentPage) {
                 link.classList.add('active');
+                console.log('메뉴 활성화:', linkPage);
             }
             
             // 블로그 포스트 페이지 특별 처리
-            if (currentPage.startsWith('post_') && linkUrl.includes('blog.html')) {
+            if ((currentPage.startsWith('post_') || window.location.pathname.includes('/posts/')) && 
+                linkUrl.includes('blog.html')) {
                 link.classList.add('active');
+                console.log('블로그 메뉴 활성화');
             }
         });
     }

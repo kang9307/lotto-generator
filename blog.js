@@ -374,12 +374,15 @@ document.addEventListener('DOMContentLoaded', function() {
 
             // 먼저 미리 정의된 포스트 인덱스 파일 시도
             try {
+                debugLog('인덱스 파일 로드 시도: ' + `${postsDir}index.json`);
                 const indexResponse = await fetch(`${postsDir}index.json`);
                 if (indexResponse.ok) {
                     const indexData = await indexResponse.json();
                     
                     // 유효한 JSON 데이터가 있는지 확인
                     if (Array.isArray(indexData) && indexData.length > 0) {
+                        debugLog('인덱스 파일 데이터:', indexData);
+                        
                         posts = indexData.map(post => ({
                             id: post.id,
                             title: post.title,
@@ -412,133 +415,19 @@ document.addEventListener('DOMContentLoaded', function() {
                         
                         return posts;
                     }
+                } else {
+                    debugLog('인덱스 파일 로드 실패, 상태 코드:', indexResponse.status);
                 }
             } catch (indexError) {
                 console.error('인덱스 파일 로드 실패, 디렉토리 스캔으로 대체:', indexError);
             }
 
-            // 인덱스 파일 로드 실패 시 디렉토리 스캔 방식으로 대체
-            // posts 디렉토리의 파일 목록 가져오기
-            const response = await fetch(postsDir);
-            if (!response.ok) {
-                throw new Error(`서버 응답 오류: ${response.status}`);
-            }
-            
-            // HTML 파싱
-            const html = await response.text();
-            const parser = new DOMParser();
-            const doc = parser.parseFromString(html, 'text/html');
-            
-            // posts 디렉토리 내 파일 목록 추출
-            const fileList = Array.from(doc.querySelectorAll('a'))
-                .map(a => a.href)
-                .filter(href => href.includes('/posts/') && getFileExtension(href) === 'html')
-                .map(href => {
-                    // URL에서 파일명 추출
-                    const parts = href.split('/');
-                    return parts[parts.length - 1];
-                });
-            
-            debugLog('디렉토리 스캔으로 파일 목록 가져옴:', fileList);
-            
-            // 각 파일의 메타데이터 추출
-            posts = [];
-            const promises = fileList.map(async filename => {
-                if (filename === 'index.json') return null;
-                
-                try {
-                    // 파일 내용 가져오기
-                    const fileUrl = `${postsDir}${filename}`;
-                    const fileResponse = await fetch(fileUrl);
-                    if (!fileResponse.ok) {
-                        console.error(`파일 로드 실패: ${filename}`);
-                        return null;
-                    }
-                    
-                    const content = await fileResponse.text();
-                    
-                    // HTML 파싱
-                    const postDoc = parser.parseFromString(content, 'text/html');
-                    
-                    // 메타데이터 추출
-                    const title = postDoc.querySelector('meta[property="og:title"]')?.content || 
-                                 postDoc.querySelector('title')?.textContent || 
-                                 '제목 없음';
-                    
-                    const description = postDoc.querySelector('meta[name="description"]')?.content || '';
-                    const category = postDoc.querySelector('meta[name="category"]')?.content || '미분류';
-                    const datePublished = postDoc.querySelector('meta[property="article:published_time"]')?.content || '';
-                    const dateModified = postDoc.querySelector('meta[property="article:modified_time"]')?.content || '';
-                    
-                    // 태그 추출
-                    const tags = postDoc.querySelector('meta[name="keywords"]')?.content?.split(',').map(tag => tag.trim()) || [];
-                    
-                    // 썸네일 이미지 URL 추출
-                    let thumbnailUrl = postDoc.querySelector('meta[property="og:image"]')?.content || '';
-                    
-                    // 썸네일이 상대 경로인 경우 절대 경로로 변환
-                    if (thumbnailUrl && !thumbnailUrl.startsWith('http')) {
-                        thumbnailUrl = new URL(thumbnailUrl, window.location.origin).href;
-                    }
-                    
-                    // 강제 썸네일 제거 (옵션 메타 태그)
-                    const hideThumbnail = postDoc.querySelector('meta[name="hide-thumbnail"]')?.content === 'true';
-                    
-                    // 요약 내용 추출
-                    let excerpt = '';
-                    const contentElement = postDoc.querySelector('article.post-content');
-                    if (contentElement) {
-                        // 첫 번째 단락 추출
-                        const firstParagraph = contentElement.querySelector('p');
-                        if (firstParagraph) {
-                            excerpt = firstParagraph.textContent.trim();
-                            if (excerpt.length > 150) {
-                                excerpt = excerpt.substring(0, 150) + '...';
-                            }
-                        }
-                    }
-                    
-                    // ID 추출
-                    const id = getIdFromFilename(filename);
-                    
-                    // 주요 정보만 포함하는 글 객체 생성
-                    const post = {
-                        id,
-                        title,
-                        description,
-                        excerpt,
-                        category,
-                        tags,
-                        thumbnailUrl: hideThumbnail ? '' : thumbnailUrl,
-                        date: datePublished,
-                        modifiedDate: dateModified,
-                        filename
-                    };
-                    
-                    return post;
-                } catch (error) {
-                    console.error(`${filename} 파일 처리 중 오류:`, error);
-                    return null;
-                }
-            });
-            
-            // 모든 파일 처리 완료 대기
-            const results = await Promise.all(promises);
-            
-            // null이 아닌 유효한 포스트만 필터링
-            posts = results.filter(post => post !== null);
-            
-            // 날짜 기준 내림차순 정렬 (최신 글이 먼저)
-            posts.sort((a, b) => {
-                const dateA = new Date(a.date);
-                const dateB = new Date(b.date);
-                return dateB - dateA;
-            });
+            // 인덱스 파일 로드 실패 시 정적 포스트 데이터 사용
+            debugLog('정적 포스트 데이터 사용');
+            posts = getStaticPostsData();
             
             // 카테고리 목록 업데이트
             updateCategories();
-            
-            debugLog('포스트 목록 처리 완료, 카테고리:', Array.from(categories));
             
             // 상태 업데이트
             renderPostList();
@@ -565,8 +454,65 @@ document.addEventListener('DOMContentLoaded', function() {
                 }
             }
             
-            return [];
+            // 오류 발생해도 기본 포스트 데이터 제공
+            posts = getStaticPostsData();
+            updateCategories();
+            renderPostList();
+            
+            return posts;
         }
+    }
+    
+    // 정적 포스트 데이터 반환 (인덱스 파일 로드 실패 시 사용)
+    function getStaticPostsData() {
+        // 기본 정적 포스트 데이터
+        return [
+            {
+                id: "ai_future_jobs_career_skills",
+                title: "AI 시대의 직업과 필요한 역량",
+                description: "인공지능 시대에 각광받는 직업과 이를 위해 필요한 역량에 대해 알아봅니다.",
+                category: "기술/IT",
+                date: "2025-06-08",
+                tags: ["AI", "인공지능", "미래", "직업", "경력", "기술", "역량"],
+                filename: "ai_future_jobs_career_skills.html"
+            },
+            {
+                id: "ai_future_social_impact",
+                title: "인공지능이 사회에 미치는 영향과 전망",
+                description: "인공지능 기술이 우리 사회에 가져올 변화와 미래 전망에 대해 분석합니다.",
+                category: "기술/IT",
+                date: "2025-06-07",
+                tags: ["AI", "인공지능", "사회", "미래", "기술 영향", "윤리"],
+                filename: "ai_future_social_impact.html"
+            },
+            {
+                id: "android_version_security",
+                title: "안드로이드 버전별 보안 이슈와 대응 방법",
+                description: "안드로이드 OS의 각 버전별 보안 취약점과 사용자 대응 방법을 알아봅니다.",
+                category: "보안",
+                date: "2025-06-06",
+                tags: ["안드로이드", "보안", "운영체제", "취약점", "대응방법"],
+                filename: "android_version_security.html"
+            },
+            {
+                id: "ceph_storage_intro",
+                title: "Ceph 스토리지 시스템 개요: 기본 구조와 활용",
+                description: "오픈소스 분산 스토리지 시스템인 Ceph의 구조와 활용 방법에 대한 소개입니다.",
+                category: "기술/IT",
+                date: "2025-06-02",
+                tags: ["Ceph", "스토리지", "분산시스템", "오픈소스", "클라우드"],
+                filename: "ceph_storage_intro.html"
+            },
+            {
+                id: "healthy_diet_nutrition",
+                title: "건강한 식단과 영양소 섭취 가이드",
+                description: "균형 잡힌 식단 구성과 필수 영양소 섭취 방법에 대한 종합 가이드입니다.",
+                category: "건강",
+                date: "2025-05-25",
+                tags: ["건강", "식단", "영양", "다이어트", "웰빙"],
+                filename: "healthy_diet_nutrition.html"
+            }
+        ];
     }
     
     // 카테고리 목록 업데이트
@@ -612,98 +558,142 @@ document.addEventListener('DOMContentLoaded', function() {
                 return;
             }
             
-            // 포스트 HTML 가져오기
-            const response = await fetch(`${postsDir}${currentPost.filename}`);
-            if (!response.ok) {
-                throw new Error(`포스트 로드 실패: HTTP 오류 ${response.status}`);
-            }
-            
-            const html = await response.text();
-            
-            // HTML 파싱
-            const parser = new DOMParser();
-            const doc = parser.parseFromString(html, 'text/html');
-            
-            // 포스트 컨텐츠 추출
-            const postContent = doc.querySelector('article.post-content');
-            if (!postContent) {
-                throw new Error('포스트 컨텐츠를 찾을 수 없습니다.');
-            }
-            
-            // 메타 정보 추출 및 업데이트
-            const postTitle = doc.querySelector('meta[property="og:title"]')?.content || 
-                             doc.querySelector('title')?.textContent || 
-                             currentPost.title;
-            
-            // 날짜 형식 변환
-            const publishDate = formatDate(currentPost.date);
-            const modifiedDate = currentPost.modifiedDate ? formatDate(currentPost.modifiedDate) : null;
-            
-            // 마크다운 컨텐츠 영역에 포스트 출력
-            if (markdownContent) {
-                markdownContent.innerHTML = `
-                <article class="post">
-                    <header class="post-header">
-                        <h1 class="post-title">${postTitle}</h1>
-                        <div class="post-meta">
-                            <span class="post-date"><i class="fas fa-calendar-alt"></i> ${publishDate}</span>
-                            ${modifiedDate ? `<span class="post-updated"><i class="fas fa-edit"></i> 수정: ${modifiedDate}</span>` : ''}
-                            <span class="post-category"><i class="fas fa-folder"></i> ${currentPost.category}</span>
+            try {
+                // 포스트 HTML 가져오기
+                debugLog('포스트 파일 로드 시도:', `${postsDir}${currentPost.filename}`);
+                const response = await fetch(`${postsDir}${currentPost.filename}`);
+                
+                if (!response.ok) {
+                    throw new Error(`포스트 로드 실패: HTTP 오류 ${response.status}`);
+                }
+                
+                const html = await response.text();
+                
+                // HTML 파싱
+                const parser = new DOMParser();
+                const doc = parser.parseFromString(html, 'text/html');
+                
+                // 포스트 컨텐츠 추출
+                const postContent = doc.querySelector('article.post-content');
+                if (!postContent) {
+                    throw new Error('포스트 컨텐츠를 찾을 수 없습니다.');
+                }
+                
+                // 메타 정보 추출 및 업데이트
+                const postTitle = doc.querySelector('meta[property="og:title"]')?.content || 
+                                doc.querySelector('title')?.textContent || 
+                                currentPost.title;
+                
+                // 날짜 형식 변환
+                const publishDate = formatDate(currentPost.date);
+                const modifiedDate = currentPost.modifiedDate ? formatDate(currentPost.modifiedDate) : null;
+                
+                // 마크다운 컨텐츠 영역에 포스트 출력
+                if (markdownContent) {
+                    markdownContent.innerHTML = `
+                    <article class="post">
+                        <header class="post-header">
+                            <h1 class="post-title">${postTitle}</h1>
+                            <div class="post-meta">
+                                <span class="post-date"><i class="fas fa-calendar-alt"></i> ${publishDate}</span>
+                                ${modifiedDate ? `<span class="post-updated"><i class="fas fa-edit"></i> 수정: ${modifiedDate}</span>` : ''}
+                                <span class="post-category"><i class="fas fa-folder"></i> ${currentPost.category}</span>
+                            </div>
+                        </header>
+                        <div class="post-content">
+                            ${postContent.innerHTML}
                         </div>
-                    </header>
-                    <div class="post-content">
-                        ${postContent.innerHTML}
-                    </div>
-                    <footer class="post-footer">
-                        <div class="post-tags">
-                            ${currentPost.tags.map(tag => `<span class="post-tag">${tag}</span>`).join('')}
-                        </div>
-                        <div class="post-share">
-                            <h4>이 글 공유하기</h4>
-                            <div class="social-share">
-                                <button id="post-kakao-share" class="share-btn kakao-btn">
-                                    <img src="https://developers.kakao.com/assets/img/about/logos/kakaolink/kakaolink_btn_small.png" alt="카카오톡 공유">
-                                    카카오톡
-                                </button>
-                                <button id="post-facebook-share" class="share-btn facebook-btn">
-                                    <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA1MTIgNTEyIj48cGF0aCBmaWxsPSJ3aGl0ZSIgZD0iTTUwNCAxNTYuNmMwLTM2LjQtMjkuNi02Ni02Ni02NmgtMzY0Yy0zNi40IDAtNjYgMjkuNi02NiA2NnYxOTguOGMwIDM2LjQgMjkuNiA2NiA2NiA2Nmg3NnYtMTQxLjFoLTQ2LjJjLTYuNyAwLTEyLjEtNS40LTEyLjEtMTIuMXYtNDMuMmMwLTYuNyA1LjQtMTIuMSAxMi4xLTEyLjFoNDYuMnYtNDAuNmMwLTUwLjkgMzAuMy04Ni4yIDgzLjctODYuMmgyNy43YzYuNyAwIDEyLjEgNS40IDEyLjEgMTIuMXY0My4yYzAgNi43LTUuNSAxMi4xLTEyLjIgMTIuMWgtMTdDMjY3IDEwNS40IDI2NCAxMTguMyAyNjQgMTMyLjF2MzUuMmg0NS4xYzcuOCAwIDEzLjggNi44IDEyLjMgMTQuNWwtNS4zIDQzLjJjLTEuMSA2LjEtNi40IDEwLjYtMTIuNiAxMC42SDI2NFYzNTVjMTMxLjEtMTkuMSAxOTguMy0xNTUuNSAxNDAuNS0yNzQuN2ExOTMuOCAxOTMuOCAwIDAgMCA5OS41IDc2LjN6Ii8+PC9zdmc+" alt="페이스북 공유">
-                                    페이스북
-                                </button>
-                                <button id="post-twitter-share" class="share-btn twitter-btn">
-                                    <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0id2hpdGUiIGQ9Ik0yMS45MyA0LjM2YTguNjkgOC42OSAwIDAgMC0yLjQ4LjY4IDguMzMgOC4zMyAwIDAxLjY5LTIuMTIgOC42NyA4LjY3IDAgMDEtMi43NCAxLjA2IDQuNDc4IDQuNDc4IDAgMDAtNy44NiAzLjA3IDEyLjQ4IDEyLjQ4IDAgMDEtOC4xMy00LjEyIDQuNTEgNC41MSAwIDAwMS40MyA1Ljk4IDQuNTMgNC41MyAwIDAxLTIuMDYtLjU2djAuMDVhNC40OTggNC40OTggMCAwMDMuNjEgNC40MiA0LjU3IDQuNTcgMCAwMS0yLjA1LjA4YTQuNDcgNC40NyAwIDAwNC4yNyAzLjEgOS4wNCA5LjA0IDAgMDEtNS41NiAxLjkgOC45OSA4Ljk5IDAgMDEtMS4wNy0uMDYgMTIuNzYgMTIuNzYgMCAwMDYuOCAyIiBzdHJva2U9IndoaXRlIi8+PC9zdmc+" alt="X(트위터) 공유">
-                                    X(트위터)
-                                </button>
-                                <button id="post-link-copy" class="share-btn link-btn">
-                                    <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9IndoaXRlIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIgY2xhc3M9ImZlYXRoZXIgZmVhdGhlci1saW5rIj48cGF0aCBkPSJNMTAgMTNhNSA1IDAgMCAwIDcuNTQuNTRsMyAzYTUgNSAwIDAgMC03LjA3LTcuMDdsLTEuNzIgMS43MSI+PC9wYXRoPjxwYXRoIGQ9Ik0xNCAxMWE1IDUgMCAwIDAtNy41NC0uNTRsLTMgM2E1IDUgMCAwIDAgNy4wNyA3LjA3bDEuNzEtMS43MSI+PC9wYXRoPjwvc3ZnPg==" alt="링크 복사">
-                                    링크 복사
-                                </button>
+                        <footer class="post-footer">
+                            <div class="post-tags">
+                                ${currentPost.tags.map(tag => `<span class="post-tag">${tag}</span>`).join('')}
+                            </div>
+                            <div class="post-share">
+                                <h4>이 글 공유하기</h4>
+                                <div class="social-share">
+                                    <button id="post-kakao-share" class="share-btn kakao-btn">
+                                        <img src="https://developers.kakao.com/assets/img/about/logos/kakaolink/kakaolink_btn_small.png" alt="카카오톡 공유">
+                                        카카오톡
+                                    </button>
+                                    <button id="post-facebook-share" class="share-btn facebook-btn">
+                                        <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA1MTIgNTEyIj48cGF0aCBmaWxsPSJ3aGl0ZSIgZD0iTTUwNCAxNTYuNmMwLTM2LjQtMjkuNi02Ni02Ni02NmgtMzY0Yy0zNi40IDAtNjYgMjkuNi02NiA2NnYxOTguOGMwIDM2LjQgMjkuNiA2NiA2NiA2Nmg3NnYtMTQxLjFoLTQ2LjJjLTYuNyAwLTEyLjEtNS40LTEyLjEtMTIuMXYtNDMuMmMwLTYuNyA1LjQtMTIuMSAxMi4xLTEyLjFoNDYuMnYtNDAuNmMwLTUwLjkgMzAuMy04Ni4yIDgzLjctODYuMmgyNy43YzYuNyAwIDEyLjEgNS40IDEyLjEgMTIuMXY0My4yYzAgNi43LTUuNSAxMi4xLTEyLjIgMTIuMWgtMTdDMjY3IDEwNS40IDI2NCAxMTguMyAyNjQgMTMyLjF2MzUuMmg0NS4xYzcuOCAwIDEzLjggNi44IDEyLjMgMTQuNWwtNS4zIDQzLjJjLTEuMSA2LjEtNi40IDEwLjYtMTIuNiAxMC42SDI2NFYzNTVjMTMxLjEtMTkuMSAxOTguMy0xNTUuNSAxNDAuNS0yNzQuN2ExOTMuOCAxOTMuOCAwIDAgMCA5OS41IDc2LjN6Ii8+PC9zdmc+" alt="페이스북 공유">
+                                        페이스북
+                                    </button>
+                                    <button id="post-twitter-share" class="share-btn twitter-btn">
+                                        <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0id2hpdGUiIGQ9Ik0yMS45MyA0LjM2YTguNjkgOC42OSAwIDAgMC0yLjQ4LjY4IDguMzMgOC4zMyAwIDAxLjY5LTIuMTIgOC42NyA4LjY3IDAgMDEtMi43NCAxLjA2IDQuNDc4IDQuNDc4IDAgMDAtNy44NiAzLjA3IDEyLjQ4IDEyLjQ4IDAgMDEtOC4xMy00LjEyIDQuNTEgNC41MSAwIDAwMS40MyA1Ljk4IDQuNTMgNC41MyAwIDAxLTIuMDYtLjU2djAuMDVhNC40OTggNC40OTggMCAwMDMuNjEgNC40MiA0LjU3IDQuNTcgMCAwMS0yLjA1LjA4YTQuNDcgNC40NyAwIDAwNC4yNyAzLjEgOS4wNCA5LjA0IDAgMDEtNS41NiAxLjkgOC45OSA4Ljk5IDAgMDEtMS4wNy0uMDYgMTIuNzYgMTIuNzYgMCAwMDYuOCAyIiBzdHJva2U9IndoaXRlIi8+PC9zdmc+" alt="X(트위터) 공유">
+                                        X(트위터)
+                                    </button>
+                                    <button id="post-link-copy" class="share-btn link-btn">
+                                        <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9IndoaXRlIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIgY2xhc3M9ImZlYXRoZXIgZmVhdGhlci1saW5rIj48cGF0aCBkPSJNMTAgMTNhNSA1IDAgMCAwIDcuNTQuNTRsMyAzYTUgNSAwIDAgMC03LjA3LTcuMDdsLTEuNzIgMS43MSI+PC9wYXRoPjxwYXRoIGQ9Ik0xNCAxMWE1IDUgMCAwIDAtNy41NC0uNTRsLTMgM2E1IDUgMCAwIDAgNy4wNyA3LjA3bDEuNzEtMS43MSI+PC9wYXRoPjwvc3ZnPg==" alt="링크 복사">
+                                        링크 복사
+                                    </button>
+                                </div>
+                            </div>
+                            <div class="back-to-list">
+                                <a href="blog.html" class="back-link">← 목록으로 돌아가기</a>
+                            </div>
+                        </footer>
+                    </article>`;
+                    
+                    // 관련 포스트 렌더링
+                    renderRelatedPosts(currentPost);
+                    
+                    // 포스트 내 코드 블록에 구문 강조 적용
+                    document.querySelectorAll('pre code').forEach(block => {
+                        hljs.highlightBlock(block);
+                    });
+                    
+                    // 공유 버튼 이벤트 연결
+                    setupPostShareButtons();
+                }
+                
+                // 메타 태그 업데이트
+                updateMetaTags(currentPost);
+                
+                // 현재 포스트 강조 표시
+                highlightCurrentPost();
+                
+                debugLog('포스트 로드 완료:', currentPost.title);
+            } catch (fetchError) {
+                console.error('포스트 파일 로드 실패:', fetchError);
+                
+                // 포스트 파일 로드 실패시 대체 콘텐츠 표시
+                if (markdownContent) {
+                    // 포스트 기본 정보로 간략한 내용 표시
+                    markdownContent.innerHTML = `
+                    <article class="post">
+                        <header class="post-header">
+                            <h1 class="post-title">${currentPost.title}</h1>
+                            <div class="post-meta">
+                                <span class="post-date"><i class="fas fa-calendar-alt"></i> ${formatDate(currentPost.date)}</span>
+                                <span class="post-category"><i class="fas fa-folder"></i> ${currentPost.category}</span>
+                            </div>
+                        </header>
+                        <div class="post-content">
+                            <div class="post-summary">
+                                <p>${currentPost.description || '이 포스트의 내용을 불러올 수 없습니다.'}</p>
+                                <p>죄송합니다. 현재 포스트 내용을 불러오는 데 문제가 발생했습니다.</p>
                             </div>
                         </div>
-                        <div class="back-to-list">
-                            <a href="blog.html" class="back-link">← 목록으로 돌아가기</a>
-                        </div>
-                    </footer>
-                </article>`;
+                        <footer class="post-footer">
+                            <div class="post-tags">
+                                ${currentPost.tags.map(tag => `<span class="post-tag">${tag}</span>`).join('')}
+                            </div>
+                            <div class="back-to-list">
+                                <a href="blog.html" class="back-link">← 목록으로 돌아가기</a>
+                            </div>
+                        </footer>
+                    </article>`;
+                    
+                    // 관련 포스트 렌더링
+                    renderRelatedPosts(currentPost);
+                }
                 
-                // 관련 포스트 렌더링
-                renderRelatedPosts(currentPost);
+                // 메타 태그는 포스트 기본 정보로 업데이트
+                updateMetaTags(currentPost);
                 
-                // 포스트 내 코드 블록에 구문 강조 적용
-                document.querySelectorAll('pre code').forEach(block => {
-                    hljs.highlightBlock(block);
-                });
-                
-                // 공유 버튼 이벤트 연결
-                setupPostShareButtons();
+                // 현재 포스트 강조 표시
+                highlightCurrentPost();
             }
-            
-            // 메타 태그 업데이트
-            updateMetaTags(currentPost);
-            
-            // 현재 포스트 강조 표시
-            highlightCurrentPost();
-            
-            debugLog('포스트 로드 완료:', currentPost.title);
         } catch (error) {
             console.error('포스트 로드 실패:', error);
             
