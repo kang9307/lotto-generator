@@ -27,6 +27,12 @@ document.addEventListener('DOMContentLoaded', function() {
     const baseDomain = 'https://braindetox.kr';
     const baseUrl = '/blog.html?post='; // 다시 파라미터 방식으로 변경
     
+    // DOM 요소 참조 설정 함수 추가
+    function setupDOMReferences() {
+        // 이미 전역 변수로 선언되어 있으므로 빈 함수로 유지
+        // 필요한 경우 여기에 추가적인 DOM 요소 참조 로직을 추가할 수 있음
+    }
+    
     // 디버깅 로그 함수
     function debugLog(...args) {
         if (DEBUG) {
@@ -605,8 +611,10 @@ document.addEventListener('DOMContentLoaded', function() {
         featuredList.innerHTML = '';
         featuredPosts.forEach(post => {
             const li = document.createElement('li');
-            li.textContent = post.title;
-            li.addEventListener('click', () => loadPost(post.id));
+            const link = document.createElement('a');
+            link.href = `posts/${post.id}.html`;
+            link.textContent = post.title;
+            li.appendChild(link);
             featuredList.appendChild(li);
         });
     }
@@ -667,7 +675,7 @@ document.addEventListener('DOMContentLoaded', function() {
                 <ul>
                     ${relatedPosts.map(post => `
                         <li>
-                            <a href="./posts/${post.id}.html" class="related-post-link" data-id="${post.id}">
+                            <a href="./posts/${post.id}.html" class="related-post-link">
                                 ${post.title}
                             </a>
                             <span class="post-date">${formatDate(post.date)}</span>
@@ -679,15 +687,6 @@ document.addEventListener('DOMContentLoaded', function() {
         
         // 관련 게시물 추가
         markdownContent.insertAdjacentHTML('beforeend', relatedPostsHTML);
-        
-        // 관련 게시물 링크에 이벤트 리스너 추가
-        document.querySelectorAll('.related-post-link').forEach(link => {
-            link.addEventListener('click', function(e) {
-                e.preventDefault();
-                const postId = this.getAttribute('data-id');
-                loadPost(postId);
-            });
-        });
     }
     
     // URL에서 포스트 ID 가져오기
@@ -756,11 +755,11 @@ document.addEventListener('DOMContentLoaded', function() {
                 // 포스트 목록 렌더링
                 renderPostList();
                 
+                // 최신 포스트 로드
+                loadLatestPost();
+                
                 // 메타 정보 업데이트
                 updateMetaInfo();
-                
-                // 포스트 로딩 (필요 없으므로 제거)
-                // URL에서 postId를 가져와서 해당 포스트 로드
                 
                 debugLog('블로그 초기화 완료');
             } else {
@@ -802,8 +801,129 @@ document.addEventListener('DOMContentLoaded', function() {
         content.style.display = '';
         blogLayout.classList.remove('post-view-mode');
         
-        // 기본 콘텐츠 표시
-        if (markdownContent) {
+        // 최신 포스트 표시
+        loadLatestPost();
+    }
+    
+    // 최신 포스트 로드 함수
+    async function loadLatestPost() {
+        if (!markdownContent || posts.length === 0) {
+            console.error('markdownContent 요소 또는 포스트 데이터가 없습니다.');
+            return;
+        }
+        
+        try {
+            // 날짜 최신순으로 정렬
+            const latestPosts = [...posts].sort((a, b) => new Date(b.date) - new Date(a.date));
+            
+            if (latestPosts.length === 0) {
+                console.error('정렬된 포스트 목록이 비어 있습니다.');
+                markdownContent.innerHTML = '<div class="welcome-message">아직 등록된 글이 없습니다.</div>';
+                return;
+            }
+            
+            console.log('최신 포스트:', latestPosts[0]);
+            const latestPost = latestPosts[0];
+            
+            // 포스트 경로
+            const postPath = `${postsDir}${latestPost.filename}`;
+            console.log('포스트 경로:', postPath);
+            
+            // 포스트 HTML 가져오기
+            const response = await fetch(postPath);
+            
+            if (!response.ok) {
+                throw new Error(`포스트 로드 실패: HTTP 오류 ${response.status}`);
+            }
+            
+            const html = await response.text();
+            
+            // HTML 파싱
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(html, 'text/html');
+            
+            // 포스트 컨텐츠 추출
+            const postContent = doc.querySelector('.post-content');
+            if (!postContent) {
+                console.error('포스트 컨텐츠를 찾을 수 없습니다. HTML 구조:', html.substring(0, 200));
+                throw new Error('포스트 컨텐츠를 찾을 수 없습니다.');
+            }
+            
+            // 내용 일부만 추출 (첫 3개 단락 또는 800자)
+            let excerptContent = '';
+            const paragraphs = postContent.querySelectorAll('p');
+            console.log('찾은 단락 수:', paragraphs.length);
+            
+            // 최대 3개 단락 또는 800자까지만 표시
+            let charCount = 0;
+            const maxChars = 800;
+            let usedParagraphs = 0;
+            
+            for (let i = 0; i < Math.min(3, paragraphs.length); i++) {
+                const paragraphText = paragraphs[i].textContent;
+                charCount += paragraphText.length;
+                usedParagraphs++;
+                excerptContent += paragraphs[i].outerHTML;
+                
+                if (charCount >= maxChars) break;
+            }
+            
+            // 단락이 없는 경우 전체 내용 일부 표시
+            if (paragraphs.length === 0) {
+                excerptContent = postContent.innerHTML.substring(0, maxChars);
+                if (excerptContent.length >= maxChars) {
+                    excerptContent += '...';
+                }
+            }
+            
+            // 더보기 링크 추가
+            const moreText = (usedParagraphs < paragraphs.length || charCount >= maxChars) ? 
+                '<p class="read-more"><a href="./posts/' + latestPost.id + '.html">더 보기...</a></p>' : '';
+            
+            // 마크다운 컨텐츠 영역에 포스트 출력
+            markdownContent.innerHTML = `
+            <div class="latest-post">
+                <h2>최신 글</h2>
+                <article class="post post-preview">
+                    <header class="post-header">
+                        <h1 class="post-title"><a href="./posts/${latestPost.id}.html">${latestPost.title}</a></h1>
+                        <div class="post-meta">
+                            <span class="post-date"><i class="fas fa-calendar-alt"></i> ${formatDate(latestPost.date)}</span>
+                            <span class="post-category"><i class="fas fa-folder"></i> ${latestPost.category}</span>
+                        </div>
+                    </header>
+                    <div class="post-content">
+                        ${excerptContent}
+                        ${moreText}
+                    </div>
+                    <footer class="post-footer">
+                        <div class="post-tags">
+                            ${latestPost.tags && latestPost.tags.length > 0 ? latestPost.tags.map(tag => `<span class="post-tag">${tag}</span>`).join('') : ''}
+                        </div>
+                        <div class="read-full">
+                            <a href="./posts/${latestPost.id}.html" class="read-more-link">글 전체 보기</a>
+                        </div>
+                    </footer>
+                </article>
+                <div class="featured-posts">
+                    <h3>추천 글</h3>
+                    <ul id="featuredList">
+                        <!-- 추천 글 목록이 여기에 동적으로 로드됨 -->
+                        <li>추천 글을 불러오는 중...</li>
+                    </ul>
+                </div>
+            </div>`;
+            
+            // featuredList 요소 다시 참조 (innerHTML이 변경되었으므로)
+            window.featuredList = document.getElementById('featuredList');
+            
+            // 추천 글 목록 렌더링
+            renderFeaturedPosts();
+            
+        } catch (error) {
+            console.error('최신 포스트 로드 실패:', error);
+            
+            // 오류 시 기본 메시지 표시
             markdownContent.innerHTML = `
             <div class="welcome-message">
                 <h2>기술 블로그에 오신 것을 환영합니다</h2>
@@ -816,6 +936,9 @@ document.addEventListener('DOMContentLoaded', function() {
                     </ul>
                 </div>
             </div>`;
+            
+            // featuredList 요소 다시 참조
+            window.featuredList = document.getElementById('featuredList');
             
             // 추천 글 목록 렌더링
             renderFeaturedPosts();
@@ -872,6 +995,12 @@ document.addEventListener('DOMContentLoaded', function() {
         
         // 공유 버튼 이벤트 리스너
         setupShareButtons();
+    }
+    
+    // 공유 버튼 이벤트 설정 함수
+    function setupShareButtons() {
+        // 현재 페이지의 공유 버튼 설정
+        updateSocialShareButtons(null);
     }
     
     // 블로그 스타일 조정 - 스크롤 지원
