@@ -161,6 +161,20 @@ function getStaticPostData() {
         "dash_diet_guide": "건강"
     };
     
+    // 태그 매핑 테이블
+    const tagMap = {
+        "ai_future_jobs_career_skills": ["AI", "직업", "미래"],
+        "ai_future_social_impact": ["AI", "사회", "영향"],
+        "android_version_security": ["안드로이드", "보안", "모바일"],
+        "anemia_breathlessness": ["건강", "빈혈", "호흡"],
+        "artificial_intelligence_intro": ["AI", "기초", "소개"],
+        "ceph_rados_crush_deep_dive": ["Ceph", "스토리지", "기술"],
+        "ceph_storage_intro": ["Ceph", "스토리지", "클라우드"],
+        "cheonggukjang_benefits": ["건강", "음식", "영양"],
+        "coffee_fatty_liver": ["건강", "음식", "간"],
+        "dash_diet_guide": ["건강", "다이어트", "식이요법"]
+    };
+    
     const allPosts = [];
     
     // 샘플 포스트 생성 (최대 10개)
@@ -183,7 +197,7 @@ function getStaticPostData() {
             filename: filename,
             date: date.toISOString().split('T')[0],
             category: categoryMap[id] || "기타",
-            tags: ["태그1", "태그2"],
+            tags: tagMap[id] || ["태그1", "태그2"],
             featured: i < 5  // 5개만 추천 글로 설정
         });
     }
@@ -280,21 +294,39 @@ function updateLastUpdatedTime() {
 function populateCategoryOptions() {
     if (!categorySelect || !posts || posts.length === 0) return;
     
-    // 기존 옵션 유지 (전체 글 옵션은 유지)
-    const allOption = categorySelect.querySelector('option[value="all"]');
-    categorySelect.innerHTML = '';
-    categorySelect.appendChild(allOption);
-    
-    // 포스트에서 고유한 카테고리 추출
-    const categories = [...new Set(posts.map(post => post.category))];
-    
-    // 카테고리별로 옵션 추가
-    categories.forEach(category => {
-        const option = document.createElement('option');
-        option.value = category;
-        option.textContent = category;
-        categorySelect.appendChild(option);
-    });
+    try {
+        // 기존 옵션 비우기
+        categorySelect.innerHTML = '';
+        
+        // 전체 글 옵션 추가
+        const allOption = document.createElement('option');
+        allOption.value = 'all';
+        allOption.textContent = '전체 글';
+        categorySelect.appendChild(allOption);
+        
+        // 포스트에서 고유한 카테고리 추출
+        const uniqueCategories = [];
+        posts.forEach(post => {
+            if (post.category && !uniqueCategories.includes(post.category)) {
+                uniqueCategories.push(post.category);
+            }
+        });
+        
+        // 카테고리 정렬
+        uniqueCategories.sort();
+        
+        // 카테고리별로 옵션 추가
+        uniqueCategories.forEach(category => {
+            const option = document.createElement('option');
+            option.value = category;
+            option.textContent = category;
+            categorySelect.appendChild(option);
+        });
+        
+        debugLog(`카테고리 ${uniqueCategories.length}개 로드됨: ${uniqueCategories.join(', ')}`);
+    } catch (error) {
+        console.error('카테고리 옵션 채우기 오류:', error);
+    }
 }
 
 // 추천 글 목록 렌더링
@@ -407,6 +439,12 @@ async function loadLatestPost() {
             <p>이는 ${latestPost.category} 카테고리에 속하는 글로, 해당 주제에 관심 있는 독자들에게 유용한 정보를 제공합니다.</p>
         `;
         
+        // 태그 HTML 생성
+        let tagsHtml = '';
+        if (latestPost.tags && latestPost.tags.length > 0) {
+            tagsHtml = latestPost.tags.map(tag => `<span class="post-tag">${tag}</span>`).join('');
+        }
+        
         // 마크다운 컨텐츠 영역에 포스트 출력
         markdownContent.innerHTML = `
         <div class="latest-post">
@@ -425,7 +463,7 @@ async function loadLatestPost() {
                 </div>
                 <footer class="post-footer">
                     <div class="post-tags">
-                        ${latestPost.tags && latestPost.tags.length > 0 ? latestPost.tags.map(tag => `<span class="post-tag">${tag}</span>`).join('') : ''}
+                        ${tagsHtml}
                     </div>
                     <div class="read-full">
                         <a href="./posts/${latestPost.id}.html" class="read-more-link">글 전체 보기</a>
