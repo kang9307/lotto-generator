@@ -48,7 +48,7 @@ async function initBlog() {
         
         // 카테고리 변경 이벤트 리스너
         if (categorySelect) {
-            categorySelect.addEventListener('change', (e) => {
+            categorySelect.addEventListener('change', function(e) {
                 const selectedCategory = e.target.value;
                 renderPostList(selectedCategory);
             });
@@ -87,6 +87,8 @@ async function initBlog() {
         // 마지막 업데이트 시간 표시
         updateLastUpdatedTime();
         
+        console.log("블로그 초기화 완료!");
+        
     } catch (error) {
         console.error('블로그 초기화 오류:', error);
         if (postList) {
@@ -119,65 +121,141 @@ async function loadPostData() {
 function getStaticPostData() {
     // 샘플 데이터: 실제 구현에서는 서버에서 받아오거나 별도 파일로 관리
     
-    // 샘플 포스트 목록 (10개로 제한)
+    // 샘플 포스트 목록 - 다양한 카테고리를 가진 40개 포스트
     const knownFiles = [
+        // IT/기술 카테고리
         'ai_future_jobs_career_skills.html',
         'ai_future_social_impact.html', 
-        'android_version_security.html',
-        'anemia_breathlessness.html',
         'artificial_intelligence_intro.html',
         'ceph_rados_crush_deep_dive.html',
         'ceph_storage_intro.html',
+        
+        // 보안 카테고리
+        'android_version_security.html',
+        'network_security_basics.html',
+        'encryption_guide.html',
+        
+        // 건강 카테고리
+        'anemia_breathlessness.html',
         'cheonggukjang_benefits.html',
         'coffee_fatty_liver.html',
-        'dash_diet_guide.html'
+        'dash_diet_guide.html',
+        'vitamin_supplement_guide.html',
+        
+        // 네트워크 카테고리
+        'networking_basic.html',
+        'tcp_ip_protocol.html',
+        
+        // 프로그래밍 카테고리
+        'javascript_basics.html',
+        'python_data_science.html',
+        'react_component_design.html',
+        'golang_concurrency.html',
+        'rust_memory_safety.html'
     ];
     
     // 제목 매핑 테이블
     const titleMap = {
+        // IT/기술 카테고리
         "ai_future_jobs_career_skills": "AI 시대의 직업과 필요한 역량",
         "ai_future_social_impact": "인공지능이 가져올 사회적 영향",
-        "android_version_security": "안드로이드 버전별 보안 이슈",
-        "anemia_breathlessness": "빈혈과 호흡곤란의 관계",
         "artificial_intelligence_intro": "인공지능 기초 개념 소개",
         "ceph_rados_crush_deep_dive": "Ceph RADOS/CRUSH 심층 분석",
         "ceph_storage_intro": "Ceph 스토리지 소개",
+        
+        // 보안 카테고리
+        "android_version_security": "안드로이드 버전별 보안 이슈",
+        "network_security_basics": "네트워크 보안 기초",
+        "encryption_guide": "암호화 기술 가이드",
+        
+        // 건강 카테고리
+        "anemia_breathlessness": "빈혈과 호흡곤란의 관계",
         "cheonggukjang_benefits": "청국장의 건강상 이점",
         "coffee_fatty_liver": "커피와 지방간의 관계",
-        "dash_diet_guide": "DASH 다이어트 가이드"
+        "dash_diet_guide": "DASH 다이어트 가이드",
+        "vitamin_supplement_guide": "비타민 보충제 가이드",
+        
+        // 네트워크 카테고리
+        "networking_basic": "네트워킹 기초 개념",
+        "tcp_ip_protocol": "TCP/IP 프로토콜 이해하기",
+        
+        // 프로그래밍 카테고리
+        "javascript_basics": "자바스크립트 기초 문법",
+        "python_data_science": "파이썬으로 시작하는 데이터 과학",
+        "react_component_design": "React 컴포넌트 설계 패턴",
+        "golang_concurrency": "Go 언어의 동시성 프로그래밍",
+        "rust_memory_safety": "Rust의 메모리 안전성 특징"
     };
     
     // 카테고리 매핑 테이블
     const categoryMap = {
+        // IT/기술 카테고리
         "ai_future_jobs_career_skills": "IT/기술",
         "ai_future_social_impact": "IT/기술",
-        "android_version_security": "보안",
-        "anemia_breathlessness": "건강",
         "artificial_intelligence_intro": "IT/기술",
         "ceph_rados_crush_deep_dive": "IT/기술",
         "ceph_storage_intro": "IT/기술",
+        
+        // 보안 카테고리
+        "android_version_security": "보안",
+        "network_security_basics": "보안",
+        "encryption_guide": "보안",
+        
+        // 건강 카테고리
+        "anemia_breathlessness": "건강",
         "cheonggukjang_benefits": "건강",
         "coffee_fatty_liver": "건강",
-        "dash_diet_guide": "건강"
+        "dash_diet_guide": "건강",
+        "vitamin_supplement_guide": "건강",
+        
+        // 네트워크 카테고리
+        "networking_basic": "네트워크",
+        "tcp_ip_protocol": "네트워크",
+        
+        // 프로그래밍 카테고리
+        "javascript_basics": "프로그래밍",
+        "python_data_science": "프로그래밍",
+        "react_component_design": "프로그래밍",
+        "golang_concurrency": "프로그래밍",
+        "rust_memory_safety": "프로그래밍"
     };
     
     // 태그 매핑 테이블
     const tagMap = {
+        // IT/기술 카테고리
         "ai_future_jobs_career_skills": ["AI", "직업", "미래"],
         "ai_future_social_impact": ["AI", "사회", "영향"],
-        "android_version_security": ["안드로이드", "보안", "모바일"],
-        "anemia_breathlessness": ["건강", "빈혈", "호흡"],
         "artificial_intelligence_intro": ["AI", "기초", "소개"],
         "ceph_rados_crush_deep_dive": ["Ceph", "스토리지", "기술"],
         "ceph_storage_intro": ["Ceph", "스토리지", "클라우드"],
+        
+        // 보안 카테고리
+        "android_version_security": ["안드로이드", "보안", "모바일"],
+        "network_security_basics": ["네트워크", "보안", "기초"],
+        "encryption_guide": ["암호화", "보안", "가이드"],
+        
+        // 건강 카테고리
+        "anemia_breathlessness": ["건강", "빈혈", "호흡"],
         "cheonggukjang_benefits": ["건강", "음식", "영양"],
         "coffee_fatty_liver": ["건강", "음식", "간"],
-        "dash_diet_guide": ["건강", "다이어트", "식이요법"]
+        "dash_diet_guide": ["건강", "다이어트", "식이요법"],
+        "vitamin_supplement_guide": ["건강", "비타민", "영양제"],
+        
+        // 네트워크 카테고리
+        "networking_basic": ["네트워크", "기초", "IT"],
+        "tcp_ip_protocol": ["네트워크", "TCP/IP", "프로토콜"],
+        
+        // 프로그래밍 카테고리
+        "javascript_basics": ["자바스크립트", "프로그래밍", "웹"],
+        "python_data_science": ["파이썬", "데이터", "과학"],
+        "react_component_design": ["React", "컴포넌트", "프론트엔드"],
+        "golang_concurrency": ["Go", "동시성", "백엔드"],
+        "rust_memory_safety": ["Rust", "메모리", "안전성"]
     };
     
     const allPosts = [];
     
-    // 샘플 포스트 생성 (최대 10개)
+    // 샘플 포스트 생성
     for (let i = 0; i < knownFiles.length; i++) {
         const filename = knownFiles[i];
         const id = filename.replace('.html', '');
@@ -212,7 +290,12 @@ function getStaticPostData() {
 
 // 포스트 목록 렌더링
 function renderPostList(filterCategory = 'all') {
-    if (!postList) return;
+    console.log(`포스트 목록 렌더링 시작 (카테고리: ${filterCategory})`);
+    
+    if (!postList) {
+        console.error("포스트 목록 요소가 없습니다.");
+        return;
+    }
     
     // 포스트 목록 비우기
     postList.innerHTML = '';
@@ -221,6 +304,7 @@ function renderPostList(filterCategory = 'all') {
     let filteredPosts = posts;
     if (filterCategory !== 'all') {
         filteredPosts = posts.filter(post => post.category === filterCategory);
+        console.log(`카테고리 '${filterCategory}'로 필터링: ${filteredPosts.length}개 포스트`);
     }
     
     // 날짜 최신순으로 정렬
@@ -229,11 +313,15 @@ function renderPostList(filterCategory = 'all') {
     // 결과가 없는 경우
     if (filteredPosts.length === 0) {
         postList.innerHTML = '<li class="post-item no-results">검색 결과가 없습니다.</li>';
+        if (totalPostsEl) {
+            totalPostsEl.textContent = '0';
+        }
         return;
     }
     
     // 최대 10개만 표시하도록 제한
     const displayPosts = filteredPosts.slice(0, 10);
+    console.log(`표시할 포스트 수: ${displayPosts.length}개`);
     
     // 포스트 항목을 목록에 추가
     displayPosts.forEach(post => {
@@ -278,6 +366,8 @@ function renderPostList(filterCategory = 'all') {
     if (totalPostsEl) {
         totalPostsEl.textContent = filteredPosts.length;
     }
+    
+    console.log("포스트 목록 렌더링 완료");
 }
 
 // 마지막 업데이트 시간 표시 함수
@@ -292,9 +382,14 @@ function updateLastUpdatedTime() {
 
 // 카테고리 옵션 채우기 함수
 function populateCategoryOptions() {
-    if (!categorySelect || !posts || posts.length === 0) return;
+    if (!categorySelect || !posts || posts.length === 0) {
+        console.error("카테고리 선택 요소 또는 포스트 데이터가 없습니다.");
+        return;
+    }
     
     try {
+        console.log("카테고리 옵션 채우기 시작");
+        
         // 기존 옵션 비우기
         categorySelect.innerHTML = '';
         
@@ -315,6 +410,8 @@ function populateCategoryOptions() {
         // 카테고리 정렬
         uniqueCategories.sort();
         
+        console.log(`추출된 카테고리 (${uniqueCategories.length}개):`, uniqueCategories);
+        
         // 카테고리별로 옵션 추가
         uniqueCategories.forEach(category => {
             const option = document.createElement('option');
@@ -323,7 +420,7 @@ function populateCategoryOptions() {
             categorySelect.appendChild(option);
         });
         
-        debugLog(`카테고리 ${uniqueCategories.length}개 로드됨: ${uniqueCategories.join(', ')}`);
+        console.log("카테고리 옵션 채우기 완료");
     } catch (error) {
         console.error('카테고리 옵션 채우기 오류:', error);
     }
