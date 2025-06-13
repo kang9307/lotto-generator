@@ -13,8 +13,8 @@ let markdownContent = null;
 let totalPostsEl = null;
 let featuredList = null;
 let categorySelect = null;
-let posts = [];
-let currentPost = null;
+    let posts = [];
+    let currentPost = null;
 let postsDir = './posts/';
 
 // 디버그 로깅 함수
@@ -140,9 +140,9 @@ async function initBlog() {
             // 마지막 업데이트 시간 표시
             updateLastUpdatedTime();
             
-            return;
-        }
-        
+                    return;
+                }
+                
         // 데이터 로드 완료 후 처리
         debugLog(`포스트 데이터 로드 완료: ${posts.length}개`);
         
@@ -181,7 +181,7 @@ async function loadPostData() {
         
         // posts 디렉토리의 index.json 파일에서 실제 존재하는 파일 목록을 가져옵니다
         const response = await fetch('./posts/index.json');
-        if (response.ok) {
+                if (response.ok) {
             const data = await response.json();
             const files = data.files || [];
             
@@ -225,10 +225,10 @@ async function loadPostData() {
                             tags: tags,
                             featured: featured
                         };
-                    }
-                } catch (error) {
-                    console.error(`파일 ${filename} 처리 중 오류:`, error);
-                }
+                                }
+                            } catch (error) {
+                                console.error(`파일 ${filename} 처리 중 오류:`, error);
+                            }
                 
                 // 파일을 읽을 수 없는 경우 기본값 사용
                 // 메타데이터 추출 (파일명에서 유추)
@@ -295,13 +295,13 @@ async function loadPostData() {
             
             console.log(`실제 파일 기반 포스트 수: ${postsData.length}개 로드됨`);
             return postsData;
-        } else {
+                    } else {
             console.error('index.json 파일을 로드할 수 없습니다.');
             return [];
-        }
-    } catch (error) {
+                    }
+            } catch (error) {
         console.error('포스트 데이터 로드 오류:', error);
-        return [];
+                return [];
     }
 }
 
@@ -389,81 +389,81 @@ function formatTitle(id) {
     return id.split('_').map(word => 
         word.charAt(0).toUpperCase() + word.slice(1)
     ).join(' ');
-}
-
-// 포스트 목록 렌더링
-function renderPostList(filterCategory = 'all') {
+    }
+    
+    // 포스트 목록 렌더링
+    function renderPostList(filterCategory = 'all') {
     console.log(`포스트 목록 렌더링 시작 (카테고리: ${filterCategory})`);
     
     if (!postList) {
         console.error("포스트 목록 요소가 없습니다.");
         return;
     }
-    
-    // 포스트 목록 비우기
-    postList.innerHTML = '';
-    
-    // 카테고리 필터링
-    let filteredPosts = posts;
-    if (filterCategory !== 'all') {
-        filteredPosts = posts.filter(post => post.category === filterCategory);
+        
+        // 포스트 목록 비우기
+        postList.innerHTML = '';
+        
+        // 카테고리 필터링
+        let filteredPosts = posts;
+        if (filterCategory !== 'all') {
+            filteredPosts = posts.filter(post => post.category === filterCategory);
         console.log(`카테고리 '${filterCategory}'로 필터링: ${filteredPosts.length}개 포스트`);
-    }
-    
-    // 날짜 최신순으로 정렬
-    filteredPosts.sort((a, b) => new Date(b.date) - new Date(a.date));
-    
-    // 결과가 없는 경우
-    if (filteredPosts.length === 0) {
-        postList.innerHTML = '<li class="post-item no-results">검색 결과가 없습니다.</li>';
+        }
+        
+        // 날짜 최신순으로 정렬
+        filteredPosts.sort((a, b) => new Date(b.date) - new Date(a.date));
+        
+        // 결과가 없는 경우
+        if (filteredPosts.length === 0) {
+            postList.innerHTML = '<li class="post-item no-results">검색 결과가 없습니다.</li>';
         if (totalPostsEl) {
             totalPostsEl.textContent = '0';
         }
-        return;
-    }
+            return;
+        }
     
     // 모든 게시글 표시
     const displayPosts = filteredPosts;
     console.log(`표시할 포스트 수: ${displayPosts.length}개`);
-    
-    // 포스트 항목을 목록에 추가
+        
+        // 포스트 항목을 목록에 추가
     displayPosts.forEach(post => {
-        const listItem = document.createElement('li');
-        listItem.className = 'post-item';
-        listItem.setAttribute('data-id', post.id);
-        
-        const postLink = document.createElement('a');
+            const listItem = document.createElement('li');
+            listItem.className = 'post-item';
+            listItem.setAttribute('data-id', post.id);
+            
+            const postLink = document.createElement('a');
         postLink.href = `posts/${post.id}.html`;
-        postLink.textContent = post.title;
+            postLink.textContent = post.title;
+            
+            const postDate = document.createElement('span');
+            postDate.className = 'post-date';
+            postDate.textContent = formatDate(post.date);
+            
+            const postCategory = document.createElement('span');
+            postCategory.className = 'post-category';
+            postCategory.textContent = post.category;
+            // 카테고리 속성 추가 - 스타일 적용을 위한 data-category 속성 추가
+            postCategory.setAttribute('data-category', post.category);
+            
+            // 리스트 아이템에 요소 추가
+            listItem.appendChild(postLink);
+            listItem.appendChild(postDate);
+            listItem.appendChild(postCategory);
+            
+            // 포스트가 추천된 경우 표시
+            if (post.featured) {
+                const featuredBadge = document.createElement('span');
+                featuredBadge.className = 'featured-badge';
+                featuredBadge.textContent = '추천';
+                listItem.appendChild(featuredBadge);
+            }
+            
+            postList.appendChild(listItem);
+        });
         
-        const postDate = document.createElement('span');
-        postDate.className = 'post-date';
-        postDate.textContent = formatDate(post.date);
-        
-        const postCategory = document.createElement('span');
-        postCategory.className = 'post-category';
-        postCategory.textContent = post.category;
-        // 카테고리 속성 추가 - 스타일 적용을 위한 data-category 속성 추가
-        postCategory.setAttribute('data-category', post.category);
-        
-        // 리스트 아이템에 요소 추가
-        listItem.appendChild(postLink);
-        listItem.appendChild(postDate);
-        listItem.appendChild(postCategory);
-        
-        // 포스트가 추천된 경우 표시
-        if (post.featured) {
-            const featuredBadge = document.createElement('span');
-            featuredBadge.className = 'featured-badge';
-            featuredBadge.textContent = '추천';
-            listItem.appendChild(featuredBadge);
-        }
-        
-        postList.appendChild(listItem);
-    });
-    
-    // 총 포스트 수 업데이트
-    if (totalPostsEl) {
+        // 총 포스트 수 업데이트
+        if (totalPostsEl) {
         totalPostsEl.textContent = filteredPosts.length;
     }
     
@@ -484,9 +484,9 @@ function updateLastUpdatedTime() {
 function populateCategoryOptions() {
     if (!categorySelect || !posts || posts.length === 0) {
         console.error("카테고리 선택 요소 또는 포스트 데이터가 없습니다.");
-        return;
-    }
-    
+            return;
+        }
+        
     try {
         console.log("카테고리 옵션 채우기 시작");
         
@@ -544,9 +544,9 @@ async function loadLatestPost() {
     if (!posts || posts.length === 0) {
         console.error('포스트 데이터가 없습니다.');
         markdownContent.innerHTML = '<div class="welcome-message"><h2>기술 블로그에 오신 것을 환영합니다</h2><p>아직 등록된 글이 없습니다.</p></div>';
-        return;
-    }
-    
+                return;
+            }
+            
     try {
         // 날짜 최신순으로 정렬
         const latestPosts = [...posts].sort((a, b) => new Date(b.date) - new Date(a.date));
@@ -623,7 +623,7 @@ async function loadLatestPost() {
         }
         
         // 마크다운 컨텐츠 영역에 포스트 출력
-        markdownContent.innerHTML = `
+                markdownContent.innerHTML = `
         <div class="latest-post">
             <h2>최신 글</h2>
             <article class="post post-preview">
@@ -649,20 +649,20 @@ async function loadLatestPost() {
             </article>
             ${recentPostsHtml}
             ${featuredPostsHtml}
-        </div>`;
-        
-    } catch (error) {
+                    </div>`;
+            
+        } catch (error) {
         console.error('최신 포스트 로드 실패:', error);
         
         // 오류 시 기본 메시지 표시
-        markdownContent.innerHTML = `
+            markdownContent.innerHTML = `
         <div class="welcome-message">
             <h2>기술 블로그에 오신 것을 환영합니다</h2>
             <p>왼쪽 목록에서 관심있는 글을 선택하세요.</p>
-        </div>`;
+                </div>`;
+        }
     }
-}
-
+    
 // 파일명에서 날짜 추출 함수
 function extractDateFromFilename(filename) {
     // YYYY-MM-DD 형식의 날짜 추출
