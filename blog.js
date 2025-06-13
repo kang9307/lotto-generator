@@ -33,6 +33,77 @@ function formatDate(dateString) {
     return `${year}년 ${month}월 ${day}일`;
 }
 
+// HTML 태그 제거 및 정리 함수
+function cleanHtml(html) {
+    if (!html) return '';
+    return html.replace(/<[^>]*>/g, '').replace(/&nbsp;/g, ' ').trim();
+}
+
+// 파일명에서 카테고리 결정 함수
+function determineCategoryFromFilename(id) {
+    // 특정 파일에 대한 수동 카테고리 매핑
+    const manualCategoryMap = {
+        "sitemap_importance": "IT/기술",
+        "robots_txt_guide": "IT/기술",
+        "meta_tags_seo_guide": "IT/기술",
+        "skt_usim_hacking_reauth_guide": "보안",
+        "skt-usim-hacking-precautions": "보안",
+        "javascript_basic": "프로그래밍",
+        "php_language_guide_part1": "프로그래밍",
+        "php_language_guide_part2": "프로그래밍",
+        "php_language_guide_part3": "프로그래밍",
+        "php_language_guide_part4": "프로그래밍",
+        "php_language_guide_part5": "프로그래밍",
+        "networking_basic": "네트워크",
+        "linux_grep_awk": "IT/기술",
+        "ceph_storage_intro": "IT/기술",
+        "ceph_rados_crush_deep_dive": "IT/기술",
+        "ai_future_jobs_career_skills": "IT/기술",
+        "ai_future_social_impact": "IT/기술",
+        "artificial_intelligence_intro": "IT/기술",
+        "android_version_security": "보안",
+        "korea_presidential_election_2025": "사회/경제",
+        "korea_21st_president_inauguration": "사회/경제",
+        "korea_economic_social_challenges_2025": "사회/경제",
+        "korea_esg_corporate_trends": "사회/경제",
+        "korea_ai_technology_future": "IT/기술",
+        "jeonse_fraud_comprehensive_report": "사회/경제",
+        "squid_game_season3_analysis_complete": "문화/엔터",
+        "yeonggwang_population_trend": "사회/경제"
+    };
+    
+    // 수동 매핑에 있으면 해당 카테고리 반환
+    if (manualCategoryMap[id]) {
+        return manualCategoryMap[id];
+    }
+    
+    // 키워드 기반 카테고리 추정
+    if (id.includes('ai') || id.includes('ceph') || id.includes('tech') || 
+        id.includes('seo') || id.includes('sitemap') || id.includes('robots') ||
+        id.includes('meta_tags') || id.includes('javascript') || id.includes('php')) {
+        return "IT/기술";
+    } else if (id.includes('security') || id.includes('hack') || id.includes('usim')) {
+        return "보안";
+    } else if (id.includes('health') || id.includes('diet') || id.includes('vitamin') || 
+              id.includes('benefits') || id.includes('fatty') || id.includes('liver') ||
+              id.includes('meditation') || id.includes('immune') || id.includes('tofu') ||
+              id.includes('zinc') || id.includes('knee') || id.includes('udca') ||
+              id.includes('anemia') || id.includes('insomnia') || id.includes('herbs')) {
+        return "건강";
+    } else if (id.includes('network')) {
+        return "네트워크";
+    } else if (id.includes('javascript') || id.includes('php') || id.includes('python')) {
+        return "프로그래밍";
+    } else if (id.includes('korea') || id.includes('economic') || id.includes('president') ||
+              id.includes('jeonse') || id.includes('fraud') || id.includes('population')) {
+        return "사회/경제";
+    } else if (id.includes('game') || id.includes('squid') || id.includes('season')) {
+        return "문화/엔터";
+    }
+    
+    return "기타";
+}
+
 // 블로그 페이지 초기화
 async function initBlog() {
     try {
@@ -108,184 +179,216 @@ async function loadPostData() {
     try {
         debugLog('포스트 데이터 로드 시작');
         
-        // 정적 데이터로 대체 (실제 구현에서는 서버에서 가져올 수 있음)
-        return getStaticPostData();
-        
+        // posts 디렉토리의 index.json 파일에서 실제 존재하는 파일 목록을 가져옵니다
+        const response = await fetch('./posts/index.json');
+        if (response.ok) {
+            const data = await response.json();
+            const files = data.files || [];
+            
+            // 실제 존재하는 파일만으로 포스트 데이터 생성
+            const realPosts = [];
+            
+            // 파일 내용에서 제목과 카테고리를 추출하기 위한 프로미스 배열
+            const filePromises = files.map(async (filename) => {
+                // 파일명에서 ID 추출 (확장자 제거)
+                const id = filename.replace('.html', '');
+                
+                try {
+                    // HTML 파일에서 제목과 카테고리 추출 시도
+                    const fileResponse = await fetch(`./posts/${filename}`);
+                    if (fileResponse.ok) {
+                        const html = await fileResponse.text();
+                        
+                        // HTML에서 제목 추출 (h1 태그 또는 title 태그)
+                        let title = extractTitle(html) || formatTitle(id);
+                        
+                        // HTML에서 카테고리 추출 (meta 태그 또는 특정 클래스)
+                        let category = extractCategory(html, id);
+                        
+                        // HTML에서 날짜 추출
+                        let date = extractDate(html, filename);
+                        
+                        // 태그 추정 (파일명에서 유추)
+                        const words = id.split('_');
+                        const tags = words.filter(word => word.length > 2).slice(0, 3);
+                        
+                        // 추천 글 여부 (임의 선정)
+                        const featured = Math.random() < 0.2; // 약 20% 확률로 추천 글로 지정
+                        
+                        // 포스트 객체 생성
+                        return {
+                            id: id,
+                            title: title,
+                            filename: filename,
+                            date: date,
+                            category: category,
+                            tags: tags,
+                            featured: featured
+                        };
+                    }
+                } catch (error) {
+                    console.error(`파일 ${filename} 처리 중 오류:`, error);
+                }
+                
+                // 파일을 읽을 수 없는 경우 기본값 사용
+                // 메타데이터 추출 (파일명에서 유추)
+                const title = formatTitle(id);
+                
+                // 카테고리 추정 (파일명에서 유추)
+                let category = determineCategoryFromFilename(id);
+                
+                // 파일명에서 날짜 추출 시도
+                let date = extractDateFromFilename(filename);
+                if (!date) {
+                    // 랜덤 날짜 생성 (최근 30일 이내)
+                    const randomDaysAgo = Math.floor(Math.random() * 30);
+                    const dateObj = new Date();
+                    dateObj.setDate(dateObj.getDate() - randomDaysAgo);
+                    date = dateObj.toISOString().split('T')[0];
+                }
+                
+                // 태그 추정 (파일명에서 유추)
+                const words = id.split('_');
+                const tags = words.filter(word => word.length > 2).slice(0, 3);
+                
+                // 추천 글 여부 (임의 선정)
+                const featured = Math.random() < 0.2; // 약 20% 확률로 추천 글로 지정
+                
+                // 포스트 객체 생성
+                return {
+                    id: id,
+                    title: title,
+                    filename: filename,
+                    date: date,
+                    category: category,
+                    tags: tags,
+                    featured: featured
+                };
+            });
+            
+            // 모든 파일 처리 완료 대기
+            const postsData = await Promise.all(filePromises);
+            
+            // 날짜 기준 내림차순 정렬 (최신 날짜가 먼저 오도록)
+            postsData.sort((a, b) => {
+                const dateA = new Date(a.date);
+                const dateB = new Date(b.date);
+                // 유효한 날짜인지 확인
+                const isValidDateA = !isNaN(dateA.getTime());
+                const isValidDateB = !isNaN(dateB.getTime());
+                
+                // 둘 다 유효한 날짜면 비교
+                if (isValidDateA && isValidDateB) {
+                    return dateB - dateA;
+                }
+                // A만 유효하지 않으면 B가 먼저
+                else if (!isValidDateA && isValidDateB) {
+                    return 1;
+                }
+                // B만 유효하지 않으면 A가 먼저
+                else if (isValidDateA && !isValidDateB) {
+                    return -1;
+                }
+                // 둘 다 유효하지 않으면 원래 순서 유지
+                return 0;
+            });
+            
+            console.log(`실제 파일 기반 포스트 수: ${postsData.length}개 로드됨`);
+            return postsData;
+        } else {
+            console.error('index.json 파일을 로드할 수 없습니다.');
+            return [];
+        }
     } catch (error) {
         console.error('포스트 데이터 로드 오류:', error);
         return [];
     }
 }
 
-// 정적 포스트 데이터 생성
-function getStaticPostData() {
-    // 샘플 데이터: 실제 구현에서는 서버에서 받아오거나 별도 파일로 관리
-    
-    // 샘플 포스트 목록 - 다양한 카테고리를 가진 40개 포스트
-    const knownFiles = [
-        // IT/기술 카테고리
-        'ai_future_jobs_career_skills.html',
-        'ai_future_social_impact.html', 
-        'artificial_intelligence_intro.html',
-        'ceph_rados_crush_deep_dive.html',
-        'ceph_storage_intro.html',
-        
-        // 보안 카테고리
-        'android_version_security.html',
-        'network_security_basics.html',
-        'encryption_guide.html',
-        
-        // 건강 카테고리
-        'anemia_breathlessness.html',
-        'cheonggukjang_benefits.html',
-        'coffee_fatty_liver.html',
-        'dash_diet_guide.html',
-        'vitamin_supplement_guide.html',
-        
-        // 네트워크 카테고리
-        'networking_basic.html',
-        'tcp_ip_protocol.html',
-        
-        // 프로그래밍 카테고리
-        'javascript_basics.html',
-        'python_data_science.html',
-        'react_component_design.html',
-        'golang_concurrency.html',
-        'rust_memory_safety.html'
-    ];
-    
-    // 제목 매핑 테이블
-    const titleMap = {
-        // IT/기술 카테고리
-        "ai_future_jobs_career_skills": "AI 시대의 직업과 필요한 역량",
-        "ai_future_social_impact": "인공지능이 가져올 사회적 영향",
-        "artificial_intelligence_intro": "인공지능 기초 개념 소개",
-        "ceph_rados_crush_deep_dive": "Ceph RADOS/CRUSH 심층 분석",
-        "ceph_storage_intro": "Ceph 스토리지 소개",
-        
-        // 보안 카테고리
-        "android_version_security": "안드로이드 버전별 보안 이슈",
-        "network_security_basics": "네트워크 보안 기초",
-        "encryption_guide": "암호화 기술 가이드",
-        
-        // 건강 카테고리
-        "anemia_breathlessness": "빈혈과 호흡곤란의 관계",
-        "cheonggukjang_benefits": "청국장의 건강상 이점",
-        "coffee_fatty_liver": "커피와 지방간의 관계",
-        "dash_diet_guide": "DASH 다이어트 가이드",
-        "vitamin_supplement_guide": "비타민 보충제 가이드",
-        
-        // 네트워크 카테고리
-        "networking_basic": "네트워킹 기초 개념",
-        "tcp_ip_protocol": "TCP/IP 프로토콜 이해하기",
-        
-        // 프로그래밍 카테고리
-        "javascript_basics": "자바스크립트 기초 문법",
-        "python_data_science": "파이썬으로 시작하는 데이터 과학",
-        "react_component_design": "React 컴포넌트 설계 패턴",
-        "golang_concurrency": "Go 언어의 동시성 프로그래밍",
-        "rust_memory_safety": "Rust의 메모리 안전성 특징"
-    };
-    
-    // 카테고리 매핑 테이블
-    const categoryMap = {
-        // IT/기술 카테고리
-        "ai_future_jobs_career_skills": "IT/기술",
-        "ai_future_social_impact": "IT/기술",
-        "artificial_intelligence_intro": "IT/기술",
-        "ceph_rados_crush_deep_dive": "IT/기술",
-        "ceph_storage_intro": "IT/기술",
-        
-        // 보안 카테고리
-        "android_version_security": "보안",
-        "network_security_basics": "보안",
-        "encryption_guide": "보안",
-        
-        // 건강 카테고리
-        "anemia_breathlessness": "건강",
-        "cheonggukjang_benefits": "건강",
-        "coffee_fatty_liver": "건강",
-        "dash_diet_guide": "건강",
-        "vitamin_supplement_guide": "건강",
-        
-        // 네트워크 카테고리
-        "networking_basic": "네트워크",
-        "tcp_ip_protocol": "네트워크",
-        
-        // 프로그래밍 카테고리
-        "javascript_basics": "프로그래밍",
-        "python_data_science": "프로그래밍",
-        "react_component_design": "프로그래밍",
-        "golang_concurrency": "프로그래밍",
-        "rust_memory_safety": "프로그래밍"
-    };
-    
-    // 태그 매핑 테이블
-    const tagMap = {
-        // IT/기술 카테고리
-        "ai_future_jobs_career_skills": ["AI", "직업", "미래"],
-        "ai_future_social_impact": ["AI", "사회", "영향"],
-        "artificial_intelligence_intro": ["AI", "기초", "소개"],
-        "ceph_rados_crush_deep_dive": ["Ceph", "스토리지", "기술"],
-        "ceph_storage_intro": ["Ceph", "스토리지", "클라우드"],
-        
-        // 보안 카테고리
-        "android_version_security": ["안드로이드", "보안", "모바일"],
-        "network_security_basics": ["네트워크", "보안", "기초"],
-        "encryption_guide": ["암호화", "보안", "가이드"],
-        
-        // 건강 카테고리
-        "anemia_breathlessness": ["건강", "빈혈", "호흡"],
-        "cheonggukjang_benefits": ["건강", "음식", "영양"],
-        "coffee_fatty_liver": ["건강", "음식", "간"],
-        "dash_diet_guide": ["건강", "다이어트", "식이요법"],
-        "vitamin_supplement_guide": ["건강", "비타민", "영양제"],
-        
-        // 네트워크 카테고리
-        "networking_basic": ["네트워크", "기초", "IT"],
-        "tcp_ip_protocol": ["네트워크", "TCP/IP", "프로토콜"],
-        
-        // 프로그래밍 카테고리
-        "javascript_basics": ["자바스크립트", "프로그래밍", "웹"],
-        "python_data_science": ["파이썬", "데이터", "과학"],
-        "react_component_design": ["React", "컴포넌트", "프론트엔드"],
-        "golang_concurrency": ["Go", "동시성", "백엔드"],
-        "rust_memory_safety": ["Rust", "메모리", "안전성"]
-    };
-    
-    const allPosts = [];
-    
-    // 샘플 포스트 생성
-    for (let i = 0; i < knownFiles.length; i++) {
-        const filename = knownFiles[i];
-        const id = filename.replace('.html', '');
-        
-        let title = titleMap[id] || id.split('_').map(word => 
-            word.charAt(0).toUpperCase() + word.slice(1)
-        ).join(' ');
-        
-        // 날짜 - 현재부터 최대 10일 전까지 랜덤하게 생성
-        const daysAgo = Math.floor(Math.random() * 10);
-        const date = new Date();
-        date.setDate(date.getDate() - daysAgo);
-        
-        allPosts.push({
-            id: id,
-            title: title,
-            filename: filename,
-            date: date.toISOString().split('T')[0],
-            category: categoryMap[id] || "기타",
-            tags: tagMap[id] || ["태그1", "태그2"],
-            featured: i < 5  // 5개만 추천 글로 설정
-        });
+// HTML에서 제목 추출 함수
+function extractTitle(html) {
+    // h1 태그에서 제목 추출 시도
+    const h1Match = html.match(/<h1[^>]*>(.*?)<\/h1>/i);
+    if (h1Match && h1Match[1]) {
+        return cleanHtml(h1Match[1]);
     }
     
-    // 날짜 기준 내림차순 정렬
-    allPosts.sort((a, b) => new Date(b.date) - new Date(a.date));
+    // title 태그에서 제목 추출 시도
+    const titleMatch = html.match(/<title[^>]*>(.*?)<\/title>/i);
+    if (titleMatch && titleMatch[1]) {
+        // 사이트 이름 등 불필요한 부분 제거
+        let title = titleMatch[1].replace(/\s*\|.*$/, '').replace(/\s*-.*$/, '');
+        return cleanHtml(title);
+    }
     
-    debugLog(`정적 데이터로 포스트 수: ${allPosts.length}개 로드됨`);
+    return null;
+}
+
+// HTML에서 카테고리 추출 함수
+function extractCategory(html, id) {
+    // meta 태그에서 카테고리 추출 시도
+    const metaMatch = html.match(/<meta\s+name="category"\s+content="([^"]+)"/i);
+    if (metaMatch && metaMatch[1]) {
+        return metaMatch[1];
+    }
     
-    return allPosts;
+    // 특정 클래스나 ID를 가진 요소에서 카테고리 추출 시도
+    const categoryClassMatch = html.match(/<span\s+class="post-category[^"]*"[^>]*>(.*?)<\/span>/i);
+    if (categoryClassMatch && categoryClassMatch[1]) {
+        return cleanHtml(categoryClassMatch[1]);
+    }
+    
+    // 카테고리 클래스 내용 추출 시도
+    const categoryDivMatch = html.match(/<div[^>]*class="[^"]*post-meta[^"]*"[^>]*>.*?<span[^>]*class="[^"]*post-category[^"]*"[^>]*>.*?<i[^>]*><\/i>\s*(.*?)\s*<\/span>/i);
+    if (categoryDivMatch && categoryDivMatch[1]) {
+        return cleanHtml(categoryDivMatch[1]);
+    }
+    
+    // 특정 키워드 기반 카테고리 추정
+    return determineCategoryFromFilename(id);
+}
+
+// HTML에서 날짜 추출 함수
+function extractDate(html, filename) {
+    // meta 태그에서 날짜 추출 시도
+    const metaMatch = html.match(/<meta\s+name="date"\s+content="([^"]+)"/i) || 
+                      html.match(/<meta\s+property="article:published_time"\s+content="([^"]+)"/i);
+    if (metaMatch && metaMatch[1]) {
+        return metaMatch[1].split('T')[0]; // ISO 형식에서 날짜 부분만 추출
+    }
+    
+    // 날짜 클래스를 가진 요소에서 추출 시도
+    const dateClassMatch = html.match(/<span\s+class="post-date[^"]*"[^>]*>(.*?)<\/span>/i);
+    if (dateClassMatch && dateClassMatch[1]) {
+        const dateText = cleanHtml(dateClassMatch[1]);
+        // "2025년 06월 12일" 형식의 날짜를 ISO 형식으로 변환
+        const dateMatch = dateText.match(/(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일/);
+        if (dateMatch) {
+            const year = dateMatch[1];
+            const month = String(dateMatch[2]).padStart(2, '0');
+            const day = String(dateMatch[3]).padStart(2, '0');
+            return `${year}-${month}-${day}`;
+        }
+    }
+    
+    // 파일명에서 날짜 추출 시도 (예: 2023-05-15-post-title.html)
+    const filenameMatch = filename.match(/^(\d{4}-\d{2}-\d{2})-/);
+    if (filenameMatch) {
+        return filenameMatch[1];
+    }
+    
+    // 기본값: 현재 날짜에서 랜덤하게 30일 이내의 날짜 생성
+    const randomDaysAgo = Math.floor(Math.random() * 30);
+    const date = new Date();
+    date.setDate(date.getDate() - randomDaysAgo);
+    return date.toISOString().split('T')[0];
+}
+
+// 파일명을 제목 형식으로 변환
+function formatTitle(id) {
+    return id.split('_').map(word => 
+        word.charAt(0).toUpperCase() + word.slice(1)
+    ).join(' ');
 }
 
 // 포스트 목록 렌더링
@@ -319,8 +422,8 @@ function renderPostList(filterCategory = 'all') {
         return;
     }
     
-    // 최대 10개만 표시하도록 제한
-    const displayPosts = filteredPosts.slice(0, 10);
+    // 모든 게시글 표시
+    const displayPosts = filteredPosts;
     console.log(`표시할 포스트 수: ${displayPosts.length}개`);
     
     // 포스트 항목을 목록에 추가
@@ -330,11 +433,8 @@ function renderPostList(filterCategory = 'all') {
         listItem.setAttribute('data-id', post.id);
         
         const postLink = document.createElement('a');
-        // 정적 HTML 페이지 경로로 변경
         postLink.href = `posts/${post.id}.html`;
         postLink.textContent = post.title;
-        
-        // 클릭 이벤트 핸들러 제거 (정적 페이지로 직접 이동)
         
         const postDate = document.createElement('span');
         postDate.className = 'post-date';
@@ -421,87 +521,17 @@ function populateCategoryOptions() {
         });
         
         console.log("카테고리 옵션 채우기 완료");
+        
+        // 카테고리 변경 이벤트 리스너 다시 추가
+        if (categorySelect) {
+            categorySelect.addEventListener('change', function(e) {
+                const selectedCategory = e.target.value;
+                renderPostList(selectedCategory);
+            });
+        }
     } catch (error) {
         console.error('카테고리 옵션 채우기 오류:', error);
     }
-}
-
-// 추천 글 목록 렌더링
-function renderFeaturedPosts() {
-    if (!featuredList) {
-        debugLog('featuredList 요소가 없습니다');
-        // featuredList 요소가 없으면 찾아서 설정
-        featuredList = document.getElementById('featuredList');
-        if (!featuredList) {
-            debugLog('featuredList 요소를 찾을 수 없습니다');
-            return;
-        }
-    }
-    
-    // 포스트가 없는 경우 처리
-    if (!posts || posts.length === 0) {
-        debugLog('렌더링할 포스트가 없습니다');
-        featuredList.innerHTML = '<div class="featured-card no-posts">추천 글이 없습니다.</div>';
-        return;
-    }
-    
-    const featuredPosts = posts.filter(post => post.featured === true);
-    
-    if (featuredPosts.length === 0) {
-        debugLog('추천 글이 없습니다');
-        featuredList.innerHTML = '<div class="featured-card no-posts">추천 글이 없습니다.</div>';
-        return;
-    }
-    
-    debugLog(`추천 글 수: ${featuredPosts.length}개`);
-    
-    // 최대 5개까지만 표시
-    const postsToShow = featuredPosts.slice(0, 5);
-    
-    // 카드 디자인으로 변경
-    featuredList.innerHTML = '';
-    featuredList.className = 'featured-cards-container';
-    
-    postsToShow.forEach(post => {
-        const card = document.createElement('div');
-        card.className = 'featured-card';
-        
-        const cardTitle = document.createElement('h4');
-        cardTitle.className = 'card-title';
-        
-        const cardLink = document.createElement('a');
-        cardLink.href = `posts/${post.id}.html`;
-        cardLink.textContent = post.title;
-        
-        // 클릭 이벤트 추가 (정적 페이지로 직접 이동)
-        cardLink.onclick = function(e) {
-            e.preventDefault();
-            window.location.href = cardLink.href;
-        };
-        
-        cardTitle.appendChild(cardLink);
-        
-        const cardMeta = document.createElement('div');
-        cardMeta.className = 'card-meta';
-        
-        const cardDate = document.createElement('span');
-        cardDate.className = 'card-date';
-        cardDate.innerHTML = `<i class="fas fa-calendar-alt"></i> ${formatDate(post.date)}`;
-        
-        const cardCategory = document.createElement('span');
-        cardCategory.className = 'card-category';
-        cardCategory.innerHTML = `<i class="fas fa-folder"></i> ${post.category}`;
-        
-        cardMeta.appendChild(cardDate);
-        cardMeta.appendChild(cardCategory);
-        
-        card.appendChild(cardTitle);
-        card.appendChild(cardMeta);
-        
-        featuredList.appendChild(card);
-    });
-    
-    debugLog('추천 글 렌더링 완료');
 }
 
 // 최신 포스트 로드 함수
@@ -527,8 +557,20 @@ async function loadLatestPost() {
             return;
         }
         
-        console.log('최신 포스트:', latestPosts[0]);
         const latestPost = latestPosts[0];
+        console.log('최신 포스트:', latestPost);
+        
+        // 최근 3주 이내 최신 글 필터링
+        const threeWeeksAgo = new Date();
+        threeWeeksAgo.setDate(threeWeeksAgo.getDate() - 21); // 3주 = 21일
+        
+        // 3주 이내의 글 필터링
+        const recentPosts = latestPosts.filter(post => new Date(post.date) >= threeWeeksAgo);
+        console.log(`최근 3주 이내 글 수: ${recentPosts.length}개`);
+        
+        // 추천 글 필터링
+        const featuredPosts = latestPosts.filter(post => post.featured === true).slice(0, 8);
+        console.log(`추천 글 수: ${featuredPosts.length}개`);
         
         // 최신 포스트 미리보기 컨텐츠 생성
         const excerptContent = `
@@ -540,6 +582,44 @@ async function loadLatestPost() {
         let tagsHtml = '';
         if (latestPost.tags && latestPost.tags.length > 0) {
             tagsHtml = latestPost.tags.map(tag => `<span class="post-tag">${tag}</span>`).join('');
+        }
+        
+        // 최근 글 목록 HTML 생성
+        let recentPostsHtml = '';
+        if (recentPosts.length > 1) {
+            // 최신 글을 제외한 나머지 최근 글 목록 (최대 5개)
+            const otherRecentPosts = recentPosts.slice(1, 6);
+            if (otherRecentPosts.length > 0) {
+                recentPostsHtml = `
+                <div class="recent-posts">
+                    <h3>최근 글</h3>
+                    <ul class="recent-posts-list">
+                        ${otherRecentPosts.map(post => 
+                            `<li class="recent-post-item">
+                                <a href="./posts/${post.id}.html">${post.title}</a>
+                                <span class="post-date">${formatDate(post.date)}</span>
+                            </li>`
+                        ).join('')}
+                    </ul>
+                </div>`;
+            }
+        }
+        
+        // 추천 글 목록 HTML 생성
+        let featuredPostsHtml = '';
+        if (featuredPosts.length > 0) {
+            featuredPostsHtml = `
+            <div class="featured-posts" style="border-left: 4px solid #e74c3c;">
+                <h3>추천 글</h3>
+                <ul class="recent-posts-list">
+                    ${featuredPosts.map(post => 
+                        `<li class="recent-post-item">
+                            <a href="./posts/${post.id}.html">${post.title}</a>
+                            <span class="post-date">${formatDate(post.date)}</span>
+                        </li>`
+                    ).join('')}
+                </ul>
+            </div>`;
         }
         
         // 마크다운 컨텐츠 영역에 포스트 출력
@@ -567,20 +647,9 @@ async function loadLatestPost() {
                     </div>
                 </footer>
             </article>
-            <div class="featured-posts">
-                <h3>추천 글</h3>
-                <div id="featuredList" class="featured-cards-container">
-                    <!-- 추천 글 목록이 여기에 동적으로 로드됨 -->
-                    <div class="featured-card loading">추천 글을 불러오는 중...</div>
-                </div>
-            </div>
+            ${recentPostsHtml}
+            ${featuredPostsHtml}
         </div>`;
-        
-        // featuredList 요소 다시 참조 (innerHTML이 변경되었으므로)
-        featuredList = document.getElementById('featuredList');
-        
-        // 추천 글 목록 렌더링
-        renderFeaturedPosts();
         
     } catch (error) {
         console.error('최신 포스트 로드 실패:', error);
@@ -590,21 +659,25 @@ async function loadLatestPost() {
         <div class="welcome-message">
             <h2>기술 블로그에 오신 것을 환영합니다</h2>
             <p>왼쪽 목록에서 관심있는 글을 선택하세요.</p>
-            <div class="featured-posts">
-                <h3>추천 글</h3>
-                <div id="featuredList" class="featured-cards-container">
-                    <!-- 추천 글 목록이 여기에 동적으로 로드됨 -->
-                    <div class="featured-card loading">추천 글을 불러오는 중...</div>
-                </div>
-            </div>
         </div>`;
-        
-        // featuredList 요소 다시 참조
-        featuredList = document.getElementById('featuredList');
-        
-        // 추천 글 목록 렌더링
-        renderFeaturedPosts();
     }
+}
+
+// 파일명에서 날짜 추출 함수
+function extractDateFromFilename(filename) {
+    // YYYY-MM-DD 형식의 날짜 추출
+    const dateMatch = filename.match(/^(\d{4}-\d{2}-\d{2})/);
+    if (dateMatch) {
+        return dateMatch[1];
+    }
+    
+    // YYYYMMDD 형식의 날짜 추출
+    const dateMatch2 = filename.match(/^(\d{4})(\d{2})(\d{2})/);
+    if (dateMatch2) {
+        return `${dateMatch2[1]}-${dateMatch2[2]}-${dateMatch2[3]}`;
+    }
+    
+    return null;
 }
 
 // 공통 요소 로드
