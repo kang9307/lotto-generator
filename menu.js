@@ -42,6 +42,12 @@ const menuItems = [
         isActive: false
     },
     {
+        id: 'speed_test',
+        name: '속도 측정기',
+        url: 'speed_test.html',
+        isActive: false
+    },
+    {
         id: 'blog',
         name: '블로그',
         url: 'blog.html',
