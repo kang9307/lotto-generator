@@ -14,7 +14,6 @@ document.addEventListener('DOMContentLoaded', function() {
         setupHarmonyButtons();
         setupSliders();
         setupPresetButtons();
-        setupSocialShare();
         generateInitialPalette();
         updateAccessibility();
     }
@@ -485,33 +484,7 @@ document.addEventListener('DOMContentLoaded', function() {
     }
     
     // 소셜 공유 설정
-    function setupSocialShare() {
-        document.getElementById('kakao-share').addEventListener('click', () => {
-            const shareUrl = `https://sharer.kakao.com/talk/friends/picker/link?url=${encodeURIComponent(window.location.href)}&text=${encodeURIComponent('색상 팔레트 생성기 - 현업용 색상 도구')}`;
-            window.open(shareUrl, 'kakaotalk_share', 'width=350, height=650');
-        });
-        
-        document.getElementById('facebook-share').addEventListener('click', () => {
-            const shareUrl = `https://www.facebook.com/sharer/sharer.php?u=${encodeURIComponent(window.location.href)}`;
-            window.open(shareUrl, 'facebook-share-dialog', 'width=626,height=436');
-        });
-        
-        document.getElementById('twitter-share').addEventListener('click', () => {
-            const text = '색상 팔레트 생성기 - 현업용 색상 도구로 완벽한 색상 조합을 만들어보세요!';
-            const shareUrl = `https://twitter.com/intent/tweet?text=${encodeURIComponent(text)}&url=${encodeURIComponent(window.location.href)}`;
-            window.open(shareUrl, 'twitter-share-dialog', 'width=626,height=436');
-        });
-        
-        document.getElementById('threads-share').addEventListener('click', () => {
-            copyToClipboard(window.location.href);
-            showToast('링크가 복사되었습니다. 쓰레드 앱에 붙여넣기하여 공유하세요!');
-        });
-        
-        document.getElementById('link-copy').addEventListener('click', () => {
-            copyToClipboard(window.location.href);
-            showToast('링크가 복사되었습니다!');
-        });
-    }
+    // 소셜 공유는 HTML에서 처리되므로 여기서는 제거
     
     // 유틸리티 함수들
     function hexToRgb(hex) {
