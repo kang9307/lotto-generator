@@ -62,6 +62,7 @@ function determineCategoryFromFilename(id) {
         "ai_future_social_impact": "IT/기술",
         "artificial_intelligence_intro": "IT/기술",
         "ai_technology_2025_comparison": "IT/기술",
+        "quince_benefits_liquor_guide": "건강",
         "android_version_security": "보안",
         "korea_presidential_election_2025": "사회/경제",
         "korea_21st_president_inauguration": "사회/경제",
