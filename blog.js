@@ -181,10 +181,37 @@ async function loadPostData() {
     try {
         debugLog('포스트 데이터 로드 시작');
         
-        // posts 디렉토리의 index.json 파일에서 실제 존재하는 파일 목록을 가져옵니다
+        // posts 디렉토리의 index.json 파일에서 posts 배열을 가져옵니다
         const response = await fetch('./posts/index.json');
                 if (response.ok) {
             const data = await response.json();
+            
+            // index.json에 posts 배열이 있으면 그것을 우선 사용
+            if (data.posts && data.posts.length > 0) {
+                console.log(`index.json에서 ${data.posts.length}개의 포스트 로드됨`);
+                
+                // posts 배열을 그대로 사용하되, 필요한 필드 보정
+                const postsData = data.posts.map(post => {
+                    const id = post.id || (post.filename ? post.filename.replace('.html', '') : '');
+                    return {
+                        id: id,
+                        title: post.title || formatTitle(id),
+                        filename: post.filename || `${id}.html`,
+                        date: post.date || new Date().toISOString().split('T')[0],
+                        category: post.category || determineCategoryFromFilename(id),
+                        tags: post.keywords ? post.keywords.split(',').map(k => k.trim()).slice(0, 5) : [],
+                        featured: post.featured || false
+                    };
+                });
+                
+                // 날짜 기준 내림차순 정렬
+                postsData.sort((a, b) => new Date(b.date) - new Date(a.date));
+                
+                console.log(`포스트 데이터 정렬 완료: ${postsData.length}개`);
+                return postsData;
+            }
+            
+            // posts 배열이 없으면 files 배열에서 생성 (구 방식 호환)
             const files = data.files || [];
             
             // 실제 존재하는 파일만으로 포스트 데이터 생성
