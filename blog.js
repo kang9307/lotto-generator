@@ -13,9 +13,19 @@ let markdownContent = null;
 let totalPostsEl = null;
 let featuredList = null;
 let categorySelect = null;
-    let posts = [];
-    let currentPost = null;
+let posts = [];
+let currentPost = null;
 let postsDir = './posts/';
+let basePath = './';  // 다국어 지원을 위한 기본 경로
+
+// 언어 경로 감지 함수
+function detectBasePath() {
+    const path = window.location.pathname;
+    if (path.startsWith('/en/') || path.startsWith('/ja/') || path.startsWith('/zh/')) {
+        return '../';
+    }
+    return './';
+}
 
 // 디버그 로깅 함수
 function debugLog(message) {
@@ -109,6 +119,11 @@ function determineCategoryFromFilename(id) {
 // 블로그 페이지 초기화
 async function initBlog() {
     try {
+        // 다국어 지원을 위한 기본 경로 설정
+        basePath = detectBasePath();
+        postsDir = basePath + 'posts/';
+        debugLog(`기본 경로: ${basePath}, 포스트 경로: ${postsDir}`);
+
         loadCommonElements();
         debugLog('블로그 페이지 초기화 시작');
         
@@ -182,7 +197,7 @@ async function loadPostData() {
         debugLog('포스트 데이터 로드 시작');
         
         // posts 디렉토리의 index.json 파일에서 posts 배열을 가져옵니다
-        const response = await fetch('./posts/index.json');
+        const response = await fetch(basePath + 'posts/index.json');
                 if (response.ok) {
             const data = await response.json();
             
@@ -224,7 +239,7 @@ async function loadPostData() {
                 
                 try {
                     // HTML 파일에서 제목과 카테고리 추출 시도
-                    const fileResponse = await fetch(`./posts/${filename}`);
+                    const fileResponse = await fetch(`${basePath}posts/${filename}`);
                     if (fileResponse.ok) {
                         const html = await fileResponse.text();
                         
@@ -462,7 +477,7 @@ function formatTitle(id) {
             listItem.setAttribute('data-id', post.id);
             
             const postLink = document.createElement('a');
-        postLink.href = `posts/${post.id}.html`;
+        postLink.href = `${basePath}posts/${post.id}.html`;
             postLink.textContent = post.title;
             
             const postDate = document.createElement('span');
@@ -623,9 +638,9 @@ async function loadLatestPost() {
                 <div class="recent-posts">
                     <h3>최근 글</h3>
                     <ul class="recent-posts-list">
-                        ${otherRecentPosts.map(post => 
+                        ${otherRecentPosts.map(post =>
                             `<li class="recent-post-item">
-                                <a href="./posts/${post.id}.html">${post.title}</a>
+                                <a href="${basePath}posts/${post.id}.html">${post.title}</a>
                                 <span class="post-date">${formatDate(post.date)}</span>
                             </li>`
                         ).join('')}
@@ -641,9 +656,9 @@ async function loadLatestPost() {
             <div class="featured-posts" style="border-left: 4px solid #e74c3c;">
                 <h3>추천 글</h3>
                 <ul class="recent-posts-list">
-                    ${featuredPosts.map(post => 
+                    ${featuredPosts.map(post =>
                         `<li class="recent-post-item">
-                            <a href="./posts/${post.id}.html">${post.title}</a>
+                            <a href="${basePath}posts/${post.id}.html">${post.title}</a>
                             <span class="post-date">${formatDate(post.date)}</span>
                         </li>`
                     ).join('')}
@@ -657,7 +672,7 @@ async function loadLatestPost() {
             <h2>최신 글</h2>
             <article class="post post-preview">
                 <header class="post-header">
-                    <h1 class="post-title"><a href="./posts/${latestPost.id}.html">${latestPost.title}</a></h1>
+                    <h1 class="post-title"><a href="${basePath}posts/${latestPost.id}.html">${latestPost.title}</a></h1>
                     <div class="post-meta">
                         <span class="post-date"><i class="fas fa-calendar-alt"></i> ${formatDate(latestPost.date)}</span>
                         <span class="post-category"><i class="fas fa-folder"></i> ${latestPost.category}</span>
@@ -665,14 +680,14 @@ async function loadLatestPost() {
                 </header>
                 <div class="post-content">
                     ${excerptContent}
-                    <p class="read-more"><a href="./posts/${latestPost.id}.html">더 보기...</a></p>
+                    <p class="read-more"><a href="${basePath}posts/${latestPost.id}.html">더 보기...</a></p>
                 </div>
                 <footer class="post-footer">
                     <div class="post-tags">
                         ${tagsHtml}
                     </div>
                     <div class="read-full">
-                        <a href="./posts/${latestPost.id}.html" class="read-more-link">글 전체 보기</a>
+                        <a href="${basePath}posts/${latestPost.id}.html" class="read-more-link">글 전체 보기</a>
                     </div>
                 </footer>
             </article>
@@ -714,9 +729,9 @@ function loadCommonElements() {
     // 헤더와 푸터 로드
     const headerContainer = document.getElementById('root-header');
     const footerContainer = document.getElementById('root-footer');
-    
+
     if (headerContainer) {
-        fetch('./components/root-header.html')
+        fetch(basePath + 'components/root-header.html')
             .then(response => response.text())
             .then(html => {
                 headerContainer.innerHTML = html;
@@ -725,9 +740,9 @@ function loadCommonElements() {
                 console.error('헤더 로드 실패:', error);
             });
     }
-    
+
     if (footerContainer) {
-        fetch('./components/root-footer.html')
+        fetch(basePath + 'components/root-footer.html')
             .then(response => response.text())
             .then(html => {
                 footerContainer.innerHTML = html;

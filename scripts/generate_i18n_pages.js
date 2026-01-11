@@ -439,6 +439,18 @@ function main() {
                 }
             }
             console.log(`\n   블로그 포스트: ${postCount}개 생성`);
+
+            // posts/index.json 복사 (blog.js에서 사용)
+            const indexJsonSource = path.join(postsDir, 'index.json');
+            const indexJsonTarget = path.join(ROOT_DIR, lang, 'posts', 'index.json');
+            if (fs.existsSync(indexJsonSource)) {
+                try {
+                    fs.copyFileSync(indexJsonSource, indexJsonTarget);
+                    console.log(`   📋 index.json 복사 완료`);
+                } catch (error) {
+                    console.log(`   ⚠️  index.json 복사 실패: ${error.message}`);
+                }
+            }
         }
     }
 
