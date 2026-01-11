@@ -26,6 +26,7 @@ const today = new Date().toISOString().split('T')[0];
 // 메인 페이지 및 도구 페이지 목록
 const mainPages = [
     { path: '/', priority: '1.0', changefreq: 'weekly' },
+    { path: '/static_index.html', priority: '0.95', changefreq: 'weekly' },
     { path: '/blog.html', priority: '0.9', changefreq: 'daily' },
     { path: '/lotto.html', priority: '0.8', changefreq: 'weekly' },
     { path: '/powerball.html', priority: '0.8', changefreq: 'weekly' },
@@ -51,7 +52,25 @@ const mainPages = [
     { path: '/mindfulness.html', priority: '0.8', changefreq: 'monthly' },
     { path: '/brain-games.html', priority: '0.9', changefreq: 'weekly' },
     { path: '/tetris.html', priority: '0.9', changefreq: 'monthly' },
+    { path: '/my_day.html', priority: '0.8', changefreq: 'daily' },
     { path: '/privacy.html', priority: '0.5', changefreq: 'monthly' },
+];
+
+// static 폴더 페이지 목록
+const staticPages = [
+    { path: '/static/salary_calculator.html', priority: '0.8', changefreq: 'monthly' },
+    { path: '/static/age_calculator.html', priority: '0.8', changefreq: 'monthly' },
+    { path: '/static/char_counter.html', priority: '0.8', changefreq: 'monthly' },
+    { path: '/static/daily_work_calculator.html', priority: '0.8', changefreq: 'monthly' },
+    { path: '/static/fortune_zodiac.html', priority: '0.8', changefreq: 'daily' },
+    { path: '/static/icon_generator.html', priority: '0.8', changefreq: 'monthly' },
+    { path: '/static/jeonse_wolse_calculator.html', priority: '0.8', changefreq: 'monthly' },
+    { path: '/static/mbti_compatibility.html', priority: '0.8', changefreq: 'monthly' },
+    { path: '/static/nickname_generator.html', priority: '0.8', changefreq: 'monthly' },
+    { path: '/static/random_menu.html', priority: '0.8', changefreq: 'monthly' },
+    { path: '/static/relaxing_day.html', priority: '0.8', changefreq: 'monthly' },
+    { path: '/static/token_counter.html', priority: '0.8', changefreq: 'monthly' },
+    { path: '/static/vnd_krw_calculator.html', priority: '0.8', changefreq: 'monthly' },
 ];
 
 // posts 폴더에서 HTML 파일 목록 가져오기
@@ -137,7 +156,37 @@ function generateSitemap() {
 
     console.log(`   ✅ ${mainPages.length * LANGUAGES.length}개 페이지 추가됨\n`);
 
-    // 2. 블로그 포스트 추가 (모든 언어 버전)
+    // 2. static 폴더 페이지 추가 (모든 언어 버전)
+    console.log('📁 static 폴더 페이지 추가 중...');
+
+    for (const page of staticPages) {
+        // 한국어 버전 (기본)
+        xml += '  <url>\n';
+        xml += `    <loc>${BASE_URL}${page.path}</loc>\n`;
+        xml += `${generateHreflangLinks(page.path)}\n`;
+        xml += `    <lastmod>${today}</lastmod>\n`;
+        xml += `    <changefreq>${page.changefreq}</changefreq>\n`;
+        xml += `    <priority>${page.priority}</priority>\n`;
+        xml += '  </url>\n';
+        totalUrls++;
+
+        // 다른 언어 버전
+        for (const lang of LANGUAGES.filter(l => l !== 'ko')) {
+            const langPriority = (parseFloat(page.priority) * 0.95).toFixed(2);
+            xml += '  <url>\n';
+            xml += `    <loc>${BASE_URL}/${lang}${page.path}</loc>\n`;
+            xml += `${generateHreflangLinks(page.path)}\n`;
+            xml += `    <lastmod>${today}</lastmod>\n`;
+            xml += `    <changefreq>${page.changefreq}</changefreq>\n`;
+            xml += `    <priority>${langPriority}</priority>\n`;
+            xml += '  </url>\n';
+            totalUrls++;
+        }
+    }
+
+    console.log(`   ✅ ${staticPages.length * LANGUAGES.length}개 페이지 추가됨\n`);
+
+    // 3. 블로그 포스트 추가 (모든 언어 버전)
     console.log('📝 블로그 포스트 추가 중...');
     const postIds = getPostFiles();
 
