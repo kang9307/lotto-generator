@@ -1,14 +1,14 @@
 /**
- * sitemap.xml 완전 재생성 스크립트
+ * sitemap.xml 다국어 지원 생성 스크립트
  * Copyright (c) 2025 braindetox.kr
- * 
+ *
  * 사용법: node generate_sitemap.js
- * 
+ *
  * 기능:
  * - posts 폴더의 모든 HTML 파일 자동 스캔
  * - 모든 도구 페이지 포함
+ * - 다국어 hreflang 링크 포함 (xhtml:link)
  * - 정적 URL 사용 (파라미터 URL 제거)
- * - 일관된 XML 포맷
  */
 
 const fs = require('fs');
@@ -16,6 +16,7 @@ const path = require('path');
 
 // 설정
 const BASE_URL = 'https://braindetox.kr';
+const LANGUAGES = ['ko', 'en', 'ja', 'zh'];
 const postsDir = path.join(__dirname, 'posts');
 const sitemapPath = path.join(__dirname, 'sitemap.xml');
 
@@ -76,53 +77,110 @@ function getFileModDate(filePath) {
     }
 }
 
+// hreflang 링크 생성
+function generateHreflangLinks(pagePath) {
+    let links = '';
+
+    for (const lang of LANGUAGES) {
+        let href;
+        if (lang === 'ko') {
+            href = `${BASE_URL}${pagePath}`;
+        } else {
+            href = `${BASE_URL}/${lang}${pagePath}`;
+        }
+        links += `    <xhtml:link rel="alternate" hreflang="${lang}" href="${href}"/>\n`;
+    }
+
+    // x-default (한국어를 기본으로)
+    links += `    <xhtml:link rel="alternate" hreflang="x-default" href="${BASE_URL}${pagePath}"/>`;
+
+    return links;
+}
+
 // sitemap.xml 생성
 function generateSitemap() {
-    console.log('🔄 sitemap.xml 생성 시작...\n');
-    
+    console.log('🔄 sitemap.xml 다국어 지원 생성 시작...\n');
+
     let xml = '<?xml version="1.0" encoding="UTF-8"?>\n';
-    xml += '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n';
-    
-    // 1. 메인 페이지 추가
+    xml += '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"\n';
+    xml += '        xmlns:xhtml="http://www.w3.org/1999/xhtml">\n';
+
+    let totalUrls = 0;
+
+    // 1. 메인 페이지 추가 (모든 언어 버전)
     console.log('📄 메인/도구 페이지 추가 중...');
-    mainPages.forEach(page => {
+
+    for (const page of mainPages) {
+        // 한국어 버전 (기본)
         xml += '  <url>\n';
         xml += `    <loc>${BASE_URL}${page.path}</loc>\n`;
+        xml += `${generateHreflangLinks(page.path)}\n`;
         xml += `    <lastmod>${today}</lastmod>\n`;
         xml += `    <changefreq>${page.changefreq}</changefreq>\n`;
         xml += `    <priority>${page.priority}</priority>\n`;
         xml += '  </url>\n';
-    });
-    console.log(`   ✅ ${mainPages.length}개 페이지 추가됨\n`);
-    
-    // 2. 블로그 포스트 추가 (정적 URL 사용!)
+        totalUrls++;
+
+        // 다른 언어 버전
+        for (const lang of LANGUAGES.filter(l => l !== 'ko')) {
+            const langPriority = (parseFloat(page.priority) * 0.95).toFixed(2);
+            xml += '  <url>\n';
+            xml += `    <loc>${BASE_URL}/${lang}${page.path}</loc>\n`;
+            xml += `${generateHreflangLinks(page.path)}\n`;
+            xml += `    <lastmod>${today}</lastmod>\n`;
+            xml += `    <changefreq>${page.changefreq}</changefreq>\n`;
+            xml += `    <priority>${langPriority}</priority>\n`;
+            xml += '  </url>\n';
+            totalUrls++;
+        }
+    }
+
+    console.log(`   ✅ ${mainPages.length * LANGUAGES.length}개 페이지 추가됨\n`);
+
+    // 2. 블로그 포스트 추가 (모든 언어 버전)
     console.log('📝 블로그 포스트 추가 중...');
     const postIds = getPostFiles();
-    
-    postIds.forEach(postId => {
+
+    for (const postId of postIds) {
         const filePath = path.join(postsDir, `${postId}.html`);
         const lastmod = getFileModDate(filePath);
-        
-        // 정적 URL 사용! (파라미터 URL 아님)
+        const pagePath = `/posts/${postId}.html`;
+
+        // 한국어 버전 (기본)
         xml += '  <url>\n';
-        xml += `    <loc>${BASE_URL}/posts/${postId}.html</loc>\n`;
+        xml += `    <loc>${BASE_URL}${pagePath}</loc>\n`;
+        xml += `${generateHreflangLinks(pagePath)}\n`;
         xml += `    <lastmod>${lastmod}</lastmod>\n`;
         xml += '    <changefreq>monthly</changefreq>\n';
         xml += '    <priority>0.7</priority>\n';
         xml += '  </url>\n';
-    });
-    console.log(`   ✅ ${postIds.length}개 포스트 추가됨\n`);
-    
+        totalUrls++;
+
+        // 다른 언어 버전
+        for (const lang of LANGUAGES.filter(l => l !== 'ko')) {
+            xml += '  <url>\n';
+            xml += `    <loc>${BASE_URL}/${lang}${pagePath}</loc>\n`;
+            xml += `${generateHreflangLinks(pagePath)}\n`;
+            xml += `    <lastmod>${lastmod}</lastmod>\n`;
+            xml += '    <changefreq>monthly</changefreq>\n';
+            xml += '    <priority>0.65</priority>\n';
+            xml += '  </url>\n';
+            totalUrls++;
+        }
+    }
+
+    console.log(`   ✅ ${postIds.length * LANGUAGES.length}개 포스트 추가됨\n`);
+
     xml += '</urlset>';
-    
+
     // 파일 저장
     fs.writeFileSync(sitemapPath, xml, 'utf8');
-    
+
     // 결과 출력
-    const totalUrls = mainPages.length + postIds.length;
     console.log('═'.repeat(50));
-    console.log(`✅ sitemap.xml 생성 완료!`);
+    console.log(`✅ sitemap.xml 다국어 지원 생성 완료!`);
     console.log(`   📊 총 URL 수: ${totalUrls}개`);
+    console.log(`   🌐 지원 언어: ${LANGUAGES.join(', ')}`);
     console.log(`   📅 lastmod: ${today}`);
     console.log(`   📁 파일 위치: ${sitemapPath}`);
     console.log('═'.repeat(50));
@@ -134,6 +192,3 @@ function generateSitemap() {
 
 // 실행
 generateSitemap();
-
-
-
