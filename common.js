@@ -298,7 +298,8 @@ document.addEventListener('DOMContentLoaded', async function() {
             subnet: '서브넷 계산기',
             password: '비밀번호 생성기',
             qrcode: 'QR 코드 생성기',
-            datetime: '시간/날짜 계산기'
+            datetime: '시간/날짜 계산기',
+            tools: '무료 도구 모음'
         };
         return defaultTexts[key] || key;
     }
@@ -332,10 +333,10 @@ document.addEventListener('DOMContentLoaded', async function() {
                 // 하위 디렉토리용 헤더
                 headerPlaceholder.innerHTML = `
                 <header class="main-header">
-                    <div class="header-container">
-                        <div class="header-top" style="display: flex; justify-content: space-between; align-items: center;">
-                            <h1 class="site-title" style="text-align: center; margin-bottom: 8px; flex: 1;"><a href="${projectRoot}index.html" style="color: inherit; text-decoration: none; font-weight: 900 !important;">BrainDetox Utility Box</a></h1>
-                            ${langSwitcher}
+                    <div class="header-container" style="position: relative;">
+                        <div class="lang-switcher-nav" style="position: absolute; right: 10px; top: 10px; z-index: 100;">${langSwitcher}</div>
+                        <div class="header-top" style="text-align: center;">
+                            <h1 class="site-title" style="display: inline-block; margin-bottom: 8px;"><a href="${projectRoot}index.html" style="color: inherit; text-decoration: none; font-weight: 900 !important;">BrainDetox Utility Box</a></h1>
                         </div>
                         <nav class="main-nav" style="margin-top: 5px;">
                             <ul class="nav-list" style="gap: 10px; display: flex; justify-content: center; flex-wrap: wrap;">
@@ -359,6 +360,9 @@ document.addEventListener('DOMContentLoaded', async function() {
                                 </li>
                                 <li class="nav-item">
                                     <a href="${projectRoot}datetime.html" class="nav-link">${getNavText('datetime')}</a>
+                                </li>
+                                <li class="nav-item">
+                                    <a href="${projectRoot}static_index.html" class="nav-link">${getNavText('tools')}</a>
                                 </li>
                             </ul>
                         </nav>
@@ -368,10 +372,10 @@ document.addEventListener('DOMContentLoaded', async function() {
                 // 루트 디렉토리용 헤더
                 headerPlaceholder.innerHTML = `
                 <header class="main-header">
-                    <div class="header-container">
-                        <div class="header-top" style="display: flex; justify-content: space-between; align-items: center;">
-                            <h1 class="site-title" style="text-align: center; margin-bottom: 8px; flex: 1;"><a href="${projectRoot}index.html" style="color: inherit; text-decoration: none; font-weight: 900 !important;">BrainDetox Utility Box</a></h1>
-                            ${langSwitcher}
+                    <div class="header-container" style="position: relative;">
+                        <div class="lang-switcher-nav" style="position: absolute; right: 10px; top: 10px; z-index: 100;">${langSwitcher}</div>
+                        <div class="header-top" style="text-align: center;">
+                            <h1 class="site-title" style="display: inline-block; margin-bottom: 8px;"><a href="${projectRoot}index.html" style="color: inherit; text-decoration: none; font-weight: 900 !important;">BrainDetox Utility Box</a></h1>
                         </div>
                         <nav class="main-nav" style="margin-top: 5px;">
                             <ul class="nav-list" style="gap: 10px; display: flex; justify-content: center; flex-wrap: wrap;">
@@ -395,6 +399,9 @@ document.addEventListener('DOMContentLoaded', async function() {
                                 </li>
                                 <li class="nav-item">
                                     <a href="${projectRoot}datetime.html" class="nav-link">${getNavText('datetime')}</a>
+                                </li>
+                                <li class="nav-item">
+                                    <a href="${projectRoot}static_index.html" class="nav-link">${getNavText('tools')}</a>
                                 </li>
                             </ul>
                         </nav>
@@ -493,19 +500,21 @@ document.addEventListener('DOMContentLoaded', async function() {
         }
     }
 
-    // 헤더에 언어 전환 UI 추가 (네비게이션 바 오른쪽 끝에 배치)
+    // 헤더에 언어 전환 UI 추가 (메뉴 바 오른쪽 끝에 배치)
     function addLanguageSwitcherToHeader() {
-        const navList = document.querySelector('.nav-list');
-        if (navList && !document.querySelector('.language-switcher')) {
+        // 이미 언어 스위처가 있으면 스킵
+        if (document.querySelector('.language-switcher')) return;
+
+        const headerContainer = document.querySelector('.header-container');
+
+        if (headerContainer) {
             const langSwitcherHtml = createLanguageSwitcher();
-
-            // nav-item으로 감싸서 네비게이션에 추가
-            const langNavItem = document.createElement('li');
-            langNavItem.className = 'nav-item lang-nav-item';
-            langNavItem.innerHTML = langSwitcherHtml;
-
-            // 네비게이션 리스트 마지막에 추가
-            navList.appendChild(langNavItem);
+            const langDiv = document.createElement('div');
+            langDiv.className = 'lang-switcher-nav';
+            langDiv.style.cssText = 'position: absolute; right: 10px; top: 10px; z-index: 100;';
+            langDiv.innerHTML = langSwitcherHtml;
+            headerContainer.style.position = 'relative';
+            headerContainer.insertBefore(langDiv, headerContainer.firstChild);
         }
     }
 

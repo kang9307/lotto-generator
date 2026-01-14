@@ -52,6 +52,12 @@ const menuItems = [
         name: '블로그',
         url: 'blog.html',
         isActive: false
+    },
+    {
+        id: 'static_tools',
+        name: '무료 도구 모음',
+        url: 'static_index.html',
+        isActive: false
     }
     // 추가 메뉴는 여기에 계속 추가할 수 있습니다
 ];
