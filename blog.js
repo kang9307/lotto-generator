@@ -16,7 +16,8 @@ let categorySelect = null;
 let posts = [];
 let currentPost = null;
 let postsDir = './posts/';
-let basePath = './';  // 다국어 지원을 위한 기본 경로
+let basePath = './';  // 공통 컴포넌트(header, footer) 로딩용 기본 경로
+let postsBasePath = './';  // 포스트 로딩용 기본 경로 (항상 현재 페이지 기준)
 
 // 언어 경로 감지 함수
 function detectBasePath() {
@@ -120,8 +121,8 @@ function determineCategoryFromFilename(id) {
 async function initBlog() {
     try {
         // 다국어 지원을 위한 기본 경로 설정
-        basePath = detectBasePath();
-        postsDir = basePath + 'posts/';
+        basePath = detectBasePath();  // 공통 컴포넌트용 (다국어 페이지에서 '../')
+        postsDir = postsBasePath + 'posts/';  // 포스트용 (항상 './posts/')
         debugLog(`기본 경로: ${basePath}, 포스트 경로: ${postsDir}`);
 
         loadCommonElements();
@@ -171,10 +172,13 @@ async function initBlog() {
         
         // 최신 포스트 로드
         await loadLatestPost();
-        
+
+        // 사이드바 높이를 콘텐츠 영역에 맞춤
+        adjustSidebarHeight();
+
         // 마지막 업데이트 시간 표시
         updateLastUpdatedTime();
-        
+
         console.log("블로그 초기화 완료!");
         
     } catch (error) {
@@ -197,7 +201,8 @@ async function loadPostData() {
         debugLog('포스트 데이터 로드 시작');
         
         // posts 디렉토리의 index.json 파일에서 posts 배열을 가져옵니다
-        const response = await fetch(basePath + 'posts/index.json');
+        // postsBasePath는 항상 './'로 현재 페이지 기준 상대 경로 (다국어 페이지에서 해당 언어 index.json 로드)
+        const response = await fetch(postsBasePath + 'posts/index.json');
                 if (response.ok) {
             const data = await response.json();
             
@@ -239,7 +244,7 @@ async function loadPostData() {
                 
                 try {
                     // HTML 파일에서 제목과 카테고리 추출 시도
-                    const fileResponse = await fetch(`${basePath}posts/${filename}`);
+                    const fileResponse = await fetch(`${postsBasePath}posts/${filename}`);
                     if (fileResponse.ok) {
                         const html = await fileResponse.text();
                         
@@ -477,7 +482,7 @@ function formatTitle(id) {
             listItem.setAttribute('data-id', post.id);
             
             const postLink = document.createElement('a');
-        postLink.href = `${basePath}posts/${post.id}.html`;
+        postLink.href = `${postsBasePath}posts/${post.id}.html`;
             postLink.textContent = post.title;
             
             const postDate = document.createElement('span');
@@ -640,7 +645,7 @@ async function loadLatestPost() {
                     <ul class="recent-posts-list">
                         ${otherRecentPosts.map(post =>
                             `<li class="recent-post-item">
-                                <a href="${basePath}posts/${post.id}.html">${post.title}</a>
+                                <a href="${postsBasePath}posts/${post.id}.html">${post.title}</a>
                                 <span class="post-date">${formatDate(post.date)}</span>
                             </li>`
                         ).join('')}
@@ -658,7 +663,7 @@ async function loadLatestPost() {
                 <ul class="recent-posts-list">
                     ${featuredPosts.map(post =>
                         `<li class="recent-post-item">
-                            <a href="${basePath}posts/${post.id}.html">${post.title}</a>
+                            <a href="${postsBasePath}posts/${post.id}.html">${post.title}</a>
                             <span class="post-date">${formatDate(post.date)}</span>
                         </li>`
                     ).join('')}
@@ -672,7 +677,7 @@ async function loadLatestPost() {
             <h2>최신 글</h2>
             <article class="post post-preview">
                 <header class="post-header">
-                    <h1 class="post-title"><a href="${basePath}posts/${latestPost.id}.html">${latestPost.title}</a></h1>
+                    <h1 class="post-title"><a href="${postsBasePath}posts/${latestPost.id}.html">${latestPost.title}</a></h1>
                     <div class="post-meta">
                         <span class="post-date"><i class="fas fa-calendar-alt"></i> ${formatDate(latestPost.date)}</span>
                         <span class="post-category"><i class="fas fa-folder"></i> ${latestPost.category}</span>
@@ -680,14 +685,14 @@ async function loadLatestPost() {
                 </header>
                 <div class="post-content">
                     ${excerptContent}
-                    <p class="read-more"><a href="${basePath}posts/${latestPost.id}.html">더 보기...</a></p>
+                    <p class="read-more"><a href="${postsBasePath}posts/${latestPost.id}.html">더 보기...</a></p>
                 </div>
                 <footer class="post-footer">
                     <div class="post-tags">
                         ${tagsHtml}
                     </div>
                     <div class="read-full">
-                        <a href="${basePath}posts/${latestPost.id}.html" class="read-more-link">글 전체 보기</a>
+                        <a href="${postsBasePath}posts/${latestPost.id}.html" class="read-more-link">글 전체 보기</a>
                     </div>
                 </footer>
             </article>
@@ -750,5 +755,26 @@ function loadCommonElements() {
             .catch(error => {
                 console.error('푸터 로드 실패:', error);
             });
+    }
+}
+
+// 사이드바 높이를 콘텐츠 영역에 맞추는 함수
+function adjustSidebarHeight() {
+    const sidebar = document.querySelector('.blog-sidebar');
+    const content = document.querySelector('.blog-content');
+
+    if (sidebar && content) {
+        // 콘텐츠 영역의 실제 높이 가져오기
+        const contentHeight = content.offsetHeight;
+
+        // 사이드바 높이를 콘텐츠 높이에 맞춤 (최소 400px)
+        const newHeight = Math.max(contentHeight, 400);
+        sidebar.style.maxHeight = newHeight + 'px';
+
+        // 윈도우 리사이즈 시에도 높이 조절
+        window.addEventListener('resize', () => {
+            const updatedHeight = Math.max(content.offsetHeight, 400);
+            sidebar.style.maxHeight = updatedHeight + 'px';
+        });
     }
 } 
