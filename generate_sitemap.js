@@ -240,5 +240,72 @@ function generateSitemap() {
     console.log('   3. URL 검사 도구로 주요 페이지 색인 요청\n');
 }
 
+// 언어별 sitemap 생성 함수
+function generateLanguageSitemaps() {
+    console.log('\n🌐 언어별 sitemap 생성 시작...\n');
+
+    const postIds = getPostFiles();
+
+    for (const lang of LANGUAGES) {
+        let xml = '<?xml version="1.0" encoding="UTF-8"?>\n';
+        xml += '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n';
+
+        let urlCount = 0;
+        const langPrefix = lang === 'ko' ? '' : `/${lang}`;
+
+        // 메인/도구 페이지
+        for (const page of mainPages) {
+            xml += '  <url>\n';
+            xml += `    <loc>${BASE_URL}${langPrefix}${page.path}</loc>\n`;
+            xml += `    <lastmod>${today}</lastmod>\n`;
+            xml += `    <changefreq>${page.changefreq}</changefreq>\n`;
+            xml += `    <priority>${page.priority}</priority>\n`;
+            xml += '  </url>\n';
+            urlCount++;
+        }
+
+        // static 페이지
+        for (const page of staticPages) {
+            xml += '  <url>\n';
+            xml += `    <loc>${BASE_URL}${langPrefix}${page.path}</loc>\n`;
+            xml += `    <lastmod>${today}</lastmod>\n`;
+            xml += `    <changefreq>${page.changefreq}</changefreq>\n`;
+            xml += `    <priority>${page.priority}</priority>\n`;
+            xml += '  </url>\n';
+            urlCount++;
+        }
+
+        // 블로그 포스트
+        for (const postId of postIds) {
+            const filePath = lang === 'ko'
+                ? path.join(postsDir, `${postId}.html`)
+                : path.join(__dirname, lang, 'posts', `${postId}.html`);
+            const lastmod = getFileModDate(filePath);
+
+            xml += '  <url>\n';
+            xml += `    <loc>${BASE_URL}${langPrefix}/posts/${postId}.html</loc>\n`;
+            xml += `    <lastmod>${lastmod}</lastmod>\n`;
+            xml += '    <changefreq>monthly</changefreq>\n';
+            xml += '    <priority>0.7</priority>\n';
+            xml += '  </url>\n';
+            urlCount++;
+        }
+
+        xml += '</urlset>';
+
+        // 파일 저장
+        const langSitemapPath = path.join(__dirname, `sitemap-${lang}.xml`);
+        fs.writeFileSync(langSitemapPath, xml, 'utf8');
+        console.log(`   ✅ sitemap-${lang}.xml 생성 완료 (${urlCount}개 URL)`);
+    }
+
+    console.log('\n💡 Google Search Console에서 각 언어별 sitemap 제출:');
+    console.log('   - sitemap-ko.xml (한국어)');
+    console.log('   - sitemap-en.xml (영어)');
+    console.log('   - sitemap-ja.xml (일본어)');
+    console.log('   - sitemap-zh.xml (중국어)\n');
+}
+
 // 실행
 generateSitemap();
+generateLanguageSitemaps();
