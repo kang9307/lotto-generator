@@ -77,6 +77,8 @@ const staticPages = [
     { path: '/static/nginx_generator.html', priority: '0.8', changefreq: 'monthly' },
     { path: '/static/name_compatibility.html', priority: '0.9', changefreq: 'monthly' },
     { path: '/static/code_image.html', priority: '0.8', changefreq: 'monthly' },
+    { path: '/static/json_formatter.html', priority: '0.8', changefreq: 'monthly' },
+    { path: '/static/timezone_converter.html', priority: '0.8', changefreq: 'monthly' },
 ];
 
 // posts 폴더에서 HTML 파일 목록 가져오기
