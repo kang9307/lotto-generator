@@ -653,3 +653,243 @@ document.addEventListener('DOMContentLoaded', async function() {
         }
     }
 });
+
+// ============================================
+// 최근 사용 도구 추적 시스템 (사용자 재방문 유도)
+// ============================================
+const RecentTools = {
+    storageKey: 'braindetox_recent_tools',
+    maxItems: 5,
+
+    // 도구 목록 정의
+    tools: {
+        'lotto.html': { name: '로또 번호 생성기', icon: '🎱', category: '게임' },
+        'subnet.html': { name: '서브넷 계산기', icon: '🌐', category: 'IT' },
+        'password.html': { name: '비밀번호 생성기', icon: '🔐', category: '보안' },
+        'qrcode.html': { name: 'QR 코드 생성기', icon: '📱', category: '유틸리티' },
+        'datetime.html': { name: '시간/날짜 계산기', icon: '📅', category: '유틸리티' },
+        'speed_test.html': { name: '인터넷 속도 측정', icon: '🚀', category: 'IT' },
+        'mbti_test.html': { name: 'MBTI 테스트', icon: '🧠', category: '심리' },
+        'fortune_tarot.html': { name: '타로 운세', icon: '🔮', category: '운세' },
+        'color_palette.html': { name: '색상 팔레트', icon: '🎨', category: '디자인' },
+        'unit_converter.html': { name: '단위 변환기', icon: '📐', category: '유틸리티' },
+        'crontab_generator.html': { name: '크론탭 생성기', icon: '⏰', category: 'IT' },
+        'docker_builder.html': { name: 'Docker 빌더', icon: '🐳', category: 'IT' },
+        'random_picker.html': { name: '랜덤 뽑기', icon: '🎲', category: '유틸리티' },
+        'interest_calculator.html': { name: '이자 계산기', icon: '💰', category: '금융' },
+        'pomodoro.html': { name: '뽀모도로 타이머', icon: '🍅', category: '생산성' },
+        'brain-games.html': { name: '브레인 게임', icon: '🎮', category: '게임' },
+        'my_day.html': { name: '마이 데이', icon: '☀️', category: '생활' },
+        'blog.html': { name: '기술 블로그', icon: '📝', category: '콘텐츠' }
+    },
+
+    // 현재 페이지 기록
+    trackCurrentPage() {
+        const path = window.location.pathname;
+        const filename = path.split('/').pop();
+
+        if (this.tools[filename]) {
+            this.addTool(filename);
+        }
+    },
+
+    // 도구 추가
+    addTool(filename) {
+        let recent = this.getRecent();
+
+        // 이미 있으면 제거 (맨 앞으로 이동시키기 위해)
+        recent = recent.filter(item => item !== filename);
+
+        // 맨 앞에 추가
+        recent.unshift(filename);
+
+        // 최대 개수 유지
+        if (recent.length > this.maxItems) {
+            recent = recent.slice(0, this.maxItems);
+        }
+
+        localStorage.setItem(this.storageKey, JSON.stringify(recent));
+    },
+
+    // 최근 사용 목록 가져오기
+    getRecent() {
+        try {
+            const data = localStorage.getItem(this.storageKey);
+            return data ? JSON.parse(data) : [];
+        } catch (e) {
+            return [];
+        }
+    },
+
+    // 관련 도구 가져오기 (같은 카테고리)
+    getRelatedTools(currentFile, limit = 3) {
+        const current = this.tools[currentFile];
+        if (!current) return [];
+
+        const related = [];
+        for (const [file, info] of Object.entries(this.tools)) {
+            if (file !== currentFile && info.category === current.category) {
+                related.push({ file, ...info });
+            }
+        }
+
+        // 랜덤하게 섞어서 반환
+        return related.sort(() => Math.random() - 0.5).slice(0, limit);
+    },
+
+    // 최근 사용 위젯 렌더링
+    renderRecentWidget() {
+        const recent = this.getRecent();
+        if (recent.length === 0) return;
+
+        const lang = i18n.detectLanguage();
+        const basePath = lang === 'ko' ? '' : '../';
+
+        const container = document.createElement('div');
+        container.id = 'recent-tools-widget';
+        container.innerHTML = `
+            <style>
+                #recent-tools-widget {
+                    position: fixed;
+                    bottom: 20px;
+                    right: 20px;
+                    background: white;
+                    border-radius: 12px;
+                    box-shadow: 0 4px 20px rgba(0,0,0,0.15);
+                    padding: 12px;
+                    z-index: 9999;
+                    max-width: 200px;
+                    font-family: 'Noto Sans KR', sans-serif;
+                    transition: transform 0.3s ease;
+                }
+                #recent-tools-widget.collapsed {
+                    transform: translateX(calc(100% + 10px));
+                }
+                #recent-tools-widget .widget-header {
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    margin-bottom: 8px;
+                    padding-bottom: 8px;
+                    border-bottom: 1px solid #eee;
+                }
+                #recent-tools-widget .widget-title {
+                    font-size: 12px;
+                    font-weight: bold;
+                    color: #333;
+                }
+                #recent-tools-widget .widget-toggle {
+                    background: none;
+                    border: none;
+                    cursor: pointer;
+                    font-size: 14px;
+                    padding: 2px 6px;
+                }
+                #recent-tools-widget .tool-item {
+                    display: flex;
+                    align-items: center;
+                    padding: 6px 8px;
+                    text-decoration: none;
+                    color: #333;
+                    border-radius: 6px;
+                    font-size: 12px;
+                    transition: background 0.2s;
+                }
+                #recent-tools-widget .tool-item:hover {
+                    background: #f5f5f5;
+                }
+                #recent-tools-widget .tool-icon {
+                    margin-right: 8px;
+                    font-size: 14px;
+                }
+                #recent-tools-toggle {
+                    position: fixed;
+                    bottom: 20px;
+                    right: 20px;
+                    background: #3498db;
+                    color: white;
+                    border: none;
+                    border-radius: 50%;
+                    width: 40px;
+                    height: 40px;
+                    cursor: pointer;
+                    z-index: 9998;
+                    font-size: 18px;
+                    display: none;
+                    box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+                }
+                @media (max-width: 768px) {
+                    #recent-tools-widget {
+                        bottom: 70px;
+                        right: 10px;
+                        max-width: 180px;
+                    }
+                }
+            </style>
+            <div class="widget-header">
+                <span class="widget-title">⏱️ 최근 사용</span>
+                <button class="widget-toggle" onclick="RecentTools.toggleWidget()">✕</button>
+            </div>
+            <div class="widget-content">
+                ${recent.map(file => {
+                    const tool = this.tools[file];
+                    if (!tool) return '';
+                    return `<a href="${basePath}${file}" class="tool-item">
+                        <span class="tool-icon">${tool.icon}</span>
+                        <span>${tool.name}</span>
+                    </a>`;
+                }).join('')}
+            </div>
+        `;
+
+        // 토글 버튼
+        const toggleBtn = document.createElement('button');
+        toggleBtn.id = 'recent-tools-toggle';
+        toggleBtn.innerHTML = '⏱️';
+        toggleBtn.onclick = () => this.toggleWidget();
+
+        document.body.appendChild(container);
+        document.body.appendChild(toggleBtn);
+
+        // 상태 복원
+        if (localStorage.getItem('recent_widget_collapsed') === 'true') {
+            container.classList.add('collapsed');
+            toggleBtn.style.display = 'block';
+        }
+    },
+
+    // 위젯 토글
+    toggleWidget() {
+        const widget = document.getElementById('recent-tools-widget');
+        const toggle = document.getElementById('recent-tools-toggle');
+
+        if (widget.classList.contains('collapsed')) {
+            widget.classList.remove('collapsed');
+            toggle.style.display = 'none';
+            localStorage.setItem('recent_widget_collapsed', 'false');
+        } else {
+            widget.classList.add('collapsed');
+            toggle.style.display = 'block';
+            localStorage.setItem('recent_widget_collapsed', 'true');
+        }
+    },
+
+    // 초기화
+    init() {
+        this.trackCurrentPage();
+
+        // 메인 도구 페이지에서만 위젯 표시 (블로그 포스트 제외)
+        const path = window.location.pathname;
+        if (!path.includes('/posts/') && this.getRecent().length > 0) {
+            // DOM 로드 후 렌더링
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', () => this.renderRecentWidget());
+            } else {
+                this.renderRecentWidget();
+            }
+        }
+    }
+};
+
+// 최근 사용 도구 시스템 초기화
+RecentTools.init();
