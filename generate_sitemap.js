@@ -82,6 +82,10 @@ const staticPages = [
     { path: '/static/hearing_age_test.html', priority: '0.8', changefreq: 'monthly' },
     { path: '/static/color_blindness_test.html', priority: '0.8', changefreq: 'monthly' },
     { path: '/static/typing_test.html', priority: '0.8', changefreq: 'monthly' },
+    { path: '/static/reaction_test.html', priority: '0.8', changefreq: 'monthly' },
+    { path: '/static/noise_meter.html', priority: '0.8', changefreq: 'monthly' },
+    { path: '/static/frequency_test.html', priority: '0.8', changefreq: 'monthly' },
+    { path: '/static/dead_pixel_test.html', priority: '0.8', changefreq: 'monthly' },
 ];
 
 // posts 폴더에서 HTML 파일 목록 가져오기
