@@ -88,6 +88,7 @@ const staticPages = [
     { path: '/static/dead_pixel_test.html', priority: '0.8', changefreq: 'monthly' },
     { path: '/static/mind_refresh_studio.html', priority: '0.8', changefreq: 'monthly' },
     { path: '/static/personality_test.html', priority: '0.8', changefreq: 'monthly' },
+    { path: '/static/fractal_explorer.html', priority: '0.8', changefreq: 'monthly' },
 ];
 
 // posts 폴더에서 HTML 파일 목록 가져오기
