@@ -54,6 +54,7 @@ const mainPages = [
     { path: '/tetris.html', priority: '0.9', changefreq: 'monthly' },
     { path: '/my_day.html', priority: '0.8', changefreq: 'daily' },
     { path: '/privacy.html', priority: '0.5', changefreq: 'monthly' },
+    { path: '/dashboard.html', priority: '0.6', changefreq: 'weekly' },
 ];
 
 // static 폴더 페이지 목록
