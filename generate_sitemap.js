@@ -92,6 +92,13 @@ const staticPages = [
     { path: '/static/fractal_explorer.html', priority: '0.8', changefreq: 'monthly' },
     { path: '/static/particle_system.html', priority: '0.8', changefreq: 'monthly' },
     { path: '/static/ascii_art.html', priority: '0.8', changefreq: 'monthly' },
+    { path: '/static/qr_code_generator.html', priority: '0.8', changefreq: 'monthly' },
+    { path: '/static/password_generator.html', priority: '0.8', changefreq: 'monthly' },
+    { path: '/static/bmi_calculator.html', priority: '0.8', changefreq: 'monthly' },
+    { path: '/static/unit_converter.html', priority: '0.8', changefreq: 'monthly' },
+    { path: '/static/regex_tester.html', priority: '0.8', changefreq: 'monthly' },
+    { path: '/static/base64_encoder.html', priority: '0.8', changefreq: 'monthly' },
+    { path: '/static/css_gradient_generator.html', priority: '0.8', changefreq: 'monthly' },
 ];
 
 // posts 폴더에서 HTML 파일 목록 가져오기
