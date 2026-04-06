@@ -656,40 +656,136 @@ document.addEventListener('DOMContentLoaded', async function() {
 
 // ============================================
 // 최근 사용 도구 추적 시스템 (사용자 재방문 유도)
+// + 같은 카테고리 관련 도구 자동 추천 (내부 회유 강화)
 // ============================================
 const RecentTools = {
     storageKey: 'braindetox_recent_tools',
     maxItems: 5,
 
-    // 도구 목록 정의
+    // 도구 목록 정의 (전체 65개, 상대경로 키 기반)
+    // 다국어 지원: i18n.json에 등록된 도구는 자동으로 번역됨, 미등록 도구는 한국어 fallback
     tools: {
-        'lotto.html': { name: '로또 번호 생성기', icon: '🎱', category: '게임' },
-        'subnet.html': { name: '서브넷 계산기', icon: '🌐', category: 'IT' },
+        // === 게임/복권 ===
+        'lotto.html': { name: '로또 번호 생성기', icon: '🎱', category: '게임/복권' },
+        'lotto7.html': { name: '로또 7/45', icon: '🎱', category: '게임/복권' },
+        'powerball.html': { name: '파워볼', icon: '🎰', category: '게임/복권' },
+        'megamillions.html': { name: '메가밀리언', icon: '💵', category: '게임/복권' },
+        'doublecolorball.html': { name: '쌍색구', icon: '🔴', category: '게임/복권' },
+        'tetris.html': { name: '테트리스', icon: '🧩', category: '게임/복권' },
+        'brain-games.html': { name: '브레인 게임', icon: '🎮', category: '게임/복권' },
+
+        // === IT 개발 ===
+        'crontab_generator.html': { name: '크론탭 생성기', icon: '⏰', category: 'IT/개발' },
+        'docker_builder.html': { name: 'Docker 빌더', icon: '🐳', category: 'IT/개발' },
+        'rsync_tool.html': { name: 'Rsync 도구', icon: '🔄', category: 'IT/개발' },
+        'static/base64_encoder.html': { name: 'Base64 인코더', icon: '🔣', category: 'IT/개발' },
+        'static/json_formatter.html': { name: 'JSON 포매터', icon: '📋', category: 'IT/개발' },
+        'static/regex_tester.html': { name: '정규식 테스터', icon: '🔍', category: 'IT/개발' },
+        'static/code_image.html': { name: '코드 이미지 생성기', icon: '💻', category: 'IT/개발' },
+        'static/token_counter.html': { name: 'AI 토큰 카운터', icon: '🤖', category: 'IT/개발' },
+
+        // === IT 네트워크 ===
+        'speed_test.html': { name: '인터넷 속도 측정', icon: '🚀', category: 'IT/네트워크' },
+        'subnet.html': { name: '서브넷 계산기', icon: '🌐', category: 'IT/네트워크' },
+        'static/iptables_generator.html': { name: 'iptables 생성기', icon: '🛡️', category: 'IT/네트워크' },
+        'static/nginx_generator.html': { name: 'Nginx 설정 생성기', icon: '⚙️', category: 'IT/네트워크' },
+
+        // === IT 유틸 / 진단 ===
+        'static/dead_pixel_test.html': { name: '데드픽셀 테스트', icon: '🖥️', category: 'IT/유틸' },
+        'static/frequency_test.html': { name: '주파수 테스트', icon: '🔊', category: 'IT/유틸' },
+        'static/noise_meter.html': { name: '소음 측정기', icon: '🔉', category: 'IT/유틸' },
+
+        // === 보안 ===
         'password.html': { name: '비밀번호 생성기', icon: '🔐', category: '보안' },
+        'static/password_generator.html': { name: '강력 비밀번호 생성기', icon: '🔑', category: '보안' },
+
+        // === 유틸리티 ===
         'qrcode.html': { name: 'QR 코드 생성기', icon: '📱', category: '유틸리티' },
+        'static/qr_code_generator.html': { name: 'QR 코드 생성기 Pro', icon: '📲', category: '유틸리티' },
         'datetime.html': { name: '시간/날짜 계산기', icon: '📅', category: '유틸리티' },
-        'speed_test.html': { name: '인터넷 속도 측정', icon: '🚀', category: 'IT' },
-        'mbti_test.html': { name: 'MBTI 테스트', icon: '🧠', category: '심리' },
-        'fortune_tarot.html': { name: '타로 운세', icon: '🔮', category: '운세' },
-        'color_palette.html': { name: '색상 팔레트', icon: '🎨', category: '디자인' },
-        'unit_converter.html': { name: '단위 변환기', icon: '📐', category: '유틸리티' },
-        'crontab_generator.html': { name: '크론탭 생성기', icon: '⏰', category: 'IT' },
-        'docker_builder.html': { name: 'Docker 빌더', icon: '🐳', category: 'IT' },
         'random_picker.html': { name: '랜덤 뽑기', icon: '🎲', category: '유틸리티' },
+        'unit-converter.html': { name: '단위 변환기', icon: '📐', category: '유틸리티' },
+        'static/unit_converter.html': { name: '단위 변환기 Pro', icon: '📏', category: '유틸리티' },
+        'static/age_calculator.html': { name: '나이 계산기', icon: '🎂', category: '유틸리티' },
+        'static/char_counter.html': { name: '글자 수 세기', icon: '📝', category: '유틸리티' },
+        'static/nickname_generator.html': { name: '닉네임 생성기', icon: '✨', category: '유틸리티' },
+        'static/random_menu.html': { name: '메뉴 추천', icon: '🍽️', category: '유틸리티' },
+        'static/timezone_converter.html': { name: '타임존 변환기', icon: '🌏', category: '유틸리티' },
+
+        // === 디자인 ===
+        'color_palette.html': { name: '색상 팔레트', icon: '🎨', category: '디자인' },
+        'static/ascii_art.html': { name: 'ASCII 아트', icon: '🖼️', category: '디자인' },
+        'static/css_gradient_generator.html': { name: 'CSS 그라디언트 생성기', icon: '🌈', category: '디자인' },
+        'static/fractal_explorer.html': { name: '프랙탈 익스플로러', icon: '🌀', category: '디자인' },
+        'static/icon_generator.html': { name: '아이콘 생성기', icon: '⭐', category: '디자인' },
+        'static/particle_system.html': { name: '파티클 시스템', icon: '✨', category: '디자인' },
+
+        // === 금융 ===
         'interest_calculator.html': { name: '이자 계산기', icon: '💰', category: '금융' },
+        'static/daily_work_calculator.html': { name: '일급 계산기', icon: '💵', category: '금융' },
+        'static/jeonse_wolse_calculator.html': { name: '전세/월세 계산기', icon: '🏠', category: '금융' },
+        'static/salary_calculator.html': { name: '연봉 실수령액 계산기', icon: '💼', category: '금융' },
+        'static/vnd_krw_calculator.html': { name: 'VND/KRW 환율 계산기', icon: '💱', category: '금융' },
+
+        // === 심리/테스트 ===
+        'mbti_test.html': { name: 'MBTI 테스트', icon: '🧠', category: '심리/테스트' },
+        'compatibility_test.html': { name: '궁합 테스트', icon: '💕', category: '심리/테스트' },
+        'static/mbti_compatibility.html': { name: 'MBTI 궁합', icon: '🫶', category: '심리/테스트' },
+        'static/personality_test.html': { name: '성격 테스트', icon: '🎭', category: '심리/테스트' },
+
+        // === 운세 ===
+        'fortune_tarot.html': { name: '타로 운세', icon: '🔮', category: '운세' },
+        'static/fortune_zodiac.html': { name: '별자리 운세', icon: '✨', category: '운세' },
+        'static/name_compatibility.html': { name: '이름 궁합', icon: '💖', category: '운세' },
+
+        // === 건강 ===
+        'static/bmi_calculator.html': { name: 'BMI 계산기', icon: '⚖️', category: '건강' },
+        'static/color_blindness_test.html': { name: '색맹/색약 테스트', icon: '👁️', category: '건강' },
+        'static/hearing_age_test.html': { name: '청력 나이 테스트', icon: '👂', category: '건강' },
+
+        // === 생산성 ===
         'pomodoro.html': { name: '뽀모도로 타이머', icon: '🍅', category: '생산성' },
-        'brain-games.html': { name: '브레인 게임', icon: '🎮', category: '게임' },
-        'my_day.html': { name: '마이 데이', icon: '☀️', category: '생활' },
-        'blog.html': { name: '기술 블로그', icon: '📝', category: '콘텐츠' }
+        'static/meeting_calculator.html': { name: '회의 비용 계산기', icon: '📊', category: '생산성' },
+
+        // === 명상/힐링 ===
+        'mindfulness.html': { name: '마인드풀니스', icon: '🧘', category: '명상/힐링' },
+        'my_day.html': { name: '마이 데이', icon: '☀️', category: '명상/힐링' },
+        'static/mind_refresh_studio.html': { name: '마인드 리프레시 스튜디오', icon: '🌿', category: '명상/힐링' },
+        'static/relaxing_day.html': { name: '릴랙싱 데이', icon: '🌅', category: '명상/힐링' },
+
+        // === 엔터테인먼트 / 반응 게임 ===
+        'static/hitel_chat.html': { name: '하이텔 채팅 (레트로)', icon: '📟', category: '엔터테인먼트' },
+        'static/max_chatbot.html': { name: 'MAX 챗봇', icon: '🤖', category: '엔터테인먼트' },
+        'static/reaction_test.html': { name: '반응속도 테스트', icon: '⚡', category: '엔터테인먼트' },
+        'static/typing_test.html': { name: '타자 속도 테스트', icon: '⌨️', category: '엔터테인먼트' }
+    },
+
+    // 도구 페이지 키 추출 (다국어 경로 지원)
+    // 예: /lotto.html → lotto.html
+    //     /static/age_calculator.html → static/age_calculator.html
+    //     /en/lotto.html → lotto.html
+    //     /en/static/age_calculator.html → static/age_calculator.html
+    getToolKey() {
+        let path = window.location.pathname;
+        // 언어 prefix 제거
+        path = path.replace(/^\/(en|ja|zh)\//, '/');
+        // 선행 슬래시 제거
+        if (path.startsWith('/')) path = path.substring(1);
+        return path;
+    },
+
+    // 절대 URL 생성 (현재 언어 prefix 유지)
+    getToolUrl(toolKey) {
+        const lang = (typeof i18n !== 'undefined' && i18n.currentLang) ? i18n.currentLang : 'ko';
+        const langPrefix = lang === 'ko' ? '' : `/${lang}`;
+        return `${langPrefix}/${toolKey}`;
     },
 
     // 현재 페이지 기록
     trackCurrentPage() {
-        const path = window.location.pathname;
-        const filename = path.split('/').pop();
-
-        if (this.tools[filename]) {
-            this.addTool(filename);
+        const key = this.getToolKey();
+        if (this.tools[key]) {
+            this.addTool(key);
         }
     },
 
@@ -741,9 +837,6 @@ const RecentTools = {
     renderRecentWidget() {
         const recent = this.getRecent();
         if (recent.length === 0) return;
-
-        const lang = i18n.detectLanguage();
-        const basePath = lang === 'ko' ? '' : '../';
 
         const container = document.createElement('div');
         container.id = 'recent-tools-widget';
@@ -834,7 +927,7 @@ const RecentTools = {
                 ${recent.map(file => {
                     const tool = this.tools[file];
                     if (!tool) return '';
-                    return `<a href="${basePath}${file}" class="tool-item">
+                    return `<a href="${this.getToolUrl(file)}" class="tool-item">
                         <span class="tool-icon">${tool.icon}</span>
                         <span>${tool.name}</span>
                     </a>`;
@@ -874,19 +967,172 @@ const RecentTools = {
         }
     },
 
+    // 본문 내 "관련 도구" 섹션 자동 삽입
+    // 도구 페이지의 main 또는 body 끝부분에 같은 카테고리 도구를 추천
+    renderRelatedToolsSection() {
+        const currentKey = this.getToolKey();
+        const related = this.getRelatedTools(currentKey, 4);
+        if (related.length === 0) return;
+
+        // 이미 렌더링된 경우 중복 방지
+        if (document.getElementById('related-tools-section')) return;
+
+        // 카테고리 라벨 (현재 도구의 카테고리)
+        const currentTool = this.tools[currentKey];
+        const categoryLabel = currentTool ? currentTool.category : '';
+
+        // 다국어 헤더 텍스트
+        const lang = (typeof i18n !== 'undefined' && i18n.currentLang) ? i18n.currentLang : 'ko';
+        const headerText = {
+            ko: '🔗 함께 사용하면 좋은 도구',
+            en: '🔗 Related Tools You Might Like',
+            ja: '🔗 一緒に使うと便利なツール',
+            zh: '🔗 一起使用更好的工具'
+        }[lang] || '🔗 함께 사용하면 좋은 도구';
+
+        const subText = {
+            ko: `같은 "${categoryLabel}" 카테고리의 도구입니다`,
+            en: `Other tools in the "${categoryLabel}" category`,
+            ja: `同じ「${categoryLabel}」カテゴリのツール`,
+            zh: `同一"${categoryLabel}"类别的工具`
+        }[lang] || `같은 "${categoryLabel}" 카테고리의 도구입니다`;
+
+        const section = document.createElement('section');
+        section.id = 'related-tools-section';
+        section.innerHTML = `
+            <style>
+                #related-tools-section {
+                    max-width: 1200px;
+                    margin: 3rem auto 2rem;
+                    padding: 2rem 1.5rem;
+                    background: linear-gradient(135deg, #f8f9fb 0%, #eef2f7 100%);
+                    border-radius: 16px;
+                    border: 1px solid #e0e6ed;
+                    font-family: 'Noto Sans KR', -apple-system, BlinkMacSystemFont, sans-serif;
+                }
+                #related-tools-section .rt-header {
+                    text-align: center;
+                    margin-bottom: 1.5rem;
+                }
+                #related-tools-section .rt-title {
+                    font-size: 1.4rem;
+                    font-weight: 700;
+                    color: #2c3e50;
+                    margin: 0 0 0.4rem 0;
+                }
+                #related-tools-section .rt-subtitle {
+                    font-size: 0.9rem;
+                    color: #7f8c9b;
+                    margin: 0;
+                }
+                #related-tools-section .rt-grid {
+                    display: grid;
+                    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+                    gap: 1rem;
+                    max-width: 1000px;
+                    margin: 0 auto;
+                }
+                #related-tools-section .rt-card {
+                    display: flex;
+                    align-items: center;
+                    padding: 1rem 1.2rem;
+                    background: white;
+                    border-radius: 12px;
+                    text-decoration: none;
+                    color: #333;
+                    box-shadow: 0 2px 6px rgba(0,0,0,0.04);
+                    border: 1px solid #e8edf2;
+                    transition: all 0.25s ease;
+                }
+                #related-tools-section .rt-card:hover {
+                    transform: translateY(-3px);
+                    box-shadow: 0 6px 18px rgba(52, 152, 219, 0.15);
+                    border-color: #3498db;
+                }
+                #related-tools-section .rt-icon {
+                    font-size: 1.8rem;
+                    margin-right: 0.9rem;
+                    flex-shrink: 0;
+                }
+                #related-tools-section .rt-info {
+                    flex: 1;
+                    min-width: 0;
+                }
+                #related-tools-section .rt-name {
+                    font-size: 0.95rem;
+                    font-weight: 600;
+                    color: #2c3e50;
+                    margin: 0 0 0.2rem 0;
+                    overflow: hidden;
+                    text-overflow: ellipsis;
+                    white-space: nowrap;
+                }
+                #related-tools-section .rt-cat {
+                    font-size: 0.78rem;
+                    color: #95a5b5;
+                    margin: 0;
+                }
+                @media (max-width: 768px) {
+                    #related-tools-section { padding: 1.5rem 1rem; margin: 2rem 0.5rem; }
+                    #related-tools-section .rt-title { font-size: 1.2rem; }
+                    #related-tools-section .rt-grid { grid-template-columns: 1fr; }
+                }
+            </style>
+            <div class="rt-header">
+                <h2 class="rt-title">${headerText}</h2>
+                <p class="rt-subtitle">${subText}</p>
+            </div>
+            <div class="rt-grid">
+                ${related.map(tool => `
+                    <a href="${this.getToolUrl(tool.file)}" class="rt-card">
+                        <div class="rt-icon">${tool.icon}</div>
+                        <div class="rt-info">
+                            <div class="rt-name">${tool.name}</div>
+                            <div class="rt-cat">${tool.category}</div>
+                        </div>
+                    </a>
+                `).join('')}
+            </div>
+        `;
+
+        // 삽입 위치 결정: main의 끝 → body 끝 순서로 시도
+        const main = document.querySelector('main') || document.querySelector('.container');
+        const footerPlaceholder = document.getElementById('footer-placeholder');
+
+        if (footerPlaceholder && footerPlaceholder.parentNode) {
+            // footer placeholder 직전에 삽입
+            footerPlaceholder.parentNode.insertBefore(section, footerPlaceholder);
+        } else if (main) {
+            main.appendChild(section);
+        } else {
+            document.body.appendChild(section);
+        }
+    },
+
     // 초기화
     init() {
         this.trackCurrentPage();
 
-        // 메인 도구 페이지에서만 위젯 표시 (블로그 포스트 제외)
+        // 블로그 포스트는 제외, 도구 페이지에서만 동작
         const path = window.location.pathname;
-        if (!path.includes('/posts/') && this.getRecent().length > 0) {
-            // DOM 로드 후 렌더링
-            if (document.readyState === 'loading') {
-                document.addEventListener('DOMContentLoaded', () => this.renderRecentWidget());
-            } else {
+        if (path.includes('/posts/')) return;
+
+        const renderAll = () => {
+            // 1. 본문 내 "관련 도구" 섹션 (모든 도구 페이지)
+            const currentKey = this.getToolKey();
+            if (this.tools[currentKey]) {
+                this.renderRelatedToolsSection();
+            }
+            // 2. 우측 하단 "최근 사용" 위젯 (최근 사용 이력 있을 때만)
+            if (this.getRecent().length > 0) {
                 this.renderRecentWidget();
             }
+        };
+
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', renderAll);
+        } else {
+            renderAll();
         }
     }
 };
