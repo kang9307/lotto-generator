@@ -662,102 +662,145 @@ const RecentTools = {
     storageKey: 'braindetox_recent_tools',
     maxItems: 5,
 
-    // 도구 목록 정의 (전체 65개, 상대경로 키 기반)
-    // 다국어 지원: i18n.json에 등록된 도구는 자동으로 번역됨, 미등록 도구는 한국어 fallback
+    // 카테고리 다국어 매핑
+    categoryLabels: {
+        'game': { ko: '게임/복권', en: 'Games/Lottery', ja: 'ゲーム・宝くじ', zh: '游戏/彩票' },
+        'it_dev': { ko: 'IT/개발', en: 'IT/Development', ja: 'IT・開発', zh: 'IT/开发' },
+        'it_net': { ko: 'IT/네트워크', en: 'IT/Network', ja: 'IT・ネットワーク', zh: 'IT/网络' },
+        'it_util': { ko: 'IT/유틸', en: 'IT/Utility', ja: 'IT・ユーティリティ', zh: 'IT/工具' },
+        'security': { ko: '보안', en: 'Security', ja: 'セキュリティ', zh: '安全' },
+        'utility': { ko: '유틸리티', en: 'Utility', ja: 'ユーティリティ', zh: '实用工具' },
+        'design': { ko: '디자인', en: 'Design', ja: 'デザイン', zh: '设计' },
+        'finance': { ko: '금융', en: 'Finance', ja: '金融', zh: '金融' },
+        'personality': { ko: '심리/테스트', en: 'Personality/Test', ja: '心理・テスト', zh: '心理/测试' },
+        'fortune': { ko: '운세', en: 'Fortune', ja: '占い', zh: '运势' },
+        'health': { ko: '건강', en: 'Health', ja: '健康', zh: '健康' },
+        'productivity': { ko: '생산성', en: 'Productivity', ja: '生産性', zh: '生产力' },
+        'meditation': { ko: '명상/힐링', en: 'Meditation/Healing', ja: '瞑想・癒し', zh: '冥想/治愈' },
+        'entertainment': { ko: '엔터테인먼트', en: 'Entertainment', ja: 'エンターテイメント', zh: '娱乐' }
+    },
+
+    // 도구 목록 정의 (전체 66개, 다국어 이름 + 카테고리 키)
     tools: {
         // === 게임/복권 ===
-        'lotto.html': { name: '로또 번호 생성기', icon: '🎱', category: '게임/복권' },
-        'lotto7.html': { name: '로또 7/45', icon: '🎱', category: '게임/복권' },
-        'powerball.html': { name: '파워볼', icon: '🎰', category: '게임/복권' },
-        'megamillions.html': { name: '메가밀리언', icon: '💵', category: '게임/복권' },
-        'doublecolorball.html': { name: '쌍색구', icon: '🔴', category: '게임/복권' },
-        'tetris.html': { name: '테트리스', icon: '🧩', category: '게임/복권' },
-        'brain-games.html': { name: '브레인 게임', icon: '🎮', category: '게임/복권' },
+        'lotto.html': { name: { ko: '로또 번호 생성기', en: 'Lotto Number Generator', ja: 'ロト番号ジェネレーター', zh: '彩票号码生成器' }, icon: '🎱', cat: 'game' },
+        'lotto7.html': { name: { ko: '로또 7/45', en: 'Lotto 7/45', ja: 'ロト 7/45', zh: '乐透 7/45' }, icon: '🎱', cat: 'game' },
+        'powerball.html': { name: { ko: '파워볼', en: 'Powerball', ja: 'パワーボール', zh: '强力球' }, icon: '🎰', cat: 'game' },
+        'megamillions.html': { name: { ko: '메가밀리언', en: 'Mega Millions', ja: 'メガミリオンズ', zh: '百万彩' }, icon: '💵', cat: 'game' },
+        'doublecolorball.html': { name: { ko: '쌍색구', en: 'Double Color Ball', ja: '双色球', zh: '双色球' }, icon: '🔴', cat: 'game' },
+        'tetris.html': { name: { ko: '테트리스', en: 'Tetris', ja: 'テトリス', zh: '俄罗斯方块' }, icon: '🧩', cat: 'game' },
+        'brain-games.html': { name: { ko: '브레인 게임', en: 'Brain Games', ja: 'ブレインゲーム', zh: '脑力游戏' }, icon: '🎮', cat: 'game' },
 
         // === IT 개발 ===
-        'crontab_generator.html': { name: '크론탭 생성기', icon: '⏰', category: 'IT/개발' },
-        'docker_builder.html': { name: 'Docker 빌더', icon: '🐳', category: 'IT/개발' },
-        'rsync_tool.html': { name: 'Rsync 도구', icon: '🔄', category: 'IT/개발' },
-        'static/base64_encoder.html': { name: 'Base64 인코더', icon: '🔣', category: 'IT/개발' },
-        'static/json_formatter.html': { name: 'JSON 포매터', icon: '📋', category: 'IT/개발' },
-        'static/regex_tester.html': { name: '정규식 테스터', icon: '🔍', category: 'IT/개발' },
-        'static/code_image.html': { name: '코드 이미지 생성기', icon: '💻', category: 'IT/개발' },
-        'static/token_counter.html': { name: 'AI 토큰 카운터', icon: '🤖', category: 'IT/개발' },
+        'crontab_generator.html': { name: { ko: '크론탭 생성기', en: 'Crontab Generator', ja: 'Crontabジェネレーター', zh: 'Crontab生成器' }, icon: '⏰', cat: 'it_dev' },
+        'docker_builder.html': { name: { ko: 'Docker 빌더', en: 'Docker Builder', ja: 'Dockerビルダー', zh: 'Docker构建器' }, icon: '🐳', cat: 'it_dev' },
+        'rsync_tool.html': { name: { ko: 'Rsync 도구', en: 'Rsync Tool', ja: 'Rsyncツール', zh: 'Rsync工具' }, icon: '🔄', cat: 'it_dev' },
+        'static/base64_encoder.html': { name: { ko: 'Base64 인코더', en: 'Base64 Encoder', ja: 'Base64エンコーダー', zh: 'Base64编码器' }, icon: '🔣', cat: 'it_dev' },
+        'static/json_formatter.html': { name: { ko: 'JSON 포매터', en: 'JSON Formatter', ja: 'JSONフォーマッター', zh: 'JSON格式化' }, icon: '📋', cat: 'it_dev' },
+        'static/regex_tester.html': { name: { ko: '정규식 테스터', en: 'Regex Tester', ja: '正規表現テスター', zh: '正则表达式测试' }, icon: '🔍', cat: 'it_dev' },
+        'static/code_image.html': { name: { ko: '코드 이미지 생성기', en: 'Code Image Generator', ja: 'コード画像ジェネレーター', zh: '代码图片生成器' }, icon: '💻', cat: 'it_dev' },
+        'static/token_counter.html': { name: { ko: 'AI 토큰 카운터', en: 'AI Token Counter', ja: 'AIトークンカウンター', zh: 'AI令牌计数器' }, icon: '🤖', cat: 'it_dev' },
 
         // === IT 네트워크 ===
-        'speed_test.html': { name: '인터넷 속도 측정', icon: '🚀', category: 'IT/네트워크' },
-        'subnet.html': { name: '서브넷 계산기', icon: '🌐', category: 'IT/네트워크' },
-        'static/iptables_generator.html': { name: 'iptables 생성기', icon: '🛡️', category: 'IT/네트워크' },
-        'static/nginx_generator.html': { name: 'Nginx 설정 생성기', icon: '⚙️', category: 'IT/네트워크' },
+        'speed_test.html': { name: { ko: '인터넷 속도 측정', en: 'Internet Speed Test', ja: 'インターネット速度測定', zh: '网速测试' }, icon: '🚀', cat: 'it_net' },
+        'subnet.html': { name: { ko: '서브넷 계산기', en: 'Subnet Calculator', ja: 'サブネット計算機', zh: '子网计算器' }, icon: '🌐', cat: 'it_net' },
+        'static/iptables_generator.html': { name: { ko: 'iptables 생성기', en: 'iptables Generator', ja: 'iptablesジェネレーター', zh: 'iptables生成器' }, icon: '🛡️', cat: 'it_net' },
+        'static/nginx_generator.html': { name: { ko: 'Nginx 설정 생성기', en: 'Nginx Config Generator', ja: 'Nginx設定ジェネレーター', zh: 'Nginx配置生成器' }, icon: '⚙️', cat: 'it_net' },
 
         // === IT 유틸 / 진단 ===
-        'static/dead_pixel_test.html': { name: '데드픽셀 테스트', icon: '🖥️', category: 'IT/유틸' },
-        'static/frequency_test.html': { name: '주파수 테스트', icon: '🔊', category: 'IT/유틸' },
-        'static/noise_meter.html': { name: '소음 측정기', icon: '🔉', category: 'IT/유틸' },
+        'static/dead_pixel_test.html': { name: { ko: '데드픽셀 테스트', en: 'Dead Pixel Test', ja: 'デッドピクセルテスト', zh: '坏点测试' }, icon: '🖥️', cat: 'it_util' },
+        'static/frequency_test.html': { name: { ko: '주파수 테스트', en: 'Frequency Test', ja: '周波数テスト', zh: '频率测试' }, icon: '🔊', cat: 'it_util' },
+        'static/noise_meter.html': { name: { ko: '소음 측정기', en: 'Noise Meter', ja: '騒音計', zh: '噪音计' }, icon: '🔉', cat: 'it_util' },
 
         // === 보안 ===
-        'password.html': { name: '비밀번호 생성기', icon: '🔐', category: '보안' },
-        'static/password_generator.html': { name: '강력 비밀번호 생성기', icon: '🔑', category: '보안' },
+        'password.html': { name: { ko: '비밀번호 생성기', en: 'Password Generator', ja: 'パスワード生成', zh: '密码生成器' }, icon: '🔐', cat: 'security' },
+        'static/password_generator.html': { name: { ko: '강력 비밀번호 생성기', en: 'Strong Password Generator', ja: '強力パスワード生成', zh: '强密码生成器' }, icon: '🔑', cat: 'security' },
 
         // === 유틸리티 ===
-        'qrcode.html': { name: 'QR 코드 생성기', icon: '📱', category: '유틸리티' },
-        'static/qr_code_generator.html': { name: 'QR 코드 생성기 Pro', icon: '📲', category: '유틸리티' },
-        'datetime.html': { name: '시간/날짜 계산기', icon: '📅', category: '유틸리티' },
-        'random_picker.html': { name: '랜덤 뽑기', icon: '🎲', category: '유틸리티' },
-        'unit-converter.html': { name: '단위 변환기', icon: '📐', category: '유틸리티' },
-        'static/unit_converter.html': { name: '단위 변환기 Pro', icon: '📏', category: '유틸리티' },
-        'static/age_calculator.html': { name: '나이 계산기', icon: '🎂', category: '유틸리티' },
-        'static/char_counter.html': { name: '글자 수 세기', icon: '📝', category: '유틸리티' },
-        'static/nickname_generator.html': { name: '닉네임 생성기', icon: '✨', category: '유틸리티' },
-        'static/random_menu.html': { name: '메뉴 추천', icon: '🍽️', category: '유틸리티' },
-        'static/timezone_converter.html': { name: '타임존 변환기', icon: '🌏', category: '유틸리티' },
+        'qrcode.html': { name: { ko: 'QR 코드 생성기', en: 'QR Code Generator', ja: 'QRコード生成', zh: '二维码生成器' }, icon: '📱', cat: 'utility' },
+        'static/qr_code_generator.html': { name: { ko: 'QR 코드 생성기 Pro', en: 'QR Code Generator Pro', ja: 'QRコード生成 Pro', zh: '二维码生成器Pro' }, icon: '📲', cat: 'utility' },
+        'datetime.html': { name: { ko: '시간/날짜 계산기', en: 'Date/Time Calculator', ja: '日時計算機', zh: '日期时间计算器' }, icon: '📅', cat: 'utility' },
+        'random_picker.html': { name: { ko: '랜덤 뽑기', en: 'Random Picker', ja: 'ランダム抽選', zh: '随机抽签' }, icon: '🎲', cat: 'utility' },
+        'unit-converter.html': { name: { ko: '단위 변환기', en: 'Unit Converter', ja: '単位変換', zh: '单位换算' }, icon: '📐', cat: 'utility' },
+        'static/unit_converter.html': { name: { ko: '단위 변환기 Pro', en: 'Unit Converter Pro', ja: '単位変換 Pro', zh: '单位换算Pro' }, icon: '📏', cat: 'utility' },
+        'static/age_calculator.html': { name: { ko: '나이 계산기', en: 'Age Calculator', ja: '年齢計算機', zh: '年龄计算器' }, icon: '🎂', cat: 'utility' },
+        'static/char_counter.html': { name: { ko: '글자 수 세기', en: 'Character Counter', ja: '文字数カウント', zh: '字符计数' }, icon: '📝', cat: 'utility' },
+        'static/nickname_generator.html': { name: { ko: '닉네임 생성기', en: 'Nickname Generator', ja: 'ニックネーム生成', zh: '昵称生成器' }, icon: '✨', cat: 'utility' },
+        'static/random_menu.html': { name: { ko: '메뉴 추천', en: 'Random Menu', ja: 'メニュー推薦', zh: '菜单推荐' }, icon: '🍽️', cat: 'utility' },
+        'static/timezone_converter.html': { name: { ko: '타임존 변환기', en: 'Timezone Converter', ja: 'タイムゾーン変換', zh: '时区转换' }, icon: '🌏', cat: 'utility' },
 
         // === 디자인 ===
-        'color_palette.html': { name: '색상 팔레트', icon: '🎨', category: '디자인' },
-        'static/ascii_art.html': { name: 'ASCII 아트', icon: '🖼️', category: '디자인' },
-        'static/css_gradient_generator.html': { name: 'CSS 그라디언트 생성기', icon: '🌈', category: '디자인' },
-        'static/fractal_explorer.html': { name: '프랙탈 익스플로러', icon: '🌀', category: '디자인' },
-        'static/icon_generator.html': { name: '아이콘 생성기', icon: '⭐', category: '디자인' },
-        'static/particle_system.html': { name: '파티클 시스템', icon: '✨', category: '디자인' },
+        'color_palette.html': { name: { ko: '색상 팔레트', en: 'Color Palette', ja: 'カラーパレット', zh: '配色板' }, icon: '🎨', cat: 'design' },
+        'static/ascii_art.html': { name: { ko: 'ASCII 아트', en: 'ASCII Art', ja: 'ASCIIアート', zh: 'ASCII艺术' }, icon: '🖼️', cat: 'design' },
+        'static/css_gradient_generator.html': { name: { ko: 'CSS 그라디언트 생성기', en: 'CSS Gradient Generator', ja: 'CSSグラデーション生成', zh: 'CSS渐变生成器' }, icon: '🌈', cat: 'design' },
+        'static/fractal_explorer.html': { name: { ko: '프랙탈 익스플로러', en: 'Fractal Explorer', ja: 'フラクタルエクスプローラー', zh: '分形探索器' }, icon: '🌀', cat: 'design' },
+        'static/icon_generator.html': { name: { ko: '아이콘 생성기', en: 'Icon Generator', ja: 'アイコン生成', zh: '图标生成器' }, icon: '⭐', cat: 'design' },
+        'static/particle_system.html': { name: { ko: '파티클 시스템', en: 'Particle System', ja: 'パーティクルシステム', zh: '粒子系统' }, icon: '✨', cat: 'design' },
 
         // === 금융 ===
-        'interest_calculator.html': { name: '이자 계산기', icon: '💰', category: '금융' },
-        'static/daily_work_calculator.html': { name: '일급 계산기', icon: '💵', category: '금융' },
-        'static/jeonse_wolse_calculator.html': { name: '전세/월세 계산기', icon: '🏠', category: '금융' },
-        'static/salary_calculator.html': { name: '연봉 실수령액 계산기', icon: '💼', category: '금융' },
-        'static/vnd_krw_calculator.html': { name: 'VND/KRW 환율 계산기', icon: '💱', category: '금융' },
+        'interest_calculator.html': { name: { ko: '이자 계산기', en: 'Interest Calculator', ja: '利息計算機', zh: '利息计算器' }, icon: '💰', cat: 'finance' },
+        'static/daily_work_calculator.html': { name: { ko: '일급 계산기', en: 'Daily Wage Calculator', ja: '日給計算機', zh: '日工资计算器' }, icon: '💵', cat: 'finance' },
+        'static/jeonse_wolse_calculator.html': { name: { ko: '전세/월세 계산기', en: 'Jeonse/Wolse Calculator', ja: 'チョンセ/月貰計算機', zh: '全租/月租计算器' }, icon: '🏠', cat: 'finance' },
+        'static/salary_calculator.html': { name: { ko: '연봉 실수령액 계산기', en: 'Salary Calculator', ja: '年収手取り計算機', zh: '年薪到手计算器' }, icon: '💼', cat: 'finance' },
+        'static/vnd_krw_calculator.html': { name: { ko: 'VND/KRW 환율 계산기', en: 'VND/KRW Exchange', ja: 'VND/KRW為替計算機', zh: 'VND/KRW汇率计算' }, icon: '💱', cat: 'finance' },
 
         // === 심리/테스트 ===
-        'mbti_test.html': { name: 'MBTI 테스트', icon: '🧠', category: '심리/테스트' },
-        'compatibility_test.html': { name: '궁합 테스트', icon: '💕', category: '심리/테스트' },
-        'static/mbti_compatibility.html': { name: 'MBTI 궁합', icon: '🫶', category: '심리/테스트' },
-        'static/personality_test.html': { name: '성격 테스트', icon: '🎭', category: '심리/테스트' },
+        'mbti_test.html': { name: { ko: 'MBTI 테스트', en: 'MBTI Test', ja: 'MBTI診断', zh: 'MBTI测试' }, icon: '🧠', cat: 'personality' },
+        'compatibility_test.html': { name: { ko: '궁합 테스트', en: 'Compatibility Test', ja: '相性テスト', zh: '配对测试' }, icon: '💕', cat: 'personality' },
+        'static/mbti_compatibility.html': { name: { ko: 'MBTI 궁합', en: 'MBTI Compatibility', ja: 'MBTI相性', zh: 'MBTI配对' }, icon: '🫶', cat: 'personality' },
+        'static/personality_test.html': { name: { ko: '성격 테스트', en: 'Personality Test', ja: '性格診断', zh: '性格测试' }, icon: '🎭', cat: 'personality' },
 
         // === 운세 ===
-        'fortune_tarot.html': { name: '타로 운세', icon: '🔮', category: '운세' },
-        'static/fortune_zodiac.html': { name: '별자리 운세', icon: '✨', category: '운세' },
-        'static/name_compatibility.html': { name: '이름 궁합', icon: '💖', category: '운세' },
+        'fortune_tarot.html': { name: { ko: '타로 운세', en: 'Tarot Fortune', ja: 'タロット占い', zh: '塔罗运势' }, icon: '🔮', cat: 'fortune' },
+        'static/fortune_zodiac.html': { name: { ko: '별자리 운세', en: 'Zodiac Fortune', ja: '星座占い', zh: '星座运势' }, icon: '✨', cat: 'fortune' },
+        'static/name_compatibility.html': { name: { ko: '이름 궁합', en: 'Name Compatibility', ja: '名前相性', zh: '姓名配对' }, icon: '💖', cat: 'fortune' },
 
         // === 건강 ===
-        'static/bmi_calculator.html': { name: 'BMI 계산기', icon: '⚖️', category: '건강' },
-        'static/color_blindness_test.html': { name: '색맹/색약 테스트', icon: '👁️', category: '건강' },
-        'static/hearing_age_test.html': { name: '청력 나이 테스트', icon: '👂', category: '건강' },
+        'static/bmi_calculator.html': { name: { ko: 'BMI 계산기', en: 'BMI Calculator', ja: 'BMI計算機', zh: 'BMI计算器' }, icon: '⚖️', cat: 'health' },
+        'static/color_blindness_test.html': { name: { ko: '색맹/색약 테스트', en: 'Color Blindness Test', ja: '色覚テスト', zh: '色盲测试' }, icon: '👁️', cat: 'health' },
+        'static/hearing_age_test.html': { name: { ko: '청력 나이 테스트', en: 'Hearing Age Test', ja: '聴力年齢テスト', zh: '听力年龄测试' }, icon: '👂', cat: 'health' },
 
         // === 생산성 ===
-        'pomodoro.html': { name: '뽀모도로 타이머', icon: '🍅', category: '생산성' },
-        'static/meeting_calculator.html': { name: '회의 비용 계산기', icon: '📊', category: '생산성' },
+        'pomodoro.html': { name: { ko: '뽀모도로 타이머', en: 'Pomodoro Timer', ja: 'ポモドーロタイマー', zh: '番茄钟' }, icon: '🍅', cat: 'productivity' },
+        'static/meeting_calculator.html': { name: { ko: '회의 비용 계산기', en: 'Meeting Cost Calculator', ja: '会議コスト計算機', zh: '会议成本计算器' }, icon: '📊', cat: 'productivity' },
 
         // === 명상/힐링 ===
-        'mindfulness.html': { name: '마인드풀니스', icon: '🧘', category: '명상/힐링' },
-        'my_day.html': { name: '마이 데이', icon: '☀️', category: '명상/힐링' },
-        'static/mind_refresh_studio.html': { name: '마인드 리프레시 스튜디오', icon: '🌿', category: '명상/힐링' },
-        'static/relaxing_day.html': { name: '릴랙싱 데이', icon: '🌅', category: '명상/힐링' },
+        'mindfulness.html': { name: { ko: '마인드풀니스', en: 'Mindfulness', ja: 'マインドフルネス', zh: '正念冥想' }, icon: '🧘', cat: 'meditation' },
+        'my_day.html': { name: { ko: '마이 데이', en: 'My Day', ja: 'マイデイ', zh: '我的一天' }, icon: '☀️', cat: 'meditation' },
+        'static/mind_refresh_studio.html': { name: { ko: '마인드 리프레시 스튜디오', en: 'Mind Refresh Studio', ja: 'マインドリフレッシュ', zh: '心灵刷新工作室' }, icon: '🌿', cat: 'meditation' },
+        'static/relaxing_day.html': { name: { ko: '릴랙싱 데이', en: 'Relaxing Day', ja: 'リラックスデイ', zh: '放松的一天' }, icon: '🌅', cat: 'meditation' },
 
         // === 엔터테인먼트 / 반응 게임 ===
-        'static/hitel_chat.html': { name: '하이텔 채팅 (레트로)', icon: '📟', category: '엔터테인먼트' },
-        'static/max_chatbot.html': { name: 'MAX 챗봇', icon: '🤖', category: '엔터테인먼트' },
-        'static/reaction_test.html': { name: '반응속도 테스트', icon: '⚡', category: '엔터테인먼트' },
-        'static/typing_test.html': { name: '타자 속도 테스트', icon: '⌨️', category: '엔터테인먼트' }
+        'static/hitel_chat.html': { name: { ko: '하이텔 채팅 (레트로)', en: 'Hitel Chat (Retro)', ja: 'ハイテルチャット', zh: 'Hitel聊天(复古)' }, icon: '📟', cat: 'entertainment' },
+        'static/max_chatbot.html': { name: { ko: 'MAX 챗봇', en: 'MAX Chatbot', ja: 'MAXチャットボット', zh: 'MAX聊天机器人' }, icon: '🤖', cat: 'entertainment' },
+        'static/reaction_test.html': { name: { ko: '반응속도 테스트', en: 'Reaction Test', ja: '反応速度テスト', zh: '反应速度测试' }, icon: '⚡', cat: 'entertainment' },
+        'static/typing_test.html': { name: { ko: '타자 속도 테스트', en: 'Typing Test', ja: 'タイピングテスト', zh: '打字测试' }, icon: '⌨️', cat: 'entertainment' }
+    },
+
+    // 현재 언어로 도구 이름 반환
+    getToolName(tool) {
+        if (typeof tool.name === 'string') return tool.name;
+        const lang = this.getCurrentLang();
+        return tool.name[lang] || tool.name.ko || '';
+    },
+
+    // 현재 언어로 카테고리 라벨 반환
+    getCategoryLabel(catKey) {
+        if (this.categoryLabels[catKey]) {
+            const lang = this.getCurrentLang();
+            return this.categoryLabels[catKey][lang] || this.categoryLabels[catKey].ko;
+        }
+        return catKey;
+    },
+
+    // 현재 언어 감지
+    getCurrentLang() {
+        if (typeof i18n !== 'undefined' && i18n.currentLang) return i18n.currentLang;
+        const path = window.location.pathname;
+        if (path.startsWith('/en/') || path.includes('/en/')) return 'en';
+        if (path.startsWith('/ja/') || path.includes('/ja/')) return 'ja';
+        if (path.startsWith('/zh/') || path.includes('/zh/')) return 'zh';
+        return 'ko';
     },
 
     // 도구 페이지 키 추출 (다국어 경로 지원)
@@ -817,15 +860,20 @@ const RecentTools = {
         }
     },
 
-    // 관련 도구 가져오기 (같은 카테고리)
+    // 관련 도구 가져오기 (같은 카테고리, 다국어 지원)
     getRelatedTools(currentFile, limit = 3) {
         const current = this.tools[currentFile];
         if (!current) return [];
 
         const related = [];
         for (const [file, info] of Object.entries(this.tools)) {
-            if (file !== currentFile && info.category === current.category) {
-                related.push({ file, ...info });
+            if (file !== currentFile && info.cat === current.cat) {
+                related.push({
+                    file,
+                    name: this.getToolName(info),
+                    icon: info.icon,
+                    category: this.getCategoryLabel(info.cat)
+                });
             }
         }
 
@@ -920,7 +968,7 @@ const RecentTools = {
                 }
             </style>
             <div class="widget-header">
-                <span class="widget-title">⏱️ 최근 사용</span>
+                <span class="widget-title">⏱️ ${({ko:'최근 사용',en:'Recent',ja:'最近使用',zh:'最近使用'})[this.getCurrentLang()] || '최근 사용'}</span>
                 <button class="widget-toggle" onclick="RecentTools.toggleWidget()">✕</button>
             </div>
             <div class="widget-content">
@@ -929,7 +977,7 @@ const RecentTools = {
                     if (!tool) return '';
                     return `<a href="${this.getToolUrl(file)}" class="tool-item">
                         <span class="tool-icon">${tool.icon}</span>
-                        <span>${tool.name}</span>
+                        <span>${this.getToolName(tool)}</span>
                     </a>`;
                 }).join('')}
             </div>
@@ -977,9 +1025,9 @@ const RecentTools = {
         // 이미 렌더링된 경우 중복 방지
         if (document.getElementById('related-tools-section')) return;
 
-        // 카테고리 라벨 (현재 도구의 카테고리)
+        // 카테고리 라벨 (현재 도구의 카테고리, 다국어 지원)
         const currentTool = this.tools[currentKey];
-        const categoryLabel = currentTool ? currentTool.category : '';
+        const categoryLabel = currentTool ? this.getCategoryLabel(currentTool.cat) : '';
 
         // 다국어 헤더 텍스트
         const lang = (typeof i18n !== 'undefined' && i18n.currentLang) ? i18n.currentLang : 'ko';
