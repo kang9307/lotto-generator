@@ -742,7 +742,17 @@ const RecentTools = {
         'static/daily_work_calculator.html': { name: { ko: '일급 계산기', en: 'Daily Wage Calculator', ja: '日給計算機', zh: '日工资计算器' }, icon: '💵', cat: 'finance' },
         'static/jeonse_wolse_calculator.html': { name: { ko: '전세/월세 계산기', en: 'Jeonse/Wolse Calculator', ja: 'チョンセ/月貰計算機', zh: '全租/月租计算器' }, icon: '🏠', cat: 'finance' },
         'static/salary_calculator.html': { name: { ko: '연봉 실수령액 계산기', en: 'Salary Calculator', ja: '年収手取り計算機', zh: '年薪到手计算器' }, icon: '💼', cat: 'finance' },
-        'static/vnd_krw_calculator.html': { name: { ko: 'VND/KRW 환율 계산기', en: 'VND/KRW Exchange', ja: 'VND/KRW為替計算機', zh: 'VND/KRW汇率计算' }, icon: '💱', cat: 'finance' },
+        'static/currency_calculator.html': { name: { ko: '통합 환율 계산기', en: 'Multi-Currency Calculator', ja: '多通貨為替計算機', zh: '多币种汇率计算器' }, icon: '💱', cat: 'finance' },
+        'static/usd_krw_calculator.html': { name: { ko: '달러 환율 계산기', en: 'USD/KRW Calculator', ja: '米ドル為替計算機', zh: '美元汇率计算器' }, icon: '🇺🇸', cat: 'finance' },
+        'static/jpy_krw_calculator.html': { name: { ko: '엔화 환율 계산기', en: 'JPY/KRW Calculator', ja: '円為替計算機', zh: '日元汇率计算器' }, icon: '🇯🇵', cat: 'finance' },
+        'static/eur_krw_calculator.html': { name: { ko: '유로 환율 계산기', en: 'EUR/KRW Calculator', ja: 'ユーロ為替計算機', zh: '欧元汇率计算器' }, icon: '🇪🇺', cat: 'finance' },
+        'static/cny_krw_calculator.html': { name: { ko: '위안 환율 계산기', en: 'CNY/KRW Calculator', ja: '人民元為替計算機', zh: '人民币汇率计算器' }, icon: '🇨🇳', cat: 'finance' },
+        'static/gbp_krw_calculator.html': { name: { ko: '파운드 환율 계산기', en: 'GBP/KRW Calculator', ja: 'ポンド為替計算機', zh: '英镑汇率计算器' }, icon: '🇬🇧', cat: 'finance' },
+        'static/thb_krw_calculator.html': { name: { ko: '바트 환율 계산기', en: 'THB/KRW Calculator', ja: 'バーツ為替計算機', zh: '泰铢汇率计算器' }, icon: '🇹🇭', cat: 'finance' },
+        'static/php_krw_calculator.html': { name: { ko: '페소 환율 계산기', en: 'PHP/KRW Calculator', ja: 'ペソ為替計算機', zh: '比索汇率计算器' }, icon: '🇵🇭', cat: 'finance' },
+        'static/idr_krw_calculator.html': { name: { ko: '루피아 환율 계산기', en: 'IDR/KRW Calculator', ja: 'ルピア為替計算機', zh: '印尼盾汇率计算器' }, icon: '🇮🇩', cat: 'finance' },
+        'static/twd_krw_calculator.html': { name: { ko: '대만달러 환율 계산기', en: 'TWD/KRW Calculator', ja: '台湾ドル為替計算機', zh: '新台币汇率计算器' }, icon: '🇹🇼', cat: 'finance' },
+        'static/vnd_krw_calculator.html': { name: { ko: '동 환율 계산기', en: 'VND/KRW Calculator', ja: 'ドン為替計算機', zh: '越南盾汇率计算器' }, icon: '🇻🇳', cat: 'finance' },
 
         // === 심리/테스트 ===
         'mbti_test.html': { name: { ko: 'MBTI 테스트', en: 'MBTI Test', ja: 'MBTI診断', zh: 'MBTI测试' }, icon: '🧠', cat: 'personality' },
