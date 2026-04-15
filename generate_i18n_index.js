@@ -52,6 +52,12 @@ languages.forEach(lang => {
                 post.category = categoryMatch[1].trim();
             }
 
+            // keywords 추출 - <meta name="keywords" content="...">
+            const keywordsMatch = html.match(/<meta\s+name="keywords"\s+content="([^"]+)"/i);
+            if (keywordsMatch) {
+                post.keywords = keywordsMatch[1].trim();
+            }
+
             updatedCount++;
         } else {
             missingCount++;
