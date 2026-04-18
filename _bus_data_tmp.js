@@ -1,0 +1,190 @@
+// 영광터미널 시간표 데이터 - 2026년 3월 9일 기준
+
+const BUS_DATA = {
+  updatedAt: '2026년 3월 9일',
+  terminal: '영광버스터미널',
+
+  routes: [
+    {
+      id: 'seoul',
+      name: '서울 (센트럴)',
+      shortName: '서울',
+      region: '수도권',
+      icon: '🚌',
+      schedules: [
+        { no: 1, time: '07:00', note: '정안' },
+        { no: 2, time: '08:40', note: '정안' },
+        { no: 3, time: '10:00', note: '정안' },
+        { no: 4, time: '11:00', note: '' },
+        { no: 5, time: '12:00', note: '정안' },
+        { no: 6, time: '13:30', note: '정안' },
+        { no: 7, time: '15:10', note: '' },
+        { no: 8, time: '16:20', note: '정안' },
+        { no: 9, time: '17:15', note: '' },
+        { no: 10, time: '20:00', note: '' },
+      ],
+    },
+    {
+      id: 'incheon-airport',
+      name: '인천공항',
+      shortName: '인천공항',
+      region: '수도권',
+      icon: '✈️',
+      schedules: [
+        { no: 1, time: '01:20', note: '심야프리미엄' },
+        { no: 2, time: '02:50', note: '심야 우등' },
+      ],
+    },
+    {
+      id: 'ansan',
+      name: '안산 / 안양',
+      shortName: '안산·안양',
+      region: '수도권',
+      icon: '🚌',
+      schedules: [
+        { no: 1, time: '09:00', note: '우등' },
+      ],
+    },
+    {
+      id: 'incheon',
+      name: '인천 / 부천',
+      shortName: '인천·부천',
+      region: '수도권',
+      icon: '🚌',
+      schedules: [
+        { no: 1, time: '09:55', note: '우등 · 금/토/일만' },
+        { no: 2, time: '14:55', note: '우등 · 금/토/일만' },
+        { no: 3, time: '17:55', note: '우등 · 금/토/일만' },
+      ],
+    },
+    {
+      id: 'gwangju',
+      name: '문장 · 송정역 · 광주',
+      shortName: '광주 방면',
+      region: '호남',
+      icon: '🚌',
+      schedules: [
+        { no: 1, time: '07:00', note: '' },
+        { no: 2, time: '07:40', note: '우등' },
+        { no: 3, time: '08:20', note: '' },
+        { no: 4, time: '09:10', note: '우등' },
+        { no: 5, time: '10:10', note: '우등' },
+        { no: 6, time: '10:50', note: '' },
+        { no: 7, time: '11:40', note: '우등' },
+        { no: 8, time: '12:30', note: '' },
+        { no: 9, time: '13:00', note: '' },
+        { no: 10, time: '13:40', note: '' },
+        { no: 11, time: '14:20', note: '' },
+        { no: 12, time: '15:00', note: '' },
+        { no: 13, time: '15:40', note: '우등' },
+        { no: 14, time: '16:30', note: '' },
+        { no: 15, time: '17:20', note: '우등' },
+        { no: 16, time: '18:20', note: '' },
+        { no: 17, time: '19:00', note: '' },
+        { no: 18, time: '19:40', note: '' },
+        { no: 19, time: '20:20', note: '금/토/일만 운행', highlight: true },
+        { no: 20, time: '21:00', note: '' },
+      ],
+    },
+    {
+      id: 'beopseong',
+      name: '법성 → 광주방면',
+      shortName: '법성→광주',
+      region: '호남',
+      icon: '🚌',
+      subtitle: '영광 · 문장 · 송정 경유',
+      schedules: [
+        { no: 1, time: '06:45', note: '' },
+        { no: 2, time: '10:35', note: '' },
+        { no: 3, time: '12:15', note: '' },
+        { no: 4, time: '13:25', note: '' },
+        { no: 5, time: '14:45', note: '' },
+        { no: 6, time: '18:05', note: '' },
+        { no: 7, time: '19:25', note: '' },
+      ],
+    },
+    {
+      id: 'mokpo',
+      name: '목포방면',
+      shortName: '목포',
+      region: '호남',
+      icon: '🚌',
+      subtitle: '함평 / 무안',
+      schedules: [
+        { no: 1, time: '07:10', note: '신광·청계' },
+        { no: 2, time: '08:25', note: '신광·청계' },
+        { no: 3, time: '09:25', note: '' },
+        { no: 4, time: '09:50', note: '신광·청계' },
+        { no: 5, time: '13:45', note: '' },
+        { no: 6, time: '14:10', note: '신광·청계' },
+        { no: 7, time: '16:00', note: '' },
+        { no: 8, time: '17:25', note: '' },
+        { no: 9, time: '19:50', note: '' },
+      ],
+    },
+    {
+      id: 'jeonju',
+      name: '전주방면',
+      shortName: '전주',
+      region: '호남',
+      icon: '🚌',
+      subtitle: '대산 / 고창 / 흥덕',
+      schedules: [
+        { no: 1, time: '07:10', note: '정읍·전주' },
+        { no: 2, time: '08:05', note: '전주' },
+        { no: 3, time: '09:00', note: '정읍·전주' },
+        { no: 4, time: '09:50', note: '정읍·전주' },
+        { no: 5, time: '10:25', note: '전주' },
+        { no: 6, time: '13:00', note: '정읍·전주' },
+        { no: 7, time: '15:50', note: '정읍·전주' },
+        { no: 8, time: '17:00', note: '정읍·전주' },
+        { no: 9, time: '18:20', note: '정읍·전주' },
+      ],
+    },
+    {
+      id: 'gunsan',
+      name: '대야 · 군산방면',
+      shortName: '군산',
+      region: '호남',
+      icon: '🚌',
+      schedules: [
+        { no: 1, time: '11:55', note: '' },
+        { no: 2, time: '13:35', note: '' },
+        { no: 3, time: '17:45', note: '' },
+        { no: 4, time: '19:40', note: '' },
+      ],
+    },
+  ],
+
+  // 인천공항 임시 운행 안내
+  incheonNotice: {
+    title: '인천공항 3월 임시 운행',
+    time: '01:50',
+    grade: '심야 우등',
+    dates: ['3월 15일', '16일', '19일', '23일', '25일', '26일', '28일', '29일'],
+    extra: '영광발 광주행 20:20 → 금/토/일만 운행 (월~목 미운행)',
+  },
+
+  // 금호고속 안내
+  notice: {
+    title: '영광터미널 내 금호고속 안내',
+    items: [
+      { label: '정상 근무시간', value: '08:00 ~ 16:30' },
+      { label: '점심시간', value: '12:30 ~ 13:20', note: '근무시간 외 화물 취급하지 않습니다' },
+      { label: '서울/광주 첫차 화물', value: '하루 전날 화물표 발행 또는 핸드폰 문의 필수' },
+    ],
+    phones: [
+      { label: '사무실', number: '061-353-0040' },
+      { label: '야간 (문자로)', number: '010-7675-7766' },
+    ],
+  },
+
+  // 화물 접수
+  cargo: {
+    title: '화물 접수·보관·발송',
+    services: ['광신고속', '대한고속'],
+    description: '광주 경유 전국 연계 발송 전문',
+  },
+};
+
+window.BUS_DATA = BUS_DATA;

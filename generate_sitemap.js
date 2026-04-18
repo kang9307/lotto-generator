@@ -55,6 +55,7 @@ const mainPages = [
     { path: '/my_day.html', priority: '0.8', changefreq: 'daily' },
     { path: '/privacy.html', priority: '0.5', changefreq: 'monthly' },
     { path: '/dashboard.html', priority: '0.6', changefreq: 'weekly' },
+    { path: '/yg_bus.html', priority: '0.9', changefreq: 'weekly', koOnly: true },
 ];
 
 // static 폴더 페이지 목록
@@ -172,28 +173,32 @@ function generateSitemap() {
         // 한국어 버전 (기본)
         xml += '  <url>\n';
         xml += `    <loc>${BASE_URL}${page.path}</loc>\n`;
-        xml += `${generateHreflangLinks(page.path)}\n`;
+        if (!page.koOnly) {
+            xml += `${generateHreflangLinks(page.path)}\n`;
+        }
         xml += `    <lastmod>${today}</lastmod>\n`;
         xml += `    <changefreq>${page.changefreq}</changefreq>\n`;
         xml += `    <priority>${page.priority}</priority>\n`;
         xml += '  </url>\n';
         totalUrls++;
 
-        // 다른 언어 버전
-        for (const lang of LANGUAGES.filter(l => l !== 'ko')) {
-            const langPriority = (parseFloat(page.priority) * 0.95).toFixed(2);
-            xml += '  <url>\n';
-            xml += `    <loc>${BASE_URL}/${lang}${page.path}</loc>\n`;
-            xml += `${generateHreflangLinks(page.path)}\n`;
-            xml += `    <lastmod>${today}</lastmod>\n`;
-            xml += `    <changefreq>${page.changefreq}</changefreq>\n`;
-            xml += `    <priority>${langPriority}</priority>\n`;
-            xml += '  </url>\n';
-            totalUrls++;
+        // 다른 언어 버전 (koOnly가 아닌 경우만)
+        if (!page.koOnly) {
+            for (const lang of LANGUAGES.filter(l => l !== 'ko')) {
+                const langPriority = (parseFloat(page.priority) * 0.95).toFixed(2);
+                xml += '  <url>\n';
+                xml += `    <loc>${BASE_URL}/${lang}${page.path}</loc>\n`;
+                xml += `${generateHreflangLinks(page.path)}\n`;
+                xml += `    <lastmod>${today}</lastmod>\n`;
+                xml += `    <changefreq>${page.changefreq}</changefreq>\n`;
+                xml += `    <priority>${langPriority}</priority>\n`;
+                xml += '  </url>\n';
+                totalUrls++;
+            }
         }
     }
 
-    console.log(`   ✅ ${mainPages.length * LANGUAGES.length}개 페이지 추가됨\n`);
+    console.log(`   ✅ 메인 페이지 추가 완료 (누적 URL: ${totalUrls})\n`);
 
     // 2. static 폴더 페이지 추가 (모든 언어 버전)
     console.log('📁 static 폴더 페이지 추가 중...');
