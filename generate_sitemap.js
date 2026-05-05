@@ -298,6 +298,7 @@ function generateLanguageSitemaps() {
 
         // 메인/도구 페이지
         for (const page of mainPages) {
+            if (lang !== 'ko' && page.koOnly) continue;
             xml += '  <url>\n';
             xml += `    <loc>${BASE_URL}${langPrefix}${page.path}</loc>\n`;
             xml += `    <lastmod>${today}</lastmod>\n`;
