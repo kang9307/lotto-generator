@@ -124,7 +124,7 @@ function parseTopics(html) {
     const id = match[1];
     const row = match[2];
 
-    const titleMatch = row.match(/<a href='([^']+)' rel='nofollow' id='tr\d+'>\s*<h1>([^<]+)<\/h1>/);
+    const titleMatch = row.match(/<a href='([^']+)' rel='nofollow' id='tr\d+'>\s*<(?:h1|h2)(?:\s+[^>]*)?>([^<]+)<\/(?:h1|h2)>/);
     if (!titleMatch) continue;
 
     const url = titleMatch[1].trim();

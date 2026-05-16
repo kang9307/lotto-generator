@@ -727,6 +727,7 @@ const RecentTools = {
         'static/char_counter.html': { name: { ko: '글자 수 세기', en: 'Character Counter', ja: '文字数カウント', zh: '字符计数' }, icon: '📝', cat: 'utility' },
         'static/nickname_generator.html': { name: { ko: '닉네임 생성기', en: 'Nickname Generator', ja: 'ニックネーム生成', zh: '昵称生成器' }, icon: '✨', cat: 'utility' },
         'static/random_menu.html': { name: { ko: '메뉴 추천', en: 'Random Menu', ja: 'メニュー推薦', zh: '菜单推荐' }, icon: '🍽️', cat: 'utility' },
+        'static/spin_wheel.html': { name: { ko: '돌림판 룰렛', en: 'Spin Wheel', ja: 'ルーレット', zh: '随机转盘' }, icon: '🎯', cat: 'utility' },
         'static/timezone_converter.html': { name: { ko: '타임존 변환기', en: 'Timezone Converter', ja: 'タイムゾーン変換', zh: '时区转换' }, icon: '🌏', cat: 'utility' },
 
         // === 디자인 ===

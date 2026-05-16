@@ -111,6 +111,7 @@ const staticPages = [
     { path: '/static/php_krw_calculator.html', priority: '0.9', changefreq: 'daily' },
     { path: '/static/idr_krw_calculator.html', priority: '0.9', changefreq: 'daily' },
     { path: '/static/twd_krw_calculator.html', priority: '0.9', changefreq: 'daily' },
+    { path: '/static/spin_wheel.html', priority: '0.9', changefreq: 'weekly' },
 ];
 
 // posts 폴더에서 HTML 파일 목록 가져오기

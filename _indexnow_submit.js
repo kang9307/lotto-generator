@@ -1,0 +1,83 @@
+/**
+ * Bing IndexNow 배치 전송
+ * 오늘(5/14) 신규 노출 URL만 신고
+ */
+const https = require('https');
+
+const KEY = '7d594d096f044fbba3a09184f68ffcfe';
+const HOST = 'braindetox.kr';
+
+// 5/14 신규 발행 URL (5 posts × 4 langs)
+const POSTS_TODAY = [
+  'summer_electricity_savings_guide_2026',
+  'ai_coding_tools_2026_comparison',
+  'deerflow_2_0_bytedance_agent_analysis',
+  'pet_summer_care_guide_2026',
+  'ai_video_generation_tools_2026_comparison'
+];
+
+const urls = [];
+
+// 1) 신규 포스트 4언어
+const langPrefix = { ko: '', en: '/en', ja: '/ja', zh: '/zh' };
+for (const slug of POSTS_TODAY) {
+  for (const lang of ['ko', 'en', 'ja', 'zh']) {
+    urls.push(`https://${HOST}${langPrefix[lang]}/posts/${slug}.html`);
+  }
+}
+
+// 2) 신규 도구 spin_wheel (4 언어)
+for (const lang of ['ko', 'en', 'ja', 'zh']) {
+  urls.push(`https://${HOST}${langPrefix[lang]}/static/spin_wheel.html`);
+}
+
+// 3) 업데이트된 random_picker (내부 링크 추가, 4언어)
+for (const lang of ['ko', 'en', 'ja', 'zh']) {
+  urls.push(`https://${HOST}${langPrefix[lang]}/random_picker.html`);
+}
+
+console.log('Total URLs to submit:', urls.length);
+console.log('Sample:', urls.slice(0, 3).join('\n  '));
+console.log();
+
+const payload = JSON.stringify({
+  host: HOST,
+  key: KEY,
+  keyLocation: `https://${HOST}/${KEY}.txt`,
+  urlList: urls
+});
+
+const options = {
+  hostname: 'api.indexnow.org',
+  port: 443,
+  path: '/IndexNow',
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(payload)
+  }
+};
+
+const req = https.request(options, (res) => {
+  console.log('Status:', res.statusCode, res.statusMessage);
+  let body = '';
+  res.on('data', c => body += c);
+  res.on('end', () => {
+    if (body) console.log('Response:', body);
+    console.log('\n결과:');
+    if (res.statusCode === 200) {
+      console.log('✅ ' + urls.length + '개 URL Bing IndexNow 신고 성공');
+      console.log('   24시간 내 색인 시작 예상');
+    } else if (res.statusCode === 202) {
+      console.log('✅ 접수 완료 (HTTP 202)');
+    } else if (res.statusCode === 422) {
+      console.log('⚠️ 일부 URL 거부됨 (422) - 키 검증 또는 URL 형식 확인');
+    } else {
+      console.log('⚠️ 비정상 응답');
+    }
+  });
+});
+
+req.on('error', e => console.error('전송 실패:', e.message));
+req.write(payload);
+req.end();
