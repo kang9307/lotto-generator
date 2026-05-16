@@ -3,6 +3,7 @@
  * 오늘(5/14) 신규 노출 URL만 신고
  */
 const https = require('https');
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
 const KEY = '7d594d096f044fbba3a09184f68ffcfe';
 const HOST = 'braindetox.kr';
