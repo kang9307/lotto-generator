@@ -728,6 +728,11 @@ const RecentTools = {
         'static/nickname_generator.html': { name: { ko: '닉네임 생성기', en: 'Nickname Generator', ja: 'ニックネーム生成', zh: '昵称生成器' }, icon: '✨', cat: 'utility' },
         'static/random_menu.html': { name: { ko: '메뉴 추천', en: 'Random Menu', ja: 'メニュー推薦', zh: '菜单推荐' }, icon: '🍽️', cat: 'utility' },
         'static/spin_wheel.html': { name: { ko: '돌림판 룰렛', en: 'Spin Wheel', ja: 'ルーレット', zh: '随机转盘' }, icon: '🎯', cat: 'utility' },
+        'static/jwt_decoder.html': { name: { ko: 'JWT 디코더', en: 'JWT Decoder', ja: 'JWTデコーダー', zh: 'JWT解码器' }, icon: '🔑', cat: 'utility' },
+        'static/yaml_json_converter.html': { name: { ko: 'YAML/JSON 변환기', en: 'YAML/JSON Converter', ja: 'YAML/JSON変換器', zh: 'YAML/JSON转换器' }, icon: '🔄', cat: 'utility' },
+        'static/http_status_codes.html': { name: { ko: 'HTTP 상태 코드', en: 'HTTP Status Codes', ja: 'HTTPステータスコード', zh: 'HTTP状态码' }, icon: '🌐', cat: 'utility' },
+        'static/curl_builder.html': { name: { ko: 'curl 명령어 생성기', en: 'curl Command Builder', ja: 'curlコマンド生成器', zh: 'curl命令生成器' }, icon: '📡', cat: 'utility' },
+        'static/ssh_config_generator.html': { name: { ko: 'SSH config 생성기', en: 'SSH Config Generator', ja: 'SSH config生成器', zh: 'SSH config生成器' }, icon: '🔐', cat: 'utility' },
         'static/timezone_converter.html': { name: { ko: '타임존 변환기', en: 'Timezone Converter', ja: 'タイムゾーン変換', zh: '时区转换' }, icon: '🌏', cat: 'utility' },
 
         // === 디자인 ===

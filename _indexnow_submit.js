@@ -1,6 +1,6 @@
 /**
  * Bing IndexNow 배치 전송
- * 오늘(5/14) 신규 노출 URL만 신고
+ * 2026-05-18: 신규 도구 5개 (JWT/YAML-JSON/HTTP/curl/SSH) × 4언어 + static_index × 4언어
  */
 const https = require('https');
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -8,33 +8,27 @@ process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 const KEY = '7d594d096f044fbba3a09184f68ffcfe';
 const HOST = 'braindetox.kr';
 
-// 5/14 신규 발행 URL (5 posts × 4 langs)
-const POSTS_TODAY = [
-  'summer_electricity_savings_guide_2026',
-  'ai_coding_tools_2026_comparison',
-  'deerflow_2_0_bytedance_agent_analysis',
-  'pet_summer_care_guide_2026',
-  'ai_video_generation_tools_2026_comparison'
+const NEW_TOOLS = [
+  'jwt_decoder',
+  'yaml_json_converter',
+  'http_status_codes',
+  'curl_builder',
+  'ssh_config_generator'
 ];
 
 const urls = [];
-
-// 1) 신규 포스트 4언어
 const langPrefix = { ko: '', en: '/en', ja: '/ja', zh: '/zh' };
-for (const slug of POSTS_TODAY) {
+
+// 1) 신규 도구 5개 × 4언어 = 20 URLs
+for (const slug of NEW_TOOLS) {
   for (const lang of ['ko', 'en', 'ja', 'zh']) {
-    urls.push(`https://${HOST}${langPrefix[lang]}/posts/${slug}.html`);
+    urls.push(`https://${HOST}${langPrefix[lang]}/static/${slug}.html`);
   }
 }
 
-// 2) 신규 도구 spin_wheel (4 언어)
+// 2) static_index (4언어) - 카드 추가 반영
 for (const lang of ['ko', 'en', 'ja', 'zh']) {
-  urls.push(`https://${HOST}${langPrefix[lang]}/static/spin_wheel.html`);
-}
-
-// 3) 업데이트된 random_picker (내부 링크 추가, 4언어)
-for (const lang of ['ko', 'en', 'ja', 'zh']) {
-  urls.push(`https://${HOST}${langPrefix[lang]}/random_picker.html`);
+  urls.push(`https://${HOST}${langPrefix[lang]}/static_index.html`);
 }
 
 console.log('Total URLs to submit:', urls.length);

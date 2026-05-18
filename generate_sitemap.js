@@ -111,6 +111,11 @@ const staticPages = [
     { path: '/static/php_krw_calculator.html', priority: '0.9', changefreq: 'daily' },
     { path: '/static/idr_krw_calculator.html', priority: '0.9', changefreq: 'daily' },
     { path: '/static/twd_krw_calculator.html', priority: '0.9', changefreq: 'daily' },
+    { path: '/static/jwt_decoder.html', priority: '0.8', changefreq: 'monthly' },
+    { path: '/static/yaml_json_converter.html', priority: '0.8', changefreq: 'monthly' },
+    { path: '/static/http_status_codes.html', priority: '0.8', changefreq: 'monthly' },
+    { path: '/static/curl_builder.html', priority: '0.8', changefreq: 'monthly' },
+    { path: '/static/ssh_config_generator.html', priority: '0.8', changefreq: 'monthly' },
     { path: '/static/spin_wheel.html', priority: '0.9', changefreq: 'weekly' },
 ];
 
