@@ -1,6 +1,6 @@
 /**
  * Bing IndexNow 배치 전송
- * 2026-05-18: 신규 도구 5개 (JWT/YAML-JSON/HTTP/curl/SSH) × 4언어 + static_index × 4언어
+ * 2026-05-19: 신규 블로그 포스트 3편 × 4언어 = 12 URLs + blog.html × 4언어
  */
 const https = require('https');
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -8,27 +8,25 @@ process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 const KEY = '7d594d096f044fbba3a09184f68ffcfe';
 const HOST = 'braindetox.kr';
 
-const NEW_TOOLS = [
-  'jwt_decoder',
-  'yaml_json_converter',
-  'http_status_codes',
-  'curl_builder',
-  'ssh_config_generator'
+const NEW_POSTS = [
+  'ai_developer_compounding_growth_2026',
+  'local_llm_hardware_selection_guide_2026',
+  'platform_engineering_complete_guide_2026'
 ];
 
 const urls = [];
 const langPrefix = { ko: '', en: '/en', ja: '/ja', zh: '/zh' };
 
-// 1) 신규 도구 5개 × 4언어 = 20 URLs
-for (const slug of NEW_TOOLS) {
+// 1) 신규 포스트 3편 × 4언어 = 12 URLs
+for (const slug of NEW_POSTS) {
   for (const lang of ['ko', 'en', 'ja', 'zh']) {
-    urls.push(`https://${HOST}${langPrefix[lang]}/static/${slug}.html`);
+    urls.push(`https://${HOST}${langPrefix[lang]}/posts/${slug}.html`);
   }
 }
 
-// 2) static_index (4언어) - 카드 추가 반영
+// 2) blog.html (4언어) - featured 갱신 반영
 for (const lang of ['ko', 'en', 'ja', 'zh']) {
-  urls.push(`https://${HOST}${langPrefix[lang]}/static_index.html`);
+  urls.push(`https://${HOST}${langPrefix[lang]}/blog.html`);
 }
 
 console.log('Total URLs to submit:', urls.length);
