@@ -1,6 +1,6 @@
 /**
  * Bing IndexNow 배치 전송
- * 2026-05-20: 백데이트 포스트 2편(5/14, 5/15) × 4언어 = 8 URLs + blog.html + RSS × 4언어
+ * 2026-05-21 발행: 신규 포스트 5편 × 4언어 = 20 URLs + blog.html + RSS × 4언어
  */
 const https = require('https');
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -9,14 +9,17 @@ const KEY = '7d594d096f044fbba3a09184f68ffcfe';
 const HOST = 'braindetox.kr';
 
 const NEW_POSTS = [
-  'programming_as_theory_building_ai_era_2026',
-  'learn_software_architecture_senior_path_2026'
+  'side_project_completion_strategy_2026',
+  'karpathy_joins_anthropic_ai_talent_2026',
+  'llm_progress_6months_recap_2026',
+  'mirage_ai_agent_filesystem_2026',
+  'ai_model_names_builders_strategy_2026'
 ];
 
 const urls = [];
 const langPrefix = { ko: '', en: '/en', ja: '/ja', zh: '/zh' };
 
-// 1) 신규 포스트 2편 × 4언어 = 8 URLs
+// 1) 신규 포스트 5편 × 4언어 = 20 URLs
 for (const slug of NEW_POSTS) {
   for (const lang of ['ko', 'en', 'ja', 'zh']) {
     urls.push(`https://${HOST}${langPrefix[lang]}/posts/${slug}.html`);
@@ -28,7 +31,7 @@ for (const lang of ['ko', 'en', 'ja', 'zh']) {
   urls.push(`https://${HOST}${langPrefix[lang]}/blog.html`);
 }
 
-// 3) RSS feeds (4언어) - 첫 등록
+// 3) RSS feeds (4언어)
 for (const lang of ['ko', 'en', 'ja', 'zh']) {
   urls.push(`https://${HOST}${langPrefix[lang]}/rss.xml`);
 }
