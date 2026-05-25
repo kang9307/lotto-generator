@@ -1,6 +1,6 @@
 /**
  * Bing IndexNow 배치 전송
- * 2026-05-23~25 발행: 신규 포스트 9편 × 4언어 = 36 URLs + blog.html + RSS × 4언어
+ * 2026-05-26 발행: 신규 포스트 6편 × 4언어 = 24 URLs + blog.html + RSS × 4언어
  */
 const https = require('https');
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -9,21 +9,18 @@ const KEY = '7d594d096f044fbba3a09184f68ffcfe';
 const HOST = 'braindetox.kr';
 
 const NEW_POSTS = [
-  'twelve_ways_wrong_ai_coding_2026',
-  'age_of_products_to_brains_2026',
-  'software_becoming_headless_2026',
-  'zero_agent_first_programming_language_2026',
-  'llm_architecture_kv_cache_trends_2026',
-  'new_programming_language_5year_5m_lesson_2026',
-  'mimalloc_performance_allocator_2026',
-  'dont_roll_your_own_browser_principle_2026',
-  'ai_capability_multiplier_2026'
+  'openai_codex_52_use_cases_2026',
+  'go_to_rust_migration_guide_2026',
+  'ai_agents_most_expensive_mistake_2026',
+  'flue_sandbox_agent_framework_2026',
+  'australia_4day_work_week_data_2026',
+  'microsoft_claude_to_copilot_switch_2026'
 ];
 
 const urls = [];
 const langPrefix = { ko: '', en: '/en', ja: '/ja', zh: '/zh' };
 
-// 1) 신규 포스트 9편 × 4언어 = 36 URLs
+// 1) 신규 포스트 6편 × 4언어 = 24 URLs
 for (const slug of NEW_POSTS) {
   for (const lang of ['ko', 'en', 'ja', 'zh']) {
     urls.push(`https://${HOST}${langPrefix[lang]}/posts/${slug}.html`);
