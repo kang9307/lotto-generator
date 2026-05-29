@@ -1,6 +1,6 @@
 /**
  * Bing IndexNow 배치 전송
- * 2026-05-29 발행: 신규 포스트 6편 × 4언어 = 24 URLs + blog.html + RSS × 4언어
+ * 2026-05-29 발행: 신규 포스트 10편 × 4언어 = 40 URLs + blog.html + RSS × 4언어
  */
 const https = require('https');
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -14,7 +14,11 @@ const NEW_POSTS = [
   'tired_of_talking_to_ai_2026',
   'claude_opus_4_8_release_2026',
   'tech_ceo_ai_psychosis_2026',
-  'duckduckgo_growth_ai_free_search_2026'
+  'duckduckgo_growth_ai_free_search_2026',
+  'codeboarding_ai_architecture_diagram_2026',
+  'naver_ai_citation_creator_compensation_2026',
+  'outsourcing_localai_cost_strategy_2026',
+  'anthropic_openai_product_market_fit_2026'
 ];
 
 const urls = [];
