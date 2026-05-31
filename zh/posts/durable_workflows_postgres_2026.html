@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<!--
+ * Tech Blog Post Template
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>用Postgres构建持久化工作流 2026 - 无需独立队列即可保证可靠性 - BrainDetox</title>
+    <meta name="description" content="真的需要Kafka吗？利用已有的Postgres，通过SKIP LOCKED、事务性发件箱和幂等性，构建可靠的后台任务与持久化工作流的方法，本文逐一解析。">
+    <meta name="keywords" content="Postgres 持久化工作流 2026, Postgres 后台任务, Postgres 队列, SELECT FOR UPDATE SKIP LOCKED, 事务性发件箱模式, Postgres vs Kafka, 任务队列, 幂等性, Temporal 替代, durable execution">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/durable_workflows_postgres_2026.html">
+
+    <meta property="og:title" content="用Postgres构建持久化工作流 2026 - 无需独立队列">
+    <meta property="og:description" content="真的需要Kafka吗？仅用已有的Postgres构建可靠后台任务与持久化工作流的五大核心模式，从实务角度解析。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/durable_workflows_postgres_2026.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-05-31">
+    <meta property="article:section" content="IT/技术">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="用Postgres构建持久化工作流 2026">
+    <meta name="twitter:description" content="无需Kafka和Temporal，仅用已有的Postgres构建可靠后台任务的方法。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "用Postgres构建持久化工作流 2026 - 无需独立队列即可保证可靠性",
+      "alternativeHeadline": "Do You Really Need Kafka? How to Build Durable Workflows With Just Postgres in 2026",
+      "datePublished": "2026-05-31",
+      "dateModified": "2026-05-31",
+      "inLanguage": "zh-CN",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "Postgres 持久化工作流, Postgres 后台任务, SKIP LOCKED, 事务性发件箱, Postgres vs Kafka",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/durable_workflows_postgres_2026.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "Postgres能否构建持久化工作流？",
+          "acceptedAnswer": { "@type": "Answer", "text": "可以，完全能够。Postgres保证ACID事务与磁盘持久化，因此只要把任务表与SELECT FOR UPDATE SKIP LOCKED、幂等键、重试列组合起来，就能构建可靠的任务队列和工作流引擎。对于每秒数十到数千任务规模的中小型服务，仅用Postgres即可在没有独立消息代理的情况下稳定处理大部分后台工作。" }
+        },
+        {
+          "@type": "Question",
+          "name": "一定需要Kafka，还是Postgres就够了？",
+          "acceptedAnswer": { "@type": "Answer", "text": "如果需要每秒数万条以上的大规模流处理、多个消费者组独立消费同一事件的扇出、或长期保留的事件日志，那么Kafka更合适。但大多数中小型服务处理的发邮件、支付后处理、通知等任务，用Postgres任务队列就足够了。考虑到运维负担与成本，先用Postgres起步、遇到瓶颈再迁移到专用工具更为合理。" }
+        },
+        {
+          "@type": "Question",
+          "name": "SELECT FOR UPDATE SKIP LOCKED是什么？",
+          "acceptedAnswer": { "@type": "Answer", "text": "这是一个Postgres锁选项，当多个工作进程同时从同一任务表取任务时，跳过已被其他进程锁定的行，只取下一个未锁定的行。借助SKIP LOCKED，工作进程之间不会重复处理同一任务，也不会因互相等待锁而停滞，从而实现无竞争的并行任务分发。它是Postgres任务队列的核心机制。" }
+        },
+        {
+          "@type": "Question",
+          "name": "什么时候用Temporal比Postgres更好？",
+          "acceptedAnswer": { "@type": "Answer", "text": "如果工作流步骤简单、缺少运维独立集群的人力、且已经在用Postgres，那么Postgres更合适。反之，若需要跨多天的长时运行工作流、复杂的分支与补偿事务、以及用代码表达的确定性重放，则Temporal更适合。小团队的现实做法是先用Postgres起步，当工作流复杂度越过明确阈值时再考虑引入Temporal。" }
+        },
+        {
+          "@type": "Question",
+          "name": "Postgres任务队列有多可靠？",
+          "acceptedAnswer": { "@type": "Answer", "text": "把任务登记放进与业务变更相同的事务中，数据变更与任务登记便会一起成功或一起失败，从而在结构上消除任务丢失。再用幂等键让重复执行无害化，用重试次数和死信表管理失败，就能获得不亚于消息代理的可靠性。事务正是持久性的根基。" }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; border-radius: 6px; padding: 1rem; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.85em; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .key-callout { background-color: #eef6ff; border: 1px solid #b6d8f7; border-left: 5px solid #3498db; border-radius: 6px; padding: 1rem 1.2rem; margin: 1.5rem 0; color: #1f3b57; font-size: 0.97rem; }
+        .key-callout strong { color: #1c5a8f; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <script src="https://t1.kakaocdn.net/kakao_js_sdk/2.4.0/kakao.min.js" crossorigin="anonymous"></script>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/durable_workflows_postgres_2026.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/durable_workflows_postgres_2026.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/durable_workflows_postgres_2026.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/durable_workflows_postgres_2026.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/durable_workflows_postgres_2026.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="用Postgres构建持久化工作流 2026 - 无需独立队列即可保证可靠性">
+                <meta itemprop="datePublished" content="2026-05-31">
+                <meta itemprop="dateModified" content="2026-05-31">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="Postgres 持久化工作流, SKIP LOCKED, 事务性发件箱, Postgres vs Kafka">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/durable_workflows_postgres_2026.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">用Postgres构建持久化工作流 2026 - 无需独立队列即可保证可靠性</h1>
+                    <h2 class="post-subtitle">真的需要Kafka吗 - 仅用已有的Postgres构建可靠的后台任务</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-05-31">2026年5月31日</span>
+                        <span class="post-category" itemprop="articleSection">IT/技术</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+                    <h2>引言：可靠的工作流一定需要Kafka、Temporal吗</h2>
+                    <p>"要可靠地处理后台任务，就需要消息队列。"许多开发者几乎是条件反射地接受这一命题。当我们要发邮件、跑支付后处理、推送通知、运行数据管道时，立刻就会想到Kafka、RabbitMQ或Temporal这类专用工具。然后为它单独搭一套集群、配运维人手、再加一层监控体系。</p>
+                    <p>但值得停下来问一句：真的非如此不可吗？2026年的今天，越来越多团队得出了相反的结论。<strong>仅用已经在跑的一台Postgres，就足以构建持久化工作流</strong>。不增加新基础设施，不制造新故障点，也不强迫团队学习新东西。</p>
+                    <p>本文将从需要以少数人手快速推进的创业团队视角，认真权衡这种可能性。我们会看Postgres工作流凭什么原理获得可靠性、有哪些核心模式，更重要的是<strong>何时Postgres就够用、何时才真正需要专用工具</strong>。先把结论摆出来：答案既不是"Postgres万能"，也不是"Kafka才对"，而是取决于数据与规模的性质。</p>
+
+                    <div class="key-callout">
+                        <strong>本文一句话总结。</strong> 在大多数中小型服务中，后台任务的可靠性并非来自独立的消息代理，而是来自<strong>Postgres的事务</strong>。把任务登记并入业务事务，用SKIP LOCKED分发工作进程，用幂等性让重复无害，就能在不增加新基础设施的前提下获得持久性。
+                    </div>
+
+                    <h2>1. 什么是"Durable Workflow" - 持久化执行的定义</h2>
+                    <p>正式讨论前先理清术语。"持久化工作流（durable workflow）"是什么？核心正如其字面：<strong>持久性（durability）</strong>。它保证一旦启动的任务，无论服务器宕机、进程重启还是网络中断，最终都会执行到底，或至少不会丢失并会被重试。</p>
+                    <p>更具体地说，持久化工作流具备以下属性。</p>
+                    <ul>
+                        <li><strong>不丢任务：</strong>一旦接收的任务，在任何故障下都不会消失，会被安全写入磁盘。</li>
+                        <li><strong>至少一次执行（at-least-once）：</strong>任务至少会执行一次。中途工作进程挂掉，会由另一个进程接手。</li>
+                        <li><strong>中断后可恢复：</strong>执行途中停止后，可从最后记录的位置继续，或安全地从头重试。</li>
+                        <li><strong>状态持久化：</strong>任务的进度保存在持久存储中，而非易失内存里。</li>
+                    </ul>
+                    <p>这里出现了关键洞察：这些属性其实<strong>几乎与关系型数据库早已提供的ACID保证完全重合</strong>。"提交即存活"是持久性（D），"并发操作互不破坏"是隔离性（I），"全有或全无"是原子性（A）。工作流引擎费力想要造出的诸多保证，Postgres用打磨了三十多年的能力就直接给了。</p>
+
+                    <h2>2. 为什么是Postgres - 已有的数据库就够用</h2>
+                    <p>那么，为什么偏偏是Postgres？原因可归结为三点：事务、持久性，以及简单性。</p>
+                    <h3>2.1 事务 - 可靠性的根基</h3>
+                    <p>Postgres最强的武器是事务。关键在于：可以把业务数据的变更和后台任务的登记并入<strong>同一个事务</strong>。例如把"创建订单 → 登记确认邮件任务"两个动作放进一个事务，二者就会一起成功或一起失败。"订单建好了但邮件任务漏掉了"这种情况在结构上变得不可能。用独立代理恰恰会出现这道缝隙，即"数据库提交成功了但消息发布失败了"；而把任务放进Postgres内部，这道缝隙本身就消失了。</p>
+                    <h3>2.2 持久性 - 提交后即落盘</h3>
+                    <p>Postgres通过WAL（预写日志）先把提交的数据安全写入磁盘。服务器即便突然宕机，已提交的任务也能恢复。内存队列在故障时可能丢掉的"最后那几条"，Postgres不会丢。任务的可靠性就等同于数据库的可靠性。</p>
+                    <h3>2.3 简单性 - 只需运维一套系统</h3>
+                    <p>从现实看，这或许是最大的好处。把任务队列放进Postgres，需要运维的系统并不增加。备份、监控、故障处理、安全补丁，全都被已在维护的那一套数据库吸收。没有新代理要学，没有新故障模式，没有新的值班负担。对小团队而言，这种"一处搞定"的简单性，往往比吞吐数字更有价值。</p>
+
+                    <h2>3. 基于Postgres的工作流五大核心模式</h2>
+                    <p>理论已经足够。下面是我按自己方式整理的、用Postgres搭可靠工作流时反复出现的五大核心模式。理解了这五个，实质上就完成了一半。</p>
+                    <h3>3.1 任务表（Job Table）</h3>
+                    <p>一切的起点。建一张表，把待处理任务逐行存入。设置状态（待处理/处理中/完成/失败）、负载（JSON）、重试次数、预约执行时间等列。任务即数据行，于是用SQL查询、过滤、聚合都很自由。</p>
+                    <h3>3.2 事务性发件箱（Transactional Outbox）</h3>
+                    <p>把业务变更与任务登记并入同一事务的模式。不直接发布要发往外部的事件，而是先记录到同一数据库的发件箱（任务）表里。再由独立的工作进程读取该表负责实际发布。如此一来，"数据库提交了但事件丢了"的双写问题便消失。</p>
+                    <h3>3.3 SELECT FOR UPDATE SKIP LOCKED</h3>
+                    <p>让多个工作进程从同一任务表无竞争取任务的加锁技巧。跳过已被其他进程锁定的行，只取未锁定的下一行。工作进程之间不再互等，也不会重复取到同一任务，从而实现干净的并行分发。这是Postgres任务队列的心脏。</p>
+                    <h3>3.4 幂等性（Idempotency）</h3>
+                    <p>"至少一次执行"的保证，也意味着"同一任务可能被执行两次"。因此任务处理器必须设计成幂等的，即执行两次结果也相同。标准做法是用幂等键（如订单ID＋任务类型）建唯一约束，拦截重复的副作用。</p>
+                    <h3>3.5 重试（Retry）与退避</h3>
+                    <p>临时性失败（网络错误、外部API超时）很自然。在任务行上保存重试次数和下次尝试时间，失败时用指数退避重新排期。超过设定次数就移入死信（dead-letter）状态，交由人工核查。这四样（重试、退避、上限、死信）构成失败管理的标准配置。</p>
+
+                    <h2>4. 代码示例 - 构建一个简单的任务队列</h2>
+                    <p>模式用实际代码来看会清晰得多。下面用SQL和伪代码勾勒一个最简单的任务队列。先看任务表。</p>
+                    <pre><code class="language-sql">CREATE TABLE jobs (
+    id           BIGSERIAL PRIMARY KEY,
+    kind         TEXT        NOT NULL,            -- 任务类型 (如 send_email)
+    payload      JSONB       NOT NULL,            -- 任务数据
+    status       TEXT        NOT NULL DEFAULT 'pending', -- pending/running/done/failed
+    run_at       TIMESTAMPTZ NOT NULL DEFAULT now(),     -- 预约执行时间
+    attempts     INT         NOT NULL DEFAULT 0,  -- 尝试次数
+    max_attempts INT         NOT NULL DEFAULT 5,
+    idem_key     TEXT        UNIQUE,              -- 幂等键
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 让工作进程快速找到下一个任务的部分索引
+CREATE INDEX idx_jobs_ready
+    ON jobs (run_at)
+    WHERE status = 'pending';</code></pre>
+                    <p>任务登记发生在与业务逻辑相同的事务内。这正是事务性发件箱的核心。</p>
+                    <pre><code class="language-sql">BEGIN;
+  -- 1) 业务变更
+  INSERT INTO orders (user_id, amount) VALUES (42, 19900);
+  -- 2) 在同一事务中登记任务
+  INSERT INTO jobs (kind, payload, idem_key)
+  VALUES ('send_email', '{"order_id": 1001}', 'email:order:1001');
+COMMIT;  -- 二者一起提交或一起回滚</code></pre>
+                    <p>工作进程用如下伪代码取任务。SKIP LOCKED就在这里登场。</p>
+                    <pre><code class="language-text">循环:
+    开始事务
+      任务 = 用 SKIP LOCKED 锁定并取出下一个就绪任务 1 条
+      若无任务: 稍候片刻后继续
+      将任务状态置为 'running', attempts += 1
+    提交
+
+    尝试:
+      执行处理器(任务.payload)   # 设计为幂等
+      将任务状态置为 'done'
+    失败时:
+      若 attempts >= max_attempts 则置 'failed'(死信)
+      否则 run_at = now() + 退避, 状态回到 'pending'</code></pre>
+                    <p>核心是：这一切都用普通的SQL和事务完成。没有新基础设施，也没有新协议。你是在用早已熟悉的工具拼装出可靠性。</p>
+
+                    <h2>5. 用SKIP LOCKED处理并发</h2>
+                    <p>五大模式里最像魔法的，要数<code>SKIP LOCKED</code>。值得再深入看看。</p>
+                    <p>设想多个工作进程同时去同一张任务表抢活儿。若天真地只用<code>SELECT ... FOR UPDATE</code>，进程B去取进程A锁住的行时，会<strong>一直阻塞到锁释放</strong>。进程越多，互相等待的拥堵越严重，实际上被串行化了。</p>
+                    <p>加上<code>SKIP LOCKED</code>后，行为彻底改变。</p>
+                    <pre><code class="language-sql">SELECT id, kind, payload
+FROM jobs
+WHERE status = 'pending' AND run_at <= now()
+ORDER BY run_at
+FOR UPDATE SKIP LOCKED
+LIMIT 1;</code></pre>
+                    <p>现在进程B遇到进程A已锁定的行时不再等待，而是<strong>直接跳过</strong>，去取下一个未锁定的行。结果是，N个进程同时、无冲突、无重复地取走N个不同任务。锁等待消失，因此进程越多，吞吐近乎线性增长。</p>
+                    <blockquote>SKIP LOCKED把"能不能用Postgres当任务队列"这个问题，反转成了"有没有理由不用Postgres当任务队列"。</blockquote>
+                    <p>正是凭这一行锁选项，外部消息代理引以为傲的"无竞争任务分发"就能在Postgres内部原样重现，而且丝毫不牺牲事务的安全性。</p>
+
+                    <h2>6. Postgres vs 专用工具对比</h2>
+                    <p>话虽如此，Postgres并不能替代所有专用工具。需要一次公平的对比。下面把四种代表性工具按复杂度、吞吐量、适用环境三个维度整理。</p>
+                    <h3>表1. 工作流与消息工具对比</h3>
+                    <table>
+                        <thead>
+                            <tr><th>工具</th><th>复杂度</th><th>吞吐量</th><th>适用环境</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Postgres</td><td>低</td><td>中</td><td>中小规模、简单基础设施、事务耦合</td></tr>
+                            <tr><td>RabbitMQ</td><td>中</td><td>高</td><td>以消息为中心、复杂路由</td></tr>
+                            <tr><td>Kafka</td><td>高</td><td>极高</td><td>大规模流处理、事件日志、扇出</td></tr>
+                            <tr><td>Temporal</td><td>高</td><td>高</td><td>复杂的长时工作流、补偿事务</td></tr>
+                        </tbody>
+                    </table>
+                    <p>贯穿全表的信息是：Postgres<strong>复杂度最低</strong>，同时把吞吐量担到"中"。而多数服务实际所需的吞吐量，恰恰就落在那个"中"的区间里。Kafka和Temporal固然强大，但这份力量贴着"运维复杂度"的价签。问题在于，许多团队为了"将来或许用得上"的吞吐量，在当下就预付了那笔复杂度成本。</p>
+
+                    <h2>7. 何时Postgres够用，何时需要专用工具</h2>
+                    <p>来到核心问题。分界线在哪里？下面整理我用作判断依据的信号。</p>
+                    <h3>7.1 Postgres够用的信号</h3>
+                    <ul>
+                        <li>吞吐量在每秒数十到数千条规模，即便激增也仍在其中。</li>
+                        <li>任务与登记所在同一数据库的数据变更强耦合（事务耦合有利）。</li>
+                        <li>运维人手少，增加新系统的成本是负担。</li>
+                        <li>工作流步骤相对简单（发送、后处理、通知级别）。</li>
+                    </ul>
+                    <h3>7.2 需要专用工具的信号</h3>
+                    <ul>
+                        <li>吞吐量持续超过每秒数万到数十万条（Kafka领域）。</li>
+                        <li>同一事件需由多个消费者组独立消费（扇出，Kafka）。</li>
+                        <li>工作流跨数天运行，需要复杂的分支、补偿与重放（Temporal）。</li>
+                        <li>需把事件再灌入长期保留的日志（Kafka）。</li>
+                    </ul>
+                    <p>我的建议很明确：<strong>用Postgres起步，等上面的"专用工具信号"真正亮起时再迁移。</strong>反过来，信号都没亮就抢先铺Kafka，多半是过早优化。</p>
+
+                    <h2>8. 五个实务应用场景</h2>
+                    <p>把抽象原则落到具体场景。下面是几类常见后台任务中，Postgres工作流如何契合。</p>
+                    <ul>
+                        <li><strong>邮件/短信发送：</strong>注册欢迎、订单确认邮件。把发送任务并入注册或订单事务，"注册成功但邮件没发"的事故就消失。外部发送API失败由重试吸收。</li>
+                        <li><strong>支付后处理：</strong>支付成功后开收据、积分入账、对账记录。用幂等键防重复入账，按步骤拆分任务以安全重试部分失败。</li>
+                        <li><strong>数据管道：</strong>夜间聚合、报表生成、外部数据同步。用预约时间（run_at）排期，把重活拆成小单元任务由工作进程并行处理。</li>
+                        <li><strong>通知（推送/Webhook）：</strong>批量推送、对外部系统的Webhook。用SKIP LOCKED让多进程分摊发送，失败的Webhook按退避重试。</li>
+                        <li><strong>预约/调度：</strong>订阅续费、提醒、过期处理。在run_at填入未来时间，工作进程便会在那一刻自然取走，无需另建cron基础设施。</li>
+                    </ul>
+                    <p>五个场景的共同点是：没有一个需要Kafka级吞吐量或Temporal级工作流复杂度。而这五类，实际上覆盖了大多数服务的绝大部分后台工作。</p>
+
+                    <h2>9. 性能与可扩展性的极限</h2>
+                    <p>为求平衡，也诚实指出Postgres工作流的极限。这套模式并非可以无限扩展。</p>
+                    <ul>
+                        <li><strong>吞吐天花板：</strong>任务队列归根结底是数据库的写入负载。当任务持续达到每秒数万条以上，就会与同一数据库的主业（业务查询）争抢资源。这是专用代理大放异彩的区段。</li>
+                        <li><strong>表膨胀与VACUUM：</strong>完成、失败的任务堆积，表会膨胀、索引会臃肿。定期归档（删除或迁移已完成任务）和autovacuum调优是必需。放任不管，查询就会变慢。</li>
+                        <li><strong>轮询负载：</strong>工作进程以短间隔轮询空队列，会累积无谓查询。加上LISTEN/NOTIFY的通知式唤醒可缓解。</li>
+                        <li><strong>对主业的影响：</strong>队列负载可能给核心业务事务带来延迟。负载变大时，把队列拆到独立的Postgres实例也是一招。</li>
+                    </ul>
+                    <p>要点是：Postgres工作流不是"无限扩展"，而是"以简单方式覆盖一段足够宽的区间"的方案。你只需识别出越界的那一刻，并准备好迁移即可。</p>
+
+                    <h2>10. 创业环境中的应用 - 简化基础设施与降低成本</h2>
+                    <p>这一讨论在创业环境中尤其有说服力，原因有几点。</p>
+                    <p>第一是<strong>人员结构</strong>。早期创业团队大多由少数全栈开发者兼管基础设施。单独搭建并运维Kafka集群或Temporal服务器，本身就是一个人的活儿。用一台Postgres把任务队列也吸收进来，要运维的系统就更少，值班负担也更轻。</p>
+                    <p>第二是<strong>成本</strong>。在云上跑托管Kafka或独立工作流集群的开销不容忽视。在流量还小的早期，为"将来的规模"现在就掏这笔钱，等于在削减现金跑道。把任务队列放进你本就在付费的Postgres里，额外基础设施成本趋近于零。</p>
+                    <p>第三是<strong>速度</strong>。创业团队的竞争力常常来自执行速度。若能把学习并集成新代理的数天到数周，换成用早已熟悉的SQL写任务队列的几个小时，那段时间就直接投入到产品开发上。</p>
+                    <div class="key-callout">
+                        <strong>务实建议。</strong> 若处于种子轮到A轮阶段，建议先用Postgres任务队列起步。等流量得到验证、"专用工具信号"亮起后再引入Kafka、Temporal也不迟。早期引入的复杂度成本，几乎总是盖过其收益。
+                    </div>
+
+                    <h2>11. 风险 - "Postgres万能"的陷阱</h2>
+                    <p>为求公正，也必须把反方向的警告讲清楚。一旦"Postgres够用"变质为"Postgres万能"，本文就成了在推动另一种过早决策。</p>
+                    <p>Postgres万能论的典型陷阱如下。</p>
+                    <ul>
+                        <li><strong>无视极限信号：</strong>吞吐明明已撞天花板，却因"我们什么都用Postgres搞定"的执念而不迁移。此时主业数据库也会跟着变慢。</li>
+                        <li><strong>低估运维负担：</strong>把队列放进Postgres虽减少了基础设施，却新增了VACUUM、归档、索引管理、监控这些运维项。不是"免费"，而是"另一种成本"。</li>
+                        <li><strong>硬塞工作流复杂度：</strong>想用一张任务表去模拟跨数天的多步补偿事务，代码会变成意大利面。那个节点就是该认真考虑Temporal的时候。</li>
+                        <li><strong>主业与队列的资源争抢：</strong>核心业务事务已被队列负载拖慢，却仍固执于同一实例。</li>
+                    </ul>
+                    <p>健康的态度很简单。Postgres是<strong>出色的默认选项</strong>，而非<strong>永恒的标准答案</strong>。作为起点它几乎总是对的，但必须同时具备诚实读取极限信号、适时迁移的纪律。</p>
+
+                    <h2>12. 结论 + 三件可立即应用的事</h2>
+                    <p>回到开头的问题。可靠的工作流，真的非Kafka、Temporal不可吗？对大多数中小型服务而言，答案是"否"。可靠性的真正源头不是华丽的代理，而是<strong>Postgres的事务</strong>，而我们早已握在手中。把任务当作数据来处理、用事务捆绑、用SKIP LOCKED分发、用幂等性让重复无害，就能造出不亚于消息代理的持久性。</p>
+                    <p>同时，这并非"永远Postgres"的教条。识别规模与复杂度越过阈值的那一刻、适时迁移到专用工具，才是关键的平衡。最后用三件可立即应用的事收尾。</p>
+                    <ol>
+                        <li><strong>把任务登记并入与业务变更相同的事务。</strong>仅此一项，就能在结构上消除最常见的事故——任务丢失。</li>
+                        <li><strong>用SELECT FOR UPDATE SKIP LOCKED实现工作进程分发。</strong>无需外部代理，就在Postgres内部原样获得无竞争的并行处理。</li>
+                        <li><strong>把每个任务处理器都设计成幂等的。</strong>在"至少一次执行"的世界里让重复执行无害，是可靠性的最后一块拼图。</li>
+                    </ol>
+                    <p>下次冒出"这是后台任务，所以需要队列"的念头时，请停一下问问自己：是真的需要新基础设施，还是已有的Postgres能把这件事做得更简单、更安全。</p>
+
+                    <h2>常见问题（FAQ）</h2>
+                    <h3>Q1. Postgres能否构建持久化工作流？</h3>
+                    <p>能。Postgres保证ACID事务与磁盘持久化，把任务表与SKIP LOCKED、幂等键、重试列组合起来，就能构建可靠的任务队列和工作流引擎。对每秒数十到数千任务的中小型服务，无需独立代理即可处理大部分后台工作。</p>
+                    <h3>Q2. 一定需要Kafka，还是Postgres就够？</h3>
+                    <p>每秒数万条以上的流处理、多消费者组扇出、长期保留的事件日志需要Kafka。但邮件、支付后处理、通知等常规任务用Postgres队列就够。先用Postgres起步，遇瓶颈再迁移更合理。</p>
+                    <h3>Q3. SELECT FOR UPDATE SKIP LOCKED是什么？</h3>
+                    <p>这是一个Postgres锁选项，多个工作进程同时取任务时，跳过已被其他进程锁定的行，只取未锁定的下一行。从而在无锁等待、无重复处理的情况下实现无竞争的并行分发。</p>
+                    <h3>Q4. 什么时候用Temporal比Postgres更好？</h3>
+                    <p>工作流简单、缺少运维独立集群的人力、且已在用Postgres时，Postgres更合适。反之，需要跨多天的长时工作流，且涉及复杂分支、补偿、确定性重放时，Temporal更适合。</p>
+                    <h3>Q5. Postgres任务队列有多可靠？</h3>
+                    <p>把任务登记并入业务事务，任务丢失便在结构上消失。再用幂等键让重复无害、用重试和死信管理失败，就能获得不亚于消息代理的可靠性。事务正是持久性的根基。</p>
+
+                    <h2>参考资料</h2>
+                    <ul>
+                        <li><a href="https://news.hada.io/" target="_blank" rel="noopener">GeekNews（news.hada.io）- Durable workflows with Postgres 讨论</a></li>
+                        <li>PostgreSQL官方文档中关于行锁（<code>FOR UPDATE</code>、<code>SKIP LOCKED</code>）及事务隔离级别的通用资料</li>
+                        <li>关于事务性发件箱模式与幂等性设计的公开资料</li>
+                        <li>BrainDetox IT系列：<a href="shopify_redis_to_mysql_migration_2026.html">Shopify为何把库存从Redis迁到MySQL</a>、<a href="go_to_rust_migration_guide_2026.html">从Go到Rust的迁移指南</a></li>
+                    </ul>
+                    <p><em>本文的技术性描述是基于公认的PostgreSQL运行原理与分布式系统模式的分析，具体实现细节系在公开信息范围内重构。</em></p>
+                </div>
+
+                <div class="share-section">
+                    <h3>分享本文</h3>
+                    <div class="social-share">
+                        <button id="kakao-share" class="share-btn kakao-btn"><img src="https://developers.kakao.com/assets/img/about/logos/kakaolink/kakaolink_btn_small.png" alt="KakaoTalk">KakaoTalk</button>
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">返回列表</a>
+                </div>
+            </article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const kakaoShareBtn = document.getElementById('kakao-share');
+        if (kakaoShareBtn) {
+            kakaoShareBtn.addEventListener('click', function() {
+                if (!window.Kakao) return;
+                if (!window.Kakao.isInitialized()) window.Kakao.init('e06d0ee93e450a11bc6451d46e09cd88');
+                if (window.Kakao.Share) {
+                    window.Kakao.Share.sendDefault({
+                        objectType: 'feed',
+                        content: { title: document.title, description: document.querySelector('meta[name="description"]')?.content || '', imageUrl: 'https://braindetox.kr/site_logo.png', link: { mobileWebUrl: location.href, webUrl: location.href } },
+                        buttons: [{ title: '在网页上查看', link: { mobileWebUrl: location.href, webUrl: location.href } }]
+                    });
+                }
+            });
+        }
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制！请粘贴到Threads应用中分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制！'); });
+    });
+    </script>
+</body>
+</html>

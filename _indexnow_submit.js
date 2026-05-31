@@ -1,6 +1,6 @@
 /**
  * Bing IndexNow 배치 전송
- * 2026-05-30 추가: GLP-1 비만치료제 가이드 1편 × 4언어 = 4 URLs + blog.html + RSS × 4언어
+ * 2026-05-31 발행: 신규 포스트 8편 × 4언어 = 32 URLs + blog.html + RSS × 4언어
  */
 const https = require('https');
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -9,7 +9,14 @@ const KEY = '7d594d096f044fbba3a09184f68ffcfe';
 const HOST = 'braindetox.kr';
 
 const NEW_POSTS = [
-  'glp1_weight_loss_drugs_complete_guide_2026'
+  'shopify_redis_to_mysql_migration_2026',
+  'claw_patrol_ai_agent_security_firewall_2026',
+  'ai_agent_investment_automation_2026',
+  'ai_smells_detecting_ai_writing_2026',
+  'sqlite_rejects_ai_generated_code_2026',
+  'durable_workflows_postgres_2026',
+  'dead_economy_theory_2026',
+  'audiomass_browser_audio_editor_2026'
 ];
 
 const urls = [];
