@@ -1,6 +1,6 @@
 /**
  * Bing IndexNow 배치 전송
- * 2026-06-05 발행: 신규 포스트 8편 × 4언어 = 32 URLs + blog.html × 4 + RSS × 4언어
+ * 2026-06-05 발행(추가): YMYL 에버그린 5편 × 4언어 = 20 URLs + blog.html × 4 + RSS × 4언어
  */
 const https = require('https');
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -9,14 +9,11 @@ const KEY = '7d594d096f044fbba3a09184f68ffcfe';
 const HOST = 'braindetox.kr';
 
 const NEW_POSTS = [
-  'google_agent_executor_distributed_runtime_2026',
-  'cathedral_bazaar_winchester_house_ai_2026',
-  'ted_chiang_ai_not_conscious_2026',
-  'google_io_2026_gemini_omni_highlights_2026',
-  'angular_v22_ai_agent_flows_2026',
-  'uber_1500_monthly_ai_spending_cap_2026',
-  'pwned_blaster_speaker_pc_hack_2026',
-  'kolongdoc_korean_government_vlm_benchmark_2026'
+  'lower_cholesterol_ldl_naturally_guide_2026',
+  'sleep_optimization_insomnia_guide_2026',
+  'fatty_liver_disease_reverse_guide_2026',
+  'improve_credit_score_guide_2026',
+  'etf_investing_beginner_guide_2026'
 ];
 
 const urls = [];
