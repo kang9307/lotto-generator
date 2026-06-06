@@ -1,6 +1,6 @@
 /**
  * Bing IndexNow 배치 전송
- * 2026-06-05 발행(추가): YMYL 에버그린 5편 × 4언어 = 20 URLs + blog.html × 4 + RSS × 4언어
+ * 2026-06-06 발행: hada 시사 8편 + 에버그린 2편 = 10편 × 4언어 = 40 URLs + blog.html × 4 + RSS × 4언어
  */
 const https = require('https');
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -9,11 +9,16 @@ const KEY = '7d594d096f044fbba3a09184f68ffcfe';
 const HOST = 'braindetox.kr';
 
 const NEW_POSTS = [
-  'lower_cholesterol_ldl_naturally_guide_2026',
-  'sleep_optimization_insomnia_guide_2026',
-  'fatty_liver_disease_reverse_guide_2026',
-  'improve_credit_score_guide_2026',
-  'etf_investing_beginner_guide_2026'
+  'ddr5_memory_price_surge_ai_demand_2026',
+  'anthropic_recursive_self_improvement_2026',
+  'voidzero_joins_cloudflare_vite_2026',
+  'ooooo_law_bloomberg_terminal_everyone_2026',
+  'building_ai_native_startups_2026',
+  'wind_solar_exceed_gas_2026',
+  'trees_file_tree_rendering_library_2026',
+  'spacex_ipo_retail_investor_criticism_2026',
+  'prediabetes_blood_sugar_control_guide',
+  'pension_irp_tax_saving_guide'
 ];
 
 const urls = [];
