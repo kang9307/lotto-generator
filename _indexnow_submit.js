@@ -1,6 +1,6 @@
 /**
  * Bing IndexNow 배치 전송
- * 2026-06-10 발행: hada 시사 8편 + 에버그린 2편 = 10편 × 4언어 = 40 URLs + blog.html × 4 + RSS × 4언어
+ * 2026-06-11 발행: hada 시사 8편 + 에버그린 2편 = 10편 × 4언어 = 40 URLs + blog.html × 4 + RSS × 4언어
  */
 const https = require('https');
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -9,16 +9,16 @@ const KEY = '7d594d096f044fbba3a09184f68ffcfe';
 const HOST = 'braindetox.kr';
 
 const NEW_POSTS = [
-  'anthropic_fable5_mythos5_release_2026',
-  'apple_intelligence_siri_ai_2026',
-  'korea_gpki_firefox_root_certificate_2026',
-  'mq_jq_markdown_query_2026',
-  'ai_growth_slowdown_compute_2026',
-  'eu_banned_pesticide_food_residue_2026',
-  'vps_oom_google_deindex_seo_lesson_2026',
-  'antisocial_media_feed_trends_2026',
-  'thyroid_disorder_guide',
-  'writing_a_will_guide'
+  'toss_securities_openapi_2026',
+  'google_ai_plus_price_cut_2026',
+  'apple_container_machine_2026',
+  'slopguard_ai_slop_pr_github_2026',
+  'ms_opensource_github_supply_chain_hack_2026',
+  'ai_replacing_employees_bad_ceo_2026',
+  'slumber_terminal_http_client_2026',
+  'wwdc_2026_apple_foldable_2026',
+  'migraine_management_guide',
+  'gut_health_probiotics_guide'
 ];
 
 const urls = [];
