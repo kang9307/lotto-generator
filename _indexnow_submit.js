@@ -1,6 +1,6 @@
 /**
  * Bing IndexNow 배치 전송
- * 2026-06-11 발행: hada 시사 8편 + 에버그린 2편 = 10편 × 4언어 = 40 URLs + blog.html × 4 + RSS × 4언어
+ * 2026-06-12 발행: hada 시사 8편 + 에버그린 2편 = 10편 × 4언어 = 40 URLs + blog.html × 4 + RSS × 4언어
  */
 const https = require('https');
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -9,16 +9,16 @@ const KEY = '7d594d096f044fbba3a09184f68ffcfe';
 const HOST = 'braindetox.kr';
 
 const NEW_POSTS = [
-  'toss_securities_openapi_2026',
-  'google_ai_plus_price_cut_2026',
-  'apple_container_machine_2026',
-  'slopguard_ai_slop_pr_github_2026',
-  'ms_opensource_github_supply_chain_hack_2026',
-  'ai_replacing_employees_bad_ceo_2026',
-  'slumber_terminal_http_client_2026',
-  'wwdc_2026_apple_foldable_2026',
-  'migraine_management_guide',
-  'gut_health_probiotics_guide'
+  'germany_court_google_ai_overviews_liable_2026',
+  'new_recaptcha_phone_verification_2026',
+  'diffusiongemma_text_generation_2026',
+  'supermemory_ai_context_engine_2026',
+  'rich_sutton_ai_creativity_discovery_2026',
+  'jqwik_anti_ai_controversy_2026',
+  'pifs_pi_filesystem_2026',
+  'visitor_funded_hosting_model_2026',
+  'emergency_fund_guide',
+  'medical_malpractice_guide'
 ];
 
 const urls = [];
