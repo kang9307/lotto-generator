@@ -717,6 +717,7 @@ const RecentTools = {
         'static/password_generator.html': { name: { ko: '강력 비밀번호 생성기', en: 'Strong Password Generator', ja: '強力パスワード生成', zh: '强密码生成器' }, icon: '🔑', cat: 'security' },
 
         // === 유틸리티 ===
+        'static/voice_assistant.html': { name: { ko: '음성 명령 비서', en: 'Voice Assistant', ja: '音声コマンドアシスタント', zh: '语音命令助手' }, icon: '🎙️', cat: 'utility' },
         'qrcode.html': { name: { ko: 'QR 코드 생성기', en: 'QR Code Generator', ja: 'QRコード生成', zh: '二维码生成器' }, icon: '📱', cat: 'utility' },
         'static/qr_code_generator.html': { name: { ko: 'QR 코드 생성기 Pro', en: 'QR Code Generator Pro', ja: 'QRコード生成 Pro', zh: '二维码生成器Pro' }, icon: '📲', cat: 'utility' },
         'datetime.html': { name: { ko: '시간/날짜 계산기', en: 'Date/Time Calculator', ja: '日時計算機', zh: '日期时间计算器' }, icon: '📅', cat: 'utility' },

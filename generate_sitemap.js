@@ -100,6 +100,7 @@ const staticPages = [
     { path: '/static/regex_tester.html', priority: '0.8', changefreq: 'monthly' },
     { path: '/static/base64_encoder.html', priority: '0.8', changefreq: 'monthly' },
     { path: '/static/css_gradient_generator.html', priority: '0.8', changefreq: 'monthly' },
+    { path: '/static/voice_assistant.html', priority: '0.8', changefreq: 'monthly' },
     // === 환율 계산기 (10개국 + 통합) ===
     { path: '/static/currency_calculator.html', priority: '0.9', changefreq: 'daily' },
     { path: '/static/usd_krw_calculator.html', priority: '0.9', changefreq: 'daily' },
