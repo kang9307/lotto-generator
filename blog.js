@@ -57,15 +57,15 @@ function determineCategoryFromFilename(id) {
         "sitemap_importance": "IT/기술",
         "robots_txt_guide": "IT/기술",
         "meta_tags_seo_guide": "IT/기술",
-        "skt_usim_hacking_reauth_guide": "보안",
-        "skt-usim-hacking-precautions": "보안",
-        "javascript_basic": "프로그래밍",
-        "php_language_guide_part1": "프로그래밍",
-        "php_language_guide_part2": "프로그래밍",
-        "php_language_guide_part3": "프로그래밍",
-        "php_language_guide_part4": "프로그래밍",
-        "php_language_guide_part5": "프로그래밍",
-        "networking_basic": "네트워크",
+        "skt_usim_hacking_reauth_guide": "개발/인프라",
+        "skt-usim-hacking-precautions": "개발/인프라",
+        "javascript_basic": "개발/인프라",
+        "php_language_guide_part1": "개발/인프라",
+        "php_language_guide_part2": "개발/인프라",
+        "php_language_guide_part3": "개발/인프라",
+        "php_language_guide_part4": "개발/인프라",
+        "php_language_guide_part5": "개발/인프라",
+        "networking_basic": "개발/인프라",
         "linux_grep_awk": "IT/기술",
         "ceph_storage_intro": "IT/기술",
         "ceph_rados_crush_deep_dive": "IT/기술",
@@ -73,8 +73,8 @@ function determineCategoryFromFilename(id) {
         "ai_future_social_impact": "IT/기술",
         "artificial_intelligence_intro": "IT/기술",
         "ai_technology_2025_comparison": "IT/기술",
-        "quince_benefits_liquor_guide": "건강",
-        "android_version_security": "보안",
+        "quince_benefits_liquor_guide": "생활/건강",
+        "android_version_security": "개발/인프라",
         "korea_presidential_election_2025": "사회/경제",
         "korea_21st_president_inauguration": "사회/경제",
         "korea_economic_social_challenges_2025": "사회/경제",
@@ -106,7 +106,7 @@ function determineCategoryFromFilename(id) {
     } else if (id.includes('network')) {
         return "네트워크";
     } else if (id.includes('javascript') || id.includes('php') || id.includes('python')) {
-        return "프로그래밍";
+        return "IT/기술";
     } else if (id.includes('korea') || id.includes('economic') || id.includes('president') ||
               id.includes('jeonse') || id.includes('fraud') || id.includes('population')) {
         return "사회/경제";
