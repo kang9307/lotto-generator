@@ -1,6 +1,6 @@
 /**
  * Bing IndexNow 배치 전송
- * 2026-06-13 발행: hada 시사 8편 + 에버그린 2편 = 10편 × 4언어 = 40 URLs + blog.html × 4 + RSS × 4언어
+ * 2026-06-14 발행: hada 시사 10편 + 에버그린 2편 = 12편 × 4언어 = 48 URLs + blog.html × 4 + RSS × 4언어
  */
 const https = require('https');
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -9,16 +9,18 @@ const KEY = '7d594d096f044fbba3a09184f68ffcfe';
 const HOST = 'braindetox.kr';
 
 const NEW_POSTS = [
-  'pokemon_go_scans_military_drone_navigation_2026',
-  'why_ai_didnt_replace_software_engineers_2026',
-  'workplace_llm_collective_delusion_2026',
-  'homebrew_6_release_2026',
-  'revo_zig_dynamic_language_2026',
-  'reuseless_software_supply_chain_2026',
-  'ai_bad_advice_marketing_2026',
-  'static_typing_rise_2026',
-  'knee_pain_arthritis_guide',
-  'funeral_cost_guide'
+  'anthropic_fable5_mythos5_disabled_export_2026',
+  'oracle_always_free_tier_reduced_2026',
+  'trump_phone_htc_teardown_2026',
+  'moonshot_kimi_k2_7_code_2026',
+  'ai_agent_6531_aws_bill_2026',
+  'renault_rare_earth_free_motor_2026',
+  'android_security_leader_departure_2026',
+  'cate_infinite_canvas_ide_2026',
+  'mouth_sound_to_sfx_generator_2026',
+  'minilex_korean_legal_rag_2026',
+  'savings_interest_rate_guide',
+  'inheritance_gift_tax_guide'
 ];
 
 const urls = [];
