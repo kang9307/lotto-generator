@@ -1,6 +1,7 @@
 /**
  * Bing IndexNow 배치 전송
- * 2026-06-15 발행: hada 시사 10편 + 에버그린 2편 = 12편 × 4언어 = 48 URLs + blog.html × 4 + RSS × 4언어
+ * 2026-06-15 추가발행: AI 비교 에버그린 5편 × 4언어 = 20 URLs + blog.html × 4 + RSS × 4 = 28
+ * (영어·일본 수익 트래픽 타겟)
  */
 const https = require('https');
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -9,18 +10,11 @@ const KEY = '7d594d096f044fbba3a09184f68ffcfe';
 const HOST = 'braindetox.kr';
 
 const NEW_POSTS = [
-  'aur_408_packages_malware_2026',
-  'glm_5_2_open_model_2026',
-  'ffmpeg_21_zero_days_2026',
-  'email_sender_verification_ai_era_2026',
-  'open_source_ai_must_win_2026',
-  'mozilla_departure_firefox_reflection_2026',
-  'murrdb_ml_cache_redis_alternative_2026',
-  'palantir_swiss_court_loss_2026',
-  'async_team_management_no_calls_2026',
-  'every_frame_perfect_ui_trust_2026',
-  'chronic_kidney_disease_guide',
-  'national_pension_guide'
+  'ai_model_comparison_2026',
+  'best_ai_coding_assistant_2026',
+  'best_ai_image_generator_2026',
+  'chatgpt_vs_claude_2026',
+  'ai_api_pricing_comparison_2026'
 ];
 
 const urls = [];
