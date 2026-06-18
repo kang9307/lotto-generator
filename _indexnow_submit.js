@@ -1,6 +1,6 @@
 /**
  * Bing IndexNow 배치 전송
- * 2026-06-17 발행: hada 6편 + 에버그린 6편 = 12편 × 4언어 = 48 URLs + blog × 4 + RSS × 4 = 56
+ * 2026-06-18 발행: hada 3편 + 에버그린 9편 = 12편 × 4언어 = 48 URLs + blog × 4 + RSS × 4 = 56
  */
 const https = require('https');
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -9,18 +9,27 @@ const KEY = '7d594d096f044fbba3a09184f68ffcfe';
 const HOST = 'braindetox.kr';
 
 const NEW_POSTS = [
-  'coreutils_for_windows_2026',
-  'homelab_ai_dev_platform_2026',
-  'apple_foundation_models_claude_2026',
-  'trump_mobile_htc_rebrand_2026',
-  'startup_support_search_service_2026',
-  'weekly_ai_ml_papers_2026_w24',
-  'atrial_fibrillation_guide',
-  'cataract_glaucoma_guide',
-  'property_tax_guide',
-  'industrial_accident_compensation_guide',
-  'school_violence_response_guide',
-  'homeowners_fire_insurance_guide'
+  'ai_generated_ui_coherence_2026',
+  'codex_mobile_vibe_coding_2026',
+  'sandboxd_ai_app_builder_sandbox_2026',
+  'four_major_insurances_guide',
+  'menopause_management_guide',
+  'quit_smoking_guide',
+  'sleep_apnea_guide',
+  'index_fund_vs_etf_guide',
+  'dollar_investing_guide',
+  'home_buying_first_time_guide',
+  'car_buying_vs_leasing_guide',
+  'real_estate_vs_stocks_guide',
+  'spacex_cursor_acquisition_2026',
+  'local_token_router_gemma_2026',
+  'codeburn_ai_coding_cost_2026',
+  'claude_designer_ai_build_2026',
+  'agentic_code_review_2026',
+  'job_interview_kubernetes_2026',
+  'graph_ai_memory_mcp_2026',
+  'why_email_strangers_2026',
+  'john_carmack_bellard_2026'
 ];
 
 const urls = [];
