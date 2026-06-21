@@ -1,6 +1,6 @@
 /**
  * Bing IndexNow 배치 전송
- * 2026-06-20 발행: hada 3편 + 에버그린 12편 = 15편 × 4언어 = 60 URLs + blog × 4 + RSS × 4 = 68
+ * 2026-06-21 발행: hada 3편 + 에버그린 9편 = 12편 × 4언어 = 48 URLs + blog × 4 + RSS × 4 = 56
  */
 const https = require('https');
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -9,21 +9,18 @@ const KEY = '7d594d096f044fbba3a09184f68ffcfe';
 const HOST = 'braindetox.kr';
 
 const NEW_POSTS = [
-  'openai_codex_record_replay_skill_2026',
-  'sogen_userspace_emulator_2026',
-  'github_malware_campaign_2026',
-  'insurance_review_guide',
-  'retirement_4percent_rule_guide',
-  'inflation_hedge_guide',
-  'fire_early_retirement_guide',
-  'divorce_process_guide',
-  'solar_panel_home_guide',
-  'pet_insurance_guide',
-  'prostate_health_guide',
-  'mortgage_refinance_guide',
-  'comprehensive_income_tax_guide',
-  'life_insurance_guide',
-  'personal_cybersecurity_guide'
+  'ai_korean_hwp_document_problem_2026',
+  'glojure_clojure_on_go_2026',
+  'alibaba_open_code_review_2026',
+  'gout_uric_acid_diet_guide',
+  'acid_reflux_gerd_management_guide',
+  'ibs_management_guide',
+  'hair_loss_treatment_guide',
+  'unemployment_benefit_guide',
+  'dui_penalty_guide',
+  'cancer_insurance_guide',
+  'home_renovation_cost_guide',
+  'travel_insurance_guide'
 ];
 
 const urls = [];
