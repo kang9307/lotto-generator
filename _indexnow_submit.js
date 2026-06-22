@@ -1,6 +1,6 @@
 /**
  * Bing IndexNow 배치 전송
- * 2026-06-22 발행: 에버그린 12편 × 4언어 = 48 URLs + blog × 4 + RSS × 4 = 56 (hada 소진, 전원 에버그린)
+ * 2026-06-22 보완발행: 놓친 hada(6/20+6/21 past) 10편 × 4언어 = 40 URLs + blog × 4 + RSS × 4 = 48
  */
 const https = require('https');
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -9,18 +9,16 @@ const KEY = '7d594d096f044fbba3a09184f68ffcfe';
 const HOST = 'braindetox.kr';
 
 const NEW_POSTS = [
-  'dry_eye_digital_eye_strain_guide',
-  'iron_deficiency_anemia_guide',
-  'anxiety_management_guide',
-  'magnesium_benefits_guide',
-  'dividend_stock_investing_guide',
-  'credit_card_optimization_guide',
-  'osteoporosis_prevention_guide',
-  'study_abroad_cost_guide',
-  'retirement_preparation_guide',
-  'cloud_backup_guide',
-  'password_manager_guide',
-  'driver_insurance_guide'
+  'ai_skill_erosion_research_2026',
+  'ml_research_zen_art_2026',
+  'opencodex_local_llm_proxy_2026',
+  'clickhouse_10years_opensource_2026',
+  'norway_school_ai_ban_2026',
+  'cli_authentication_guide_2026',
+  'project_valhalla_jdk28_2026',
+  'emacs_still_relevant_2026',
+  'uk_age_verification_vpn_2026',
+  'ai_decodes_linear_a_2026'
 ];
 
 const urls = [];
