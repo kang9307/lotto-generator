@@ -1,6 +1,6 @@
 /**
  * Bing IndexNow 배치 전송
- * 2026-06-22 보완발행: 놓친 hada(6/20+6/21 past) 10편 × 4언어 = 40 URLs + blog × 4 + RSS × 4 = 48
+ * 2026-06-23 신규 12편 × 4언어 = 48 URLs + blog × 4 + RSS × 4 = 56
  */
 const https = require('https');
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -9,16 +9,18 @@ const KEY = '7d594d096f044fbba3a09184f68ffcfe';
 const HOST = 'braindetox.kr';
 
 const NEW_POSTS = [
-  'ai_skill_erosion_research_2026',
-  'ml_research_zen_art_2026',
-  'opencodex_local_llm_proxy_2026',
-  'clickhouse_10years_opensource_2026',
-  'norway_school_ai_ban_2026',
-  'cli_authentication_guide_2026',
-  'project_valhalla_jdk28_2026',
-  'emacs_still_relevant_2026',
-  'uk_age_verification_vpn_2026',
-  'ai_decodes_linear_a_2026'
+  'ponytail_ai_lazy_senior_dev_2026',
+  'ai_programmer_nondeterminism_control_2026',
+  'prefer_duplication_over_abstraction_2026',
+  'agent_blackbox_token_analysis_2026',
+  'brain_bad_news_overload_2026',
+  'mydoo_claude_code_ide_2026',
+  'cverader_cve_aggregator_2026',
+  'shingles_herpes_zoster_guide',
+  'dementia_prevention_guide',
+  'us_stock_investing_guide',
+  'inheritance_renunciation_guide',
+  'car_maintenance_guide'
 ];
 
 const urls = [];
