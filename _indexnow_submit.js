@@ -1,6 +1,6 @@
 /**
  * Bing IndexNow 배치 전송
- * 2026-06-25 신규 12편 × 4언어 = 48 URLs + blog × 4 + RSS × 4 = 56
+ * 2026-06-26 신규 12편 × 4언어 = 48 URLs + blog × 4 + RSS × 4 = 56
  */
 const https = require('https');
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -9,18 +9,18 @@ const KEY = '7d594d096f044fbba3a09184f68ffcfe';
 const HOST = 'braindetox.kr';
 
 const NEW_POSTS = [
-  'typescript_7_native_go_2026',
-  'llm_wiki_cognitive_load_2026',
-  'boring_ssh_tunnel_manager_2026',
-  'memcached_appreciation_2026',
-  'software_jobs_dead_debate_2026',
-  'ai_found_rare_diagnosis_oih_2026',
-  'baidu_unlimited_ocr_2026',
-  'webcam_privacy_protection_guide',
-  'lower_back_pain_relief_guide',
-  'budgeting_50_30_20_guide',
-  'defamation_online_guide',
-  'reduce_electricity_bill_guide'
+  'ai_career_redesign_ax_2026',
+  'cafe24_llm_router_2026',
+  'vibethinker_3b_reasoning_2026',
+  'anthropic_claude_tag_2026',
+  'code_as_agent_harness_2026',
+  'john_carmack_early_mistakes_2026',
+  'datacenter_water_zero_cooling_2026',
+  'two_factor_authentication_guide',
+  'omega3_benefits_guide',
+  'dollar_cost_averaging_guide',
+  'copyright_basics_guide',
+  'phone_plan_optimization_guide'
 ];
 
 const urls = [];
