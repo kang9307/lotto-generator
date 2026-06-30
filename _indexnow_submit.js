@@ -1,6 +1,6 @@
 /**
  * Bing IndexNow 배치 전송
- * 2026-06-29 신규 12편 × 4언어 = 48 URLs + blog × 4 + RSS × 4 = 56
+ * 2026-06-30 신규 20편 × 4언어 = 80 URLs + blog × 4 + RSS × 4 = 88
  */
 const https = require('https');
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -9,18 +9,26 @@ const KEY = '7d594d096f044fbba3a09184f68ffcfe';
 const HOST = 'braindetox.kr';
 
 const NEW_POSTS = [
-  'open_vs_closed_llm_gap_2026',
-  'dspark_speculative_decoding_2026',
-  'github_anonymous_0day_dump_2026',
-  'fintech_engineering_handbook_2026',
-  'linux_revive_old_hardware_2026',
-  'playstation_digital_ownership_2026',
-  'paca_ai_project_management_2026',
-  'kidney_stones_guide',
-  'credit_recovery_workout_guide',
-  'unpaid_wages_guide',
-  'home_boiler_replacement_guide',
-  'iot_device_security_guide'
+  'memory_price_history_1960_2026',
+  'foldkit_frontend_framework_2026',
+  'lost_confidence_engineering_2026',
+  'gtm_ai_failure_lessons_2026',
+  'orch_term_ai_agent_orchestration_2026',
+  'eu_chat_control_privacy_2026',
+  'claude_code_mri_second_opinion_2026',
+  'regex_everywhere_portable_2026',
+  'tokenmaxxing_dead_2026',
+  'asia_ai_startups_anthropic_alt_2026',
+  'gastritis_helicobacter_guide',
+  'hemorrhoids_guide',
+  'earned_income_tax_credit_guide',
+  'parking_account_cma_guide',
+  'fraud_complaint_guide',
+  'debt_collection_response_guide',
+  'hybrid_car_fuel_efficiency_guide',
+  'water_purifier_rental_guide',
+  'kakao_security_guide',
+  'account_hacking_recovery_guide'
 ];
 
 const urls = [];
