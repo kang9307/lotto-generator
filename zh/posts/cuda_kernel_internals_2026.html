@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh-Hans">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>执行CUDA内核时GPU内部发生了什么 — 逐步深度解析 2026</title>
+    <meta name="description" content="逐步分析CUDA内核启动后GPU内部的运行机制。涵盖网格/块/线程束结构、SM调度、SIMT执行模型、内存层次、线程束分歧与占用率对性能的影响。">
+    <meta name="keywords" content="CUDA内核, GPU内部机制, 线程束调度, SIMT, 流多处理器, SM, 线程束分歧, 占用率, 共享内存, 寄存器, 全局内存, 深度学习加速, AI基础设施, CUDA优化">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/cuda_kernel_internals_2026.html">
+
+    <meta property="og:title" content="执行CUDA内核时GPU内部发生了什么 — 逐步深度解析 2026">
+    <meta property="og:description" content="逐步分析CUDA内核启动后GPU内部运行机制。涵盖网格/块/线程束、SM调度、SIMT、内存层次、线程束分歧与占用率。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/cuda_kernel_internals_2026.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-07-01">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="执行CUDA内核时GPU内部发生了什么">
+    <meta name="twitter:description" content="逐步分析CUDA内核启动后GPU内部运行机制。涵盖网格/块/线程束、SM调度、SIMT、内存层次、线程束分歧与占用率。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "执行CUDA内核时GPU内部发生了什么 — 逐步深度解析 2026",
+      "alternativeHeadline": "CUDA Kernel Internals: Grid, Warp, SM Scheduling, Memory Hierarchy and Occupancy",
+      "datePublished": "2026-07-01",
+      "dateModified": "2026-07-01",
+      "inLanguage": "zh-CN",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "CUDA内核, GPU内部机制, 线程束调度, SIMT, 流多处理器, 线程束分歧, 占用率, 深度学习加速",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/cuda_kernel_internals_2026.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "「启动CUDA内核时CPU端会发生什么？」",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "在主机端用<<<grid, block>>>语法调用内核时，nvcc生成的主机存根（stub）会执行。存根在运行时注册表中查找内核，并将参数对齐存入argument buffer。CUDA驱动随后构建QMD（Queue Meta Data），其中包含网格/块大小、每线程寄存器数、共享内存需求、程序起始地址和内核参数的constant bank地址。驱动将QMD写入pushbuffer，GPFIFO条目指向它，最后通过doorbell MMIO写操作唤醒GPU。即便是简单的向量加法，strace追踪也能看到数百个ioctl调用。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "「网格、块和线程束如何映射到GPU硬件？」",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "网格是块的集合，块是线程的集合。GPU的SM（流多处理器）以块为单位接收工作。同一块内的线程必须在同一个SM上运行，因此可以共享共享内存并用__syncthreads()同步。SM将块内线程按线程ID顺序每32个打包成一个线程束进行调度。例如256线程的块会产生8个线程束。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "「SIMT是什么，与SIMD有何区别？」",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "SIMT（单指令多线程）是NVIDIA GPU的执行模型，同一线程束中的32个线程在同一时钟周期执行相同指令。CPU的SIMD需要程序员或编译器显式向量化。SIMT让开发者写标量线程代码，硬件自动并行化。每个线程有独立的寄存器和程序计数器，但在正常流程下所有线程执行相同指令。当线程束内线程走不同分支时，发生线程束分歧，分歧路径被串行化执行。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "「占用率越高性能越好吗？」",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "不一定。占用率是SM实际分配的线程束数与SM支持的最大线程束数之比。更高的占用率有助于SM通过切换线程束来隐藏内存延迟。但超过约20~40%后，额外线程束对性能的提升通常微乎其微。为提高占用率而过度节省寄存器可能导致寄存器溢出到全局内存，反而降低性能。应使用Nsight Compute实测而非凭感觉调整。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "「理解CUDA内部结构对深度学习性能有何帮助？」",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "深度学习训练以矩阵乘法为核心，与SIMT结构完美契合。FlashAttention等感知内存层次的内核设计通过在共享内存中处理计算来最小化全局内存访问，将Transformer训练速度提升数倍。理解线程束分歧和占用率能精准定位性能瓶颈。大语言模型训练和推断的吞吐量与成本，在很大程度上取决于CUDA内核对GPU内存层次的利用效率。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/cuda_kernel_internals_2026.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/cuda_kernel_internals_2026.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/cuda_kernel_internals_2026.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/cuda_kernel_internals_2026.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/cuda_kernel_internals_2026.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="执行CUDA内核时GPU内部发生了什么 — 逐步深度解析 2026">
+                <meta itemprop="datePublished" content="2026-07-01">
+                <meta itemprop="dateModified" content="2026-07-01">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="CUDA内核, GPU内部机制, 线程束调度, SIMT, 流多处理器, 线程束分歧, 占用率">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/cuda_kernel_internals_2026.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">执行CUDA内核时GPU内部发生了什么</h1>
+                    <h2 class="post-subtitle">从主机启动到线程束执行、内存层次与占用率 — 逐步深度解析</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-07-01">2026-07-01</span>
+                        <span class="post-category" itemprop="articleSection">开发/基础设施</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <h2>引言：一行代码触发的庞大流水线</h2>
+                    <p>无论是训练深度学习模型、运行GPU加速仿真，还是渲染高质量图形，我们都在执行<strong>CUDA内核</strong>。从开发者角度看，这不过是一行启动调用。但在这行代码背后，主机CPU的驱动调用、GPU命令队列、数千线程的并发调度以及多层内存访问正在有机地协同运作。</p>
+                    <p>本文以2026年6月为基准，从头到尾逐步解剖这条流水线。目标有两个：一是建立开发者层面对GPU为何如此运行的直觉；二是理解为什么深度学习和AI推理加速的基础依赖于CUDA内部结构。无论是第一次写<code>vectorAdd<<<4096, 256>>>(a, b, c, N);</code>的初学者，还是调优训练吞吐量的ML工程师，都能从中获得具体的心智模型。</p>
+                    <p>前提说明：GPU微架构的细节因代际而异，NVIDIA也并未全部公开。以下以Hopper（H100）和Ada（RTX 40系列）为参考基准，基于公开文档和开放研究进行阐述。数字旨在帮助理解方向，并非精确的基准测试数据。</p>
+
+                    <h2>第一步：从主机代码到内核启动</h2>
+
+                    <h3>1.1 nvcc编译流水线</h3>
+                    <p>CUDA代码从<code>.cu</code>文件开始，经过<code>nvcc</code>处理。nvcc将主机代码和设备代码分离，设备代码经过两阶段编译。第一阶段编译为<strong>PTX（并行线程执行）</strong>虚拟ISA，假设寄存器无限，与具体GPU微架构无关，移植性强。第二阶段编译为实际GPU机器码<strong>SASS（着色器汇编）</strong>，RTX 4090对应<code>sm_89</code>。最终二进制<strong>fatbin</strong>同时打包cubin（机器码）和PTX，使新一代GPU可以从PTX进行JIT编译。</p>
+
+                    <h3>1.2 主机存根与驱动调用</h3>
+                    <p>运行时调用<code>kernelFunc<<<grid, block>>>(args...)</code>时，nvcc生成的<strong>主机存根（host stub）</strong>执行。存根在运行时注册表中查找内核，并将参数对齐存入argument buffer。首次GPU调用时，<code>libcuda.so</code>动态加载并创建GPU上下文——初始化开销较大，但后续可复用。即便是简单的向量加法，用<code>strace</code>追踪也能看到数百个ioctl，大部分是一次性初始化开销。</p>
+
+                    <h3>1.3 QMD、pushbuffer、GPFIFO与doorbell</h3>
+                    <p>驱动构建<strong>QMD（队列元数据）</strong>，即内核启动描述符。QMD包含网格大小、块大小、每线程寄存器数、共享内存需求、程序起始地址、内核参数的constant bank地址以及完成信号位置。驱动将QMD写入<strong>pushbuffer</strong>，<strong>GPFIFO</strong>条目指向它，最后通过<strong>doorbell</strong> MMIO写操作通知GPU有新任务。从这里开始，控制权从CPU转移到GPU。</p>
+
+                    <h2>第二步：网格、块与SM——工作如何分配</h2>
+
+                    <h3>2.1 三级层次结构</h3>
+                    <p>CUDA的执行层次是<strong>网格 → 块 → 线程</strong>三级。网格对应一次内核启动。网格和块都支持1D、2D、3D排列，便于图像处理（2D）或体积仿真（3D）等问题的索引计算。多维块中的线程ID按行优先顺序线性化后分配到线程束。</p>
+
+                    <h3>2.2 块到SM的分配</h3>
+                    <p>GPU的物理执行单元是<strong>SM（流多处理器）</strong>。H100有144个，RTX 4090有128个。内核网格的块被分配到各SM上。核心规则是：<strong>同一块内的所有线程必须在同一个SM上运行</strong>。这使得同块线程可以共享内存，并用<code>__syncthreads()</code>同步。不同块之间相互独立，不能假定执行顺序。SM能同时容纳的块数由寄存器、共享内存和硬件限制共同决定。</p>
+
+                    <h3>2.3 SM内部结构</h3>
+                    <p>SM内部包含CUDA核心（FP32/INT32执行单元）、特殊功能单元（SFU）、张量核心（矩阵运算专用）、线程束调度器、寄存器文件以及L1缓存/共享内存（合一）。H100 SM有128个FP32核心和4个线程束调度器，每个调度器每个周期可从就绪线程束中发射一条指令。SM同时保持大量线程束in-flight并交替执行，是GPU隐藏延迟的核心机制。</p>
+
+                    <h2>第三步：线程束与SIMT执行</h2>
+
+                    <h3>3.1 什么是线程束</h3>
+                    <p><strong>线程束（warp）</strong>是SM调度的基本单位，由32个线程组成。块中的线程按线程ID顺序每32个打包成一个线程束。256线程的块产生8个线程束。线程束内32个线程在<strong>同一时钟周期执行相同指令</strong>，这就是<strong>SIMT（单指令多线程）</strong>模型。每个线程有独立的寄存器和程序计数器，但在正常流程下所有线程同步执行。</p>
+
+                    <h3>3.2 SIMT与SIMD的区别</h3>
+                    <p>CPU的SIMD需要程序员或编译器显式向量化操作。SIMT让开发者写标量线程代码，硬件自动并行化32个线程。编程体验简单得多。代价是SIMT的性能建立在线程束内所有线程走相同路径的假设之上。当这个假设被打破时，发生<strong>线程束分歧（warp divergence）</strong>。</p>
+
+                    <h3>3.3 线程束调度与延迟隐藏</h3>
+                    <p>SM保持远多于同时可执行数量的线程束in-flight。当某线程束等待全局内存访问（数百周期延迟）时，调度器立即切换到<strong>就绪的其他线程束</strong>，无需保存/恢复寄存器——线程束的寄存器始终驻留在SM寄存器文件中。这种零开销上下文切换是GPU容忍高内存延迟的根本机制。线程束变为eligible需通过scoreboard（可变延迟指令等待）和stall计数器（固定延迟指令等待）两项条件。</p>
+
+                    <h2>第四步：线程束分歧——条件分支为何影响性能</h2>
+
+                    <h3>4.1 分歧发生的情形</h3>
+                    <p>同一线程束内的32个线程在<code>if</code>、<code>for</code>、<code>switch</code>等条件语句中走<strong>不同分支</strong>时，发生线程束分歧。由于SIMT要求所有线程执行相同指令，硬件将分歧路径串行化：执行路径A时路径B的线程被屏蔽（masked），执行路径B时路径A的线程被屏蔽。两个分支使实际执行周期最多翻倍，N个分支最多增至N倍。</p>
+
+                    <h3>4.2 减少分歧的设计原则</h3>
+                    <p>核心原则是<strong>让同一线程束内的线程走相同的代码路径</strong>。奇偶线程走不同分支是最坏情况。通过预先对数据排序或使分支条件在块层面均一，可以最小化分歧。现代GPU通过Thread Block Compaction等技术在硬件层面部分缓解分歧开销。</p>
+
+                    <h2>第五步：内存层次——从寄存器到全局内存</h2>
+
+                    <h3>5.1 寄存器——最快也最受限</h3>
+                    <p><strong>寄存器</strong>是线程私有的最快存储，访问延迟约1个周期。H100 SM有65,536个32位寄存器。每线程寄存器使用量增加时，SM能同时容纳的线程（线程束）数减少。寄存器不足时发生<strong>寄存器溢出（spill）</strong>，数据逃逸到本地内存（物理上位于全局内存），性能大幅下降。</p>
+
+                    <h3>5.2 共享内存——块内线程的协作空间</h3>
+                    <p><strong>共享内存（shared memory）</strong>是同一块内线程共享的片上内存，访问延迟约25个周期——比全局内存（350~1000周期）快数十倍。H100与L1缓存共用同一SRAM，每SM最大可配置228KB。用<code>__shared__</code>关键字声明。矩阵乘法的分块（tiling）优化是共享内存的典型用法。注意<strong>存储体冲突（bank conflict）</strong>：共享内存分为32个存储体，同一线程束中多个线程访问同一存储体时会被串行化。</p>
+
+                    <h3>5.3 全局内存——广阔但缓慢</h3>
+                    <p><strong>全局内存</strong>覆盖GPU全部VRAM，所有线程均可访问。H100的HBM3提供约3TB/s带宽，但延迟在TLB命中时约350周期，未命中时超过1000周期。隐藏此延迟需要保持足够的线程束in-flight，且<strong>合并访问（coalesced access）</strong>至关重要：线程束32个线程访问连续内存地址时可以单次事务完成；步长大或随机访问会分解为多次事务，浪费带宽。</p>
+
+                    <h3>5.4 内存层次汇总</h3>
+
+                    <table>
+                        <thead>
+                            <tr><th>内存类型</th><th>作用域</th><th>延迟</th><th>大小(H100)</th><th>特点</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>寄存器</td><td>线程私有</td><td>~1周期</td><td>每SM 65,536个</td><td>最快；数量受限</td></tr>
+                            <tr><td>共享内存</td><td>块内共享</td><td>~25周期</td><td>每SM最大228KB</td><td>片上；注意存储体冲突</td></tr>
+                            <tr><td>L1缓存</td><td>SM内</td><td>~25周期</td><td>共用SRAM</td><td>自动；与共享内存分割</td></tr>
+                            <tr><td>L2缓存</td><td>全GPU</td><td>~100周期</td><td>72MB(4090)</td><td>自动；缓存全局内存访问</td></tr>
+                            <tr><td>全局内存</td><td>所有线程</td><td>350~1000周期</td><td>数十至数百GB</td><td>合并访问至关重要</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2>第六步：占用率——SM应该填多满</h2>
+
+                    <h3>6.1 占用率的定义与制约因素</h3>
+                    <p><strong>占用率（occupancy）</strong>是SM实际分配的线程束数与SM支持的最大线程束数之比。H100 SM最多支持64个线程束、2048个线程、32个块。三个因素制约占用率：<strong>寄存器数</strong>（每线程寄存器越多，可容纳的线程束越少）、<strong>共享内存</strong>（每块使用的共享内存越多，可容纳的块越少）、<strong>块大小</strong>（块太小会先触碰SM最大块数限制）。例如块大小为32（1个线程束）时，H100上最多放32个块→32个线程束，占用率仅50%。</p>
+
+                    <h3>6.2 占用率并非越高越好</h3>
+                    <p>与直觉相反，<strong>超过约20~40%的占用率后，额外线程束对性能的提升通常微乎其微</strong>。为提高占用率过度节省寄存器导致溢出，反而更慢。将共享内存预算用于更好的缓存命中率往往比增加线程束更有效。使用<strong>CUDA Occupancy Calculator</strong>或Nsight Compute实测比凭直觉调整要准确得多。</p>
+
+                    <h2>第七步：内核完成与结果传回</h2>
+                    <p>网格所有块完成后，GPU发出<strong>completion semaphore</strong>。CPU端的<code>cudaDeviceSynchronize()</code>或流事件等待此信号。通过<code>cudaMemcpy</code>（设备到主机）将数据从GPU VRAM经PCIe总线传回主机内存。在配备NVLink的多GPU环境中，GPU间可以直接传输。即便是简单的向量加法，Nsight实测显示约10~11μs，DRAM利用率约80%，线程束发射效率约5%——典型的<strong>内存受限</strong>内核。</p>
+
+                    <h2>第八步：CUDA内部结构作为AI加速的基础</h2>
+
+                    <h3>8.1 为何GPU天然适合深度学习</h3>
+                    <p>深度学习训练的核心是矩阵乘法——对数百万权重与激活矩阵反复相乘。这与GPU的SIMT结构完美契合：相同操作作用于不同数据位置，数百个SM可以无线程束分歧地同时并行执行。H100的144SM × 128个FP32核心 = 18,432个核心充分发挥这种并行性。张量核心（Tensor Core）以硬件直接加速FP16/BF16矩阵运算，在相同周期内比FP32核心实现远更高的TFLOPS。</p>
+
+                    <h3>8.2 FlashAttention：感知内存层次的内核设计典范</h3>
+                    <p>Transformer的Attention机制的内存访问量与序列长度的平方成正比。朴素实现需要反复读写全局内存，形成严重的内存瓶颈。<strong>FlashAttention</strong>将Attention运算分块，使每块数据在共享内存中完成所有计算，只将最终结果写回全局内存。算法结果相同，但内存移动大幅减少。这就是2022年后大语言模型训练速度提升数倍的原因——不改变算法，仅优化CUDA内核设计。不理解CUDA内部结构，就无法设计出这类优化。</p>
+
+                    <h3>8.3 何时需要编写自定义CUDA内核</h3>
+                    <p>PyTorch和JAX等框架对标准操作使用高度优化的cuBLAS和cuDNN内核。但当需要新算子、特殊稀疏模式或特定领域的内核融合时，就需要编写自定义CUDA内核。此时需要自行设计网格/块大小、共享内存使用方式、合并访问模式以及最小化线程束分歧。Nsight Compute能以SM级、线程束级的粒度定位瓶颈所在。</p>
+
+                    <h2>对普通开发者的实践启示</h2>
+
+                    <h3>批大小与线程束利用率</h3>
+                    <p>在深度学习中，批大小太小会导致SM利用率不足。将批大小设为32的倍数可确保线程束完整填满。512或1024是常见的起点。但批大小过大会超出VRAM限制。</p>
+
+                    <h3>张量尺寸与内存对齐</h3>
+                    <p>矩阵运算中，行列尺寸为8或16的倍数时可充分利用张量核心和合并访问模式。不对齐的尺寸会引入填充或额外事务，降低效率。</p>
+
+                    <h3>先做性能分析，再考虑升级硬件</h3>
+                    <p>速度慢不代表一定要买更大的GPU。先用Nsight Compute或PyTorch Profiler分析内核是计算受限还是内存受限。内存受限的内核增加CUDA核心几乎没有效果。改善合并访问或应用内核融合，往往能在同一GPU上实现数倍提速。</p>
+
+                    <h2>结语：了解抽象层之下结构的力量</h2>
+                    <p><code>kernel<<<grid, block>>>(args)</code>这一行背后，隐藏着编译流水线、主机存根执行、QMD构建、pushbuffer写入、doorbell信号、SM块分配、线程束调度、SIMT执行、内存层次遍历以及completion semaphore的完整流水线。不了解这些也能运行深度学习代码。但要诊断瓶颈、设计优化方案、实现感知内存层次的内核，就必须将这些结构内化为活的知识。</p>
+                    <p>大语言模型的训练和推理吞吐量、Attention运算速度以及推理成本的很大一部分，取决于CUDA内核对GPU内存层次的利用效率。AI基础设施的真正根基不是抽象化的框架，而是这些GPU内部结构。截至2026年6月，理解这些内部机制正在成为ML工程师和基础设施开发者的必备素养。</p>
+
+                    <h2>参考资料</h2>
+                    <ul>
+                        <li>GeekNews话题(2026): <a href="https://news.hada.io/topic?id=30953" target="_blank" rel="noopener">https://news.hada.io/topic?id=30953</a></li>
+                        <li>Fergus Finn - What happens when you run a CUDA kernel: <a href="https://fergusfinn.com/blog/what-happens-when-you-run-a-gpu-kernel/" target="_blank" rel="noopener">fergusfinn.com</a></li>
+                        <li>Alex Dillhoff - CUDA Architecture Notes: <a href="https://ajdillhoff.github.io/notes/cuda_architecture/" target="_blank" rel="noopener">ajdillhoff.github.io</a></li>
+                        <li>eunomia - Understanding GPU Architecture and Execution Model: <a href="https://eunomia.dev/others/cuda-tutorial/04-gpu-architecture/" target="_blank" rel="noopener">eunomia.dev</a></li>
+                        <li>Thunder Compute - CUDA Cores Explained 2026: <a href="https://www.thundercompute.com/blog/cuda-cores-explained-ai-training" target="_blank" rel="noopener">thundercompute.com</a></li>
+                        <li>NVIDIA CUDA C编程指南(官方): <a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/" target="_blank" rel="noopener">docs.nvidia.com</a></li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>分享本文</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(推特)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../../blog.html" class="back-link">返回列表</a>
+                </div>
+            <!-- AUTO-RELATED-START -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="self_hosting_tld_2026.html">.self TLD — 为自托管设计的新顶级域名分析 2026</a></li>
+      <li><a href="foldkit_frontend_framework_2026.html">Foldkit — 追求正确性的新前端框架 2026</a></li>
+      <li><a href="regex_everywhere_portable_2026.html">随处可用的正则表达式 — 跨语言与工具的兼容性陷阱与解法 2026</a></li>
+      <li><a href="github_anonymous_0day_dump_2026.html">匿名账号大量公开未披露0-day漏洞 — 负责任披露规范的崩溃 2026</a></li>
+      </ul>
+    </div>
+    <!-- AUTO-RELATED-END -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制！请粘贴到Threads应用中分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制！'); });
+    });
+    </script>
+</body>
+</html>
