@@ -1,6 +1,6 @@
 /**
  * Bing IndexNow 배치 전송
- * 2026-07-01 신규 16편 × 4언어 = 64 URLs + blog × 4 + RSS × 4 = 72
+ * 2026-07-02 신규 16편 × 4언어 = 64 URLs + blog × 4 + RSS × 4 = 72
  */
 const https = require('https');
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -9,22 +9,22 @@ const KEY = '7d594d096f044fbba3a09184f68ffcfe';
 const HOST = 'braindetox.kr';
 
 const NEW_POSTS = [
-  'cuda_kernel_internals_2026',
-  'qwen_3_6_27b_local_2026',
-  'boutlet_ai_agent_payments_2026',
-  'memora_extensible_memory_2026',
-  'eu_age_verification_problems_2026',
-  'monthly_subscription_best_2026',
-  'claude_code_work_archetypes_2026',
-  'ai_email_firewall_2026',
-  'hackerrank_ats_scoring_inconsistency_2026',
-  'self_hosting_tld_2026',
-  'gallstones_guide',
-  'covered_call_etf_guide',
-  'legal_reserve_inheritance_guide',
-  'bathroom_waterproofing_repair_guide',
-  'naver_account_security_guide',
-  'asthma_management_guide'
+  'claude_sonnet_5_release_2026',
+  'geo_generative_search_optimization_2026',
+  'ai_native_tutor_prompt_2026',
+  'ts_code_graph_mcp_2026',
+  'engineering_leadership_rules_2026',
+  'atlassian_design_md_2026',
+  'last_generation_understand_tech_2026',
+  'specify_ai_dev_why_2026',
+  'ctx_claude_code_persistent_memory_2026',
+  'claude_fable5_mythos5_export_2026',
+  'rheumatoid_arthritis_guide',
+  'yellow_umbrella_mutual_aid_guide',
+  'insurance_claim_dispute_guide',
+  'induction_cooktop_selection_guide',
+  'qr_code_scam_prevention_guide',
+  'psoriasis_guide'
 ];
 
 const urls = [];
