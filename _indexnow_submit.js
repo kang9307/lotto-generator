@@ -1,6 +1,6 @@
 /**
  * Bing IndexNow 배치 전송
- * 2026-07-02 신규 16편 × 4언어 = 64 URLs + blog × 4 + RSS × 4 = 72
+ * 2026-07-03 신규 22편 × 4언어 = 88 URLs + blog × 4 + RSS × 4 = 96
  */
 const https = require('https');
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -9,22 +9,28 @@ const KEY = '7d594d096f044fbba3a09184f68ffcfe';
 const HOST = 'braindetox.kr';
 
 const NEW_POSTS = [
-  'claude_sonnet_5_release_2026',
-  'geo_generative_search_optimization_2026',
-  'ai_native_tutor_prompt_2026',
-  'ts_code_graph_mcp_2026',
-  'engineering_leadership_rules_2026',
-  'atlassian_design_md_2026',
-  'last_generation_understand_tech_2026',
-  'specify_ai_dev_why_2026',
-  'ctx_claude_code_persistent_memory_2026',
-  'claude_fable5_mythos5_export_2026',
-  'rheumatoid_arthritis_guide',
-  'yellow_umbrella_mutual_aid_guide',
-  'insurance_claim_dispute_guide',
-  'induction_cooktop_selection_guide',
-  'qr_code_scam_prevention_guide',
-  'psoriasis_guide'
+  'debate_ego_not_ideas_2026',
+  'frontier_ai_medical_tool_reproducibility_2026',
+  'korea_transit_mcp_cli_2026',
+  'supertree_decision_tree_viz_2026',
+  'kubernetes_in_browser_2026',
+  'longcat_2_open_model_2026',
+  'godot_rejects_ai_code_2026',
+  'mit_pinker_perfect_world_2026',
+  'openai_codex_micro_keyboard_2026',
+  'ai_takes_before_jobs_2026',
+  'playstation_physical_disc_end_2026',
+  'windy_api_randomized_data_2026',
+  'varicose_veins_guide',
+  'periodontal_disease_guide',
+  'card_loan_caution_guide',
+  'els_dls_risk_guide',
+  'child_support_enforcement_guide',
+  'jeonse_lien_registration_guide',
+  'prepaid_funeral_sangjo_guide',
+  'bidet_installation_guide',
+  'dark_web_exposure_check_guide',
+  'ai_resume_writing_guide'
 ];
 
 const urls = [];
