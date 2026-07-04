@@ -1,6 +1,6 @@
 /**
  * Bing IndexNow 배치 전송
- * 2026-07-03 신규 22편 × 4언어 = 88 URLs + blog × 4 + RSS × 4 = 96
+ * 2026-07-04 신규 16편 × 4언어 = 64 URLs + blog × 4 + RSS × 4 = 72
  */
 const https = require('https');
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -9,28 +9,22 @@ const KEY = '7d594d096f044fbba3a09184f68ffcfe';
 const HOST = 'braindetox.kr';
 
 const NEW_POSTS = [
-  'debate_ego_not_ideas_2026',
-  'frontier_ai_medical_tool_reproducibility_2026',
-  'korea_transit_mcp_cli_2026',
-  'supertree_decision_tree_viz_2026',
-  'kubernetes_in_browser_2026',
-  'longcat_2_open_model_2026',
-  'godot_rejects_ai_code_2026',
-  'mit_pinker_perfect_world_2026',
-  'openai_codex_micro_keyboard_2026',
-  'ai_takes_before_jobs_2026',
-  'playstation_physical_disc_end_2026',
-  'windy_api_randomized_data_2026',
-  'varicose_veins_guide',
-  'periodontal_disease_guide',
-  'card_loan_caution_guide',
-  'els_dls_risk_guide',
-  'child_support_enforcement_guide',
-  'jeonse_lien_registration_guide',
-  'prepaid_funeral_sangjo_guide',
-  'bidet_installation_guide',
-  'dark_web_exposure_check_guide',
-  'ai_resume_writing_guide'
+  'code_review_maintainability_2026',
+  'adventures_with_ai_2026',
+  'oomwoo_opensource_robot_vacuum_2026',
+  'google_zkp_age_verification_2026',
+  'startup_first_half_slump_2026',
+  'senior_swe_bench_2026',
+  'graphics_programmer_learning_2026',
+  'free_saas_monitoring_sentry_posthog_2026',
+  'hearing_loss_guide',
+  'adult_adhd_guide',
+  'japan_stock_investing_guide',
+  'silver_investing_guide',
+  'will_validity_requirements_guide',
+  'dishwasher_installation_guide',
+  'airbnb_vs_hotel_guide',
+  'online_payment_security_guide'
 ];
 
 const urls = [];
