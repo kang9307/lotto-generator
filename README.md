@@ -1,4 +1,4 @@
-# BrainDetox Utility Box
+# BrainDetox Utility Box.
 
 BrainDetox Utility Box는 일상생활과 업무에 유용한 다양한 웹 기반 유틸리티 도구를 제공하는 서비스입니다. 로또 번호 생성, IP 서브넷 계산, 비밀번호 생성, QR 코드 생성, 기술 블로그 등 여러 도구를 한 곳에서 편리하게 이용할 수 있습니다.
 
