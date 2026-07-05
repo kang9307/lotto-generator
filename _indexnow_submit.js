@@ -1,6 +1,6 @@
 /**
  * Bing IndexNow 배치 전송
- * 2026-07-05 신규 20편 × 4언어 = 80 URLs + blog × 4 + RSS × 4 = 88
+ * 2026-07-06 신규 20편 × 4언어 = 80 URLs + blog × 4 + RSS × 4 = 88
  */
 const https = require('https');
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -9,26 +9,26 @@ const KEY = '7d594d096f044fbba3a09184f68ffcfe';
 const HOST = 'braindetox.kr';
 
 const NEW_POSTS = [
-  'loop_engineering_art_2026',
-  'alert_iac_standardization_2026',
-  'clickhouse_observability_2026',
-  'inshellisense_shell_autocomplete_2026',
-  'alibaba_bans_claude_code_2026',
-  'agent_autonomy_levels_2026',
-  'valve_steam_machine_eink_2026',
-  'one_person_founder_era_2026',
-  'zuckerberg_meta_layoffs_admit_2026',
-  'eu_parliament_pegasus_spyware_2026',
-  'pm_hiring_60sec_demo_2026',
-  'costco_anti_amazon_2026',
-  'overactive_bladder_guide',
-  'macular_degeneration_guide',
-  'corporate_bond_investing_guide',
-  'oil_etf_investing_guide',
-  'landlord_unlawful_eviction_guide',
-  'golf_beginner_guide',
-  'camping_gear_beginner_guide',
-  'social_engineering_scam_guide'
+  'memnixfs_memory_forensics_2026',
+  'yeomil_mono_coding_font_2026',
+  'epiq_git_issue_tracker_2026',
+  'databow_adbc_query_cli_2026',
+  'code_as_image_llm_cost_2026',
+  'safari_mcp_server_2026',
+  'local_llm_running_guide_2026',
+  'kernel_level_ai_safety_2026',
+  'generative_ai_seo_geo_2026',
+  'designing_perfect_worlds_2026',
+  'newsroom_multiagent_architecture_2026',
+  'windows_automation_guide',
+  'vitamin_b12_deficiency_guide',
+  'vertigo_bppv_guide',
+  'negative_account_guide',
+  'jeonse_vs_monthly_rent_guide',
+  'noise_dispute_neighbor_guide',
+  'moving_checklist_guide',
+  'mold_condensation_removal_guide',
+  'spam_call_block_guide'
 ];
 
 const urls = [];
