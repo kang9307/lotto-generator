@@ -1,6 +1,6 @@
 /**
  * Bing IndexNow 배치 전송
- * 2026-07-04 신규 16편 × 4언어 = 64 URLs + blog × 4 + RSS × 4 = 72
+ * 2026-07-05 신규 20편 × 4언어 = 80 URLs + blog × 4 + RSS × 4 = 88
  */
 const https = require('https');
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -9,22 +9,26 @@ const KEY = '7d594d096f044fbba3a09184f68ffcfe';
 const HOST = 'braindetox.kr';
 
 const NEW_POSTS = [
-  'code_review_maintainability_2026',
-  'adventures_with_ai_2026',
-  'oomwoo_opensource_robot_vacuum_2026',
-  'google_zkp_age_verification_2026',
-  'startup_first_half_slump_2026',
-  'senior_swe_bench_2026',
-  'graphics_programmer_learning_2026',
-  'free_saas_monitoring_sentry_posthog_2026',
-  'hearing_loss_guide',
-  'adult_adhd_guide',
-  'japan_stock_investing_guide',
-  'silver_investing_guide',
-  'will_validity_requirements_guide',
-  'dishwasher_installation_guide',
-  'airbnb_vs_hotel_guide',
-  'online_payment_security_guide'
+  'loop_engineering_art_2026',
+  'alert_iac_standardization_2026',
+  'clickhouse_observability_2026',
+  'inshellisense_shell_autocomplete_2026',
+  'alibaba_bans_claude_code_2026',
+  'agent_autonomy_levels_2026',
+  'valve_steam_machine_eink_2026',
+  'one_person_founder_era_2026',
+  'zuckerberg_meta_layoffs_admit_2026',
+  'eu_parliament_pegasus_spyware_2026',
+  'pm_hiring_60sec_demo_2026',
+  'costco_anti_amazon_2026',
+  'overactive_bladder_guide',
+  'macular_degeneration_guide',
+  'corporate_bond_investing_guide',
+  'oil_etf_investing_guide',
+  'landlord_unlawful_eviction_guide',
+  'golf_beginner_guide',
+  'camping_gear_beginner_guide',
+  'social_engineering_scam_guide'
 ];
 
 const urls = [];
