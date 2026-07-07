@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ko">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>메모리 아끼며 Cross Entropy 계산하기 - LM Head가 GPU 메모리를 잡아먹는 이유와 해법 2026</title>
+    <meta name="description" content="긴 컨텍스트·큰 vocab LLM 학습에서 LM head와 Cross Entropy가 왜 최대 메모리 소비처가 되는지, Fused Linear CE로 이를 피하는 원리를 분석한다.">
+    <meta name="keywords" content="Fused Linear Cross Entropy, LM head 메모리, Cross Entropy 메모리, LLM 학습 메모리, Liger Kernel, 로짓 물질화, 청크 단위 계산, GPU VRAM 최적화, 온라인 소프트맥스, QuACK, 긴 컨텍스트 학습, LLM vocab 크기">
+
+    <link rel="canonical" href="https://braindetox.kr/posts/fused_cross_entropy_memory_2026.html">
+
+    <meta property="og:title" content="메모리 아끼며 Cross Entropy 계산하기 - LM Head가 GPU 메모리를 잡아먹는 이유와 해법 2026">
+    <meta property="og:description" content="긴 컨텍스트·큰 vocab LLM 학습에서 LM head와 Cross Entropy가 왜 최대 메모리 소비처가 되는지, Fused Linear CE로 이를 피하는 원리를 분석한다.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/posts/fused_cross_entropy_memory_2026.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ko_KR">
+    <meta property="article:published_time" content="2026-07-07">
+    <meta property="article:section" content="IT/기술">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Fused Linear Cross Entropy로 LLM 학습 메모리 줄이기">
+    <meta name="twitter:description" content="LM head와 Cross Entropy가 LLM 학습 메모리를 잡아먹는 이유와, 로짓을 통째로 만들지 않는 Fused Linear CE의 원리를 분석한다.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "메모리 아끼며 Cross Entropy 계산하기 - LM Head가 GPU 메모리를 잡아먹는 이유와 해법 2026",
+      "alternativeHeadline": "Saving Memory on Cross Entropy Loss - Why the LM Head Eats GPU Memory in LLM Training",
+      "datePublished": "2026-07-07",
+      "dateModified": "2026-07-07",
+      "inLanguage": "ko-KR",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "Fused Linear Cross Entropy, LM head 메모리, Cross Entropy 메모리, LLM 학습 메모리, Liger Kernel, 로짓 물질화, 청크 단위 계산, GPU VRAM 최적화",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/posts/fused_cross_entropy_memory_2026.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "Fused Linear Cross Entropy(FLCE)란 무엇인가?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "LM head의 마지막 선형 프로젝션과 Cross Entropy 손실 계산을 하나로 묶어, 어휘 사전 전체 크기의 로짓 텐서를 통째로 만들지 않고도 같은 손실과 그래디언트를 구하는 커널 최적화 기법이다. 청크(조각) 단위로 로짓을 만들자마자 손실과 그래디언트까지 계산해 흘려보내, 로짓이라는 크고 수명 짧은 텐서가 계산 그래프에 오래 남지 않도록 한다."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "왜 LM head와 Cross Entropy가 LLM 학습에서 메모리 병목이 되는가?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "트랜스포머 몸통이 만드는 히든 스테이트는 수천 차원 수준으로 작지만, 다음 토큰을 예측하려면 이를 어휘 사전 크기(수만~수십만)만큼의 로짓으로 부풀려야 한다. vocab이 커지고 컨텍스트 길이도 길어지면 배치×시퀀스×vocab 크기의 로짓 텐서가 순식간에 모델 가중치보다 커져, 학습 도중 가장 큰 메모리 소비처가 될 수 있다."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "단순히 시퀀스를 나눠 계산(naive chunking)하면 왜 메모리가 줄지 않는가?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "조각별로 로짓을 만들었다가 버려도, 역전파를 위해 각 조각의 계산 그래프를 프레임워크가 계속 붙들고 있어야 하기 때문이다. 모든 조각의 그래프가 최종 역전파 시점까지 누적된 채로 남아 있다면, 조각을 아무리 잘게 나눠도 최대 메모리 사용량은 크게 줄지 않고 지연 시간만 늘어나는 경우가 보고된다."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "이 최적화를 실제로 쓰려면 어떻게 해야 하는가?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "직접 커널을 짜기보다, 이미 이 기법을 구현해 둔 라이브러리를 활용하는 편이 실용적이다. LinkedIn이 공개한 Liger Kernel의 FusedLinearCrossEntropy가 대표적이며, Hugging Face 모델이나 Axolotl 같은 파인튜닝 프레임워크에 비교적 쉽게 연결할 수 있다고 알려져 있다. 저수준에서는 Tri Dao 연구실의 QuACK처럼 특정 GPU 세대에 맞춰 더 깊이 최적화된 커널 모음도 있다."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "이 기법의 한계나 트레이드오프는 무엇인가?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "청크 단위 계산과 온라인 정규화 방식은 구현 복잡도와 수치 안정성 검증 부담을 늘리고, 단순한 구현에서는 오히려 속도가 느려질 수 있다. 또한 이 기법이 줄이는 것은 LM head와 손실 계산 구간의 메모리일 뿐, KV 캐시나 옵티마이저 상태 등 다른 메모리 소비처는 그대로 남으므로 학습 메모리 문제 전체를 해결하는 만능 해법은 아니다."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <script src="https://t1.kakaocdn.net/kakao_js_sdk/2.4.0/kakao.min.js" crossorigin="anonymous"></script>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/fused_cross_entropy_memory_2026.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/fused_cross_entropy_memory_2026.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/fused_cross_entropy_memory_2026.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/fused_cross_entropy_memory_2026.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/fused_cross_entropy_memory_2026.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="메모리 아끼며 Cross Entropy 계산하기 - LM Head가 GPU 메모리를 잡아먹는 이유와 해법 2026">
+                <meta itemprop="datePublished" content="2026-07-07">
+                <meta itemprop="dateModified" content="2026-07-07">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="Fused Linear Cross Entropy, LM head 메모리, Cross Entropy 메모리, LLM 학습 메모리, Liger Kernel, 로짓 물질화">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/posts/fused_cross_entropy_memory_2026.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">메모리 아끼며 Cross Entropy 계산하기 - LM Head가 GPU 메모리를 잡아먹는 이유와 해법</h1>
+                    <h2 class="post-subtitle">긴 컨텍스트·큰 vocab LLM 학습에서 로짓이 병목이 되는 이유, 그리고 Fused Linear Cross Entropy가 이를 피하는 법</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-07-07">2026-07-07</span>
+                        <span class="post-category" itemprop="articleSection">IT/기술</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+                    <h2>서론: 학습이 터지는 곳은 어텐션이 아니라 맨 마지막 한 줄이다</h2>
+                    <p>LLM을 학습시켜 본 사람이라면 한 번쯤 겪는 상황이 있다. 모델 크기도, 배치도, 시퀀스 길이도 전부 계산해서 GPU 메모리가 넉넉하다고 확신했는데, 정작 학습이 죽는 지점은 어텐션도 피드포워드도 아닌 맨 마지막 한 줄, 손실(loss)을 구하는 순간이다. 2026년 7월 초 Trillion Labs가 공개한 분석 글은 이 현상을 정면으로 다뤘다. 16B 규모 모델을 8K 안팎의 시퀀스로 학습하던 중, Cross Entropy 손실을 구하는 단 한 번의 호출에서 30GB가 넘는 메모리가 한꺼번에 소비되며 학습이 죽었다는 실제 장애 사례를 소개한 것이다.</p>
+                    <p>이 글은 그 분석 글의 숫자를 그대로 옮기는 대신, 왜 LM head 뒤의 손실 계산이 메모리 병목이 되는지, 그리고 로짓을 통째로 만들지 않고 같은 손실을 구하는 아이디어가 무엇인지를 개념 위주로 본인 해석을 더해 정리한다. 2026년 7월 기준으로 이 최적화는 이미 여러 학습 라이브러리에 스며들어 있는 실무 기법이다.</p>
+
+                    <h2>1. 왜 하필 LM head와 Cross Entropy가 병목인가</h2>
+                    <h3>1.1 히든 스테이트는 작고, 로짓은 크다</h3>
+                    <p>트랜스포머 몸통을 통과한 결과물은 토큰 하나당 히든 스테이트 벡터 하나이고, 그 크기는 보통 수천 차원(D) 수준이다. 그런데 다음 토큰을 예측하려면 이 벡터를 어휘 사전 크기(V)만큼의 점수, 즉 로짓으로 바꿔야 한다. 문제는 V가 D보다 훨씬 크다는 점이다. 최근 모델의 vocab은 13만에서 26만 토큰 수준까지 커졌고, 히든 차원은 그 수십분의 1에 불과한 경우가 흔하다. 토큰 하나마다 D 크기의 벡터가 V 크기의 로짓으로 부풀려지니, 시퀀스 전체·배치 전체로 곱하면 로짓 텐서 하나가 모델 가중치 자체보다 커지는 역전이 일어난다.</p>
+                    <h3>1.2 vocab도 커지고 컨텍스트도 길어졌다</h3>
+                    <p>vocab이 커진 이유는 다국어·코드·특수 토큰을 더 세밀하게 다루기 위해서고, 컨텍스트가 길어진 이유는 문서·코드베이스·대화 이력을 통째로 넣으려는 요구 때문이다. 둘 다 각자 타당한 방향이지만, 이 둘이 동시에 커지면 로짓 텐서(배치×시퀀스×vocab)의 부피는 두 축에서 동시에 불어난다. 실제로 십수만 수준의 vocab과 그에 맞먹는 시퀀스를 함께 쓰면, 로짓 텐서 하나만으로 수십 GB에 이르는 경우가 드물지 않다고 보고된다.</p>
+                    <h3>1.3 잠깐 스쳐 지나가는데도 문제인 이유</h3>
+                    <p>더 성가신 점은 이 거대한 텐서가 계속 필요한 값이 아니라는 것이다. 손실 하나를 계산하기 위해 잠깐 만들어졌다가 바로 버려질 값인데, 그 잠깐 동안 GPU 메모리에서 가장 큰 덩어리를 차지한다. 학습 프레임워크 입장에서는 어텐션이나 피드포워드보다 오히려 이 마지막 한 줄에서 메모리 예산이 터지는 역설이 생긴다.</p>
+
+                    <h2>2. 단순히 쪼개면 되지 않을까 - 순진한 chunking이 실패하는 이유</h2>
+                    <h3>2.1 시퀀스를 나눠서 계산하면</h3>
+                    <p>직관적인 첫 대응은 시퀀스를 여러 조각(청크)으로 나눠, 조각마다 로짓과 손실을 따로 계산한 뒤 버리는 것이다. 이렇게 하면 한 번에 만들어지는 로짓의 크기는 확실히 줄어든다. 그런데 실제로 측정해 보면 이 방식으로는 학습 스텝 전체의 최대 메모리 사용량이 기대만큼 줄지 않는다는 보고가 있다.</p>
+                    <h3>2.2 계산 그래프가 그대로 남는다</h3>
+                    <p>이유는 역전파에 있다. 딥러닝 프레임워크는 각 조각의 순전파 결과를 역전파 때 그래디언트 계산에 써야 하므로, 조각별 계산 그래프를 역전파가 실행될 때까지 계속 붙들고 있어야 한다. 즉 조각을 아무리 잘게 나눠도, 모든 조각의 그래프가 한꺼번에 메모리에 쌓인 채로 최종 역전파를 기다리는 구조라면 최대 메모리 사용량은 별로 줄지 않는다. 관련 실험에서도 조각 수를 늘려도 최대 메모리는 어느 수준에서 거의 그대로였고, 오히려 조각을 잘게 쪼갤수록 지연 시간만 늘었다고 한다. '나눠서 계산한다'는 방향 자체는 맞지만, 그 그래프를 언제 내려놓느냐가 진짜 관건이라는 뜻이다.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>방식</th><th>로짓 텐서</th><th>계산 그래프</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>한 번에 계산</td><td>전체를 한 번에 생성</td><td>전체를 그대로 보유</td></tr>
+                            <tr><td>순진한 시퀀스 chunking</td><td>조각별로 생성 후 폐기</td><td>모든 조각 그래프가 역전파까지 누적</td></tr>
+                            <tr><td>Fused Linear CE</td><td>조각별로 생성 즉시 그래디언트로 치환</td><td>조각 그래프를 역전파까지 붙들지 않음</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2>3. Fused Linear Cross Entropy의 아이디어</h2>
+                    <h3>3.1 프로젝션과 손실을 하나로 묶는다</h3>
+                    <p>FLCE의 핵심은 마지막 선형 계층(LM head)의 프로젝션과 그 결과에 대한 Cross Entropy 계산을 하나의 연산 단위로 합치는 것이다. 조각 하나를 처리할 때 그 조각의 로짓을 구하는 즉시 손실도 함께 계산해 버리고, 로짓 자체는 다음 조각으로 넘어가기 전에 미련 없이 버린다.</p>
+                    <h3>3.2 로짓 전체 없이도 손실을 구하는 법</h3>
+                    <p>Cross Entropy를 구하려면 이론적으로 전체 어휘에 대한 소프트맥스 정규화가 필요하다. 그런데 정규화에 필요한 값(최댓값과 지수합)은 어휘를 조각조각 훑으면서 누적해서 갱신할 수 있다. 이런 흐르는 값 갱신 방식은 FlashAttention류의 어텐션 최적화에서도 쓰이는 익숙한 아이디어로, 전체를 한 번에 펼쳐 놓지 않고도 같은 결과에 도달하게 해준다. 그 결과 로짓 전체를 어딘가에 늘어놓을 필요 없이, 작은 조각만 순간적으로 GPU에 올렸다가 흘려보내는 방식으로 손실을 계산할 수 있다.</p>
+                    <h3>3.3 그래디언트도 그 자리에서 계산하고 흘려보낸다</h3>
+                    <p>진짜 묘수는 역전파를 준비하는 방식에 있다. FLCE는 순전파 단계에서 조각별 로짓에 대한 그래디언트까지 바로 계산해 버린다. 그 그래디언트를 곧장 입력 방향(히든 스테이트에 대한 그래디언트)과 LM head 가중치 방향(가중치에 대한 그래디언트, 조각마다 누적)으로 옮겨 담고 나면, 조각의 로짓과 그 그래디언트는 더는 붙들고 있을 이유가 없다. 역전파가 실제로 실행될 때는 이렇게 미리 계산해 둔, 훨씬 작은 결과물만 스케일링하면 끝난다. 결국 로짓이라는 이름의 크고 수명 짧은 텐서가 계산 그래프에 오래 등록되지 않는 구조가 되는 셈이다. 이는 수학 공식을 바꾼 게 아니라, 어떤 중간 결과를 언제까지 들고 있을지를 재설계한 것에 가깝다.</p>
+
+                    <h2>4. 실제 구현은 어떻게 흘러가나</h2>
+                    <h3>4.1 Liger Kernel</h3>
+                    <p>이 아이디어를 실무에서 가장 널리 접하는 형태는 LinkedIn이 공개한 오픈소스 Triton 커널 모음 Liger Kernel의 FusedLinearCrossEntropy다. Hugging Face 모델에 몇 줄만 추가하면 적용되고, PyTorch FSDP나 DeepSpeed 같은 분산 학습 스택과도 맞물려 동작하도록 만들어졌다고 공개돼 있다. 공개 자료에서는 십만대 vocab 구간에서 여러 배의 메모리 절감 효과를 보고하고 있는데, 이런 수치는 모델 구조·GPU·설정에 따라 크게 달라질 수 있는 벤치마크값이라는 점은 감안해야 한다.</p>
+                    <h3>4.2 학습 프레임워크에 스며든 최적화</h3>
+                    <p>Liger Kernel뿐 아니라 여러 파인튜닝 도구도 비슷한 아이디어의 자체 구현을 내놓고 있다. 한 파인튜닝 프레임워크는 청크 단위 fused loss를 적용해 같은 하드웨어에서 지원 가능한 컨텍스트 길이를 눈에 띄게 늘렸다고 보고한 바 있다. 이런 사례들은 공통적으로 조각 단위 계산과 조각 안에서 그래디언트까지 끝내기라는 같은 뼈대를 공유한다.</p>
+                    <h3>4.3 더 낮은 층위의 커널</h3>
+                    <p>Trillion Labs가 자체 FLCE 구현의 참고로 삼은 것은 Liger가 아니라 QuACK이라는, Tri Dao 연구실(Dao-AILab)이 공개한 CUTLASS·CuTe 기반 저수준 커널 모음이다. QuACK은 RMSNorm·소프트맥스·Cross Entropy 같은 몇 가지 연산을 최신 GPU 아키텍처(H100·B200급)에 맞춰 극한까지 최적화하는 데 초점을 둔다. 같은 개념이라도 어떤 하드웨어에 얼마나 밀착해서 짜느냐에 따라 서로 다른 구현체가 병존하는 생태계가 이미 형성돼 있는 셈이다.</p>
+
+                    <h2>5. 실무에서 체감하는 효과</h2>
+                    <h3>5.1 더 긴 컨텍스트, 더 큰 배치</h3>
+                    <p>이 최적화가 실무에 주는 의미는 단순하다. 손실 계산 단계에서 아끼는 메모리만큼, 같은 GPU로 더 긴 컨텍스트를 학습하거나 배치 크기를 키울 여유가 생긴다. 실제로 한 파인튜닝 도구는 fused·chunked cross entropy를 적용한 뒤 같은 GPU 한 장에서 다룰 수 있는 컨텍스트 길이가 눈에 띄게 늘었다고 보고했다. vocab이 크고 컨텍스트가 긴 모델일수록 이 효과는 더 뚜렷하게 나타나는 경향이 있다.</p>
+                    <h3>5.2 절감폭은 워크로드마다 다르다</h3>
+                    <p>다만 이 절감폭을 고정된 수치로 외우는 것은 위험하다. vocab 크기, 히든 차원, 시퀀스 길이, 배치 크기, 그리고 어떤 커널 구현을 쓰느냐에 따라 체감 효과는 상당히 달라진다. 여러 공개 벤치마크가 수 배에서 80~90% 안팎까지의 메모리 절감을 보고하고 있지만, 이는 특정 조건에서 관측된 수치이지 모든 상황에 그대로 적용되는 보장치는 아니다.</p>
+
+                    <h2>6. 트레이드오프와 한계</h2>
+                    <h3>6.1 공짜 점심은 아니다</h3>
+                    <p>청크 단위로 쪼개 계산하는 만큼, 완전히 한 번에 계산하는 방식보다 커널 호출 횟수나 오버헤드가 늘어날 여지가 있다. 교육 목적으로 단순하게 짠 구현체에서는 이런 오버헤드 때문에 표준 구현보다 오히려 더 느려지는 경우도 보고된다. 실무에서 쓰이는 완성도 높은 커널들은 이 오버헤드를 최소화하도록 별도로 정교하게 튜닝돼 있지만, 메모리는 줄고 속도는 항상 그대로라고 단정할 수는 없다.</p>
+                    <h3>6.2 수치 안정성이라는 숙제</h3>
+                    <p>소프트맥스 정규화 값을 조각조각 흐르듯 갱신하는 방식은 한 번에 계산하는 방식보다 구현이 까다롭다. 부동소수점 오차가 누적되는 지점을 잘못 다루면 손실 값이나 그래디언트가 미묘하게 어긋날 수 있어, 커널을 자체 구현한다면 정확도 검증이 필수다.</p>
+                    <h3>6.3 은탄환은 아니다</h3>
+                    <p>이 기법이 줄여주는 것은 어디까지나 LM head와 손실 계산 구간의 메모리다. 어텐션의 KV 캐시, 중간 활성값, 옵티마이저 상태 같은 다른 메모리 소비처는 그대로 남는다. FLCE는 학습 메모리 문제 전체를 푸는 만능 열쇠가 아니라, 유독 vocab과 컨텍스트가 함께 커질 때 두드러지는 특정 병목 하나를 정확히 겨냥한 최적화로 보는 것이 정확하다.</p>
+
+                    <h2>7. 결론 - 오늘 확인할 것</h2>
+                    <p>이번 분석에서 얻을 수 있는 실용적 결론은 이렇다. 직접 학습 루프를 짜고 있고 vocab이나 컨텍스트가 크다면, 로짓 텐서가 언제 메모리 사용량 그래프에서 가장 큰 봉우리를 만드는지부터 점검해 볼 만하다. 이미 Hugging Face Trainer나 Axolotl 같은 익숙한 학습 스택을 쓰고 있다면, Liger Kernel 같은 fused cross entropy 옵션이 이미 통합돼 있는지 먼저 확인하는 편이 커널을 직접 짜는 것보다 훨씬 실용적이다. 그리고 어떤 절감 수치를 보든, 본인의 모델 크기·vocab·컨텍스트 길이로 직접 측정해 보기 전까지는 참고치로만 받아들이는 편이 안전하다.</p>
+
+                    <h2>참고 자료</h2>
+                    <ul>
+                        <li>Trillion Labs - 메모리 아끼면서 Cross Entropy Loss 계산하기: <a href="https://trillion-labs.github.io/blog/posts/fused-linear-cross-entropy/" target="_blank" rel="noopener">trillion-labs.github.io</a></li>
+                        <li>GeekNews(hada) 토픽 (2026-07-04): <a href="https://news.hada.io/topic?id=31168" target="_blank" rel="noopener">news.hada.io</a></li>
+                        <li>Liger Kernel(LinkedIn, GitHub): <a href="https://github.com/linkedin/Liger-Kernel" target="_blank" rel="noopener">github.com/linkedin/Liger-Kernel</a></li>
+                        <li>QuACK(Dao-AILab, GitHub): <a href="https://github.com/Dao-AILab/quack" target="_blank" rel="noopener">github.com/Dao-AILab/quack</a></li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>이 글 공유하기</h3>
+                    <div class="social-share">
+                        <button id="kakao-share" class="share-btn kakao-btn"><img src="https://developers.kakao.com/assets/img/about/logos/kakaolink/kakaolink_btn_small.png" alt="카카오톡">카카오톡</button>
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(트위터)</button>
+                        <button id="threads-share" class="share-btn threads-btn">쓰레드</button>
+                        <button id="link-copy" class="share-btn link-btn">링크 복사</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">목록으로 돌아가기</a>
+                </div>
+            <!-- AUTO-RELATED-START -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">관련 글</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="public_wifi_safe_use_guide.html">공공 와이파이 안전하게 사용하기 - 위험과 보호 방법 완전 가이드</a></li>
+      <li><a href="code_as_image_llm_cost_2026.html">코드를 이미지로 바꾸면 LLM 토큰 비용이 준다? pxpipe가 파고든 비전 토큰 과금의 허점 2026</a></li>
+      <li><a href="local_llm_running_guide_2026.html">로컬 LLM 실행 가이드 - 하드웨어 요건과 GGUF 양자화 트레이드오프 2026</a></li>
+      <li><a href="kernel_level_ai_safety_2026.html">커널 레벨 AI 안전장치 논의 - 애플리케이션 가드레일 너머의 방어선 2026</a></li>
+      </ul>
+    </div>
+    <!-- AUTO-RELATED-END -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const kakaoShareBtn = document.getElementById('kakao-share');
+        if (kakaoShareBtn) {
+            kakaoShareBtn.addEventListener('click', function() {
+                if (!window.Kakao) return;
+                if (!window.Kakao.isInitialized()) window.Kakao.init('e06d0ee93e450a11bc6451d46e09cd88');
+                if (window.Kakao.Share) {
+                    window.Kakao.Share.sendDefault({
+                        objectType: 'feed',
+                        content: { title: document.title, description: document.querySelector('meta[name="description"]')?.content || '', imageUrl: 'https://braindetox.kr/site_logo.png', link: { mobileWebUrl: location.href, webUrl: location.href } },
+                        buttons: [{ title: '웹으로 보기', link: { mobileWebUrl: location.href, webUrl: location.href } }]
+                    });
+                }
+            });
+        }
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('링크가 복사되었습니다. 쓰레드 앱에 붙여넣기하여 공유하세요!');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('링크가 복사되었습니다!'); });
+    });
+    </script>
+</body>
+</html>

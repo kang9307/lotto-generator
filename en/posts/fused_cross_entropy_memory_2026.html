@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Saving Memory on Cross Entropy Loss - Why the LM Head Eats GPU Memory in LLM Training 2026</title>
+    <meta name="description" content="Why LM head and cross-entropy loss eat GPU memory in long-context LLM training, and how Fused Linear CE avoids materializing logits.">
+    <meta name="keywords" content="Fused Linear Cross Entropy, LM head memory, cross entropy memory, LLM training memory, Liger Kernel, logits materialization, chunked cross entropy, GPU VRAM optimization, online softmax, QuACK kernel, long context training, LLM vocab size">
+
+    <link rel="canonical" href="https://braindetox.kr/en/posts/fused_cross_entropy_memory_2026.html">
+
+    <meta property="og:title" content="Saving Memory on Cross Entropy Loss - Why the LM Head Eats GPU Memory in LLM Training 2026">
+    <meta property="og:description" content="Why LM head and cross entropy dominate memory in long-context, large-vocab LLM training, and how Fused Linear CE avoids materializing logits.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/en/posts/fused_cross_entropy_memory_2026.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="en_US">
+    <meta property="article:published_time" content="2026-07-07">
+    <meta property="article:section" content="Tech">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Cutting LLM Training Memory With Fused Linear Cross Entropy">
+    <meta name="twitter:description" content="Why LM head and cross entropy loss eat GPU memory in LLM training, and how Fused Linear CE avoids materializing full logits.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "Saving Memory on Cross Entropy Loss - Why the LM Head Eats GPU Memory in LLM Training 2026",
+      "alternativeHeadline": "메모리 아끼며 Cross Entropy 계산하기 - LM Head가 GPU 메모리를 잡아먹는 이유와 해법",
+      "datePublished": "2026-07-07",
+      "dateModified": "2026-07-07",
+      "inLanguage": "en-US",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "Fused Linear Cross Entropy, LM head memory, cross entropy memory, LLM training memory, Liger Kernel, logits materialization, chunked cross entropy, GPU VRAM optimization",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/en/posts/fused_cross_entropy_memory_2026.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "What is Fused Linear Cross Entropy (FLCE)?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "FLCE is a kernel-level optimization that fuses the LM head's final linear projection with the cross-entropy loss computation, so the same loss and gradients can be obtained without ever materializing a full vocab-sized logits tensor. It computes loss and gradients chunk by chunk, right as each chunk's logits are produced, so the large, short-lived logits tensor never lingers in the computation graph."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Why do the LM head and cross entropy become a memory bottleneck in LLM training?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "The hidden state produced by the transformer body is small, typically a few thousand dimensions, but predicting the next token requires expanding it into logits sized to the vocabulary - tens to hundreds of thousands of entries. As vocabularies grow and context length stretches out, the resulting batch-by-sequence-by-vocab logits tensor can quickly exceed the size of the model weights themselves, becoming the single largest memory consumer during training."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Why doesn't naive sequence chunking reduce memory?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Even if logits are created and discarded chunk by chunk, the framework still has to hold each chunk's computation graph until backpropagation runs, since it needs the forward-pass results to compute gradients. If every chunk's graph stays accumulated in memory until the final backward pass, peak memory barely drops no matter how finely you chunk - and latency tends to increase instead, according to reported experiments."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How can teams actually use this optimization?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Rather than writing a custom kernel, it is more practical to use a library that already implements this technique. LinkedIn's open-source FusedLinearCrossEntropy in Liger Kernel is the most widely used option, reportedly easy to wire into Hugging Face models or fine-tuning frameworks like Axolotl. At a lower level, kernel collections such as QuACK from Tri Dao's lab optimize the same idea more deeply for specific GPU generations."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "What are the limits or trade-offs of this technique?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Chunked computation and online normalization add implementation complexity and numerical-stability validation overhead, and naive implementations can even run slower than the standard approach. The technique only reduces memory in the LM head and loss computation stage - other consumers like the KV cache and optimizer states are untouched, so it is not a universal fix for LLM training memory pressure."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/fused_cross_entropy_memory_2026.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/fused_cross_entropy_memory_2026.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/fused_cross_entropy_memory_2026.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/fused_cross_entropy_memory_2026.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/fused_cross_entropy_memory_2026.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="Saving Memory on Cross Entropy Loss - Why the LM Head Eats GPU Memory in LLM Training 2026">
+                <meta itemprop="datePublished" content="2026-07-07">
+                <meta itemprop="dateModified" content="2026-07-07">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="Fused Linear Cross Entropy, LM head memory, cross entropy memory, LLM training memory, Liger Kernel, logits materialization">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/en/posts/fused_cross_entropy_memory_2026.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">Saving Memory on Cross Entropy Loss - Why the LM Head Eats GPU Memory in LLM Training</h1>
+                    <h2 class="post-subtitle">Why logits become the memory bottleneck in long-context, large-vocab LLM training, and how Fused Linear Cross Entropy avoids it</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-07-07">Jul 7, 2026</span>
+                        <span class="post-category" itemprop="articleSection">Tech</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+                    <h2>Intro: Training Doesn't Blow Up at Attention - It Blows Up at the Last Line</h2>
+                    <p>If you have ever trained an LLM, you have probably hit this moment. You sized the model, the batch, and the sequence length carefully, convinced GPU memory was comfortably enough - and then training died not in attention, not in the feed-forward block, but at the very last line: computing the loss. An analysis published by Trillion Labs in early July 2026 tackled exactly this. While training a 16B-scale model on sequences around 8K tokens, a single call to compute the cross-entropy loss consumed over 30GB of memory at once, killing the run - a real incident the post walks through in detail.</p>
+                    <p>Rather than repeat that post's numbers verbatim, this piece unpacks, in my own words and concept-first, why loss computation right after the LM head becomes a memory bottleneck, and what idea lets you compute the same loss without ever materializing the full logits tensor. As of July 2026, this optimization is no longer a lab curiosity - it is already baked into several training libraries in everyday use.</p>
+
+                    <h2>1. Why the LM Head and Cross Entropy Become the Bottleneck</h2>
+                    <h3>1.1 The Hidden State Is Small; the Logits Are Huge</h3>
+                    <p>What comes out of the transformer body is one hidden-state vector per token, typically a few thousand dimensions (D). But predicting the next token requires turning that vector into a score for every entry in the vocabulary (V) - the logits. The catch is that V dwarfs D. Recent models carry vocabularies of 130K to 260K tokens, while the hidden dimension is often only a fraction of that. Every single token's D-sized vector balloons into a V-sized row of logits, and once you multiply across the whole sequence and batch, the logits tensor can end up larger than the model weights themselves - a strange inversion.</p>
+                    <h3>1.2 Vocabularies Grew, and So Did Context</h3>
+                    <p>Vocabularies grew to handle multilingual text, code, and special tokens more precisely; context grew because people want to feed in whole documents, codebases, and conversation histories. Both trends make sense on their own, but when they grow together, the logits tensor (batch × sequence × vocab) balloons along two axes at once. When a vocabulary in the low hundred-thousands meets a sequence length of similar scale, it is not unusual for the logits tensor alone to reach tens of gigabytes, per reported cases.</p>
+                    <h3>1.3 Why a Fleeting Tensor Still Causes Trouble</h3>
+                    <p>What makes this worse is that this giant tensor is not something you actually need to keep around. It exists briefly to compute a single loss value and is meant to be thrown away immediately - but during that brief moment, it is the single largest chunk of memory on the GPU. The paradox is that, for many training setups, the memory budget blows not in attention or the feed-forward layers but in this last line.</p>
+
+                    <h2>2. Why Not Just Chunk It? - Where Naive Chunking Falls Short</h2>
+                    <h3>2.1 Splitting the Sequence Into Pieces</h3>
+                    <p>The intuitive first fix is to split the sequence into chunks, computing logits and loss for each chunk separately and discarding them right away. This clearly shrinks the size of the logits materialized at any one instant. But measured in practice, this approach reportedly fails to cut peak memory for the whole training step by as much as you would expect.</p>
+                    <h3>2.2 The Computation Graph Sticks Around</h3>
+                    <p>The reason lies in backpropagation. A deep learning framework needs each chunk's forward-pass results to compute gradients during the backward pass, so it has to hold every chunk's computation graph until backward actually runs. In other words, no matter how finely you chunk, if every chunk's graph piles up in memory waiting for the final backward pass, peak memory barely moves. Related experiments reportedly found that increasing the chunk count left peak memory nearly flat while latency kept climbing instead. The direction - "split it up" - is right; what actually matters is when you let go of the graph.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Approach</th><th>Logits tensor</th><th>Computation graph</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Compute all at once</td><td>Materialized in full, at once</td><td>Kept in full</td></tr>
+                            <tr><td>Naive sequence chunking</td><td>Created and discarded per chunk</td><td>Every chunk's graph accumulates until backward</td></tr>
+                            <tr><td>Fused Linear CE</td><td>Created per chunk, immediately turned into gradients</td><td>Chunk graphs are not held until backward</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2>3. The Idea Behind Fused Linear Cross Entropy</h2>
+                    <h3>3.1 Fusing the Projection and the Loss</h3>
+                    <p>FLCE's core move is to fuse the LM head's final linear projection with the cross-entropy computation on its output into a single operation. As each chunk is processed, the loss is computed the instant that chunk's logits are produced, and the logits themselves are discarded without hesitation before moving to the next chunk.</p>
+                    <h3>3.2 Computing Loss Without the Full Logits</h3>
+                    <p>Cross entropy, in theory, requires a softmax normalization over the entire vocabulary. But the values that normalization needs - a running maximum and a running sum of exponentials - can be accumulated incrementally by sweeping through the vocabulary piece by piece. This "streaming update" idea is the same one used in FlashAttention-style attention optimizations: it reaches the same result without ever laying the whole thing out in memory at once. As a result, loss can be computed by momentarily loading a small chunk onto the GPU and letting it flow through, with no need to lay out the full logits anywhere.</p>
+                    <h3>3.3 Computing and Flushing Gradients on the Spot</h3>
+                    <p>The real trick is in how backward is prepared. FLCE computes the gradient with respect to each chunk's logits right there in the forward pass. Once that gradient is immediately routed into the input direction (the gradient with respect to the hidden state) and the LM head weight direction (the weight gradient, accumulated chunk by chunk), there is no longer any reason to hold onto that chunk's logits or its gradient. When backward actually executes, it merely scales these already-computed, far smaller results. The upshot is that the large, short-lived tensor called "logits" never gets registered in the computation graph for long. This is not a change to the math - it is a redesign of which intermediate results get held, and for how long.</p>
+
+                    <h2>4. How This Actually Gets Implemented</h2>
+                    <h3>4.1 Liger Kernel</h3>
+                    <p>The most common way this idea reaches practitioners is LinkedIn's open-source Triton kernel collection, Liger Kernel, and its FusedLinearCrossEntropy. It reportedly applies with just a few lines added to a Hugging Face model, and is built to work alongside distributed training stacks like PyTorch FSDP and DeepSpeed. Public materials report memory savings of several times over at vocabularies in the low hundred-thousands - figures that can vary substantially by model architecture, GPU, and configuration.</p>
+                    <h3>4.2 The Optimization Baked Into Training Frameworks</h3>
+                    <p>Beyond Liger Kernel, several fine-tuning tools have shipped their own implementations of a similar idea. One fine-tuning framework reported a noticeable increase in the context length it could handle on the same hardware after applying a chunked, fused loss. Across these examples, the same skeleton keeps showing up: compute chunk by chunk, and finish the gradient inside each chunk.</p>
+                    <h3>4.3 Lower-Level Kernels</h3>
+                    <p>Trillion Labs's own FLCE implementation reportedly used not Liger but QuACK as its reference - a collection of low-level CUTLASS/CuTe kernels from Tri Dao's lab (Dao-AILab). QuACK focuses on pushing a handful of operations - RMSNorm, softmax, cross entropy - to the limit on recent GPU architectures (H100/B200-class). Even for the same underlying concept, an ecosystem of distinct implementations already coexists, differing in how tightly they are hand-tuned to a given hardware generation.</p>
+
+                    <h2>5. The Practical Payoff</h2>
+                    <h3>5.1 Longer Context, Bigger Batches</h3>
+                    <p>What this optimization means in practice is simple: whatever memory you save at the loss-computation stage, you get to spend on a longer context or a bigger batch on the same GPU. One fine-tuning tool reportedly reported a noticeable increase in the context length it could fit on a single GPU after adopting a fused, chunked cross entropy. The effect tends to be more pronounced the larger the vocabulary and the longer the context.</p>
+                    <h3>5.2 The Savings Vary by Workload</h3>
+                    <p>That said, it is risky to treat any single savings figure as a fixed constant. Vocabulary size, hidden dimension, sequence length, batch size, and which kernel implementation you use all shift the practical effect considerably. Various public benchmarks report savings ranging from several-fold to roughly 80-90%, but these are figures observed under specific conditions - not a guarantee that transfers to every setup.</p>
+
+                    <h2>6. Trade-offs and Limits</h2>
+                    <h3>6.1 Not a Free Lunch</h3>
+                    <p>Because computation is split into chunks, there is room for more kernel launches and overhead than a single, one-shot computation. Simple, education-oriented implementations reportedly can even run slower than the standard approach because of this overhead. Production-grade kernels are carefully tuned to minimize that cost, but it is not safe to assume memory always drops while speed stays exactly the same.</p>
+                    <h3>6.2 The Homework Called Numerical Stability</h3>
+                    <p>Updating a softmax normalization value in a streaming, piece-by-piece fashion is trickier to implement correctly than computing it all at once. Mishandling where floating-point error accumulates can subtly throw off the loss value or the gradients, so validating accuracy is essential if you implement a kernel yourself.</p>
+                    <h3>6.3 Not a Silver Bullet</h3>
+                    <p>What this technique reduces is strictly the memory used by the LM head and the loss computation. Other consumers - the attention KV cache, intermediate activations, optimizer states - are untouched. FLCE is best understood not as a universal fix for training-memory pressure, but as an optimization aimed precisely at one specific bottleneck that stands out exactly when vocabulary and context both grow large together.</p>
+
+                    <h2>7. Conclusion - What to Check Today</h2>
+                    <p>The practical takeaway from this analysis is straightforward. If you are writing your own training loop and working with a large vocabulary or long context, it is worth checking whether the logits tensor is what forms the tallest peak on your memory-usage graph. If you are already on a familiar stack like Hugging Face Trainer or Axolotl, checking whether a fused cross-entropy option such as Liger Kernel is already integrated is far more practical than writing a kernel yourself. And whatever savings figure you come across, treat it as a reference point rather than a promise until you measure it against your own model size, vocabulary, and context length.</p>
+
+                    <h2>References</h2>
+                    <ul>
+                        <li>Trillion Labs - Computing Cross Entropy Loss While Saving Memory: <a href="https://trillion-labs.github.io/blog/posts/fused-linear-cross-entropy/" target="_blank" rel="noopener">trillion-labs.github.io</a></li>
+                        <li>GeekNews (hada) topic (2026-07-04): <a href="https://news.hada.io/topic?id=31168" target="_blank" rel="noopener">news.hada.io</a></li>
+                        <li>Liger Kernel (LinkedIn, GitHub): <a href="https://github.com/linkedin/Liger-Kernel" target="_blank" rel="noopener">github.com/linkedin/Liger-Kernel</a></li>
+                        <li>QuACK (Dao-AILab, GitHub): <a href="https://github.com/Dao-AILab/quack" target="_blank" rel="noopener">github.com/Dao-AILab/quack</a></li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>Share this article</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">Copy Link</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">Back to List</a>
+                </div>
+            <!-- AUTO-RELATED-START -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Related Posts</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="public_wifi_safe_use_guide.html">How to Use Public Wi-Fi Safely - A Complete Guide to Risks and Protection</a></li>
+      <li><a href="code_as_image_llm_cost_2026.html">Rendering Code as an Image to Cut LLM Token Costs - pxpipe and the Vision Token Loophole 2026</a></li>
+      <li><a href="local_llm_running_guide_2026.html">Running LLMs Locally in 2026 - A Practical Guide to Hardware, Quantization, and Tooling</a></li>
+      <li><a href="kernel_level_ai_safety_2026.html">Kernel-Level AI Safety - Defenses Below the Application Guardrail 2026</a></li>
+      </ul>
+    </div>
+    <!-- AUTO-RELATED-END -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('Link copied! Paste it in the Threads app to share.');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('Link copied!'); });
+    });
+    </script>
+</body>
+</html>

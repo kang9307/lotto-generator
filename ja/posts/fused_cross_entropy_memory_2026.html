@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>メモリを節約してCross Entropyを計算する - LM HeadがGPUメモリを食い尽くす理由と対策 2026</title>
+    <meta name="description" content="長いコンテキスト・大きなvocabのLLM学習でLM HeadとCross Entropyが最大のメモリ消費源になる理由と、Fused Linear CEで回避する仕組みを分析する。">
+    <meta name="keywords" content="Fused Linear Cross Entropy, LM headメモリ, Cross Entropyメモリ, LLM学習メモリ, Liger Kernel, ロジット物質化, チャンク計算, GPU VRAM最適化, オンラインソフトマックス, QuACK, 長いコンテキスト学習, LLM vocabサイズ">
+
+    <link rel="canonical" href="https://braindetox.kr/ja/posts/fused_cross_entropy_memory_2026.html">
+
+    <meta property="og:title" content="メモリを節約してCross Entropyを計算する - LM HeadがGPUメモリを食い尽くす理由と対策 2026">
+    <meta property="og:description" content="長いコンテキスト・大きなvocabのLLM学習でLM HeadとCross Entropyが最大のメモリ消費源になる理由と、Fused Linear CEで回避する仕組みを分析する。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/ja/posts/fused_cross_entropy_memory_2026.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ja_JP">
+    <meta property="article:published_time" content="2026-07-07">
+    <meta property="article:section" content="IT・技術">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Fused Linear Cross EntropyでLLM学習メモリを削減する">
+    <meta name="twitter:description" content="LM HeadとCross EntropyがLLM学習メモリを食い尽くす理由と、ロジット全体を作らないFused Linear CEの仕組みを分析する。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "メモリを節約してCross Entropyを計算する - LM HeadがGPUメモリを食い尽くす理由と対策 2026",
+      "alternativeHeadline": "Saving Memory on Cross Entropy Loss - Why the LM Head Eats GPU Memory in LLM Training",
+      "datePublished": "2026-07-07",
+      "dateModified": "2026-07-07",
+      "inLanguage": "ja-JP",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "Fused Linear Cross Entropy, LM headメモリ, Cross Entropyメモリ, LLM学習メモリ, Liger Kernel, ロジット物質化, チャンク計算, GPU VRAM最適化",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/ja/posts/fused_cross_entropy_memory_2026.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "Fused Linear Cross Entropy(FLCE)とは何か?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "LM headの最終線形射影とCross Entropy損失計算を一つに融合し、語彙サイズ分のロジットテンソルを丸ごと作らずに同じ損失と勾配を求めるカーネル最適化手法だ。チャンク(断片)単位でロジットを作った瞬間に損失と勾配まで計算して流し、ロジットという大きく寿命の短いテンソルが計算グラフに長く残らないようにする。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "なぜLM headとCross EntropyがLLM学習のメモリボトルネックになるのか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "トランスフォーマー本体が作る隠れ状態は数千次元程度と小さいが、次のトークンを予測するにはこれを語彙サイズ(数万〜数十万)分のロジットに膨らませる必要がある。vocabが大きくなり、コンテキスト長も伸びると、バッチ×シーケンス×vocabの大きさを持つロジットテンソルがあっという間にモデル重み自体より大きくなり、学習中最大のメモリ消費源になりうる。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "単純にシーケンスを分けて計算(naive chunking)しても、なぜメモリが減らないのか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "断片ごとにロジットを作って捨てても、逆伝播のためにフレームワークは各断片の計算グラフを逆伝播が実行されるまで持ち続けなければならないからだ。すべての断片のグラフが最終的な逆伝播まで蓄積されたまま残るなら、断片をどれだけ細かく分けても最大メモリ使用量はほとんど減らず、遅延だけが増えるケースが報告されている。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "この最適化を実際に使うにはどうすればよいか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "自分でカーネルを書くより、すでにこの手法を実装済みのライブラリを活用する方が実用的だ。LinkedInが公開したLiger KernelのFusedLinearCrossEntropyが代表例で、Hugging FaceモデルやAxolotlのようなファインチューニングフレームワークに比較的容易に組み込めるとされる。より低いレイヤーでは、Tri Dao研究室のQuACKのように特定のGPU世代に合わせてさらに深く最適化されたカーネル群もある。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "この手法の限界やトレードオフは何か?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "チャンク単位の計算とオンライン正規化方式は実装の複雑さと数値安定性の検証負担を増やし、単純な実装ではむしろ速度が遅くなることもある。またこの手法が減らすのはLM headと損失計算区間のメモリだけで、KVキャッシュやオプティマイザ状態といった他のメモリ消費源はそのまま残るため、学習メモリ問題全体を解決する万能策ではない。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/fused_cross_entropy_memory_2026.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/fused_cross_entropy_memory_2026.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/fused_cross_entropy_memory_2026.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/fused_cross_entropy_memory_2026.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/fused_cross_entropy_memory_2026.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="メモリを節約してCross Entropyを計算する - LM HeadがGPUメモリを食い尽くす理由と対策 2026">
+                <meta itemprop="datePublished" content="2026-07-07">
+                <meta itemprop="dateModified" content="2026-07-07">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="Fused Linear Cross Entropy, LM headメモリ, Cross Entropyメモリ, LLM学習メモリ, Liger Kernel, ロジット物質化">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/ja/posts/fused_cross_entropy_memory_2026.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">メモリを節約してCross Entropyを計算する - LM HeadがGPUメモリを食い尽くす理由と対策</h1>
+                    <h2 class="post-subtitle">長いコンテキスト・大きなvocabのLLM学習でロジットがボトルネックになる理由と、Fused Linear Cross Entropyがそれを避ける仕組み</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-07-07">2026-07-07</span>
+                        <span class="post-category" itemprop="articleSection">IT・技術</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+                    <h2>序論: 学習が落ちるのはAttentionではなく最後の一行だ</h2>
+                    <p>LLMを学習させたことがある人なら、一度は経験する状況がある。モデルサイズもバッチもシーケンス長もすべて計算し、GPUメモリは十分だと確信していたのに、実際に学習が落ちるのはAttentionでもフィードフォワードでもなく、最後の一行、損失(loss)を求める瞬間だ。2026年7月初め、Trillion Labsが公開した分析記事はこの現象を正面から扱った。16B規模のモデルを8K前後のシーケンスで学習していた際、Cross Entropy損失を求めるたった一度の呼び出しで30GBを超えるメモリが一気に消費され、学習が落ちたという実際の障害事例を紹介したのだ。</p>
+                    <p>本稿はその分析記事の数字をそのまま転記するのではなく、なぜLM headの直後にある損失計算がメモリボトルネックになるのか、そしてロジットを丸ごと作らずに同じ損失を求めるアイデアが何なのかを、概念中心に自分自身の解釈を加えて整理する。2026年7月現在、この最適化はすでに複数の学習ライブラリに組み込まれた実務的な手法になっている。</p>
+
+                    <h2>1. なぜLM HeadとCross Entropyがボトルネックになるのか</h2>
+                    <h3>1.1 隠れ状態は小さく、ロジットは大きい</h3>
+                    <p>トランスフォーマー本体を通過した結果はトークン一つあたり隠れ状態ベクトル一つで、その大きさは通常数千次元(D)程度だ。しかし次のトークンを予測するには、このベクトルを語彙サイズ(V)分のスコア、つまりロジットに変換しなければならない。問題はVがDよりはるかに大きいことだ。最近のモデルのvocabは13万から26万トークン規模まで大きくなっており、隠れ次元はその数十分の一に過ぎないことが多い。トークン一つごとにD次元のベクトルがV次元のロジットへと膨らむため、シーケンス全体・バッチ全体で掛け合わせると、ロジットテンソル一つがモデル重み自体より大きくなるという逆転現象が起きる。</p>
+                    <h3>1.2 vocabも大きくなり、コンテキストも長くなった</h3>
+                    <p>vocabが大きくなった理由は多言語・コード・特殊トークンをより細かく扱うためであり、コンテキストが長くなった理由は文書・コードベース・会話履歴を丸ごと入れたいという要求のためだ。どちらもそれぞれ理にかなっているが、この二つが同時に大きくなると、ロジットテンソル(バッチ×シーケンス×vocab)の体積は二つの軸で同時に膨れ上がる。実際、十数万規模のvocabとそれに匹敵するシーケンスを組み合わせると、ロジットテンソル一つだけで数十GBに達するケースも珍しくないと報告されている。</p>
+                    <h3>1.3 一瞬しか使わないのに問題になる理由</h3>
+                    <p>さらに厄介なのは、この巨大なテンソルがずっと必要な値ではないという点だ。損失一つを計算するために一瞬作られ、すぐに捨てられる値であるにもかかわらず、その一瞬の間GPUメモリの中で最大の塊を占める。学習フレームワークにとっては、AttentionやフィードフォワードよりもむしろこのLM head後の一行でメモリ予算が破裂するという逆説が生まれる。</p>
+
+                    <h2>2. 単純に分ければよいのでは - naive chunkingが失敗する理由</h2>
+                    <h3>2.1 シーケンスを分けて計算すると</h3>
+                    <p>直感的な最初の対応は、シーケンスを複数の断片(チャンク)に分け、断片ごとにロジットと損失を別々に計算してから捨てることだ。こうすれば一度に作られるロジットの大きさは確実に減る。しかし実際に測定してみると、この方式では学習ステップ全体の最大メモリ使用量が期待ほど減らないという報告がある。</p>
+                    <h3>2.2 計算グラフがそのまま残る</h3>
+                    <p>理由は逆伝播にある。ディープラーニングフレームワークは各断片の順伝播結果を逆伝播時の勾配計算に使う必要があるため、断片ごとの計算グラフを逆伝播が実行されるまで持ち続けなければならない。つまり断片をどれだけ細かく分けても、すべての断片のグラフが一度にメモリに積み上がったまま最終的な逆伝播を待つ構造であれば、最大メモリ使用量はほとんど減らない。関連する実験でも、断片数を増やしても最大メモリはある水準でほぼ変わらず、むしろ断片を細かく分けるほど遅延だけが増えたという。「分けて計算する」という方向性自体は正しいが、そのグラフをいつ手放すかが本当の鍵だということだ。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>方式</th><th>ロジットテンソル</th><th>計算グラフ</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>一度に計算</td><td>全体を一度に生成</td><td>全体をそのまま保持</td></tr>
+                            <tr><td>naiveなシーケンスchunking</td><td>断片ごとに生成後破棄</td><td>すべての断片のグラフが逆伝播まで蓄積</td></tr>
+                            <tr><td>Fused Linear CE</td><td>断片ごとに生成し即座に勾配へ置換</td><td>断片グラフを逆伝播まで保持しない</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2>3. Fused Linear Cross Entropyのアイデア</h2>
+                    <h3>3.1 射影と損失を一つにまとめる</h3>
+                    <p>FLCEの核心は、最終線形層(LM head)の射影とその結果に対するCross Entropy計算を一つの演算単位に統合することだ。断片一つを処理する際、その断片のロジットを求めた瞬間に損失も同時に計算してしまい、ロジット自体は次の断片に移る前に未練なく捨てる。</p>
+                    <h3>3.2 ロジット全体なしで損失を求める方法</h3>
+                    <p>Cross Entropyを求めるには理論上、語彙全体に対するソフトマックス正規化が必要だ。しかし正規化に必要な値(最大値と指数和)は、語彙を断片ごとに巡りながら累積的に更新できる。この「流れるような値の更新」方式はFlashAttention系のAttention最適化でも使われる馴染みのあるアイデアで、全体を一度に広げなくても同じ結果にたどり着ける。その結果、ロジット全体をどこかに並べる必要なく、小さな断片だけを一瞬GPUに載せては流していく方式で損失を計算できる。</p>
+                    <h3>3.3 勾配もその場で計算して流す</h3>
+                    <p>本当の妙手は逆伝播の準備方法にある。FLCEは順伝播の段階で断片ごとのロジットに対する勾配まですぐに計算してしまう。その勾配を直ちに入力方向(隠れ状態に対する勾配)とLM head重み方向(重みに対する勾配、断片ごとに累積)へ移し替えてしまえば、断片のロジットとその勾配はもはや保持しておく理由がない。逆伝播が実際に実行される際は、こうして事前に計算しておいた、はるかに小さな結果をスケーリングするだけで済む。結局、ロジットという名の大きく寿命の短いテンソルが計算グラフに長く登録されない構造になるわけだ。これは数式を変えたのではなく、どの中間結果をいつまで保持するかを再設計したことに近い。</p>
+
+                    <h2>4. 実際の実装はどう流れるか</h2>
+                    <h3>4.1 Liger Kernel</h3>
+                    <p>このアイデアが実務で最も広く触れられる形は、LinkedInが公開したオープンソースのTritonカーネル集Liger KernelのFusedLinearCrossEntropyだ。Hugging Faceモデルに数行加えるだけで適用でき、PyTorch FSDPやDeepSpeedのような分散学習スタックとも噛み合って動作するよう作られているという。公開資料では十万台のvocab帯で数倍のメモリ削減効果を報告しているが、こうした数値はモデル構造・GPU・設定によって大きく変わりうるベンチマーク値である点は考慮すべきだ。</p>
+                    <h3>4.2 学習フレームワークに組み込まれた最適化</h3>
+                    <p>Liger Kernelだけでなく、複数のファインチューニングツールも似たアイデアの独自実装を出している。あるファインチューニングフレームワークは、チャンク単位のfused lossを適用して同じハードウェアで扱えるコンテキスト長が目に見えて伸びたと報告している。こうした事例はいずれも「断片単位で計算し、断片の中で勾配まで終わらせる」という同じ骨組みを共有している。</p>
+                    <h3>4.3 より低層のカーネル</h3>
+                    <p>Trillion Labsが自前のFLCE実装の参照としたのはLigerではなく、Tri Dao研究室(Dao-AILab)が公開したCUTLASS・CuTeベースの低層カーネル集QuACKだ。QuACKはRMSNorm・ソフトマックス・Cross Entropyといった数種類の演算を、最新のGPUアーキテクチャ(H100・B200級)に合わせて極限まで最適化することに焦点を当てている。同じ概念であっても、どのハードウェアにどれだけ密着して書くかによって異なる実装が並存するエコシステムがすでに形成されているわけだ。</p>
+
+                    <h2>5. 実務で体感する効果</h2>
+                    <h3>5.1 より長いコンテキスト、より大きなバッチ</h3>
+                    <p>この最適化が実務にもたらす意味は単純だ。損失計算の段階で節約したメモリの分だけ、同じGPUでより長いコンテキストを学習したり、バッチサイズを大きくしたりする余裕が生まれる。実際、あるファインチューニングツールはfused・chunked cross entropyを適用した後、同じGPU一枚で扱えるコンテキスト長が目に見えて伸びたと報告した。vocabが大きく、コンテキストが長いモデルほど、この効果はより鮮明に現れる傾向がある。</p>
+                    <h3>5.2 削減幅はワークロードごとに異なる</h3>
+                    <p>ただし、この削減幅を固定された数値として覚えるのは危険だ。vocabサイズ、隠れ次元、シーケンス長、バッチサイズ、そしてどのカーネル実装を使うかによって体感効果はかなり異なる。複数の公開ベンチマークが数倍から80〜90%前後までのメモリ削減を報告しているが、これは特定の条件下で観測された数値であり、あらゆる状況にそのまま当てはまる保証値ではない。</p>
+
+                    <h2>6. トレードオフと限界</h2>
+                    <h3>6.1 タダ飯ではない</h3>
+                    <p>チャンク単位で分けて計算する分、完全に一度に計算する方式よりもカーネル呼び出し回数やオーバーヘッドが増える余地がある。教育目的で単純に書かれた実装では、こうしたオーバーヘッドのために標準実装よりむしろ遅くなるケースも報告されている。実務で使われる完成度の高いカーネルはこのオーバーヘッドを最小化するよう別途精巧にチューニングされているが、「メモリは減り、速度は常に変わらない」と断定はできない。</p>
+                    <h3>6.2 数値安定性という宿題</h3>
+                    <p>ソフトマックス正規化値を断片ごとに流れるように更新する方式は、一度に計算する方式より実装が難しい。浮動小数点誤差が蓄積する箇所を誤って扱うと、損失値や勾配が微妙にずれる可能性があるため、カーネルを自前で実装するなら精度検証が欠かせない。</p>
+                    <h3>6.3 万能薬ではない</h3>
+                    <p>この手法が減らすのはあくまでLM headと損失計算区間のメモリだ。AttentionのKVキャッシュ、中間活性値、オプティマイザ状態といった他のメモリ消費源はそのまま残る。FLCEは学習メモリ問題全体を解く万能の鍵ではなく、vocabとコンテキストが同時に大きくなるときに際立つ特定のボトルネック一つを正確に狙った最適化と見るのが正確だ。</p>
+
+                    <h2>7. 結論 - 今日確認すべきこと</h2>
+                    <p>今回の分析から得られる実用的な結論はこうだ。自前で学習ループを書いていて、vocabやコンテキストが大きいなら、ロジットテンソルがメモリ使用量グラフのどこで最大の山を作っているかからまず点検してみる価値がある。すでにHugging Face TrainerやAxolotlのような馴染みの学習スタックを使っているなら、Liger Kernelのようなfused cross entropyオプションがすでに組み込まれているかを先に確認する方が、カーネルを自分で書くよりはるかに実用的だ。そしてどんな削減数値を見ても、自分のモデルサイズ・vocab・コンテキスト長で実際に測定してみるまでは参考値として受け止めるのが安全だ。</p>
+
+                    <h2>参考資料</h2>
+                    <ul>
+                        <li>Trillion Labs - メモリ節約とCross Entropy Loss計算: <a href="https://trillion-labs.github.io/blog/posts/fused-linear-cross-entropy/" target="_blank" rel="noopener">trillion-labs.github.io</a></li>
+                        <li>GeekNews(hada)トピック(2026-07-04): <a href="https://news.hada.io/topic?id=31168" target="_blank" rel="noopener">news.hada.io</a></li>
+                        <li>Liger Kernel(LinkedIn, GitHub): <a href="https://github.com/linkedin/Liger-Kernel" target="_blank" rel="noopener">github.com/linkedin/Liger-Kernel</a></li>
+                        <li>QuACK(Dao-AILab, GitHub): <a href="https://github.com/Dao-AILab/quack" target="_blank" rel="noopener">github.com/Dao-AILab/quack</a></li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>この記事をシェア</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">スレッズ</button>
+                        <button id="link-copy" class="share-btn link-btn">リンクをコピー</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">一覧に戻る</a>
+                </div>
+            <!-- AUTO-RELATED-START -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">関連記事</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="public_wifi_safe_use_guide.html">公共Wi-Fiを安全に使う方法 - リスクと対策の完全ガイド</a></li>
+      <li><a href="code_as_image_llm_cost_2026.html">コードを画像化してLLMトークン費用を減らす - pxpipeが突いたビジョン課金の隙 2026</a></li>
+      <li><a href="local_llm_running_guide_2026.html">ローカルLLM実行ガイド2026 - ハードウェア要件とGGUF量子化のトレードオフ</a></li>
+      <li><a href="kernel_level_ai_safety_2026.html">カーネルレベルAI安全論議 - アプリケーションガードレールを超える防御線 2026</a></li>
+      </ul>
+    </div>
+    <!-- AUTO-RELATED-END -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('リンクがコピーされました。Threadsアプリに貼り付けてシェアしてください!');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('リンクがコピーされました!'); });
+    });
+    </script>
+</body>
+</html>

@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>省内存计算Cross Entropy - 长上下文·大词表LLM训练中LM Head为何吃光显存 2026</title>
+    <meta name="description" content="长上下文、大词表LLM训练中,LM Head与Cross Entropy为何成为最大显存消耗点,以及Fused Linear CE如何避免物化完整logits的原理。">
+    <meta name="keywords" content="Fused Linear Cross Entropy, LM head显存, Cross Entropy显存, LLM训练内存, Liger Kernel, logits物化, 分块计算, GPU显存优化, 在线softmax, QuACK, 长上下文训练, LLM词表大小">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/fused_cross_entropy_memory_2026.html">
+
+    <meta property="og:title" content="省内存计算Cross Entropy - 长上下文·大词表LLM训练中LM Head为何吃光显存 2026">
+    <meta property="og:description" content="长上下文、大词表LLM训练中,LM Head与Cross Entropy为何成为最大显存消耗点,以及Fused Linear CE如何避免物化完整logits的原理。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/fused_cross_entropy_memory_2026.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-07-07">
+    <meta property="article:section" content="IT/技术">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="用Fused Linear Cross Entropy削减LLM训练显存">
+    <meta name="twitter:description" content="LM Head与Cross Entropy为何吃光LLM训练显存,以及不物化完整logits的Fused Linear CE原理分析。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "省内存计算Cross Entropy - 长上下文·大词表LLM训练中LM Head为何吃光显存 2026",
+      "alternativeHeadline": "Saving Memory on Cross Entropy Loss - Why the LM Head Eats GPU Memory in LLM Training",
+      "datePublished": "2026-07-07",
+      "dateModified": "2026-07-07",
+      "inLanguage": "zh-CN",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "Fused Linear Cross Entropy, LM head显存, Cross Entropy显存, LLM训练内存, Liger Kernel, logits物化, 分块计算, GPU显存优化",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/fused_cross_entropy_memory_2026.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "什么是Fused Linear Cross Entropy(FLCE)?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "FLCE是一种内核级优化,把LM head的最后一层线性投影与Cross Entropy损失计算融合成一个操作,从而在不生成整张词表大小logits张量的情况下求出同样的损失和梯度。它按分块(chunk)处理,每算出一块的logits就立刻算出损失和梯度并释放,让logits这种体积大、生命周期短的张量不会长时间留在计算图里。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "为什么LM Head和Cross Entropy会成为LLM训练的显存瓶颈?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Transformer主干产生的隐藏状态通常只有几千维,体积不大,但要预测下一个token,就必须把它展开成词表大小(数万到数十万)的logits。随着词表变大、上下文变长,批次×序列×词表大小的logits张量会迅速超过模型权重本身,成为训练过程中最大的显存消耗点。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "简单地按序列分块计算(naive chunking)为何不能降低显存?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "即便逐块生成logits再丢弃,框架仍需保留每一块的计算图直到反向传播执行,因为反向传播要用到前向计算的结果来求梯度。如果所有分块的计算图都一直累积到最终反向传播才释放,那么无论分块切得多细,峰值显存都很难明显下降,据报告反而会因为分块增多导致延迟上升。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "要在实践中用上这项优化,应该怎么做?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "比起自己手写内核,更实际的做法是使用已经实现了这项技术的库。LinkedIn开源的Liger Kernel中的FusedLinearCrossEntropy是最常见的选择,据称可以比较容易地接入Hugging Face模型或Axolotl等微调框架。在更底层,Tri Dao团队的QuACK等内核库则针对特定GPU世代做了更深入的优化。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "这项技术有哪些局限或权衡?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "分块计算和在线归一化会增加实现复杂度和数值稳定性的验证成本,简单实现有时甚至比标准方式更慢。而且这项技术只减少LM head和损失计算这一段的显存,KV缓存、优化器状态等其他显存消耗点并不会因此减少,因此它并不是解决LLM训练显存问题的万能方案。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/fused_cross_entropy_memory_2026.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/fused_cross_entropy_memory_2026.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/fused_cross_entropy_memory_2026.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/fused_cross_entropy_memory_2026.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/fused_cross_entropy_memory_2026.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="省内存计算Cross Entropy - 长上下文·大词表LLM训练中LM Head为何吃光显存 2026">
+                <meta itemprop="datePublished" content="2026-07-07">
+                <meta itemprop="dateModified" content="2026-07-07">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="Fused Linear Cross Entropy, LM head显存, Cross Entropy显存, LLM训练内存, Liger Kernel, logits物化">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/fused_cross_entropy_memory_2026.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">省内存计算Cross Entropy - 长上下文·大词表LLM训练中LM Head为何吃光显存</h1>
+                    <h2 class="post-subtitle">长上下文、大词表LLM训练中logits为何成为内存瓶颈,以及Fused Linear Cross Entropy如何避免它</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-07-07">2026-07-07</span>
+                        <span class="post-category" itemprop="articleSection">IT/技术</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+                    <h2>引言: 训练崩溃的地方不是Attention,而是最后一行代码</h2>
+                    <p>训练过LLM的人大概都遇到过这种情况: 模型大小、批次、序列长度都算得清清楚楚,以为显存绰绰有余,结果训练真正崩掉的地方既不是Attention也不是前馈层,而是最后一行——计算损失(loss)的那一刻。2026年7月初,Trillion Labs发布的一篇分析文章正面讲了这件事: 在用大约8K长度的序列训练一个16B规模的模型时,仅仅一次Cross Entropy损失的计算调用就一次性吃掉了超过30GB显存,直接导致训练崩溃——这是文章作者真实遇到的一次故障。</p>
+                    <p>本文不打算照搬那篇分析文章里的数字,而是用自己的话、以概念为主,讲清楚为什么紧跟在LM head之后的损失计算会成为显存瓶颈,以及不生成完整logits也能求出同样损失的思路是什么。截至2026年7月,这项优化已经不是实验室里的稀罕技巧,而是被写进了好几个主流训练库里的常规做法。</p>
+
+                    <h2>1. 为什么偏偏是LM Head和Cross Entropy成为瓶颈</h2>
+                    <h3>1.1 隐藏状态很小,logits却很大</h3>
+                    <p>Transformer主干处理完之后,每个token对应一个隐藏状态向量,大小通常是几千维(D)。但要预测下一个token,就必须把这个向量转换成词表大小(V)那么多个分数,也就是logits。问题在于V比D大得多。近期模型的词表已经涨到13万到26万token的规模,而隐藏维度往往只有它的几十分之一。每个token的D维向量都要膨胀成V维的logits,乘上整个序列、整个批次之后,一个logits张量的体积反而会超过模型权重本身——这是一个反直觉的现象。</p>
+                    <h3>1.2 词表变大了,上下文也变长了</h3>
+                    <p>词表变大是为了更精细地处理多语言、代码和特殊token;上下文变长则是因为大家希望把整篇文档、整个代码库、完整的对话历史一次性塞进去。这两个方向各自都有道理,但当它们同时变大时,logits张量(批次×序列×词表)的体积会在两个维度上同时膨胀。据报告,当词表达到十几万规模、序列长度也差不多时,单单一个logits张量就可能达到几十GB。</p>
+                    <h3>1.3 明明只是一闪而过,为何还成问题</h3>
+                    <p>更麻烦的是,这个巨大的张量并不是需要长期持有的值——它只是为了算出一个损失值而短暂生成,本该立刻丢弃,可就在这一瞬间,它却占据了GPU显存中最大的一块。对训练框架来说,反而是这最后一行,而不是Attention或前馈层,把显存预算给撑爆了。</p>
+
+                    <h2>2. 简单分块不就行了吗 - naive chunking为何行不通</h2>
+                    <h3>2.1 把序列切开分别计算</h3>
+                    <p>最直觉的第一反应是把序列切成若干块(chunk),每一块分别算出logits和损失后就丢弃。这样一来,单次生成的logits体积确实变小了。但实际测量下来,据报告这种方式并不能让整个训练步骤的峰值显存降到预期的程度。</p>
+                    <h3>2.2 计算图仍然留在那里</h3>
+                    <p>原因出在反向传播上。深度学习框架需要用每一块的前向计算结果来算反向传播时的梯度,所以必须把每一块的计算图一直保留到反向传播真正执行为止。也就是说,不管分块切得多细,只要所有分块的计算图都一直累积在显存里、等到最终反向传播才释放,峰值显存就很难明显下降。相关实验也显示,增加分块数量后峰值显存基本维持在某个水平不变,分块切得越细反而只是让延迟不断上升。「分开计算」这个方向本身没错,真正的关键在于计算图什么时候被释放。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>方式</th><th>logits张量</th><th>计算图</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>一次性计算</td><td>一次性生成完整张量</td><td>完整保留</td></tr>
+                            <tr><td>naive序列分块</td><td>逐块生成后丢弃</td><td>所有分块的图累积到反向传播才释放</td></tr>
+                            <tr><td>Fused Linear CE</td><td>逐块生成即刻转换为梯度</td><td>分块的图不会保留到反向传播</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2>3. Fused Linear Cross Entropy的思路</h2>
+                    <h3>3.1 把投影和损失合并成一步</h3>
+                    <p>FLCE的核心,是把最后线性层(LM head)的投影和对其结果做的Cross Entropy计算,合并成一个操作单元。处理某一块时,算出这一块的logits的同时立刻算出损失,而logits本身在进入下一块之前就毫不犹豫地被丢弃。</p>
+                    <h3>3.2 不生成完整logits也能求出损失</h3>
+                    <p>理论上,求Cross Entropy需要对整个词表做softmax归一化。但归一化所需的值(最大值和指数和)可以在逐块扫过词表的过程中累积更新。这种「流式更新」的思路,和FlashAttention一类的Attention优化用的是同一套熟悉的手法——不需要把全体一次性摊开,也能得到相同的结果。于是,损失可以通过把很小的一块暂时放上GPU、算完就流走的方式求出,完全不需要在任何地方把完整logits铺开。</p>
+                    <h3>3.3 梯度也当场算完、当场放手</h3>
+                    <p>真正的巧思在于反向传播的准备方式。FLCE在前向阶段就直接把每一块logits对应的梯度算出来。一旦这个梯度被立刻转移到输入方向(对隐藏状态的梯度)和LM head权重方向(对权重的梯度,逐块累加)之后,这一块的logits和它的梯度就再没有继续保留的理由了。等到反向传播真正执行时,只需要对这些早已算好的、体积小得多的结果做一次缩放即可。最终的结果是,logits这个体积庞大、生命周期极短的张量,根本不会长期挂在计算图上。这并不是改变了数学公式,而是重新设计了「哪个中间结果该保留到什么时候」。</p>
+
+                    <h2>4. 实际的实现是怎么落地的</h2>
+                    <h3>4.1 Liger Kernel</h3>
+                    <p>这个思路在实践中最常见的落地形式,是LinkedIn开源的Triton内核集合Liger Kernel里的FusedLinearCrossEntropy。据称只需给Hugging Face模型加几行代码就能用上,并且设计上能与PyTorch FSDP、DeepSpeed等分布式训练方案配合运作。公开资料在十万级词表区间报告了数倍的显存节省效果,不过这类数字会因模型结构、GPU型号和具体配置而有很大差异,应当作参考而非保证。</p>
+                    <h3>4.2 融入训练框架的优化</h3>
+                    <p>除了Liger Kernel,不少微调工具也推出了基于类似思路的自研实现。有一个微调框架就报告称,在应用了分块式的fused loss之后,同一硬件上能处理的上下文长度出现了明显提升。这些案例背后共享同一套骨架: 按块计算,并在块内就把梯度算完。</p>
+                    <h3>4.3 更底层的内核</h3>
+                    <p>Trillion Labs自己实现FLCE时参考的并不是Liger,而是Tri Dao团队(Dao-AILab)开源的、基于CUTLASS·CuTe的底层内核集合QuACK。QuACK专注于把RMSNorm、softmax、Cross Entropy这几种运算,针对最新GPU架构(H100、B200级别)做到极致优化。也就是说,即便是同一个概念,针对不同硬件贴近程度不同的实现已经形成了一个并存的生态。</p>
+
+                    <h2>5. 实际能带来什么好处</h2>
+                    <h3>5.1 更长的上下文,更大的批次</h3>
+                    <p>这项优化对实际工作的意义很直白: 在损失计算这一步省下多少显存,同一块GPU上就有多少余量可以拿去训练更长的上下文,或者用更大的批次。据报告,一个微调工具在采用fused、chunked cross entropy之后,单张GPU能处理的上下文长度出现了明显提升。词表越大、上下文越长的模型,这种效果往往越明显。</p>
+                    <h3>5.2 节省幅度因工作负载而异</h3>
+                    <p>不过,把某个节省幅度当成固定数值来记是有风险的。词表大小、隐藏维度、序列长度、批次大小,以及具体用哪种内核实现,都会让实际体感效果有相当大的差异。多个公开基准报告的节省幅度从数倍到80%~90%左右不等,但这些都是在特定条件下观测到的数字,并不能保证套用到所有场景。</p>
+
+                    <h2>6. 权衡与局限</h2>
+                    <h3>6.1 并非免费的午餐</h3>
+                    <p>由于是按块拆分计算,相比一次性整体计算,内核调用次数和额外开销都有可能增加。一些以教学为目的、写得比较简单的实现,据报告甚至会因为这类开销而比标准实现更慢。实务中打磨成熟的内核会专门做精细调优以尽量压低这部分开销,但不能因此断言「显存一定下降、速度始终不变」。</p>
+                    <h3>6.2 数值稳定性这道功课</h3>
+                    <p>以流式方式逐块更新softmax归一化值,实现难度比一次性计算更高。如果浮点误差累积的环节处理不当,损失值或梯度可能出现细微偏差,因此如果要自己实现内核,精度验证是必不可少的一环。</p>
+                    <h3>6.3 不是万能药</h3>
+                    <p>这项技术减少的,终究只是LM head与损失计算这一段的显存。Attention的KV缓存、中间激活值、优化器状态等其他显存消耗点并不会因此减少。把FLCE理解为精准针对「词表和上下文同时变大」这一特定瓶颈的优化,而不是解决训练显存问题的万能钥匙,会更准确。</p>
+
+                    <h2>7. 结论 - 今天可以做的事</h2>
+                    <p>这次分析能带来的实用结论很简单。如果你在自己编写训练循环,而且词表或上下文规模较大,值得先查一查logits张量是不是显存使用曲线上那个最高的峰值。如果已经在用Hugging Face Trainer、Axolotl这类熟悉的训练框架,先确认一下Liger Kernel这类fused cross entropy选项是否已经集成进去,远比自己动手写内核更实际。而且不论看到什么样的节省数字,在用自己的模型规模、词表、上下文长度实际测量之前,都应该只当作参考值,而不是承诺。</p>
+
+                    <h2>参考资料</h2>
+                    <ul>
+                        <li>Trillion Labs - 省内存计算Cross Entropy Loss: <a href="https://trillion-labs.github.io/blog/posts/fused-linear-cross-entropy/" target="_blank" rel="noopener">trillion-labs.github.io</a></li>
+                        <li>GeekNews(hada)话题(2026-07-04): <a href="https://news.hada.io/topic?id=31168" target="_blank" rel="noopener">news.hada.io</a></li>
+                        <li>Liger Kernel(LinkedIn, GitHub): <a href="https://github.com/linkedin/Liger-Kernel" target="_blank" rel="noopener">github.com/linkedin/Liger-Kernel</a></li>
+                        <li>QuACK(Dao-AILab, GitHub): <a href="https://github.com/Dao-AILab/quack" target="_blank" rel="noopener">github.com/Dao-AILab/quack</a></li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>分享本文</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">返回列表</a>
+                </div>
+            <!-- AUTO-RELATED-START -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="public_wifi_safe_use_guide.html">安全使用公共WiFi指南 - 风险与防护完全解读</a></li>
+      <li><a href="code_as_image_llm_cost_2026.html">把代码渲染成图片能降低LLM Token成本?pxpipe与视觉Token计价的漏洞 2026</a></li>
+      <li><a href="local_llm_running_guide_2026.html">本地运行LLM指南2026 - 硬件要求与GGUF量化权衡</a></li>
+      <li><a href="kernel_level_ai_safety_2026.html">内核级AI安全讨论 - 超越应用层护栏的下一道防线 2026</a></li>
+      </ul>
+    </div>
+    <!-- AUTO-RELATED-END -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制!请粘贴到Threads应用中分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制!'); });
+    });
+    </script>
+</body>
+</html>
