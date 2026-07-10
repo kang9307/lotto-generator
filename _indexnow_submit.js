@@ -1,6 +1,6 @@
 /**
  * Bing IndexNow 배치 전송
- * 2026-07-09 신규 16편 × 4언어 = 64 URLs + blog × 4 + RSS × 4 = 72
+ * 2026-07-10 신규 16편 + 허브 갱신 1편(GPT-5.6) = 17편 × 4언어 = 68 URLs + blog × 4 + RSS × 4 = 76
  */
 const https = require('https');
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -9,22 +9,23 @@ const KEY = '7d594d096f044fbba3a09184f68ffcfe';
 const HOST = 'braindetox.kr';
 
 const NEW_POSTS = [
-  'typescript_v7_go_release_2026',
-  'oracle_always_free_backend_2026',
-  'no_mistakes_git_push_2026',
-  'gh_attach_cli_2026',
-  'ilya_30_papers_ai_reading_2026',
-  'learn_to_code_still_worth_2026',
-  'bile_duct_stone_guide',
-  'bladder_cancer_early_detection_guide',
-  'blood_test_results_interpretation_guide',
-  'nft_basics_and_risk_guide',
-  'zero_based_budgeting_guide',
-  'contract_review_guide',
-  'adult_guardianship_application_guide',
-  'tire_replacement_guide',
-  'car_inspection_pass_tips_guide',
-  'smartphone_sync_guide'
+  'openai_gpt_5_6_release_2026',
+  'weave_router_llm_2026',
+  'firebase_dynamic_links_shutdown_2026',
+  'digital_money_evolution_2026',
+  'game_localization_agent_skill_2026',
+  'chatto_open_source_selfhost_2026',
+  'brain_aneurysm_warning_signs_guide',
+  'breast_density_mammogram_guide',
+  'callus_corn_foot_care_guide',
+  'tech_startup_investment_guide',
+  'gdp_economic_growth_indicator_guide',
+  'lease_maintenance_repair_dispute_guide',
+  'labor_union_rights_guide',
+  'car_battery_replacement_guide',
+  'window_insulation_diy_guide',
+  'mesh_wifi_guide',
+  'ai_model_comparison_2026'
 ];
 
 const urls = [];
