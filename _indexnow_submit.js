@@ -1,6 +1,6 @@
 /**
  * Bing IndexNow 배치 전송
- * 2026-07-12 신규 hada 6편 × 4언어 = 24 URLs + blog × 4 + RSS × 4 = 32
+ * 2026-07-13 신규 hada 6편 × 4언어 = 24 URLs + blog × 4 + RSS × 4 = 32
  */
 const https = require('https');
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -9,12 +9,12 @@ const KEY = '7d594d096f044fbba3a09184f68ffcfe';
 const HOST = 'braindetox.kr';
 
 const NEW_POSTS = [
-  'korea_institutions_diagram_ai_literacy_2026',
-  'why_lisp_still_matters_2026',
-  'write_maintainable_code_ai_2026',
-  'himitsushell_shell_binary_2026',
-  'invisible_good_tools_2026',
-  'ai_2040_plan_a_2026'
+  'sem_semantic_version_control_2026',
+  'ai_model_build_off_2026',
+  'ghost_font_ai_resistant_2026',
+  'competence_blindness_2026',
+  'qamap_pr_qa_cli_2026',
+  'reporter_github_stats_2026'
 ];
 
 const urls = [];
