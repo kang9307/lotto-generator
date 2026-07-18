@@ -1,6 +1,6 @@
 /**
  * Bing IndexNow 배치 전송
- * 2026-07-17 신규 10편 × 4언어 = 40 URLs + blog × 4 + RSS × 4 = 48
+ * 2026-07-18 신규 7편 × 4언어 = 28 URLs + blog × 4 + RSS × 4 = 36
  */
 const https = require('https');
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -9,16 +9,13 @@ const KEY = '7d594d096f044fbba3a09184f68ffcfe';
 const HOST = 'braindetox.kr';
 
 const NEW_POSTS = [
-  'grok_build_opensource_2026',
-  'sqlite_editions_proposal_2026',
-  'databricks_coding_benchmark_2026',
-  'thinking_machines_inkling_model_2026',
-  'how_chatgpt_picks_sources_2026',
-  'ml_self_study_roadmap_2026',
-  'aiwatch_ai_service_reliability_2026',
-  'consumer_app_distribution_scaling_2026',
-  'gitfut_github_stats_cards_2026',
-  'anthropic_blackstone_ode_jv_2026'
+  'leafwiki_selfhosted_wiki_2026',
+  'torvalds_llm_kernel_dev_2026',
+  'malicious_takehome_interview_scam_2026',
+  'senior_dev_premium_ai_era_2026',
+  'microsoft_comic_chat_opensource_2026',
+  'korean_spec_driven_commit_2026',
+  'wes_mckinney_ai_data_future_2026'
 ];
 
 const urls = [];
