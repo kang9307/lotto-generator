@@ -1,48 +1,38 @@
 /**
  * Bing IndexNow 배치 전송
- * 2026-07-22 신규 7편 × 4언어 = 28 URLs + blog × 4 + RSS × 4 + AI허브 × 4 = 40
+ * 2026-07-23 신규 6편 × 4언어 = 24 + desc 전면수정 변경파일 전체(_indexnow_urls.txt) + rss × 4
+ * (IndexNow 요청당 1만 URL 한도 내)
  */
 const https = require('https');
+const fs = require('fs');
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
 const KEY = '7d594d096f044fbba3a09184f68ffcfe';
 const HOST = 'braindetox.kr';
 
-const NEW_POSTS = [
-  'gemini_new_models_2026',
-  'anthropic_copyright_settlement_2026',
-  'monitor_input_ddc_cli_2026',
-  'apple_maps_military_blur_2026',
-  'offline_sync_toggle_distributed_2026',
-  'claude_md_hooks_compile_2026',
-  'ai_agent_society_simulation_2026',
-  'ai_model_comparison_2026'
-];
-
-const urls = [];
+const urls = new Set();
 const langPrefix = { ko: '', en: '/en', ja: '/ja', zh: '/zh' };
 
-for (const slug of NEW_POSTS) {
-  for (const lang of ['ko', 'en', 'ja', 'zh']) {
-    urls.push(`https://${HOST}${langPrefix[lang]}/posts/${slug}.html`);
-  }
-}
+// 1) 변경 파일 전체 (desc 수정 + 관련글 재생성 + 신규 6편 포함)
+const listed = fs.readFileSync('_indexnow_urls.txt', 'utf8').split(/\r?\n/).filter(Boolean);
+for (const p of listed) urls.add(`https://${HOST}/${p}`);
+
+// 2) blog/rss (각 언어)
 for (const lang of ['ko', 'en', 'ja', 'zh']) {
-  urls.push(`https://${HOST}${langPrefix[lang]}/blog.html`);
-}
-for (const lang of ['ko', 'en', 'ja', 'zh']) {
-  urls.push(`https://${HOST}${langPrefix[lang]}/rss.xml`);
+  urls.add(`https://${HOST}${langPrefix[lang]}/blog.html`);
+  urls.add(`https://${HOST}${langPrefix[lang]}/rss.xml`);
 }
 
-console.log('Total URLs to submit:', urls.length);
-console.log('Sample:', urls.slice(0, 3).join('\n  '));
+const urlList = [...urls];
+console.log('Total URLs to submit:', urlList.length);
+console.log('Sample:', urlList.slice(0, 3).join('\n  '));
 console.log();
 
 const payload = JSON.stringify({
   host: HOST,
   key: KEY,
   keyLocation: `https://${HOST}/${KEY}.txt`,
-  urlList: urls
+  urlList
 });
 
 const options = {
@@ -63,7 +53,7 @@ const req = https.request(options, (res) => {
   res.on('end', () => {
     if (body) console.log('Response:', body);
     console.log('\n결과:');
-    if (res.statusCode === 200) console.log('✅ ' + urls.length + '개 URL Bing IndexNow 신고 성공');
+    if (res.statusCode === 200) console.log('✅ ' + urlList.length + '개 URL Bing IndexNow 신고 성공');
     else if (res.statusCode === 202) console.log('✅ 접수 완료 (HTTP 202)');
     else console.log('⚠️ 비정상 응답');
   });

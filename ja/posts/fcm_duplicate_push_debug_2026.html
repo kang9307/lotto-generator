@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<!--
+ * 技術ブログ記事テンプレート
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ja">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>再デプロイで送信済みのプッシュ通知が再送された - FCM通知重複配信のデバッグ 2026</title>
+    <meta name="description" content="再デプロイしたら昨日送ったはずのプッシュ通知が再送された。重複防止状態をメモリだけに置く設計の落とし穴と、冪等キー・アウトボックスパターン・スケジューラーの分散ロックで防ぐ実践パターンをFCMの実例から整理した。">
+    <meta name="keywords" content="FCM 通知重複, プッシュ通知 重複, 冪等性, idempotency key, アウトボックスパターン, outbox pattern, 分散ロック, スケジューラーロック, collapse_key, at-least-once, 再デプロイ バグ, 分散システム設計">
+
+    <link rel="canonical" href="https://braindetox.kr/ja/posts/fcm_duplicate_push_debug_2026.html">
+
+    <meta property="og:title" content="再デプロイで送信済みのプッシュ通知が再送された - FCM通知重複配信のデバッグ 2026">
+    <meta property="og:description" content="重複防止状態をメモリだけに置く設計の落とし穴。冪等キー・アウトボックスパターン・スケジューラーの分散ロックでFCM通知の重複配信を防ぐ実践パターンを整理した。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/ja/posts/fcm_duplicate_push_debug_2026.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ja_JP">
+    <meta property="article:published_time" content="2026-07-23">
+    <meta property="article:section" content="開発・インフラ">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="再デプロイで送信済みのプッシュ通知が再送された - FCM通知重複配信のデバッグ">
+    <meta name="twitter:description" content="重複防止状態をメモリだけに置く設計の落とし穴と、冪等キー・アウトボックスパターン・スケジューラーロックでFCM通知の重複配信を防ぐ方法。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "再デプロイで送信済みのプッシュ通知が再送された - FCM通知重複配信のデバッグ 2026",
+      "alternativeHeadline": "Debugging FCM Duplicate Push Notifications After a Redeploy",
+      "datePublished": "2026-07-23",
+      "dateModified": "2026-07-23",
+      "inLanguage": "ja-JP",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "FCM 通知重複, プッシュ通知 重複, 冪等性, idempotency key, アウトボックスパターン, 分散ロック, collapse_key, at-least-once, 再デプロイ バグ",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/ja/posts/fcm_duplicate_push_debug_2026.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "FCMで同じ通知が何度も届くのはなぜか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "大きく4つの原因がある。送信済みかどうかの状態をサーバーのメモリだけに保存しており再デプロイ・再起動で消えてしまう場合、FCMを含む多くのメッセージング基盤が「最低1回(at-least-once)」配信しか保証せずネットワークタイムアウト時の再試行がそのまま重複になる場合、複数インスタンスでロックなしにスケジューラーが同時実行される場合、そして条件確認と送信の間にロックがなく複数のワーカーが同じイベントを同時に処理してしまう競合状態である。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "「正確に1回(exactly-once)」の配信は技術的に可能か?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "信頼できないネットワークを前提とする分散システムでは、ネットワーク層での正確に1回の配信は理論上不可能である(二将軍問題)。実務での現実的な答えは「最低1回配信+受信側での冪等処理」を組み合わせ、結果的に1回だけ処理されたのと同じ効果、いわゆるeffectively-onceを作ることである。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "FCMのcollapse_keyで重複配信を防げるか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "部分的にしか役立たない。collapse_keyはデータ(data)メッセージにのみ適用され通知(notification)メッセージには適用されず、すでに複数回送信されたメッセージのうち最新のものだけが端末に届くようにする事後整理機能に過ぎない。サーバーがなぜ複数回送信したのかという原因そのものは直さないため、送信履歴の永続化や冪等キーといった根本対策と併用する必要がある。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "冪等キー(idempotency key)はどう設計すべきか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "通知が何についてのものかを一意に識別できるよう、ユーザーID・イベント種別・対象エンティティ・時間ウィンドウなどを組み合わせて作るのが一般的である。このキーにデータベースの一意制約をかけておけば、同じキーで2回目の挿入を試みたときにデータベースが自動的に拒否するため、アプリケーションコード側で重複チェックのロジックを書かなくても重複を防げる。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "複数インスタンスでスケジューラーが同時実行されるのをどう防ぐか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "分散ロックを使い、ある実行タイミングのジョブに対して1つのインスタンスだけがロックを取得できるようにし、他のインスタンスはロック取得に失敗した場合に静かにスキップするようにする。Redis・データベース・ZooKeeperなどをロックストアとして使うライブラリがこのパターンを実装している。Kubernetes環境であれば、CronJobのconcurrencyPolicyをForbidに設定することも最低限の補完策になる。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 4px; overflow-x: auto; margin-bottom: 1.2rem; }
+        .post-content pre code { background-color: transparent; padding: 0; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/fcm_duplicate_push_debug_2026.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/fcm_duplicate_push_debug_2026.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/fcm_duplicate_push_debug_2026.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/fcm_duplicate_push_debug_2026.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/fcm_duplicate_push_debug_2026.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="再デプロイで送信済みのプッシュ通知が再送された - FCM通知重複配信のデバッグ 2026">
+                <meta itemprop="datePublished" content="2026-07-23">
+                <meta itemprop="dateModified" content="2026-07-23">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="FCM 通知重複, プッシュ通知 重複, 冪等性, idempotency key, アウトボックスパターン, 分散ロック">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/ja/posts/fcm_duplicate_push_debug_2026.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">再デプロイで送信済みのプッシュ通知が再送された - FCM通知重複配信のデバッグ</h1>
+                    <h2 class="post-subtitle">送信状態をメモリだけに置くとどうなるか - 冪等キー・アウトボックス・スケジューラーロックで防ぐ実践パターン</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-07-23">2026-07-23</span>
+                        <span class="post-category" itemprop="articleSection">開発・インフラ</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+                    <h2>序論: 再デプロイしたら昨日の通知がまた届いた</h2>
+                    <p>2026年7月時点であらためて取り上げる価値のある事例がある。サーフィン予報アプリを一人で開発・運用する開発者が経験したことだ。このアプリは波・気象条件が<strong>「危険な水準に入った瞬間だけ」</strong>通知を送るよう設計されていた。常時通知ではなく、条件が変化したときだけ発火するイベント駆動型の通知だったわけだ。ところがサーバーを再デプロイした直後、昨日すでに送信を終えていたはずの通知がユーザーに再び届くという出来事が起きた。ローカル環境ではなかなか再現できず、原因を突き止めるまでに時間がかかったという。</p>
+                    <p>結論から言えば、原因は拍子抜けするほど単純だった。「この通知はすでに送った」という状態を、サーバープロセスの<strong>メモリだけ</strong>に載せていたのだ。再デプロイでプロセスが新しく立ち上がると、そのメモリはまるごと消える。新しいプロセスから見れば「まだ一度も送っていない通知」なので、条件を再評価した瞬間にもう一度送信してしまうのは、むしろ当然の挙動だったわけだ。</p>
+                    <p>本稿はこの一つの事例を出発点に、なぜこの種のバグが特定のアプリだけの問題ではなく、通知・メッセージングシステム全般で繰り返し起きるパターンなのかを整理する。そして<strong>「正確に1回(exactly-once)」</strong>の配信という目標がそもそもなぜ間違った目標なのか、代わりに何を目指すべきかを実践パターン中心に解説する。</p>
+
+                    <h2>1. 重複配信はなぜ繰り返し起きるのか - 4つの典型的な原因</h2>
+
+                    <h3>1.1 送信状態をメモリだけに保存</h3>
+                    <p>最も多い原因である。「このユーザーにこの通知をすでに送った」という事実をアプリケーションのメモリ上の変数やキャッシュ(dict、Set、インメモリキャッシュ)だけに記録すると、その情報はプロセスのライフサイクルに縛られる。デプロイ、再起動、スケールダウン、コンテナの再スケジューリング、OOMによる強制終了 - このどれが起きても状態は消える。サーフィン予報アプリの事例の根本原因はまさにこれだった。厄介なのは、普段は絶対に表面化しない点だ。プロセスが長期間再起動されなければバグは眠り続け、デプロイ一回で爆発する。</p>
+
+                    <h3>1.2 at-least-onceの再試行</h3>
+                    <p>FCMをはじめとするほとんどのプッシュ・メッセージング基盤は「正確に1回」の配信を保証しない。代わりに<strong>「最低1回(at-least-once)」</strong>の配信を保証する。サーバーがFCMに送信リクエストを送り、応答がタイムアウトした場合、サーバーは成功したのか失敗したのかを知る術がない。この状況での安全なデフォルト動作は再試行だ。しかし実際には最初のリクエストがすでに届いており応答だけが失われていた場合、その再試行はそのまま重複送信になる。これはバグではなく、ネットワークが信頼できないという事実から必然的に生じる結果である。</p>
+
+                    <h3>1.3 スケジューラーの重複実行</h3>
+                    <p>通知をcronやスケジューラーで送信する構造であれば、同じジョブが複数のワーカー・複数のポッドで同時に実行されるリスクがある。特にKubernetes環境でCronJobの同時実行制御を有効にしていないと、デプロイのタイミングが重なったり、前のジョブが終わる前に次のジョブが始まったりして、同じ通知が二度作られることがある。インスタンスが一つしかなかった頃には絶対に見えなかったバグが、スケールアウトした瞬間に現れる典型的なパターンだ。</p>
+
+                    <h3>1.4 複数インスタンスの競合</h3>
+                    <p>送信ロジック自体が「条件確認 → 送信」の二段階でできており、その間にロックがなければ、複数のインスタンスがほぼ同時に同じ条件を確認し、それぞれが送信を実行してしまうことがある。一つのイベントを複数のワーカーが同時に取り合う競合状態(race condition)だ。送信状態をメモリに置く問題(1.1)と重なることが多いが、原因は異なる。これはデータが消える問題ではなく、そもそも「誰がこの作業をするか」を決める調整の仕組みがない問題である。</p>
+
+                    <h2>2. 「正確に1回」という目標そのものが間違っている</h2>
+
+                    <h3>2.1 分散システムでexactly-onceが不可能な理由</h3>
+                    <p>二将軍問題(Two Generals Problem)は、信頼できない通信チャネルを介して二者がある行動を正確に同時に、確実に合意することができないことを示す古典的な思考実験だ。メッセージが失われうるネットワークでは、送信者は相手が受け取ったかどうかを確実に知る方法がない。受け取ったという応答そのものも失われる可能性があるからだ。この根本的な限界のため、ネットワーク層で「正確に1回の配信」を保証することは理論上不可能である。FCMであれKafkaであれSQSであれ、例外ではない。</p>
+
+                    <h3>2.2 だから実務の答えは「at-least-once + 冪等性」</h3>
+                    <p>実務においてメッセージング・イベントシステムの大半が採用する答えは、「正確に1回の配信」を諦め、<strong>「最低1回配信 + 冪等処理」</strong>で同じ効果を出すことである。つまりメッセージは重複して届きうるという前提を受け入れ、受信側で同じメッセージを二度処理しても結果が変わらないよう設計する。これはよく「effectively-once(事実上1回)」と呼ばれる。配信保証は緩く保つ代わりに、処理結果の安全性をアプリケーションレベルで確保する戦略だ。この考え方は、<a href="../../ja/posts/kafka_event_ordering_scale_2026.html">Kafkaが解く大規模イベント処理の3つの難題</a>で取り上げた「順序・正確に1回・低遅延は同時には成立しない」というトレードオフと、まったく同じ結論に行き着く。</p>
+
+                    <h2>3. 解決パターン - 実際にどう防ぐか</h2>
+
+                    <h3>3.1 送信履歴の永続化</h3>
+                    <p>まずやるべきことは、「すでに送った」という事実をプロセスのメモリではなくDB(またはRedisのような永続ストア)に記録することだ。サーフィン予報アプリの事例の解決策も結局ここに行き着いた - 起動時にDBから送信履歴を再度読み込んで状態を再構築する構造に変えたのだ。原則はシンプルだ。「一度だけ起きるべき事実」は、プロセスが死んでも生き残る場所に残さなければならない。</p>
+
+                    <h3>3.2 冪等キー(idempotency key)の設計</h3>
+                    <p>送信前に、この通知が何についてのものかを一意に識別するキーを作る。よくある組み合わせはユーザーID + イベント種別 + 対象エンティティ + 時間ウィンドウだ。例えば次のような形になる。</p>
+                    <pre><code>dedup_key = f"{user_id}:{event_type}:{entity_id}:{window_bucket}"</code></pre>
+                    <p>このキーにデータベースの一意制約(unique constraint)をかけておけば、同じキーで二度目の挿入を試みたとき、二度目はデータベースが自動的に拒否してくれる(<code>INSERT ... ON CONFLICT DO NOTHING</code>)。アプリケーションコード側で「すでに存在するか」を確認するロジックを自前で書くより、データベースの原子的な制約に任せるほうが競合状態にはるかに強い。</p>
+
+                    <h3>3.3 送信前チェックとトランザクション</h3>
+                    <p>「送ったか確認 → 送っていなければ送信 → 送信済みとして記録」という3段階が原子的にまとまっていないと、確認と記録の間に別のプロセスが割り込んで同じ通知をもう一度送ってしまうことがある。方法は二つある。一つは「送信予定」の状態を先にDBに原子的に記録し(冪等キーの一意制約を利用して)、その記録が成功した場合にのみ実際の送信を行う方法。もう一つは、送信するかどうか自体をDBトランザクション内で他の状態変更と一緒にまとめ、送信の判断と状態更新がひとかたまりで成功するか、ひとかたまりで失敗するようにする方法だ。</p>
+
+                    <h3>3.4 アウトボックスパターン</h3>
+                    <p>「DBの状態変更」と「外部への通知送信」という異なる二つの作業を一つのトランザクションのようにまとめたいときに使うパターンだ。実際の送信の代わりに、同じトランザクション内で「送信すべきイベント」をアウトボックステーブルに一緒に記録する。そうすれば状態変更と送信予約が原子的に一緒に成功するか、一緒に失敗するかのどちらかになる。別途用意したリレー(relay)プロセスがアウトボックステーブルをポーリングして実際の送信を行い、成功すればレコードを送信完了としてマークする。ただしこのリレー段階自体は依然として最低1回の配信しか保証しないため、最終的な送信ロジックは冪等でなければならない点は変わらない。アウトボックスパターンは「イベントを取りこぼさないこと」を保証するが、「重複をなくすこと」を単独では保証しない - 3.2の冪等キーとセットで初めて完成する。</p>
+
+                    <h3>3.5 スケジューラーロック</h3>
+                    <p>複数のインスタンスが同じスケジュールジョブを実行するリスクがあるなら、分散ロックによって「今回の実行タイミングでは一つのインスタンスだけがジョブを取得する」ことを保証しなければならない。Redisやデータベース、ZooKeeperなどをロックストアとして使うライブラリ(ShedLock系など)がこの役割を担う。原理はシンプルだ。作業開始前に「この時間帯のこの作業」に対するロックを原子的に取得しようとし、失敗すれば(すでに他のインスタンスが取得していれば)静かにスキップする。Kubernetes環境であれば、CronJobを<code>concurrencyPolicy: Forbid</code>に設定することも最低限の防御線になる。</p>
+
+                    <h3>3.6 FCMのcollapse_key - 補助手段であり根本解決策ではない</h3>
+                    <p>FCMは<code>collapse_key</code>というフィールドをサポートしている。同じcollapse_keyを持つメッセージが複数たまると、端末が再びオンラインになったときにFCMは最新のメッセージ一つだけを配信する。一見すると重複防止のように見えるが、二つの制約がある。第一に、この機能は通知(notification)メッセージには適用されず、データ(data)メッセージにのみ動作する。第二に、これは「サーバーがすでに複数回送ったもの」をクライアント/FCM側で事後的に整理する機能であって、サーバーがそもそもなぜ複数回送ったのかを直してはくれない。つまりcollapse_keyは症状緩和のための補助装置であり、3.1〜3.5の根本対策を代替できるものではない。</p>
+
+                    <h2>4. 再デプロイ・クラッシュにも安全な設計 - 「メモリを信用しない」</h2>
+                    <p>これらすべてのパターンを貫く原則は一つだ。プロセスはいつでも死ぬという前提で設計すること。再デプロイ、オートスケーリングによるスケールダウン、OOMキル、ノード障害 - どれもプロセスを予告なく終わらせうる。「一度だけ起きるべき状態」をメモリ変数だけに置いた瞬間、その保証はプロセスの寿命とともに消える一時的な保証になる。本当に保証が必要な状態(送信履歴、冪等キー、ロック、アウトボックスイベント)は、常にプロセスの外側にある永続ストアになければならない。ローカル開発環境でこの種のバグがなかなか再現しない理由もここにある - ローカルはデプロイもスケールアウトもコンテナの再スケジューリングもない、安定した単一プロセスだからだ。本番環境のデプロイパイプラインこそ、こうした前提の崩壊を実際に引き起こす場所なのである。</p>
+
+                    <h2>5. すでに扱った二つの原則とのつながり</h2>
+                    <p>この問題は実は、このブログですでに扱った二つの原則の再確認である。<a href="../../ja/posts/offline_sync_toggle_distributed_2026.html">トグル一つが分散システムになる</a>では、オフライン状態でオフにした設定が復活するバグを扱ったが、根本原因は結局、クライアントとサーバーの状態を一つの信頼できる真実にまとめる<strong>冪等な同期設計</strong>の欠如だった。FCMの重複配信も同じ種類の問題だ - 「すでに処理済み」という事実が複数の場所(メモリ、再起動前後のプロセス)で一貫していないときに問題が起きる。そして<a href="../../ja/posts/kafka_event_ordering_scale_2026.html">Kafkaが解く大規模イベント処理の3つの難題</a>で扱った「正確に1回の処理」の難しさも同じ文脈にある - 大規模なイベントパイプラインであれ、個人開発者のプッシュ送信ロジックであれ、分散環境で「正確に1回」をネットワーク層に期待した瞬間、同じ罠にはまる。規模に関係なく、原則は一つに収束する。</p>
+
+                    <h2>6. ユーザー信頼の観点 - 重複通知の本当のコスト</h2>
+                    <p>重複配信を単なる「うっとうしいバグ」程度に扱ってはいけない。ユーザーの立場からすれば、すでに確認して済んだはずの通知が唐突にまた表示される体験は、信頼を静かに蝕む。「このアプリは状態管理ができていないのだな」という印象は、通知権限をオフにする、ひどい場合はアプリを削除するという行動につながりやすい。特にサーフィン予報アプリのように「危険な瞬間だけ」通知すると約束したサービスであれば、その約束が破られた瞬間(不要な通知が繰り返される)、通知そのものの信頼性が損なわれる。通知システムの安定性は機能要件ではなく、ユーザー信頼の問題として扱うべきである。</p>
+
+                    <h2>7. チェックリスト - デプロイ前に確認すべきこと</h2>
+                    <ul>
+                        <li>送信の有無・履歴をプロセスのメモリではなくDB・Redisなどの永続ストアに記録しているか</li>
+                        <li>各通知に(ユーザー・イベント・エンティティ・時間ウィンドウ)の組み合わせによる冪等キーがあり、一意制約がかかっているか</li>
+                        <li>「確認してから送信」の間をロックまたは原子的な挿入で競合状態から守っているか</li>
+                        <li>状態変更と送信予約を一緒にまとめる必要がある場合、アウトボックスパターンを検討したか</li>
+                        <li>スケジュールジョブが複数インスタンスで同時に動く可能性を分散ロックまたは<code>concurrencyPolicy</code>で防いでいるか</li>
+                        <li>FCMなどに再試行ロジックがある場合、再試行がそのまま重複送信になりうることを理解し、冪等処理を備えているか</li>
+                        <li>再デプロイ・再起動直後に通知関連のバッチ・スケジューラーがすぐ再実行され、過去のイベントを再評価していないか</li>
+                    </ul>
+
+                    <h2>結論</h2>
+                    <p>FCM通知の重複配信は特定のアプリ特有の奇妙なバグではなく、分散環境で状態を扱うやり方に関する非常に普遍的な失敗の一例である。原因はほとんど常に同じところに収束する - 「一度だけ起きるべきこと」の記録をプロセスのメモリだけに置いていたか、確認と実行の間に競合を防ぐ仕組みがなかったか、再試行の可能性を考慮していなかったか。目標を「正確に1回の配信」から「最低1回配信 + 冪等処理」に変えた瞬間、解決策はむしろ明確になる。送信履歴は永続化し、冪等キーに一意制約をかけ、必要であればアウトボックスパターンと分散ロックを追加する。再デプロイと再起動は日常茶飯事だ。その前でも揺るがない設計とは、結局のところメモリを信用しない設計のことである。</p>
+
+                    <h2>参考資料</h2>
+                    <ul>
+                        <li>原文 - whaletail、「再デプロイしたら送信済みのプッシュ通知がまた届いた」(原題・韓国語): <a href="https://whale-tail.tistory.com/entry/Troubleshooting-%EC%9E%AC%EB%B0%B0%ED%8F%AC%ED%96%88%EB%8D%94%EB%8B%88-%EC%9D%B4%EB%AF%B8-%EB%B3%B4%EB%82%B8-%ED%91%B8%EC%8B%9C%EA%B0%80-%EB%98%90-%EA%B0%84%EB%8B%A4-%E2%80%94-FCM-%EC%95%8C%EB%A6%BC-%EC%A4%91%EB%B3%B5-%EB%B0%9C%EC%86%A1-%EC%9E%A1%EA%B8%B0" target="_blank" rel="noopener">whale-tail.tistory.com</a></li>
+                        <li>GeekNewsトピック (2026-07-17): <a href="https://news.hada.io/topic?id=31694" target="_blank" rel="noopener">news.hada.io/topic?id=31694</a></li>
+                        <li>関連記事: <a href="../../ja/posts/offline_sync_toggle_distributed_2026.html">トグル一つが分散システムになる</a>、<a href="../../ja/posts/kafka_event_ordering_scale_2026.html">Kafkaが解く大規模イベント処理の3つの難題</a></li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>この記事をシェア</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(トウィッター)</button>
+                        <button id="threads-share" class="share-btn threads-btn">スレッズ</button>
+                        <button id="link-copy" class="share-btn link-btn">リンクをコピー</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">一覧に戻る</a>
+                </div>
+            <!-- AUTO-RELATED-START -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">関連記事</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="offline_sync_toggle_distributed_2026.html">トグル一つが分散システムになる - オフライン同期がオフにした設定を復活させる理由</a></li>
+      <li><a href="kafka_event_ordering_scale_2026.html">順序通りに、一度だけ、速く - Kafkaが解く大規模イベント処理の3つの難題 2026</a></li>
+      <li><a href="fintech_engineering_handbook_2026.html">フィンテックエンジニアリングハンドブック — 金融システムを作る開発者が知るべきこと</a></li>
+      <li><a href="http_query_method_2026.html">HTTP QUERYメソッド — GET・POSTの限界を超える新しい検索標準 RFC 10008</a></li>
+      </ul>
+    </div>
+    <!-- AUTO-RELATED-END -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('リンクがコピーされました。Threadsアプリに貼り付けてシェアしてください!');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('リンクがコピーされました!'); });
+    });
+    </script>
+</body>
+</html>

@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<!--
+ * Tech blog post template
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="en">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>A Redeploy Resent Already-Sent Notifications - Debugging FCM Duplicate Push 2026</title>
+    <meta name="description" content="Why a redeploy resent already-sent notifications, and how idempotency keys, outbox pattern, and scheduler locks stop duplicate FCM push sends.">
+    <meta name="keywords" content="FCM duplicate notifications, push notification idempotency, outbox pattern, exactly-once delivery, distributed scheduler lock, collapse_key FCM, at-least-once delivery, idempotency key, dedup key, redeploy bug, distributed systems design">
+
+    <link rel="canonical" href="https://braindetox.kr/en/posts/fcm_duplicate_push_debug_2026.html">
+
+    <meta property="og:title" content="A Redeploy Resent Already-Sent Notifications - Debugging FCM Duplicate Push 2026">
+    <meta property="og:description" content="In-memory dedup state is the usual trap. Idempotency keys, the outbox pattern, and scheduler locks are how you actually stop duplicate FCM push sends.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/en/posts/fcm_duplicate_push_debug_2026.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="en_US">
+    <meta property="article:published_time" content="2026-07-23">
+    <meta property="article:section" content="Dev & Infra">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="A Redeploy Resent Already-Sent Notifications - FCM Duplicate Push Debug">
+    <meta name="twitter:description" content="Why in-memory dedup state fails, and how idempotency keys, outbox pattern, and scheduler locks stop duplicate FCM push sends.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "A Redeploy Resent Already-Sent Notifications - Debugging FCM Duplicate Push 2026",
+      "alternativeHeadline": "How In-Memory Dedup State Causes FCM Push Notifications to Be Sent Twice",
+      "datePublished": "2026-07-23",
+      "dateModified": "2026-07-23",
+      "inLanguage": "en-US",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "FCM duplicate notifications, push notification idempotency, outbox pattern, distributed scheduler lock, collapse_key FCM, at-least-once delivery, idempotency key, redeploy bug",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/en/posts/fcm_duplicate_push_debug_2026.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "Why do the same FCM notifications get sent more than once?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "There are four common causes: send-state kept only in server memory and wiped out by a redeploy or restart; messaging infrastructure like FCM guaranteeing only at-least-once delivery, so a retry after a network timeout becomes a duplicate; a cron or scheduler running on multiple instances at once without a lock; and a race condition where multiple workers check a condition and each fire off the same send before any of them records it."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Is truly exactly-once delivery technically possible?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "No, not at the network layer of a distributed system built on an unreliable network - this is what the Two Generals Problem demonstrates. The practical answer used in production systems is at-least-once delivery combined with an idempotent receiver, which together produce the same outcome as exactly-once processing. This is usually called effectively-once."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Can FCM's collapse_key stop duplicate notifications?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Only partially. collapse_key applies to data messages, not notification messages, and it only makes sure the device receives the newest of several already-sent messages instead of all of them - it cleans up symptoms after the fact rather than fixing why the server sent duplicates in the first place. It should be paired with root fixes like persisted send records and idempotency keys, not used as a substitute for them."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How should an idempotency key be designed?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "A common approach combines a user ID, event type, target entity, and a time window into one key that uniquely identifies what the notification is about. Putting a database unique constraint on that key means a second insert attempt with the same key is automatically rejected by the database, preventing duplicates without extra application-level checking logic."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How do you stop a scheduler from running on multiple instances at once?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Use a distributed lock so that only one instance acquires the lock for a given scheduled run, and every other instance silently skips when the acquisition fails. Libraries that use Redis, a database, or ZooKeeper as the lock store implement this pattern. In Kubernetes, setting a CronJob's concurrencyPolicy to Forbid is a minimal additional safeguard."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 4px; overflow-x: auto; margin-bottom: 1.2rem; }
+        .post-content pre code { background-color: transparent; padding: 0; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/fcm_duplicate_push_debug_2026.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/fcm_duplicate_push_debug_2026.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/fcm_duplicate_push_debug_2026.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/fcm_duplicate_push_debug_2026.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/fcm_duplicate_push_debug_2026.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="A Redeploy Resent Already-Sent Notifications - Debugging FCM Duplicate Push 2026">
+                <meta itemprop="datePublished" content="2026-07-23">
+                <meta itemprop="dateModified" content="2026-07-23">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="FCM duplicate notifications, push notification idempotency, outbox pattern, distributed scheduler lock">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/en/posts/fcm_duplicate_push_debug_2026.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">A Redeploy Resent Already-Sent Notifications - Debugging FCM Duplicate Push</h1>
+                    <h2 class="post-subtitle">What Happens When Send-State Lives Only in Memory - Fixing It With Idempotency Keys, the Outbox Pattern, and Scheduler Locks</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-07-23">2026-07-23</span>
+                        <span class="post-category" itemprop="articleSection">Dev & Infra</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+                    <h2>Introduction: A Redeploy Brought Back Yesterday's Notifications</h2>
+                    <p>As of July 2026, there's a case worth revisiting. A solo developer running a surf-forecast app ran into this: the app was designed to send a notification only "the moment conditions cross into dangerous territory" - an event-triggered alert, not a recurring one. Right after a server redeploy, though, notifications that had already gone out the day before landed on users' phones again. It barely reproduced locally, so tracking down the cause took a while.</p>
+                    <p>The cause, once found, was almost embarrassingly simple: the fact that "this notification has already been sent" was tracked <strong>only in the server process's memory</strong>. When the redeploy spun up a fresh process, that memory vanished entirely. To the new process, the notification looked like it had never gone out, so re-evaluating the condition and firing again was, from its point of view, the correct behavior.</p>
+                    <p>This piece uses that one case as a starting point to unpack why this class of bug isn't specific to one app - it's a pattern that recurs across notification and messaging systems in general. It also walks through why chasing <strong>"exactly-once"</strong> delivery is the wrong goal to begin with, and what to aim for instead, through a set of practical patterns.</p>
+
+                    <h2>1. Why Duplicate Sends Keep Happening - Four Typical Causes</h2>
+
+                    <h3>1.1 Send-State Kept Only in Memory</h3>
+                    <p>This is the most common cause. If the fact that "this notification was already sent to this user" lives only in an in-process variable or cache (a dict, a Set, an in-memory cache), that information is tied to the process's lifecycle. A deploy, a restart, a scale-down, a container reschedule, an OOM kill - any of these wipes the state clean. This was exactly the root cause in the surf-forecast app case. The insidious part is that it never surfaces under normal conditions. As long as the process stays up for weeks, the bug sleeps quietly - until one deploy sets it off.</p>
+
+                    <h3>1.2 At-Least-Once Retries</h3>
+                    <p>FCM, like most push and messaging infrastructure, does not guarantee "exactly-once" delivery. It guarantees <strong>at-least-once</strong> delivery instead. If a server sends a request to FCM and the response times out, the server genuinely doesn't know whether it succeeded or failed. The safe default in that situation is to retry. But if the first request actually went through and only the response was lost, that retry becomes a duplicate send. This isn't a bug - it's an unavoidable consequence of an unreliable network.</p>
+
+                    <h3>1.3 Duplicate Scheduler Execution</h3>
+                    <p>If notifications are sent by a cron job or scheduler, the same job can end up running on multiple workers or pods at once. In Kubernetes especially, if a CronJob's concurrency controls aren't configured, overlapping deploy timing or a previous run not finishing before the next one starts can produce the same notification twice. This is the classic bug that never shows up when you're running a single instance and only appears the moment you scale out.</p>
+
+                    <h3>1.4 Multi-Instance Race Conditions</h3>
+                    <p>If the send logic itself is a two-step "check condition, then send" flow with no lock between the steps, multiple instances can check the same condition nearly simultaneously and each fire off its own send. This is a race condition where several workers grab the same event at once. It often overlaps with 1.1 (state kept in memory), but the root cause is different - this isn't data disappearing, it's the absence of any coordination mechanism to decide who owns the job in the first place.</p>
+
+                    <h2>2. "Exactly-Once" Was the Wrong Goal All Along</h2>
+
+                    <h3>2.1 Why Exactly-Once Is Impossible in a Distributed System</h3>
+                    <p>The Two Generals Problem is the classic thought experiment showing that two parties communicating over an unreliable channel can never reach certain, simultaneous agreement on an action. On a network where messages can be lost, a sender has no way to be certain the other side received anything - because the acknowledgment itself can also be lost. Because of this fundamental limitation, guaranteeing "exactly-once delivery" at the network layer is theoretically impossible. FCM, Kafka, SQS - none of them are exceptions.</p>
+
+                    <h3>2.2 So the Practical Answer Is "At-Least-Once Plus Idempotency"</h3>
+                    <p>The answer most messaging and event systems settle on in practice is to give up on "exactly-once delivery" and instead combine <strong>at-least-once delivery with idempotent processing</strong> to produce the same effect. You accept up front that messages may arrive more than once, and you design the receiving side so that processing the same message twice changes nothing. This is commonly called "effectively-once": you relax the delivery guarantee and instead secure the safety of the outcome at the application level. This is exactly the same conclusion reached in <a href="../../en/posts/kafka_event_ordering_scale_2026.html">Three Hard Problems Kafka Solves at Scale</a>, which covers the tradeoff that ordering, exactly-once processing, and low latency can't all be had at once.</p>
+
+                    <h2>3. Solution Patterns - How to Actually Fix This</h2>
+
+                    <h3>3.1 Persist the Send Record</h3>
+                    <p>The first thing to do is record the fact that "this was already sent" in a database (or a persistent store like Redis) instead of process memory. The surf-forecast app case's fix landed exactly here - the state was rebuilt by reloading the send history from the database at boot time instead of trusting in-memory state. The principle is simple: any fact that "must happen only once" needs to live somewhere that survives the process dying.</p>
+
+                    <h3>3.2 Designing an Idempotency Key</h3>
+                    <p>Before sending, build a key that uniquely identifies what this notification is about. A common combination is user ID + event type + target entity + time window, for example:</p>
+                    <pre><code>dedup_key = f"{user_id}:{event_type}:{entity_id}:{window_bucket}"</code></pre>
+                    <p>Putting a database unique constraint on this key means a second insert attempt with the same key gets automatically rejected by the database (<code>INSERT ... ON CONFLICT DO NOTHING</code>). Letting the database's atomic constraint handle this is far more resilient to race conditions than writing your own "check if it already exists" logic in application code.</p>
+
+                    <h3>3.3 Pre-Send Checks and Transactions</h3>
+                    <p>If the three steps "check if sent, send if not, mark as sent" aren't bound together atomically, another process can slip in between the check and the mark and send the same notification again. There are two ways to fix this. One is to atomically write a "send pending" record to the database first (using the idempotency key's unique constraint) and only perform the actual send if that write succeeds. The other is to wrap the send decision itself inside a database transaction together with any other state change, so the decision and the state update succeed or fail as one unit.</p>
+
+                    <h3>3.4 The Outbox Pattern</h3>
+                    <p>This pattern is for when you need "changing database state" and "sending a notification externally" to behave like a single transaction. Instead of sending directly, you write the event that needs to be sent into an outbox table within the same transaction. That way, the state change and the scheduled send succeed or fail together, atomically. A separate relay process polls the outbox table, performs the actual send, and marks the record as sent once it succeeds. Note that this relay step still only guarantees at-least-once delivery, so the final send logic still needs to be idempotent. The outbox pattern guarantees you won't lose events - it does not, on its own, guarantee you won't get duplicates. It's only complete when paired with the idempotency key from 3.2.</p>
+
+                    <h3>3.5 Scheduler Locks</h3>
+                    <p>If multiple instances risk running the same scheduled job, a distributed lock is what guarantees that only one instance claims the job for a given run. Libraries that use Redis, a database, or ZooKeeper as a lock store (ShedLock and similar tools) serve this role. The principle is simple: before starting, atomically attempt to acquire a lock for "this job at this scheduled time," and if that fails (because another instance already holds it), skip silently. In Kubernetes, setting <code>concurrencyPolicy: Forbid</code> on a CronJob is a minimal additional safeguard.</p>
+
+                    <h3>3.6 FCM's collapse_key - A Supplement, Not a Root Fix</h3>
+                    <p>FCM supports a field called <code>collapse_key</code>. When multiple messages sharing the same collapse_key pile up, FCM delivers only the newest one once the device comes back online. It looks like deduplication at first glance, but it has two limits. First, it only applies to data messages, not notification messages. Second, it's a cleanup mechanism that runs on the client/FCM side after the server has already sent duplicates - it does nothing to fix why the server sent them in the first place. In short, collapse_key is a symptom-relief tool, not a substitute for the root fixes in 3.1 through 3.5.</p>
+
+                    <h2>4. Designing for Redeploys and Crashes - "Don't Trust Memory"</h2>
+                    <p>One principle runs through every pattern above: design on the assumption that a process can die at any moment. A redeploy, an autoscaler scaling down, an OOM kill, a node failure - any of these can end a process without warning. The moment you keep a "must happen only once" state in a memory variable, that guarantee becomes a temporary one that expires along with the process's lifetime. State that needs a real guarantee - send history, idempotency keys, locks, outbox events - always belongs in a persistent store outside the process. This is also why these bugs rarely reproduce in local development: local environments are stable single processes with no deploys, no scale-out, no container rescheduling. A production deploy pipeline is precisely where these broken assumptions actually get triggered.</p>
+
+                    <h2>5. The Connection to Two Principles We've Covered Before</h2>
+                    <p>This problem is, in fact, a re-confirmation of two principles this blog has already covered. <a href="../../en/posts/offline_sync_toggle_distributed_2026.html">One Toggle Becomes a Distributed System</a> covered a bug where a setting turned off offline came back on, and the root cause ultimately traced back to the absence of an <strong>idempotent synchronization design</strong> that reconciles client and server state into a single trustworthy truth. FCM duplicate sends are the same kind of problem - things break when the fact "already processed" isn't consistent across multiple locations (memory, the process before and after a restart). <a href="../../en/posts/kafka_event_ordering_scale_2026.html">Three Hard Problems Kafka Solves at Scale</a> covers the same difficulty with "exactly-once processing" - whether it's a large-scale event pipeline or a solo developer's push-send logic, expecting the network layer to deliver "exactly once" leads to the same trap, regardless of scale. The principle converges to one, independent of size.</p>
+
+                    <h2>6. The User-Trust Angle - What Duplicate Notifications Really Cost</h2>
+                    <p>Duplicate sends shouldn't be treated as a mere annoying bug. From a user's perspective, having a notification you already dismissed reappear out of nowhere quietly erodes trust. The impression that "this app can't manage its own state" easily leads to users turning off notification permissions, or in worse cases, deleting the app. For a service like a surf-forecast app that specifically promised to alert only "at the moment of real danger," breaking that promise (by repeating an unnecessary alert) undermines the credibility of the notifications themselves. Notification-system reliability isn't a feature requirement - it's a matter of user trust.</p>
+
+                    <h2>7. Checklist - What to Verify Before You Deploy</h2>
+                    <ul>
+                        <li>Is send status/history recorded in a database or Redis, not just in process memory?</li>
+                        <li>Does each notification have an idempotency key combining (user, event, entity, time window), backed by a unique constraint?</li>
+                        <li>Is the gap between "check" and "send" protected by a lock or an atomic insert against race conditions?</li>
+                        <li>If a state change and a scheduled send need to happen together, has the outbox pattern been considered?</li>
+                        <li>Is the risk of a scheduled job running on multiple instances at once blocked by a distributed lock or a <code>concurrencyPolicy</code>?</li>
+                        <li>If FCM (or similar) has retry logic, is it understood that a retry can become a duplicate send, and is processing idempotent as a result?</li>
+                        <li>Right after a redeploy or restart, do notification-related batches/schedulers avoid immediately re-evaluating past events?</li>
+                    </ul>
+
+                    <h2>Conclusion</h2>
+                    <p>Duplicate FCM notifications aren't some quirky bug specific to one app - they're one instance of an extremely common mistake in how state is handled in distributed environments. The cause almost always converges on the same handful of things: the record of something that "must happen only once" was kept only in process memory, there was no mechanism to prevent a race between checking and executing, or the possibility of retries was never accounted for. The moment you change the goal from "exactly-once delivery" to "at-least-once delivery plus idempotent processing," the fix becomes obvious. Persist the send record, put a unique constraint on the idempotency key, and add the outbox pattern and a distributed lock where needed. Redeploys and restarts are a daily occurrence. A design that doesn't flinch in the face of them is, in the end, a design that doesn't trust memory.</p>
+
+                    <h2>References</h2>
+                    <ul>
+                        <li>Original post - whaletail, "A Redeploy Resent Notifications Already Sent": <a href="https://whale-tail.tistory.com/entry/Troubleshooting-%EC%9E%AC%EB%B0%B0%ED%8F%AC%ED%96%88%EB%8D%94%EB%8B%88-%EC%9D%B4%EB%AF%B8-%EB%B3%B4%EB%82%B8-%ED%91%B8%EC%8B%9C%EA%B0%80-%EB%98%90-%EA%B0%84%EB%8B%A4-%E2%80%94-FCM-%EC%95%8C%EB%A6%BC-%EC%A4%91%EB%B3%B5-%EB%B0%9C%EC%86%A1-%EC%9E%A1%EA%B8%B0" target="_blank" rel="noopener">whale-tail.tistory.com</a></li>
+                        <li>GeekNews topic (2026-07-17): <a href="https://news.hada.io/topic?id=31694" target="_blank" rel="noopener">news.hada.io/topic?id=31694</a></li>
+                        <li>Related posts: <a href="../../en/posts/offline_sync_toggle_distributed_2026.html">One Toggle Becomes a Distributed System</a>, <a href="../../en/posts/kafka_event_ordering_scale_2026.html">Three Hard Problems Kafka Solves at Scale</a></li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>Share this article</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">Copy Link</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">Back to List</a>
+                </div>
+            <!-- AUTO-RELATED-START -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Related Posts</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="offline_sync_toggle_distributed_2026.html">One Toggle Becomes a Distributed System - Why Offline Sync Revives Settings You Turned Off</a></li>
+      <li><a href="kafka_event_ordering_scale_2026.html">In Order, Once, and Fast - Three Hard Problems Kafka Solves at Scale 2026</a></li>
+      <li><a href="fintech_engineering_handbook_2026.html">Fintech Engineering Handbook — What Developers Must Know to Build Financial Systems</a></li>
+      <li><a href="http_query_method_2026.html">HTTP QUERY Method — The New Search Standard Beyond GET and POST (RFC 10008)</a></li>
+      </ul>
+    </div>
+    <!-- AUTO-RELATED-END -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('Link copied! Paste it in the Threads app to share.');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('Link copied!'); });
+    });
+    </script>
+</body>
+</html>

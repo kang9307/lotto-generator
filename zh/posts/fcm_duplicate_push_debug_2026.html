@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<!--
+ * 技术博客文章模板
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>重新部署后已发送的推送通知又被重发 - FCM 通知重复发送调试 2026</title>
+    <meta name="description" content="重新部署后,昨天已经发送过的推送通知又被重新发送了一遍。本文以某冲浪预报应用的 FCM 踩坑案例为线索,系统梳理仅将去重状态保存在内存中的设计陷阱,以及如何用幂等键、发件箱模式与调度器分布式锁彻底解决推送重复发送问题。">
+    <meta name="keywords" content="FCM 重复推送, 推送通知重复, 幂等性, idempotency key, 发件箱模式, outbox pattern, 分布式锁, 调度器锁, collapse_key, at-least-once, 重新部署 bug, 分布式系统设计">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/fcm_duplicate_push_debug_2026.html">
+
+    <meta property="og:title" content="重新部署后已发送的推送通知又被重发 - FCM 通知重复发送调试 2026">
+    <meta property="og:description" content="仅将去重状态保存在内存中的设计陷阱。用幂等键、发件箱模式与调度器分布式锁解决 FCM 推送重复发送问题的实战方法。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/fcm_duplicate_push_debug_2026.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-07-23">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="重新部署后已发送的推送通知又被重发 - FCM 通知重复发送调试">
+    <meta name="twitter:description" content="仅将去重状态保存在内存中的设计陷阱,以及用幂等键、发件箱模式与调度器分布式锁解决 FCM 推送重复发送的方法。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "重新部署后已发送的推送通知又被重发 - FCM 通知重复发送调试 2026",
+      "alternativeHeadline": "Debugging FCM Duplicate Push Notifications After a Redeploy",
+      "datePublished": "2026-07-23",
+      "dateModified": "2026-07-23",
+      "inLanguage": "zh-CN",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "FCM 重复推送, 推送通知重复, 幂等性, idempotency key, 发件箱模式, 分布式锁, collapse_key, at-least-once, 重新部署 bug",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/fcm_duplicate_push_debug_2026.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "为什么 FCM 会把同一条通知重复推送好几次?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "常见原因有四个:一是把是否已发送的状态只保存在服务器内存中,重新部署或重启时会被清空;二是 FCM 等大多数消息基础设施只保证「至少一次(at-least-once)」投递,网络超时后的重试本身就会变成重复发送;三是多个实例上未加锁的定时任务同时执行;四是「检查条件—发送」两步之间没有锁,导致多个 worker 同时抢到同一个事件并各自发送。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "「恰好一次(exactly-once)」投递在技术上可行吗?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "在以不可靠网络为前提的分布式系统中,网络层的恰好一次投递在理论上是不可能实现的(两将军问题)。实践中真正可行的做法是把「至少一次投递」与「接收端幂等处理」结合起来,得到与恰好一次处理相同的效果,通常称为 effectively-once(事实上的一次)。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "FCM 的 collapse_key 能防止重复推送吗?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "只能起到部分作用。collapse_key 仅适用于数据(data)消息,不适用于通知(notification)消息,它只是让设备在多条已发送消息中只收到最新一条的事后清理机制,并不能修复服务器为什么会多次发送的根本原因。因此需要与持久化发送记录、幂等键等根本对策配合使用,不能替代它们。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "幂等键(idempotency key)应该怎么设计?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "常见做法是把用户 ID、事件类型、目标实体、时间窗口等组合成一个键,唯一标识这条通知具体对应的是什么。在数据库中为该键设置唯一约束后,第二次用相同键尝试插入时会被数据库自动拒绝,无需在应用代码中额外编写去重判断逻辑即可防止重复。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "如何防止调度器在多个实例上同时执行?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "使用分布式锁,确保在某次调度执行时只有一个实例能够获取锁,其余实例在获取锁失败时静默跳过。使用 Redis、数据库或 ZooKeeper 作为锁存储的库(如 ShedLock 一类)实现的就是这种模式。在 Kubernetes 环境下,把 CronJob 的 concurrencyPolicy 设置为 Forbid 也是一道最基本的防线。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 4px; overflow-x: auto; margin-bottom: 1.2rem; }
+        .post-content pre code { background-color: transparent; padding: 0; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/fcm_duplicate_push_debug_2026.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/fcm_duplicate_push_debug_2026.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/fcm_duplicate_push_debug_2026.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/fcm_duplicate_push_debug_2026.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/fcm_duplicate_push_debug_2026.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="重新部署后已发送的推送通知又被重发 - FCM 通知重复发送调试 2026">
+                <meta itemprop="datePublished" content="2026-07-23">
+                <meta itemprop="dateModified" content="2026-07-23">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="FCM 重复推送, 推送通知重复, 幂等性, idempotency key, 发件箱模式, 分布式锁">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/fcm_duplicate_push_debug_2026.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">重新部署后已发送的推送通知又被重发 - FCM 通知重复发送调试</h1>
+                    <h2 class="post-subtitle">仅将发送状态保存在内存中会发生什么 - 用幂等键、发件箱模式与调度器锁解决的实战方法</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-07-23">2026-07-23</span>
+                        <span class="post-category" itemprop="articleSection">开发/基础设施</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+                    <h2>引言:重新部署后,昨天的通知又发了一遍</h2>
+                    <p>截至 2026 年 7 月,有一个值得重新审视的案例。一位独立开发者运营的冲浪预报应用遇到了这样的问题:这款应用被设计为只在<strong>「浪况或天气条件进入危险水平的那一刻」</strong>才发送通知,也就是说不是常规通知,而是仅在条件发生变化时才触发的事件型通知。但服务器重新部署后不久,昨天已经发送完毕的通知又一次到达了用户手机。这个问题在本地环境很难复现,查明原因花了不少时间。</p>
+                    <p>结论其实简单得有点让人意外:「这条通知已经发送过」这一状态,<strong>只被保存在服务器进程的内存里</strong>。重新部署让进程重新启动,那块内存就整个消失了。对新进程来说,这条通知看起来「从未发送过」,于是一重新评估条件就立刻再次发送——从进程自身的角度看,这甚至是「正确」的行为。</p>
+                    <p>本文以这一个案例为起点,梳理为什么这类 bug 并非某个应用独有的问题,而是通知与消息系统中反复出现的一种共性模式。同时也解释为什么追求<strong>「恰好一次(exactly-once)」</strong>发送本身就是一个错误的目标,以及应该转而追求什么,并给出一套实战解决模式。</p>
+
+                    <h2>1. 重复发送为什么反复出现 - 四种典型原因</h2>
+
+                    <h3>1.1 发送状态只保存在内存中</h3>
+                    <p>这是最常见的原因。如果「已经给这个用户发送过这条通知」这一事实只记录在应用内存的变量或缓存(dict、Set、内存缓存)中,这份信息就与进程的生命周期绑定在一起。无论是部署、重启、缩容、容器重新调度,还是因 OOM 被强制终止,只要发生其中任何一种情况,状态就会消失。冲浪预报应用案例的根本原因正是如此。麻烦之处在于,这类问题平时完全不会暴露——只要进程长期不重启,bug 就会一直潜伏,直到某一次部署把它引爆。</p>
+
+                    <h3>1.2 at-least-once 重试</h3>
+                    <p>包括 FCM 在内的绝大多数推送与消息基础设施,并不保证「恰好一次」投递,而是保证<strong>「至少一次(at-least-once)」</strong>投递。如果服务器向 FCM 发出发送请求后响应超时,服务器就真的无法判断请求是成功了还是失败了。这种情况下安全的默认做法是重试。但如果第一次请求其实已经成功送达,只是响应丢失了,那么这次重试就变成了重复发送。这不是 bug,而是网络本身不可靠这一事实所带来的必然结果。</p>
+
+                    <h3>1.3 调度器重复执行</h3>
+                    <p>如果通知是通过 cron 或调度器发送的,同一个任务就有可能在多个 worker、多个 pod 上同时执行。尤其是在 Kubernetes 环境下,如果没有正确配置 CronJob 的并发控制,部署时间点重叠,或者上一次任务还没结束下一次就开始了,都可能导致同一条通知被生成两次。这是那种在只有单实例时完全不会出现、一旦扩容到多实例就立刻现形的典型 bug。</p>
+
+                    <h3>1.4 多实例竞争</h3>
+                    <p>如果发送逻辑本身是「检查条件 → 发送」这两步,且两步之间没有加锁,多个实例就可能在几乎同一时刻各自检查到同样的条件,并各自执行发送。这是多个 worker 同时抢占同一个事件的竞态(race condition)。它经常和 1.1(状态存在内存中)的问题同时出现,但根本原因不同——这不是数据消失的问题,而是从一开始就缺少「由谁来做这件事」的协调机制。</p>
+
+                    <h2>2. 「恰好一次」这个目标本身就错了</h2>
+
+                    <h3>2.1 为什么分布式系统中 exactly-once 不可能实现</h3>
+                    <p>两将军问题(Two Generals Problem)是一个经典的思想实验,它说明在不可靠的通信信道上,两方无法就某个行动达成确定、同步的一致。在消息可能丢失的网络中,发送方没有办法确定对方是否收到了消息——因为「已收到」的确认本身同样可能丢失。正是这一根本限制,使得在网络层保证「恰好一次投递」在理论上是不可能的。无论是 FCM、Kafka 还是 SQS,概莫能外。</p>
+
+                    <h3>2.2 所以实践中的答案是「at-least-once + 幂等性」</h3>
+                    <p>大多数消息与事件系统在实践中采用的答案,是放弃「恰好一次投递」,转而用<strong>「至少一次投递 + 幂等处理」</strong>的组合来达到同样的效果。也就是说,先接受消息可能会重复到达这一前提,再把接收端设计成即使重复处理同一条消息,结果也不会改变。这通常被称为「effectively-once(事实上的一次)」——把投递保证放宽,转而在应用层保证处理结果的安全性。这一思路与<a href="../../zh/posts/kafka_event_ordering_scale_2026.html">Kafka 破解大规模事件处理三大难题</a>一文中提到的「顺序、恰好一次与低延迟无法同时兼得」的权衡,结论完全一致。</p>
+
+                    <h2>3. 解决模式 - 到底该怎么修</h2>
+
+                    <h3>3.1 持久化发送记录</h3>
+                    <p>首先要做的,是把「已经发送过」这一事实记录到数据库(或 Redis 这类持久化存储)中,而不是进程内存里。冲浪预报应用案例的最终修复方式也归结到这里——改为在启动时从数据库重新读取发送历史来重建状态,而不再信任内存中的状态。原则很简单:任何「只应该发生一次」的事实,都必须保存在进程死亡后依然存在的地方。</p>
+
+                    <h3>3.2 设计幂等键(idempotency key)</h3>
+                    <p>在发送之前,构造一个能唯一标识「这条通知具体是关于什么」的键。常见的组合是用户 ID + 事件类型 + 目标实体 + 时间窗口,例如:</p>
+                    <pre><code>dedup_key = f"{user_id}:{event_type}:{entity_id}:{window_bucket}"</code></pre>
+                    <p>在这个键上设置数据库唯一约束(unique constraint)后,用同一个键第二次尝试插入时,数据库会自动拒绝(<code>INSERT ... ON CONFLICT DO NOTHING</code>)。相比自己在应用代码里写「先检查是否已存在」的逻辑,把这件事交给数据库的原子约束去做,对竞态问题的抵抗力要强得多。</p>
+
+                    <h3>3.3 发送前检查与事务</h3>
+                    <p>如果「检查是否已发送 → 未发送则发送 → 标记为已发送」这三步没有被原子化地绑定在一起,就可能在检查和标记之间被另一个进程插入,导致同一条通知被再次发送。解决办法有两种。一种是先把「即将发送」的状态原子性地写入数据库(利用幂等键的唯一约束),只有这次写入成功,才真正执行发送。另一种是把是否发送这件事本身和其他状态变更一起包进同一个数据库事务,让发送决策与状态更新要么一起成功,要么一起失败。</p>
+
+                    <h3>3.4 发件箱模式(Outbox Pattern)</h3>
+                    <p>当你需要把「修改数据库状态」和「向外部发送通知」这两个不同的操作当作一个事务来处理时,可以使用这种模式。做法不是直接发送,而是在同一个事务里,把「需要发送的事件」一并写入发件箱(outbox)表。这样一来,状态变更与发送预约就会原子性地一起成功或一起失败。另有一个独立的中继(relay)进程轮询发件箱表,执行实际的发送,成功后再把该记录标记为已发送。需要注意的是,这个中继环节本身依然只能保证至少一次投递,因此最终的发送逻辑仍然必须是幂等的。发件箱模式保证的是「不丢事件」,并不能单独保证「没有重复」——它必须和 3.2 中的幂等键搭配使用才算完整。</p>
+
+                    <h3>3.5 调度器锁</h3>
+                    <p>如果多个实例存在同时执行同一个定时任务的风险,就需要用分布式锁来保证「本次执行只有一个实例能拿到任务」。以 Redis、数据库或 ZooKeeper 作为锁存储的库(例如 ShedLock 一类)承担的正是这个角色。原理很简单:在任务开始前,原子性地尝试为「这个时间点的这个任务」获取锁,如果失败(说明已经被其他实例抢到),就静默跳过。在 Kubernetes 环境下,把 CronJob 的 <code>concurrencyPolicy</code> 设置为 <code>Forbid</code>,也是一道最基本的防线。</p>
+
+                    <h3>3.6 FCM 的 collapse_key - 辅助手段,而非根本解决方案</h3>
+                    <p>FCM 支持一个叫 <code>collapse_key</code> 的字段。当带有相同 collapse_key 的消息堆积了多条时,设备重新上线后 FCM 只会投递其中最新的一条。乍看像是一种去重机制,但有两点限制。第一,这个功能只对数据(data)消息生效,对通知(notification)消息不生效。第二,这只是在服务器已经多次发送之后,由客户端/FCM 一侧做的事后清理,并不能修复服务器为什么会多次发送这个根本原因。换句话说,collapse_key 只是缓解症状的辅助手段,无法替代 3.1 至 3.5 中的根本对策。</p>
+
+                    <h2>4. 面向重新部署与崩溃的安全设计 - 「不要相信内存」</h2>
+                    <p>贯穿以上所有模式的原则只有一条:设计时要假设进程随时可能死亡。重新部署、自动伸缩导致的缩容、OOM kill、节点故障——任何一种都可能在毫无预警的情况下终止进程。一旦把「只应发生一次」的状态仅仅放在内存变量里,这个保证就会变成一个随进程生命周期一起消失的临时保证。真正需要保证的状态(发送历史、幂等键、锁、发件箱事件)必须始终放在进程之外的持久化存储中。这也是为什么这类 bug 在本地开发环境很难复现——本地是一个稳定的单进程环境,没有部署、没有扩容、没有容器重新调度。恰恰是生产环境的部署流水线,才会真正触发这些被打破的假设。</p>
+
+                    <h2>5. 与两条已有原则的呼应</h2>
+                    <p>这个问题其实是本博客已经讨论过的两条原则的再次印证。<a href="../../zh/posts/offline_sync_toggle_distributed_2026.html">一个开关就是一个分布式系统</a>一文讨论过一个 bug:离线状态下关掉的设置又自己恢复了,其根本原因归根到底是缺少一套<strong>幂等的同步设计</strong>,来把客户端与服务器的状态合并成一个可信的唯一真相。FCM 重复发送属于同一类问题——当「已处理」这一事实在多个地方(内存、重启前后的进程)不一致时,问题就出现了。而<a href="../../zh/posts/kafka_event_ordering_scale_2026.html">Kafka 破解大规模事件处理三大难题</a>一文讨论的「恰好一次处理」之难,也是同样的脉络——无论是大规模事件管道,还是个人开发者的推送发送逻辑,只要在分布式环境中指望网络层做到「恰好一次」,就会掉进同一个陷阱。原则不因规模大小而改变,最终都会收敛为同一条。</p>
+
+                    <h2>6. 用户信任的视角 - 重复通知的真正代价</h2>
+                    <p>不应该把重复发送仅仅当作一个「烦人的 bug」来看待。站在用户的角度,一条本来已经确认过的通知莫名其妙又弹出来,这种体验会悄悄侵蚀信任。「这个应用连状态都管理不好」这种印象,很容易导致用户关闭通知权限,严重时甚至直接卸载应用。尤其对于像冲浪预报应用这样明确承诺「只在危险时刻」才发通知的服务而言,一旦这个承诺被打破(不必要的通知反复出现),通知本身的可信度就会下降。通知系统的稳定性不应该只被当作一项功能需求,而应该被当作用户信任问题来对待。</p>
+
+                    <h2>7. 检查清单 - 部署前应确认的事项</h2>
+                    <ul>
+                        <li>发送状态与历史是否记录在数据库或 Redis 等持久化存储中,而不是仅存于进程内存</li>
+                        <li>每条通知是否都有由(用户、事件、实体、时间窗口)组成的幂等键,并设置了唯一约束</li>
+                        <li>「检查后发送」之间的空档是否已用锁或原子插入防止了竞态</li>
+                        <li>如果状态变更与发送预约需要一起完成,是否已考虑发件箱模式</li>
+                        <li>定时任务在多个实例上同时执行的风险,是否已用分布式锁或 <code>concurrencyPolicy</code> 加以阻止</li>
+                        <li>如果 FCM 等具备重试逻辑,是否理解重试本身可能变成重复发送,并已具备相应的幂等处理</li>
+                        <li>重新部署或重启之后,通知相关的批处理/调度器是否会立即重新执行,并重新评估过去的事件</li>
+                    </ul>
+
+                    <h2>结论</h2>
+                    <p>FCM 通知重复发送并不是某个应用特有的奇怪 bug,而是分布式环境中处理状态方式上一种极其普遍的失误的典型体现。原因几乎总是收敛到同样几点:「只应发生一次」的记录只存在于进程内存中,检查与执行之间没有机制防止竞态,或者根本没有考虑到重试的可能性。一旦把目标从「恰好一次投递」改为「至少一次投递 + 幂等处理」,解决方案反而变得清晰起来:把发送记录持久化,给幂等键加上唯一约束,必要时再叠加发件箱模式与分布式锁。重新部署与重启是家常便饭。能在它们面前不出问题的设计,归根结底就是一种不信任内存的设计。</p>
+
+                    <h2>参考资料</h2>
+                    <ul>
+                        <li>原文 - whaletail,《重新部署后已发送的推送通知又被重发》(原题为韩语): <a href="https://whale-tail.tistory.com/entry/Troubleshooting-%EC%9E%AC%EB%B0%B0%ED%8F%AC%ED%96%88%EB%8D%94%EB%8B%88-%EC%9D%B4%EB%AF%B8-%EB%B3%B4%EB%82%B8-%ED%91%B8%EC%8B%9C%EA%B0%80-%EB%98%90-%EA%B0%84%EB%8B%A4-%E2%80%94-FCM-%EC%95%8C%EB%A6%BC-%EC%A4%91%EB%B3%B5-%EB%B0%9C%EC%86%A1-%EC%9E%A1%EA%B8%B0" target="_blank" rel="noopener">whale-tail.tistory.com</a></li>
+                        <li>GeekNews 讨论帖 (2026-07-17): <a href="https://news.hada.io/topic?id=31694" target="_blank" rel="noopener">news.hada.io/topic?id=31694</a></li>
+                        <li>相关文章: <a href="../../zh/posts/offline_sync_toggle_distributed_2026.html">一个开关就是一个分布式系统</a>、<a href="../../zh/posts/kafka_event_ordering_scale_2026.html">Kafka 破解大规模事件处理三大难题</a></li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>分享本文</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">返回列表</a>
+                </div>
+            <!-- AUTO-RELATED-START -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="offline_sync_toggle_distributed_2026.html">一个开关就是一个分布式系统 - 为什么离线同步会让你关掉的设置又打开</a></li>
+      <li><a href="kafka_event_ordering_scale_2026.html">按顺序、只处理一次、快速处理 - Kafka破解大规模事件处理三大难题 2026</a></li>
+      <li><a href="fintech_engineering_handbook_2026.html">金融科技工程手册 — 构建金融系统的开发者必知原则</a></li>
+      <li><a href="http_query_method_2026.html">HTTP QUERY方法 — 超越GET和POST限制的新搜索标准 RFC 10008</a></li>
+      </ul>
+    </div>
+    <!-- AUTO-RELATED-END -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制!请粘贴到Threads应用中分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制!'); });
+    });
+    </script>
+</body>
+</html>
