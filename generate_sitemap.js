@@ -56,6 +56,14 @@ const mainPages = [
     { path: '/privacy.html', priority: '0.5', changefreq: 'monthly' },
     { path: '/dashboard.html', priority: '0.6', changefreq: 'weekly' },
     { path: '/yg_bus.html', priority: '0.9', changefreq: 'weekly', koOnly: true },
+    // 카테고리 SEO 허브 페이지 (generate_category_pages.js 산출물, 4개 언어 x 7개 카테고리)
+    { path: '/category/tech.html', priority: '0.7', changefreq: 'daily' },
+    { path: '/category/dev.html', priority: '0.7', changefreq: 'daily' },
+    { path: '/category/health.html', priority: '0.7', changefreq: 'daily' },
+    { path: '/category/finance.html', priority: '0.7', changefreq: 'daily' },
+    { path: '/category/law.html', priority: '0.7', changefreq: 'daily' },
+    { path: '/category/life.html', priority: '0.7', changefreq: 'daily' },
+    { path: '/category/culture.html', priority: '0.7', changefreq: 'daily' },
 ];
 
 // static 폴더 페이지 목록
