@@ -702,9 +702,11 @@ const RecentTools = {
         'static/regex_tester.html': { name: { ko: '정규식 테스터', en: 'Regex Tester', ja: '正規表現テスター', zh: '正则表达式测试' }, icon: '🔍', cat: 'it_dev' },
         'static/code_image.html': { name: { ko: '코드 이미지 생성기', en: 'Code Image Generator', ja: 'コード画像ジェネレーター', zh: '代码图片生成器' }, icon: '💻', cat: 'it_dev' },
         'static/token_counter.html': { name: { ko: 'AI 토큰 카운터', en: 'AI Token Counter', ja: 'AIトークンカウンター', zh: 'AI令牌计数器' }, icon: '🤖', cat: 'it_dev' },
-        'static/audio_visualizer.html': { name: { ko: '오디오 비주얼라이저', en: 'Audio Visualizer', ja: 'オーディオビジュアライザー', zh: '音频可视化器' }, icon: '🎵', cat: 'fun' },
-        'static/electricity_bill_calculator.html': { name: { ko: '전기요금 계산기', en: 'Korea Electricity Bill Calculator', ja: '電気料金計算機(韓国)', zh: '电费计算器(韩国)' }, icon: '⚡', cat: 'life' },
+        'static/audio_visualizer.html': { name: { ko: '오디오 비주얼라이저', en: 'Audio Visualizer', ja: 'オーディオビジュアライザー', zh: '音频可视化器' }, icon: '🎵', cat: 'entertainment' },
+        'static/electricity_bill_calculator.html': { name: { ko: '전기요금 계산기', en: 'Korea Electricity Bill Calculator', ja: '電気料金計算機(韓国)', zh: '电费计算器(韩国)' }, icon: '⚡', cat: 'utility' },
         'static/llm_price_calculator.html': { name: { ko: 'LLM API 가격 계산기', en: 'LLM API Price Calculator', ja: 'LLM API料金計算機', zh: 'LLM API 价格计算器' }, icon: '💰', cat: 'it_dev' },
+        'static/severance_pay_calculator.html': { name: { ko: '퇴직금 계산기', en: 'Severance Pay Calculator', ja: '退職金計算機(韓国)', zh: '离职金计算器(韩国)' }, icon: '💼', cat: 'finance' },
+        'static/unemployment_benefit_calculator.html': { name: { ko: '실업급여 계산기', en: 'Jobless Benefit Calculator', ja: '失業給付計算機(韓国)', zh: '失业金计算器(韩国)' }, icon: '🧾', cat: 'finance' },
 
         // === IT 네트워크 ===
         'speed_test.html': { name: { ko: '인터넷 속도 측정', en: 'Internet Speed Test', ja: 'インターネット速度測定', zh: '网速测试' }, icon: '🚀', cat: 'it_net' },
