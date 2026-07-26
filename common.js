@@ -707,6 +707,7 @@ const RecentTools = {
         'static/llm_price_calculator.html': { name: { ko: 'LLM API 가격 계산기', en: 'LLM API Price Calculator', ja: 'LLM API料金計算機', zh: 'LLM API 价格计算器' }, icon: '💰', cat: 'it_dev' },
         'static/severance_pay_calculator.html': { name: { ko: '퇴직금 계산기', en: 'Severance Pay Calculator', ja: '退職金計算機(韓国)', zh: '离职金计算器(韩国)' }, icon: '💼', cat: 'finance' },
         'static/unemployment_benefit_calculator.html': { name: { ko: '실업급여 계산기', en: 'Jobless Benefit Calculator', ja: '失業給付計算機(韓国)', zh: '失业金计算器(韩国)' }, icon: '🧾', cat: 'finance' },
+        'static/pdf_toolkit.html': { name: { ko: 'PDF 도구 세트', en: 'PDF Toolkit', ja: 'PDFツール', zh: 'PDF 工具箱' }, icon: '📕', cat: 'utility' },
 
         // === IT 네트워크 ===
         'speed_test.html': { name: { ko: '인터넷 속도 측정', en: 'Internet Speed Test', ja: 'インターネット速度測定', zh: '网速测试' }, icon: '🚀', cat: 'it_net' },
