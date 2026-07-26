@@ -28,6 +28,26 @@ function detectBasePath() {
     return './';
 }
 
+// 현재 언어 코드 감지 (2026-07-26 추가 — UI 문구 현지화용)
+function detectLang() {
+    const p = window.location.pathname;
+    if (p.startsWith('/en/')) return 'en';
+    if (p.startsWith('/ja/')) return 'ja';
+    if (p.startsWith('/zh/')) return 'zh';
+    return 'ko';
+}
+
+// UI 문구 사전
+const UI_TEXT = {
+    ko: { welcome: '기술 블로그에 오신 것을 환영합니다', noResults: '검색 결과가 없습니다.', all: '전체 글', featured: '추천', empty: '등록된 글이 없습니다.', error: '오류가 발생했습니다. 나중에 다시 시도하세요.', date: (y,m,d)=>`${y}년 ${m}월 ${d}일` },
+    en: { welcome: 'Welcome to the BrainDetox blog', noResults: 'No results found.', all: 'All posts', featured: 'Featured', empty: 'No posts yet.', error: 'Something went wrong. Please try again later.', date: (y,m,d)=>`${m}/${d}/${y}` },
+    ja: { welcome: '技術ブログへようこそ', noResults: '検索結果がありません。', all: 'すべての記事', featured: 'おすすめ', empty: '記事がありません。', error: 'エラーが発生しました。しばらくしてから再度お試しください。', date: (y,m,d)=>`${y}年${m}月${d}日` },
+    zh: { welcome: '欢迎来到技术博客', noResults: '没有搜索结果。', all: '全部文章', featured: '推荐', empty: '暂无文章。', error: '发生错误，请稍后重试。', date: (y,m,d)=>`${y}年${m}月${d}日` },
+};
+function t(key) {
+    return (UI_TEXT[detectLang()] || UI_TEXT.ko)[key];
+}
+
 // 디버그 로깅 함수
 function debugLog(message) {
     if (false) { // 디버그 모드 끄기
@@ -41,7 +61,7 @@ function formatDate(dateString) {
     const year = date.getFullYear();
     const month = String(date.getMonth() + 1).padStart(2, '0');
     const day = String(date.getDate()).padStart(2, '0');
-    return `${year}년 ${month}월 ${day}일`;
+    return t('date')(year, month, day);
 }
 
 // HTML 태그 제거 및 정리 함수
@@ -149,7 +169,7 @@ async function initBlog() {
         if (!posts || posts.length === 0) {
             debugLog('포스트 데이터가 없습니다.');
             if (postList) {
-                postList.innerHTML = '<li class="post-item no-results">등록된 글이 없습니다.</li>';
+                postList.innerHTML = '<li class="post-item no-results">'+t('empty')+'</li>';
             }
             if (totalPostsEl) {
                 totalPostsEl.textContent = '0';
@@ -184,7 +204,7 @@ async function initBlog() {
     } catch (error) {
         console.error('블로그 초기화 오류:', error);
         if (postList) {
-            postList.innerHTML = '<li class="post-item error">오류가 발생했습니다. 나중에 다시 시도하세요.</li>';
+            postList.innerHTML = '<li class="post-item error">'+t('error')+'</li>';
         }
         if (totalPostsEl) {
             totalPostsEl.textContent = '0';
@@ -464,7 +484,7 @@ function formatTitle(id) {
         
         // 결과가 없는 경우
         if (filteredPosts.length === 0) {
-            postList.innerHTML = '<li class="post-item no-results">검색 결과가 없습니다.</li>';
+            postList.innerHTML = '<li class="post-item no-results">'+t('noResults')+'</li>';
         if (totalPostsEl) {
             totalPostsEl.textContent = '0';
         }
@@ -504,7 +524,7 @@ function formatTitle(id) {
             if (post.featured) {
                 const featuredBadge = document.createElement('span');
                 featuredBadge.className = 'featured-badge';
-                featuredBadge.textContent = '추천';
+                featuredBadge.textContent = t('featured');
                 listItem.appendChild(featuredBadge);
             }
             
@@ -545,7 +565,7 @@ function populateCategoryOptions() {
         // 전체 글 옵션 추가
         const allOption = document.createElement('option');
         allOption.value = 'all';
-        allOption.textContent = '전체 글';
+        allOption.textContent = t('all');
         categorySelect.appendChild(allOption);
         
         // 포스트에서 고유한 카테고리 추출
@@ -592,7 +612,7 @@ async function loadLatestPost() {
     
     if (!posts || posts.length === 0) {
         console.error('포스트 데이터가 없습니다.');
-        markdownContent.innerHTML = '<div class="welcome-message"><h2>기술 블로그에 오신 것을 환영합니다</h2><p>아직 등록된 글이 없습니다.</p></div>';
+        markdownContent.innerHTML = '<div class="welcome-message"><h2>'+t('welcome')+'</h2><p>'+t('empty')+'</p></div>';
                 return;
             }
             
@@ -602,7 +622,7 @@ async function loadLatestPost() {
         
         if (latestPosts.length === 0) {
             console.error('정렬된 포스트 목록이 비어 있습니다.');
-            markdownContent.innerHTML = '<div class="welcome-message"><h2>기술 블로그에 오신 것을 환영합니다</h2><p>아직 등록된 글이 없습니다.</p></div>';
+            markdownContent.innerHTML = '<div class="welcome-message"><h2>'+t('welcome')+'</h2><p>'+t('empty')+'</p></div>';
             return;
         }
         

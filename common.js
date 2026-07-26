@@ -167,11 +167,13 @@ document.addEventListener('DOMContentLoaded', async function() {
     // 컴포넌트 기본 경로
     let componentsBasePath;
     if (isLangSubDirectory) {
-        if (pathName.includes('/posts/')) {
-            componentsBasePath = '../../';
-        } else {
-            componentsBasePath = '../';
-        }
+        // 2026-07-26 수정: 기존엔 '/posts/' 포함 여부로만 판단해 {lang}/static/ 같은
+        // 다른 2단계 경로에서 '../'(→ en/components/…, 존재하지 않음)를 만들었다.
+        // 실제 경로 깊이로 판단하도록 교체.
+        const segs = pathName.replace(/^\/|\/$/g, '').split('/').filter(Boolean);
+        // segs 예: ['en','static','tool.html'] → 파일 제외 깊이 2 → '../../'
+        const depth = Math.max(1, segs.length - 1);
+        componentsBasePath = '../'.repeat(depth);
     } else if (isSubDirectory) {
         componentsBasePath = '../';
     } else {
@@ -700,6 +702,9 @@ const RecentTools = {
         'static/regex_tester.html': { name: { ko: '정규식 테스터', en: 'Regex Tester', ja: '正規表現テスター', zh: '正则表达式测试' }, icon: '🔍', cat: 'it_dev' },
         'static/code_image.html': { name: { ko: '코드 이미지 생성기', en: 'Code Image Generator', ja: 'コード画像ジェネレーター', zh: '代码图片生成器' }, icon: '💻', cat: 'it_dev' },
         'static/token_counter.html': { name: { ko: 'AI 토큰 카운터', en: 'AI Token Counter', ja: 'AIトークンカウンター', zh: 'AI令牌计数器' }, icon: '🤖', cat: 'it_dev' },
+        'static/audio_visualizer.html': { name: { ko: '오디오 비주얼라이저', en: 'Audio Visualizer', ja: 'オーディオビジュアライザー', zh: '音频可视化器' }, icon: '🎵', cat: 'fun' },
+        'static/electricity_bill_calculator.html': { name: { ko: '전기요금 계산기', en: 'Korea Electricity Bill Calculator', ja: '電気料金計算機(韓国)', zh: '电费计算器(韩国)' }, icon: '⚡', cat: 'life' },
+        'static/llm_price_calculator.html': { name: { ko: 'LLM API 가격 계산기', en: 'LLM API Price Calculator', ja: 'LLM API料金計算機', zh: 'LLM API 价格计算器' }, icon: '💰', cat: 'it_dev' },
 
         // === IT 네트워크 ===
         'speed_test.html': { name: { ko: '인터넷 속도 측정', en: 'Internet Speed Test', ja: 'インターネット速度測定', zh: '网速测试' }, icon: '🚀', cat: 'it_net' },
