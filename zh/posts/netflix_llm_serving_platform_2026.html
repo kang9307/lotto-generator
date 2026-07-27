@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>自己部署大模型这个决定 - 自建推理服务检查清单 2026</title>
+    <meta name="description" content="以奈飞公开的内部大模型推理服务架构为线索，整理了考虑自建部署的团队究竟需要做出哪些决定。内容涵盖引擎选型的判断轴、显存容量估算方法、批处理与排队设计、与既有机器学习平台的集成冲突、应当盯住的运行指标以及典型故障场景的排查顺序。">
+    <meta name="keywords" content="大模型推理服务, 自建部署, vLLM, Triton, KV缓存, 连续批处理, 显存容量估算, 首字延迟, 每token延迟, 推理服务器, 机器学习平台, 奈飞技术博客, 结构化输出, 逻辑处理器, 模型发布策略">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/netflix_llm_serving_platform_2026.html">
+
+    <meta property="og:title" content="自己部署大模型这个决定 - 自建推理服务检查清单">
+    <meta property="og:description" content="在已有机器学习平台之上叠加大模型时，真正需要做的决定。以公开案例梳理引擎选型、显存估算、批处理设计、可观测性与故障处理。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/netflix_llm_serving_platform_2026.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-07-28">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="自己部署大模型这个决定 - 自建推理服务检查清单">
+    <meta name="twitter:description" content="引擎选型、显存估算、批处理设计、可观测性与故障处理。以公开案例整理自建大模型推理服务的决定项。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "自己部署大模型这个决定 - 自建推理服务检查清单",
+      "alternativeHeadline": "Deciding to Serve LLMs Yourself - A Checklist Before You Build the Platform",
+      "datePublished": "2026-07-28",
+      "dateModified": "2026-07-28",
+      "inLanguage": "zh-CN",
+      "articleSection": "开发/基础设施",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "大模型推理服务, 自建部署, vLLM, Triton, KV缓存, 连续批处理, 显存容量估算, 首字延迟, 每token延迟, 机器学习平台集成",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/netflix_llm_serving_platform_2026.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "什么时候值得考虑自建大模型推理服务?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "有几个条件排在成本前面。当法规或合同不允许数据离开边界时，当必须运行微调过的模型时，当需要直接介入解码环节来强制输出格式时，以及当流量可预测且持续、能够让显卡一直保持繁忙时，自建才开始有意义。反过来，如果流量非常尖锐、峰值与均值差距很大，如果需要最新前沿模型的质量，或者团队里没有人能够长期负责引擎版本与内核层面的问题，自建就会明显不利。成本测算应当放在这些条件通过之后，而不是放在最前面。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "推理服务需要多少显存该怎么估算?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "把权重和KV缓存分开计算。权重等于参数量乘以每个元素的字节数。KV缓存的每token字节数等于2(键和值)乘以层数乘以KV头数乘以头维度乘以元素字节数。若层数为32、KV头数为8、头维度为128、采用16位浮点，则每个token占131,072字节，约128KiB。再乘以目标上下文长度即可得到单条序列的占用量，用显卡内存减去权重与框架开销后的余量除以该值，就得到并发序列上限。这里的头数必须使用KV头数而不是注意力头数，因为近期多数模型采用分组查询注意力。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "大模型推理服务与传统机器学习服务有何不同?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "所有差异都源自一个性质，即请求到达时无法得知输出长度。传统机器学习一次前向传播就结束，每个请求占用的内存近乎恒定；大模型则要按输出token数反复前向传播，并为每个请求累积KV缓存。因此预先打包批次的方式不再适用，需要以步为单位随时纳入和退出请求的连续批处理。延迟也不再是单一的响应时间，而是分为首个token的时间和token之间的间隔。容量上限也不再是每秒请求数，而是并发序列数与上下文长度的乘积。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "把大模型叠加到既有机器学习平台上时最先出问题的是什么?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "通常最先冲突的是接口契约。既有平台假定固定张量的输入输出，而大模型需要流式传输和可变长度。其次是产物分发，每次冷启动都从对象存储拉取数十GB权重，会超出调度器能够容忍的时间。第三是可观测性，推理引擎和模型服务器各自输出指标，如果没有汇聚层，既有仪表盘就无法直接沿用。第四是弹性伸缩信号，需要用等待队列长度和KV缓存使用率来替代每秒请求数。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "自建运行时应该盯住哪些指标?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "延迟要拆成首个token的时间和每个输出token的时间来看。只看端到端延迟会把输出长度差异很大的请求混在一起，分布因此变得模糊，按长度区间分桶来看更准确。容量方面要同时观察单实例输出token吞吐、KV缓存使用率、等待队列长度和回退次数。单看显卡利用率容易造成误解，因为解码阶段受限于显存带宽，运算单元占用率很高时仍可能有余量。从服务角度看，用满足延迟目标的每秒完成请求数，也就是有效吞吐，更能反映真实能力。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.88em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; font-size:0.95rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/netflix_llm_serving_platform_2026.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/netflix_llm_serving_platform_2026.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/netflix_llm_serving_platform_2026.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/netflix_llm_serving_platform_2026.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/netflix_llm_serving_platform_2026.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="自己部署大模型这个决定 - 自建推理服务检查清单">
+                <meta itemprop="datePublished" content="2026-07-28">
+                <meta itemprop="dateModified" content="2026-07-28">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="大模型推理服务, 自建部署, vLLM, Triton, KV缓存, 连续批处理, 显存容量估算, 机器学习平台集成">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/netflix_llm_serving_platform_2026.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">自己部署大模型这个决定 - 自建推理服务检查清单</h1>
+                    <h2 class="post-subtitle">从奈飞公开的内部推理服务架构，看引擎选型、显存估算、批处理设计与既有机器学习平台集成的决定项</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-07-28">2026年7月28日</span>
+                        <span class="post-category" itemprop="articleSection">开发/基础设施</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <div class="callout">
+                        <strong>本文范围</strong> — 本文是基于公开技术文档与论文整理的一般性信息，并非推荐采用任何特定厂商或开源项目。推理服务的性能会随模型、硬件与请求分布而大幅变化，因此文中提到的任何配置都不保证特定性能。实际的采用判断请以自家工作负载的实测结果为依据。
+                    </div>
+
+                    <h2>引言: 有人说「我们自己跑一个吧」的那一刻</h2>
+                    <p>从调用接口起步的团队，通常经由三扇门中的一扇走到自建这个议题。其一是后来才发现数据边界比预想的更严格。其二是需要把微调过的模型推上生产，而托管路径给不出想要的形态。其三是月度账单越过某条线，财务开始提问。无论从哪扇门进来，会议室里的那句话都很相似。<strong>「听说开放权重的模型也不错了，我们自己跑不行吗?」</strong></p>
+                    <p>这个问题本身是健康的。麻烦的是它之后发生的事。讨论多半滑向比较显卡报价和模型跑分，而真正在生产中消耗时间的项目根本没有进入评估表。比如引擎与服务器的版本组合、模型产物通过什么路径落到节点上、更换模型时调用方代码会怎样、指标散落在两处时既有仪表盘还能不能用。</p>
+                    <p>2026年7月17日，奈飞技术博客刊出了一篇介绍其内部大模型推理服务平台的文章，由人工智能平台组织下的模型运行时团队与推理团队共同撰写。这篇文章值得读的地方不是架构图，而是那份<strong>出问题的清单</strong>。它具体记下了哪个参数被悄悄丢弃、哪个版本组合让后端整个起不来、延迟在哪一环被绑在了处理器上。</p>
+                    <p>本文不是那篇文章的介绍。奈飞遇到的多数问题都是<strong>结构性问题</strong>，因此规模小得多的团队尝试自建时同样会遇到。所以本文把那份清单重新整理成「评估自建大模型推理服务时需要决定的项目表」。成本如何管控在<a href="ai_token_cost_finops_2026.html">以组织为单位管控token成本</a>中另行讨论，如何在多家厂商之间迁移则见<a href="ai_vendor_lockin_exit_strategy_2026.html">厂商锁定与退出策略</a>。这里只看<strong>自己运行模型这一侧的基础设施问题</strong>。</p>
+
+                    <h2>1. 奈飞实际做出来的东西，以及结构透露的信息</h2>
+                    <p>公开的结构分三层。最前端是基于JVM的服务层，负责路由、特征获取、候选生成、后处理与日志。其后是一个名为<strong>模型打分服务(MSS)</strong>的共用推理后端，再往下由NVIDIA Triton推理服务器负责模型加载、批处理与显卡调度。小型处理器模型直接在服务层内运行，大模型则通过远程调用交给MSS。</p>
+                    <p>这里最关键的设计判断不是技术选型，而是<strong>放置的位置</strong>。奈飞没有另起一套大模型专用栈。用原文的说法，他们在既有的生产环境内自行运行整套栈，而不是放进一个独立的机器学习孤岛。MSS在同一个接口之后支持XGBoost、TensorFlow、PyTorch与大模型，任何模型都用同一次gRPC调用打分。原本负责发布、版本管理、健康检查、弹性伸缩与多区域推广的Java控制面也被原样复用。</p>
+                    <ul>
+                        <li><strong>目标不是「建一个大模型平台」。</strong>目标是把大模型作为一种模型类型，加入既有的模型服务体系。</li>
+                        <li><strong>前端有两个。</strong>面向既有服务层的gRPC，与面向新应用的兼容式HTTP接口，并列暴露在同一个实例上。</li>
+                        <li><strong>提供兼容接口的理由不是便利，而是迁移路径。</strong>为的是让团队从托管模型实验过渡到自建的微调模型时，代码改动最小。</li>
+                        <li><strong>模型产物的存放路径是单独设计的。</strong>不是每次都从对象存储拉取大权重，而是在模型公告时就预先落到高性能文件系统上。</li>
+                        <li><strong>指标合并后再输出。</strong>他们另外做了一个代理，把推理引擎和模型服务器各自输出的指标汇聚到同一个端点。</li>
+                    </ul>
+                    <p>把这五行反过来，就是自建评估表的前五项。挂在哪里、暴露什么接口面、怎么迁过来、权重怎么搬运、指标在哪里汇聚。</p>
+
+                    <h2>2. 大模型推理服务与传统机器学习服务在哪里分岔</h2>
+                    <p>已经运营过机器学习平台的团队最容易低估这一段，因为它看上去只是「多加一个模型」。但分岔比表面上更深，而且绝大部分都源自一个性质: <strong>请求到达时无法得知输出长度</strong>。</p>
+                    <table>
+                        <thead><tr><th>维度</th><th>传统机器学习(树模型、小型网络)</th><th>大模型</th></tr></thead>
+                        <tbody>
+                            <tr><td>输出长度</td><td>固定，由结构定义决定</td><td>可变，生成结束才知道</td></tr>
+                            <tr><td>单请求计算</td><td>一次前向传播</td><td>按输出token数反复前向传播</td></tr>
+                            <tr><td>内存性质</td><td>以权重为主，单请求近乎恒定</td><td>权重加上按请求累积的KV缓存</td></tr>
+                            <tr><td>批处理方式</td><td>把请求打包一次跑完(静态批)</td><td>逐步纳入与退出的连续批处理</td></tr>
+                            <tr><td>主要瓶颈</td><td>大体上是算力</td><td>预填充受限于算力，解码受限于显存带宽</td></tr>
+                            <tr><td>延迟定义</td><td>单一响应时间</td><td>拆成首个token与token间隔</td></tr>
+                            <tr><td>容量上限</td><td>每秒请求数</td><td>并发序列数乘以上下文长度</td></tr>
+                            <tr><td>饱和时的表现</td><td>排队与超时</td><td>KV缓存不足导致进行中的请求被回退</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h3>2.1 预填充与解码是性质不同的两件事</h3>
+                    <p>一个请求分两个阶段处理。一次性读入全部输入并构建内部状态的<strong>预填充</strong>，以及逐个吐出token的<strong>解码</strong>。预填充按输入token数并行计算，运算单元很忙。解码为了取出一个token需要重新读取整份模型权重，因而被显存带宽卡住。两个阶段瓶颈不同这一事实，左右了整个批处理设计。</p>
+
+                    <h3>2.2 KV缓存是容量计算的中心</h3>
+                    <p>解码阶段为了不重复计算前面token的键与值而把它们存下来，这就是KV缓存。它<strong>按请求存在，并随token增加而线性增长</strong>，这是传统机器学习没有的性质。决定内存的不是请求数量而是存活token的总量，因此「每秒多少笔」这个熟悉的容量指标无法直接套用。</p>
+                    <p>把这个问题当作操作系统虚拟内存来处理的提议就是分页注意力。它把缓存切成块放进非连续的物理空间以减少碎片，并允许在请求内外共享缓存。原论文把<strong>KV缓存内存几乎没有浪费</strong>作为目标，并报告在相当的延迟水平下，吞吐相较当时最先进的系统提升了2到4倍，同时指出序列越长、模型越大、解码越复杂，提升幅度越大。</p>
+
+                    <h3>2.3 连续批处理改变了批大小的含义</h3>
+                    <p>静态批把若干请求打包一次跑完，其余槽位要等到最慢的那个结束才空出来。在输出长度参差不齐的大模型上，这种浪费很大。连续批处理把调度单位从批次下放到<strong>解码步</strong>，完成的请求立刻退出，等待中的请求随即补进空位。于是在自建场景中，「批大小32」这类固定值失去意义，取而代之的是每步token预算与并发序列上限这两个旋钮。</p>
+
+                    <h2>3. 引擎选型 - 由运维契合度而非跑分表决定</h2>
+                    <p>奈飞最初采用基于编译的引擎，在2025年夏天工作负载构成变宽之后重新跑了基准测试，把vLLM定为<strong>标准路径引擎</strong>。原文列出四条选型理由，值得注意的是<strong>其中没有一条是性能</strong>。</p>
+                    <ol>
+                        <li><strong>无需多阶段编译流水线即可加载自定义架构</strong>，在非标准模型上的迭代速度更快。</li>
+                        <li><strong>具备自定义解码逻辑的扩展点</strong>，这是后文提到的约束解码工作所必需的。</li>
+                        <li><strong>更容易查看失败与中间状态</strong>，比当时编译型引擎的调试更顺手。</li>
+                        <li><strong>研究团队已经在用</strong>，从研究交接到生产的成本因此下降。</li>
+                    </ol>
+                    <p>原文判断，性能差距本身在2025年时已经收窄。也就是说这个决定是按<strong>「哪个引擎契合本组织的工作流」而不是「哪个引擎更快」</strong>做出的。这里要说的不是推荐某个工具，而是判断轴落在那一侧这件事本身。</p>
+                    <table>
+                        <thead><tr><th>路线</th><th>性质</th><th>优势场景</th><th>需要付出的代价</th></tr></thead>
+                        <tbody>
+                            <tr><td>编译型</td><td>把模型按硬件预先构建为引擎</td><td>模型与硬件固定且长期维持</td><td>构建步骤进入发布路径，内部状态相对难以观察</td></tr>
+                            <tr><td>运行时型</td><td>直接加载权重并在运行时调度</td><td>模型频繁变动且需要改动解码</td><td>脚本层留在热路径上，可能成为瓶颈</td></tr>
+                            <tr><td>模型服务器型</td><td>承载多种后端并管理加载、版本与批处理</td><td>需要在一个服务器里处理多种模型类型</td><td>服务器与后端之间产生版本耦合</td></tr>
+                        </tbody>
+                    </table>
+                    <p>在实务中使用这张表的方法很简单。回答下面四个问题，答案聚集在哪一侧就选哪一侧。</p>
+                    <ul>
+                        <li>我们的模型多久换一次? 如果是一个季度一次，构建步骤是承担得起的。</li>
+                        <li>有没有需要介入解码的场合? 要强制输出格式就需要扩展点。</li>
+                        <li>凌晨出故障时谁来处理? 那个人必须能打开这套栈的内部。</li>
+                        <li>研究与分析团队在用什么? 交接成本比想象中大。</li>
+                    </ul>
+
+                    <h2>4. 适合自建的条件，以及不该自建的条件</h2>
+                    <p>这个判断中常见的错误是从成本算起。成本是<strong>最后一个条件</strong>。前面的条件不成立，再怎么算那个数字也不会变成现实。奈飞能走这条路的前提在原文中也一览无遗: 共用推理后端和Java控制面已经存在，而且有能把约束解码热路径用C++重写的工程力量。</p>
+                    <table>
+                        <thead><tr><th>判断维度</th><th>倾向自建的状态</th><th>倾向托管接口的状态</th></tr></thead>
+                        <tbody>
+                            <tr><td>数据边界</td><td>法规或合同禁止对外传输</td><td>没有传输限制，或可通过合同解决</td></tr>
+                            <tr><td>模型</td><td>需要运行微调或领域适配模型</td><td>需要前沿模型的最新质量</td></tr>
+                            <tr><td>流量形态</td><td>持续且可预测，夜间也有流量</td><td>尖锐，峰值与均值差距很大</td></tr>
+                            <tr><td>输出控制</td><td>必须直接介入解码环节</td><td>提示词与后处理已经够用</td></tr>
+                            <tr><td>组织</td><td>已有显卡运维与机器学习运维人员</td><td>没有专职，或由他人兼任</td></tr>
+                            <tr><td>更换周期</td><td>长期固定使用一个模型</td><td>一有更好的就立刻更换</td></tr>
+                            <tr><td>延迟要求</td><td>需要自行掌控延迟下限</td><td>厂商的服务等级协议已经够用</td></tr>
+                            <tr><td>规模</td><td>大到足以持续填满一个实例</td><td>连一个实例都填不满</td></tr>
+                        </tbody>
+                    </table>
+                    <p>看这张表就会发现，右列只要有一项强烈命中，自建的依据就急剧减弱。尤其是<strong>流量形态</strong>会把整个成本计算翻过来。显卡闲着也照样计费，因此为承受峰值而配置的实例在其余时段空转，单位token成本就会按那个比例上升。这一项会在后面的盈亏平衡一节再谈。</p>
+
+                    <h2>5. 显存容量估算 - 权重与KV缓存分开数</h2>
+                    <p>面对「跑这个模型要多少显存」这个问题，只用参数量回答只对了一半。需要的内存分成三块。</p>
+                    <ul>
+                        <li><strong>权重</strong> — 参数量乘以每元素字节数。16位浮点即每参数2字节。用张量并行切分时按显卡数量分摊。</li>
+                        <li><strong>KV缓存</strong> — 与存活序列的token数成正比。这实际上决定了并发度。</li>
+                        <li><strong>激活值与框架开销</strong> — 中间张量、通信缓冲以及运行时占住的部分。难以精确预测，作为余量保留。</li>
+                    </ul>
+
+                    <h3>5.1 先求每token的KV缓存字节数</h3>
+                    <p>公式本身只是简单算术。键与值两套，按层、按KV头、按头维度存放。</p>
+                    <pre><code>每token的KV字节数
+  = 2 (键与值)
+  × 层数(num_hidden_layers)
+  × KV头数(num_key_value_heads)
+  × 头维度(head_dim)
+  × 元素字节数(bf16 = 2)
+
+例) 层数32、KV头数8、头维度128、bf16
+  = 2 × 32 × 8 × 128 × 2
+  = 131,072 字节 = 128 KiB / token
+
+单条序列 × 8,000 token  ->  约 1.0 GiB
+并发序列 20 条          ->  约 20 GiB</code></pre>
+                    <p>这里有一个反复出错的地方。<strong>头数必须用KV头数，而不是注意力头数。</strong>近期多数模型采用分组查询注意力，KV头数远小于注意力头数。上例中若误填注意力头数32，就会把需求高估四倍。这些数值务必从对应模型的配置文件中确认。</p>
+
+                    <h3>5.2 估算顺序</h3>
+                    <ol>
+                        <li>从显卡总内存中减去<strong>权重</strong>。</li>
+                        <li>确定运行时预分配的比例。vLLM会按<code>gpu_memory_utilization</code>的比例预先占用显存缓存，调高该值可扩大KV空间并减少回退。</li>
+                        <li>把可用于KV的余量除以<strong>每token字节数乘以目标上下文长度</strong>。这就是并发序列上限。</li>
+                        <li>由并发上限与平均处理时间推出大致的吞吐上限。这个值<strong>只是估计，必须以实测替换</strong>。</li>
+                        <li>用峰值流量除以该上限求出实例数，再加上冗余与发布重叠的份额。</li>
+                    </ol>
+                    <ul>
+                        <li>把上下文上限翻倍，单序列的KV也会翻倍，同一张卡上的并发大致减半。<strong>上下文不是免费的。</strong></li>
+                        <li>前缀缓存命中良好时实际用量会低于计算值，但容量规划按最坏情况来做更稳妥。</li>
+                        <li>量化会缩小权重，但不会自动缩小KV缓存。KV量化是另一项设置，其质量影响需要单独测量。</li>
+                        <li>开发与预发布环境的显卡常被漏算。只算生产会与真实账单对不上。</li>
+                    </ul>
+
+                    <h2>6. 批处理与排队中真正要决定的项目</h2>
+                    <p>用上连续批处理之后，调优旋钮就收敛到有限的几个。麻烦在于这些旋钮<strong>朝相反方向拉扯</strong>。所以要做的不是寻找「最优值」，而是先决定牺牲哪个指标。</p>
+                    <table>
+                        <thead><tr><th>决定项</th><th>决定什么</th><th>调大</th><th>调小</th></tr></thead>
+                        <tbody>
+                            <tr><td>每步token预算</td><td>一步中处理的预填充与解码token总量</td><td>首个token的时间变好</td><td>token之间的间隔更稳定</td></tr>
+                            <tr><td>并发序列上限</td><td>KV池被分成几份</td><td>吞吐上升，回退风险同时上升</td><td>回退减少，显卡可能空转</td></tr>
+                            <tr><td>最大上下文长度</td><td>单条序列可占用的上限</td><td>可接纳长输入</td><td>保住并发度</td></tr>
+                            <tr><td>内存预分配比例</td><td>KV池的整体大小</td><td>回退减少</td><td>对内存不足留出更多余量</td></tr>
+                            <tr><td>回退方式</td><td>重算还是换出</td><td colspan="2">因环境而异，近期实现以重算为默认</td></tr>
+                            <tr><td>排队等待上限</td><td>何时拒绝请求</td><td>拒绝减少，尾部延迟拉长</td><td>尾部延迟缩短，拒绝增多</td></tr>
+                            <tr><td>优先级隔离</td><td>交互式与批量任务如何区分</td><td colspan="2">混在同一个池里，批量任务会把交互式延迟顶上去</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h3>6.1 分块预填充为何成为默认</h3>
+                    <p>当一个长提示词进来，它的预填充可能占满一整步，正在吐字的请求在这期间停住。用户看到的是<strong>文字出着出着突然卡住</strong>。分块预填充把长预填充拆到多步里，从而缓解这个现象。vLLM官方文档说明该功能会改善token间延迟与解码，同时通过把受算力限制的预填充与受带宽限制的解码放进同一批来提高显卡利用率。在较新的架构中，只要条件允许就默认开启。</p>
+                    <p>调优方向文档里也写明了。每步token预算<strong>调小(例如2048)会改善token间延迟，调大则会改善首个token的时间。</strong>若追求最大吞吐，文档建议设到8192以上，并指出在大显卡上跑小模型时尤其如此。没有一个值能同时满足三个目标，所以先确定服务是交互式还是批量式才是顺序。</p>
+
+                    <h3>6.2 回退告警开始出现时</h3>
+                    <p>内存不够时引擎会回收进行中请求的KV并在稍后重新调度。回退频繁意味着同样的token被算了两遍，吞吐与尾部延迟会一起恶化。vLLM文档给出的处理顺序如下。</p>
+                    <ol>
+                        <li>调高内存预分配比例以扩大KV空间。</li>
+                        <li>降低并发序列上限，减少同时存活的请求数。</li>
+                        <li>加大张量并行规模。</li>
+                        <li>加大流水线并行规模。</li>
+                    </ol>
+
+                    <h3>6.3 排队设计中最容易漏掉的</h3>
+                    <ul>
+                        <li><strong>没有准入控制，尾部延迟就没有上限。</strong>无限接收排队固然最终会给出回答，但用户早就走了。超过等待上限就拒绝反而更好。</li>
+                        <li><strong>拒绝是设计，不是失败。</strong>还要一并决定收到429的客户端要做什么: 换用备选模型、返回精简回答，或稍后重试。</li>
+                        <li><strong>把服务目标拆成首个token与token间隔来定义。</strong>只用一个端到端延迟来定义，就无从判断参数该往哪边拧。</li>
+                        <li><strong>重试策略会放大负载。</strong>饱和状态下自动重试叠加会让队列更长。要同时设置退避与重试预算。</li>
+                        <li><strong>服务端必须察觉流式客户端已经离开。</strong>用户关掉窗口后还在吐token，那部分全是浪费。</li>
+                    </ul>
+
+                    <h2>7. 模型打包与发布 - 接口变化时什么会坏掉</h2>
+                    <p>奈飞这篇文章里，实务人员收获最大的就是这一段。装载同一个模型有两种打包方式，而<strong>两者的差别不是性能而是耦合度</strong>。</p>
+                    <ul>
+                        <li><strong>脚本后端方式</strong> — 在打包时直接定义输入输出张量规格，该规格被固化进产物。前端做了触及输入输出规格的升级，打包代码也必须一起改，否则请求会在运行时失败。</li>
+                        <li><strong>引擎后端方式</strong> — 产物是指向权重与分词器的配置文件，规格在发布时动态生成。模型与前端可以各自独立演进，因此成为默认推荐路径。</li>
+                    </ul>
+                    <p>但第二种方式带着代价，那就是服务器与引擎之间的<strong>版本耦合</strong>。原文举了具体例子: 某个服务器版本试图导入引擎侧已经删除的模块，结果后端整个起不来。因此奈飞把一起验证过的组合成对固定后再发布。需要自定义前处理、后处理、集成流水线或非标准分词的模型仍然要退回脚本后端，文中也写到这个逃生口对一部分模型今后仍会需要。</p>
+
+                    <h3>7.1 两种发布策略及其显卡成本</h3>
+                    <table>
+                        <thead><tr><th>策略</th><th>行为</th><th>适用场景</th><th>弱点</th></tr></thead>
+                        <tbody>
+                            <tr><td>红黑发布</td><td>新版本在旁边启动，健康检查通过后分阶段切流量，失败时原子回滚</td><td>模型接口稳定时</td><td>输入输出结构变化会在迁移途中造成不匹配</td></tr>
+                            <tr><td>多版本并行</td><td>按模型标识与版本组合独立发布，多个版本同时提供服务</td><td>破坏性接口变更不可避免时</td><td>重叠期间显卡成本临时增加</td></tr>
+                        </tbody>
+                    </table>
+                    <p>奈飞的建议很明确: 把张量形状这类可变配置嵌进模型，做成<strong>与版本无关的接口</strong>，然后走成本更低的红黑路径。多版本并行留给破坏性变更不可避免的少数情况。翻译成实务语言就是下面几条。</p>
+                    <ul>
+                        <li>发布大模型不是替换容器镜像。要把<strong>过渡期间显卡会有一段时间需要翻倍</strong>这件事提前写进容量规划。</li>
+                        <li>模型接口里若没有版本协商的概念，更换模型就会和调用方代码的发布绑在一起。切断这层耦合正是发布策略的目的。</li>
+                        <li>先把回滚路径做好。往回退的流程比往前推的流程需要得更频繁。</li>
+                        <li>把引擎与服务器验证过的组合做成清单来管理。没有这份清单，每次升级都是赌博。</li>
+                    </ul>
+
+                    <h2>8. 叠加到既有机器学习平台上的六处冲突</h2>
+                    <p>这些是已有模型服务体系的团队在加入大模型时真正会撞上的地方。奈飞公开了各自的处理方式，便于对照。</p>
+                    <ol>
+                        <li><strong>接口契约</strong> — 既有平台假定「放入输入张量就得到输出张量」。大模型要求流式、可变长度与中途取消。奈飞没有强行统一，而是让gRPC与兼容式HTTP<strong>两个前端并列跑在同一个实例上</strong>，既有调用方保持不动，只让新调用方使用新的接口面。</li>
+                        <li><strong>产物分发路径</strong> — 既有模型几秒钟就能起来，大模型权重却是数十GB。原文指出，若在启动时直接从对象存储或模型仓库拉取，冷启动会超出调度器可容忍的水平，于是改为<strong>在模型公告时就预先落到高性能文件系统上</strong>。</li>
+                        <li><strong>弹性伸缩信号</strong> — 依据每秒请求数与处理器使用率的既有规则在大模型上反应太慢，因为单个请求存活很久。需要改用等待队列长度、KV缓存使用率与等待时间作为信号。</li>
+                        <li><strong>可观测性</strong> — 推理引擎与模型服务器互不知晓对方的指标。据原文，服务器内置的桥接只暴露了引擎四十多项指标中的<strong>九项</strong>，恰恰漏掉了token吞吐、KV缓存使用率、前缀缓存命中率这些关键项。奈飞做了一个轻量代理，读取两个来源并汇聚到同一个指标端点，让既有仪表盘与告警无需改动即可继续工作。</li>
+                        <li><strong>接口契约的静默缺失</strong> — 这是原文中最实用的一条警告。服务器的兼容式前端把结构化输出的指定字段在抵达引擎之前<strong>悄悄丢掉了</strong>。它不报错，只是被忽略，因此很晚才被发现。奈飞把该前端取回并打了补丁，让这个字段被翻译成引擎的引导解码参数。由此得到的教训很直白: <strong>「兼容」并不等于对规范的遵从保证。</strong>凡是实际使用的字段，都需要契约测试。</li>
+                        <li><strong>发布流水线与节点池</strong> — 显卡节点池的隔离、镜像大小、驱动版本、节点重启时的预热流程，都会与既有持续集成流程的假设错位。尤其镜像变大会拉长发布时间，从而反过来影响上面的发布策略选择。</li>
+                    </ol>
+
+                    <h2>9. 强制结构化输出时会遇到的问题</h2>
+                    <p>许多服务不能直接使用大模型的原始输出，必须按固定格式接收。常见做法是生成结束后校验，不符就重来，而这等于<strong>先付了无效生成的代价再去修补</strong>。奈飞选择把约束推进解码循环内部。由于每个请求适用的规则不同，结构上是按请求配置各自的处理器。</p>
+
+                    <h3>9.1 延迟为何被绑在处理器而不是显卡上</h3>
+                    <p>早期实现暴露了问题: 逻辑值处理器是<strong>按请求</strong>运行的。显卡产出整批的逻辑值后由处理器取回，随后约束逻辑对每个请求依次执行。由于全局解释器锁的存在，这部分工作无法并行，批次越大处理器时间越是线性增长。原文的描述精准地点出了这一点: 前向传播在显卡上被高效批处理，而<strong>端到端延迟却变成受处理器限制，尾部延迟随之飙升</strong>。</p>
+                    <p>结构性的解决来自引擎侧的世代更替，逻辑值处理被移到批级别。奈飞按批级数据结构重写了处理器，并用C++与多线程重新实现热路径以绕开锁，此后<strong>逻辑值处理时间在批次增大时保持平稳</strong>。代价是接口复杂度: 必须显式追踪批次组成的变化，比先前按请求的接口更难驾驭。</p>
+
+                    <h3>9.2 只在生产中才浮现的两个问题</h3>
+                    <p>有两个在基准测试里看不到、在真实并发下才出现的问题被记录下来。两者都属于<strong>状态机前提被打破</strong>的类型。</p>
+                    <pre><code>[问题1] 部分预填充
+  分块预填充会让一个请求跨多步完成预填充。
+  仅凭批次更新信息无法区分是完整预填充还是部分预填充。
+  -> 在内部另行追踪进度状态加以补强
+
+[问题2] 回退导致的状态重置
+  内存吃紧时引擎会回收进行中请求的KV缓存，
+  稍后用不同的提示词与输出token列表重新调度。
+  状态机原本假定输出token列表只会单调增长。
+  -> 检测到步与步之间token历史变短时，
+     重置状态机并以新的提示词重新初始化</code></pre>
+
+                    <h3>9.3 不过多数团队并不需要走到这一步</h3>
+                    <p>照搬这一段是危险的判断。深入到内核层面的工作，<strong>只有在无效生成的代价大于重试代价时</strong>才成立。判断标准可归纳为三条。</p>
+                    <ul>
+                        <li><strong>当前有效输出率</strong> — 仅靠提示词与结构声明有多少比例能通过。这个值本来就高，改进空间就小。</li>
+                        <li><strong>重试单价</strong> — 让一次失败重来的费用与延迟是多少。输出较短时重试很便宜。</li>
+                        <li><strong>延迟预算</strong> — 重试是否还能落在服务目标之内。交互式场景下一次重试就可能耗尽预算。</li>
+                    </ul>
+                    <p>只有三个值都落在不利一侧时，介入解码才划算。否则提示词设计、结构声明与失败重试这种平常的组合在维护上更占优。不过无论选哪条路，<strong>验证结构化输出参数是否真正抵达引擎的测试</strong>都是必需的。前面看到的静默丢弃案例正是发生在这个接缝上。</p>
+
+                    <h2>10. 运行指标 - 应该盯住什么</h2>
+                    <p>照着传统网页服务的习惯只挂一个p95响应时间，在大模型推理服务上几乎什么也看不出来，因为输出长度参差会把分布混在一起。至少下列指标要分开看。</p>
+                    <table>
+                        <thead><tr><th>指标</th><th>定义</th><th>能说明什么</th><th>如何设定基准</th></tr></thead>
+                        <tbody>
+                            <tr><td>首个token的时间</td><td>从请求到达到第一个输出token</td><td>排队等待与预填充的状态</td><td>交互式按用户感知阈值，批量式可以不管</td></tr>
+                            <tr><td>每输出token的时间</td><td>输出token之间的平均间隔</td><td>解码阶段的健康度</td><td>快于人的阅读速度后感知差异很小</td></tr>
+                            <tr><td>端到端延迟</td><td>从请求到完成</td><td>整体体感</td><td>按输出长度区间分开来看</td></tr>
+                            <tr><td>单实例输出token吞吐</td><td>每秒生成的token数</td><td>真实容量</td><td>随批大小变化，需同时记录负载水平</td></tr>
+                            <tr><td>KV缓存使用率</td><td>已分配KV池中被占用的比例</td><td>回退是否临近</td><td>持续高位就降低并发或增加显卡</td></tr>
+                            <tr><td>前缀缓存命中率</td><td>被复用的预填充比例</td><td>提示词设计的效果</td><td>系统提示词混入变动值时会骤降</td></tr>
+                            <tr><td>等待队列长度</td><td>尚未被调度的请求数</td><td>是否已经饱和</td><td>很适合用作弹性伸缩信号</td></tr>
+                            <tr><td>回退次数</td><td>因KV回收而被退回的请求数</td><td>内存压力</td><td>以接近零为目标</td></tr>
+                            <tr><td>显卡利用率</td><td>运算单元占用率</td><td>单独看容易误导</td><td>解码受带宽限制，需与其他指标合看</td></tr>
+                            <tr><td>有效吞吐</td><td>满足延迟目标而完成的每秒请求数</td><td>服务视角下的真实能力</td><td>用它而不是吞吐来定义容量</td></tr>
+                        </tbody>
+                    </table>
+                    <ul>
+                        <li><strong>看有效吞吐而不是吞吐。</strong>把批次调大吞吐会上升，但错过延迟目标的响应也可能增多。只统计达标的那部分更接近服务的真实能力。</li>
+                        <li><strong>按长度区间分桶。</strong>把短回答与长回答放进同一个直方图，p95就说不清含义了。</li>
+                        <li><strong>指标来自引擎与服务器两边。</strong>不做汇聚层就无法沿用既有的可观测性资产，这是奈飞案例的核心。</li>
+                        <li><strong>从第一天就记录token账目。</strong>不把每个请求的输入输出token数写进日志，日后就无法回溯计算成本。</li>
+                    </ul>
+
+                    <h2>11. 故障场景与首要排查</h2>
+                    <p>这些是开始运维后必然遇到的典型情形。事先知道可能的原因，处理时间会大幅缩短。</p>
+                    <table>
+                        <thead><tr><th>症状</th><th>常见原因</th><th>首要排查</th><th>防止复发</th></tr></thead>
+                        <tbody>
+                            <tr><td>发布根本起不来</td><td>服务器与引擎的版本组合不匹配</td><td>启动日志中的模块导入错误，回滚到上一个组合</td><td>把验证过的组合成对固定</td></tr>
+                            <tr><td>均值正常但尾部延迟飙升</td><td>按请求依次执行的处理器环节</td><td>处理器耗时相对批大小的曲线</td><td>转为批级处理，隔离热路径</td></tr>
+                            <tr><td>起初正常之后逐渐变慢</td><td>KV吃紧导致反复回退</td><td>回退计数器与KV使用率的走势</td><td>下调并发上限，整顿上下文上限</td></tr>
+                            <tr><td>新节点过不了健康检查</td><td>下载权重造成的冷启动</td><td>各启动阶段耗时与产物路径</td><td>使用预热缓存或专用文件系统</td></tr>
+                            <tr><td>输出格式不符</td><td>结构化输出参数在中间层丢失</td><td>引擎日志中该参数是否真正抵达</td><td>把字段级契约测试纳入回归</td></tr>
+                            <tr><td>只有特定请求内存不足</td><td>一个长上下文独占了KV</td><td>输入长度分布与最大上下文设置</td><td>明文规定输入长度上限与拒绝策略</td></tr>
+                            <tr><td>换模型后部分调用方失败</td><td>输入输出结构变更</td><td>比对变更字段与调用方版本</td><td>多版本并行发布或与版本无关的接口</td></tr>
+                            <tr><td>发布过程中显卡不够</td><td>并行期间需要双倍容量</td><td>过渡期的重叠时长与预留容量</td><td>在发布窗口预先确保余量</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2>12. 如何自己算盈亏平衡</h2>
+                    <p>「每月超过多少自建更便宜」或者「每天多少token是分界点」之类的数字流传甚广。问题是这些数值通常<strong>连前提都没有公开</strong>。看不到用的是哪种显卡、什么合同价、利用率按多少计、是否算入人力成本，那个数字就无法原样搬到别的团队。所以本文不引用任何具体的盈亏平衡数值，只给出<strong>计算框架</strong>。</p>
+                    <pre><code>[托管接口侧]
+  月度 = (输入token × 输入单价 + 输出token × 输出单价)
+         × 月请求数
+         - 提示词缓存节省 - 批量折扣
+
+[自建侧]
+  月度 = 显卡小时单价 × 实例数 × 730小时
+         + 存储 + 网络 + 负载均衡
+         + 运维人力(折算为全职当量)
+         + 开发/预发布环境显卡
+         + 发布重叠期的额外容量
+
+[比较口径]
+  单位token成本 = 月度费用 ÷ 当月实际处理的token数
+  注: 分母才是关键。利用率减半，单位token成本翻倍。</code></pre>
+                    <p>计算顺序这样安排。</p>
+                    <ol>
+                        <li><strong>先画出按小时的流量分布。</strong>峰均比是这项计算的主导变量。</li>
+                        <li><strong>在目标服务水平下实测单实例有效吞吐。</strong>不做基准测试而靠估计，后面的计算全都会晃动。</li>
+                        <li>求出承受峰值所需的实例数，再加上冗余份额。</li>
+                        <li>计算这些实例在平均时段空闲多少，得出<strong>实效利用率</strong>。</li>
+                        <li>用总费用除以月处理token数，得到单位token成本。</li>
+                        <li>再把人的成本加进去。管理版本组合、跟踪引擎问题、汇聚指标都是常态工作而非一次性任务。</li>
+                    </ol>
+                    <p>把最容易漏掉的项目单独列出来。</p>
+                    <ul>
+                        <li>开发与预发布环境的显卡。只算生产会与真实账单对不上。</li>
+                        <li>发布过渡期重叠启动的实例费用。</li>
+                        <li>模型产物仓库与高性能文件系统的费用。</li>
+                        <li>跨区域冗余或为故障预留的备用容量。</li>
+                        <li>基准测试本身消耗的显卡时长。调优不会一次就结束。</li>
+                        <li>夜间与周末的值守人力。自建会产生无法交给厂商的故障。</li>
+                    </ul>
+                    <p>三个常见误解也一并整理。</p>
+                    <ul>
+                        <li><strong>「开放权重所以免费」</strong> — 免费的是权重，不是推理服务。费用的大头是显卡时间与人的时间。</li>
+                        <li><strong>「买一张显卡就完事」</strong> — 没有冗余就是单点故障。最小配置只有一张卡的情形只存在于实验环境。</li>
+                        <li><strong>「只要接口的一半」</strong> — 看到这类比较时应先去找它的利用率前提。以满负荷为前提的计算在真实流量分布下并不成立。</li>
+                    </ul>
+                    <p>token单价本身如何管理、如何按部门归属，超出了本文范围。那部分见<a href="ai_token_cost_finops_2026.html">token成本管控设计</a>，按场景把请求分发给多个模型的问题见<a href="weave_router_llm_2026.html">模型路由</a>。</p>
+
+                    <h2>13. 结论: 先做决定清单，而不是先做平台</h2>
+                    <p>从奈飞的案例里该带走的不是架构图。那家公司的架构建立在既有共用推理后端与JVM服务层这个前提之上，没有这个前提的团队照搬同一张图反而吃亏。该带走的是<strong>他们真正必须做出的决定清单</strong>。</p>
+                    <ol>
+                        <li>大模型另起一套栈，还是作为一种模型类型并入既有的模型服务体系?</li>
+                        <li>暴露什么样的接口面? 既有接口与标准兼容接口是否并行?</li>
+                        <li>引擎按性能选，还是按迭代速度与可调试性选?</li>
+                        <li>打包走哪一条路? 是否愿意用固定版本换取更低的耦合度?</li>
+                        <li>发布走红黑还是多版本并行? 相应的显卡成本记在哪里?</li>
+                        <li>KV缓存预算怎么分? 上下文上限与并发度放弃哪一个?</li>
+                        <li>服务目标如何拆成首个token与token间隔? 等待上限与拒绝策略是什么?</li>
+                        <li>结构化输出是在解码中强制，还是用后处理与重试来消化?</li>
+                        <li>指标在哪里汇聚? 既有仪表盘能否不加改动继续使用?</li>
+                        <li>权重通过什么路径落到节点上? 冷启动预算是多少?</li>
+                    </ol>
+                    <p>建议的起步顺序是这样。先用自家的请求分布跑一次<strong>实测基准</strong>，求出单实例有效吞吐。用这个值定义服务目标。然后以一个模型、一种工作负载做试点，但要把指标汇聚与发布策略<strong>放在试点阶段一并做出来</strong>。把这两件事推后，扩容时就得回头重做。</p>
+                    <p>最后补一句。本文提到的任何配置都不保证特定性能。引擎版本、模型结构、请求长度分布、显卡代际稍有不同，数字就会变。公开案例<strong>只告诉你需要决定什么，并不告诉你这些决定的答案。</strong>答案只能靠自家流量亲自测量，而先把这套测量体系搭起来，才是自建推理服务真正的第一步。</p>
+
+                    <h2>参考资料</h2>
+                    <ul>
+                        <li>Netflix Technology Blog - In-House LLM Serving at Netflix (2026年7月17日，人工智能平台的模型运行时与推理团队)。架构、引擎选型理由、打包、发布策略、约束解码与指标汇聚的一手来源: <a href="https://netflixtechblog.com/in-house-llm-serving-at-netflix-a5a8e799ea2c" target="_blank" rel="noopener">netflixtechblog.com</a></li>
+                        <li>GeekNews - 发掘本主题的讨论帖: <a href="https://news.hada.io/topic?id=31856" target="_blank" rel="noopener">news.hada.io</a></li>
+                        <li>Kwon 等 - Efficient Memory Management for Large Language Model Serving with PagedAttention (SOSP 2023)。KV缓存碎片与吞吐提升的原始论文: <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">arxiv.org/abs/2309.06180</a></li>
+                        <li>vLLM 官方文档 - Optimization and Tuning。内存预分配、每步token预算、分块预填充与回退处理顺序: <a href="https://docs.vllm.ai/en/latest/configuration/optimization.html" target="_blank" rel="noopener">docs.vllm.ai</a></li>
+                        <li>NVIDIA Triton Inference Server 官方文档 - 模型加载、版本管理与后端结构: <a href="https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/index.html" target="_blank" rel="noopener">docs.nvidia.com</a></li>
+                        <li>InfoQ - Netflix Details Its In-House LLM Serving Platform with Triton and vLLM (2026年7月27日，二手整理): <a href="https://www.infoq.com/news/2026/07/netflix-llm-platform/" target="_blank" rel="noopener">infoq.com</a></li>
+                        <li>延伸阅读: <a href="ai_token_cost_finops_2026.html">以组织为单位管控AI token成本</a>、<a href="ai_vendor_lockin_exit_strategy_2026.html">AI厂商锁定与退出策略</a>、<a href="weave_router_llm_2026.html">模型路由抛出的问题</a>、<a href="omniroute_ai_gateway_2026.html">用AI网关整合服务商</a></li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>分享本文</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">返回列表</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/json_formatter.html">JSON 格式化工具</a></li>
+      <li><a href="../static/regex_tester.html">正则表达式测试器</a></li>
+      <li><a href="../static/jwt_decoder.html">JWT解码生成器 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 编码器/解码器</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="self_hosting_tld_2026.html">.self TLD — 为自托管设计的新顶级域名分析 2026</a></li>
+      <li><a href="homelab_ai_dev_platform_2026.html">用家庭实验室搭建AI开发平台 - 技术栈、硬件、成本实务分析 2026</a></li>
+      <li><a href="murrdb_ml_cache_redis_alternative_2026.html">murrdb - 替代 Redis 的 ML/AI 工作负载亚毫秒缓存 2026</a></li>
+      <li><a href="thorvg_vector_animation_2026.html">网页动画格式怎么选 - ThorVG 1.1 与 Lottie、SVG、GIF 的判断标准</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制！请粘贴到Threads应用中分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制！'); });
+    });
+    </script>
+</body>
+</html>

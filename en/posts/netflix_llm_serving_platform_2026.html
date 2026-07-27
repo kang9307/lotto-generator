@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="en">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Deciding to Serve LLMs Yourself - A Checklist Before You Build the Platform 2026</title>
+    <meta name="description" content="Netflix published how it serves LLMs in-house. Here is the decision list that follows: engine choice, GPU sizing, batching design, metrics and failure modes.">
+    <meta name="keywords" content="LLM serving, self-hosting LLM, vLLM, Triton Inference Server, KV cache, continuous batching, GPU capacity planning, TTFT, TPOT, goodput, ML platform integration, Netflix tech blog, structured output, logits processor, model deployment strategy">
+
+    <link rel="canonical" href="https://braindetox.kr/en/posts/netflix_llm_serving_platform_2026.html">
+
+    <meta property="og:title" content="Deciding to Serve LLMs Yourself - A Checklist Before You Build the Platform">
+    <meta property="og:description" content="What you actually have to decide when you put LLMs on top of an existing ML platform: engines, GPU sizing, batching, observability and failure handling.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/en/posts/netflix_llm_serving_platform_2026.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="en_US">
+    <meta property="article:published_time" content="2026-07-28">
+    <meta property="article:section" content="Dev & Infra">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Deciding to Serve LLMs Yourself - A Practical Checklist">
+    <meta name="twitter:description" content="Engine choice, GPU sizing, batching design, observability and failure handling for in-house LLM serving.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "Deciding to Serve LLMs Yourself - A Checklist Before You Build the Platform",
+      "alternativeHeadline": "In-House LLM Serving - What You Actually Have to Decide",
+      "datePublished": "2026-07-28",
+      "dateModified": "2026-07-28",
+      "inLanguage": "en-US",
+      "articleSection": "Dev & Infra",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "LLM serving, self-hosting, vLLM, Triton, KV cache, continuous batching, GPU capacity planning, TTFT, TPOT, ML platform integration",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/en/posts/netflix_llm_serving_platform_2026.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "When is in-house LLM serving worth considering?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Several conditions come before cost. Serving in-house starts to make sense when regulation or contracts prevent data from leaving your boundary, when you have to operate a fine-tuned model, when you need to intervene inside the decode loop to enforce an output format, or when traffic is steady and predictable enough to keep GPUs busy. It becomes much weaker when traffic is spiky with a large peak-to-average ratio, when you need the quality of the newest frontier models, or when nobody on the team can own engine versions and kernel-level issues day to day. Cost modelling belongs after those conditions are satisfied, not before."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How do you size GPU memory for LLM serving?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Count weights and KV cache separately. Weights are parameter count multiplied by bytes per element. KV cache per token is 2 (key and value) times the number of layers times the number of KV heads times head dimension times bytes per element. With 32 layers, 8 KV heads, a head dimension of 128 and 16-bit floats, that is 131,072 bytes, or roughly 128 KiB per token. Multiply by your target context length to get the footprint of one sequence, then divide the memory left after weights and framework overhead by that number to get your concurrency ceiling. The head count must be the KV head count, not the attention head count, because most recent models use grouped-query attention."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How does LLM serving differ from traditional ML serving?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Every difference starts from one property: the output length is unknown when the request arrives. Traditional ML finishes in a single forward pass and uses close to constant memory per request. An LLM repeats a forward pass once per output token and accumulates a KV cache for every live request. Static batching therefore stops working and is replaced by continuous batching that admits and retires requests at each decoding step. Latency also splits into time to first token and the interval between output tokens. Capacity is no longer requests per second but the product of concurrent sequences and context length."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "What breaks first when you add LLMs to an existing ML platform?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "The interface contract usually breaks first. Existing platforms assume fixed tensors in and out, while LLMs need streaming, variable length and cancellation. Artifact distribution comes next, because pulling tens of gigabytes of weights from object storage on every cold start exceeds what schedulers tolerate. Observability is third: the inference engine and the model server each publish their own metrics, so without a merging layer your existing dashboards stop working. Autoscaling signals are fourth, since requests per second reacts too slowly and you need queue depth and KV cache utilisation instead."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Which metrics should you watch when running LLM serving yourself?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Split latency into time to first token and time per output token. End-to-end latency alone mixes requests of very different output lengths, so bucket it by length before reading any percentile. On the capacity side, track output tokens per second per instance, KV cache utilisation, waiting queue depth and preemption count together. GPU utilisation on its own is misleading, because the decode phase is bound by memory bandwidth and compute occupancy can look high while headroom remains. For a service view, goodput, meaning completed requests per second that also met the latency target, describes real capability better than raw throughput."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.88em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; font-size:0.95rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/netflix_llm_serving_platform_2026.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/netflix_llm_serving_platform_2026.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/netflix_llm_serving_platform_2026.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/netflix_llm_serving_platform_2026.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/netflix_llm_serving_platform_2026.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="Deciding to Serve LLMs Yourself - A Checklist Before You Build the Platform">
+                <meta itemprop="datePublished" content="2026-07-28">
+                <meta itemprop="dateModified" content="2026-07-28">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="LLM serving, self-hosting, vLLM, Triton, KV cache, continuous batching, GPU capacity planning, ML platform integration">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/en/posts/netflix_llm_serving_platform_2026.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">Deciding to Serve LLMs Yourself - A Checklist Before You Build the Platform</h1>
+                    <h2 class="post-subtitle">Engine choice, GPU sizing, batching design and ML platform integration, read through the in-house serving setup Netflix made public</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-07-28">Jul 28, 2026</span>
+                        <span class="post-category" itemprop="articleSection">Dev &amp; Infra</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <div class="callout">
+                        <strong>Scope of this article</strong> — This is general information assembled from public technical documentation and papers. It does not recommend adopting any particular vendor or open-source project. Serving performance varies widely with model, hardware and request distribution, so none of the configurations described here guarantees any particular result. Base your own decision on measurements taken with your own workload.
+                    </div>
+
+                    <h2>Introduction: the moment someone says we should just run it ourselves</h2>
+                    <p>Teams that started on hosted APIs usually arrive at the self-hosting question through one of three doors. A data boundary turns out to be stricter than anyone assumed. A fine-tuned model has to reach production and the hosted path does not give the shape you need. Or the monthly invoice crosses a line and finance starts asking questions. Whichever door it is, the sentence in the room sounds the same. <strong>Open-weight models have gotten good, so why not run one ourselves?</strong></p>
+                    <p>The question is healthy. What follows it usually is not. The discussion drifts into comparing GPU quotes and benchmark scores, while the items that actually consume time in production never make the evaluation sheet at all. Things like which engine and server versions are safe together, how model artifacts get onto a node, what happens to consumer code when a model is replaced, and whether existing dashboards still work when metrics arrive from two separate places.</p>
+                    <p>On 17 July 2026 the Netflix technology blog published a description of its in-house LLM serving platform, written jointly by the Model Runtime and Inference teams within the AI Platform organisation. What makes it worth reading is not the architecture diagram but the <strong>list of things that went wrong</strong>. It records which parameter was silently dropped, which version pairing prevented a backend from loading at all, and where latency ended up bound to the CPU.</p>
+                    <p>This article is not a summary of that post. Most of the problems Netflix hit are <strong>structural</strong>, which means a far smaller team attempting the same thing will meet them too. So the goal here is to convert that list into a decision checklist for anyone evaluating in-house LLM serving. How to control spend is covered separately in <a href="ai_token_cost_finops_2026.html">governing token cost at the org level</a>, and how to move between vendors in <a href="ai_vendor_lockin_exit_strategy_2026.html">vendor lock-in and exit strategy</a>. What follows deals only with <strong>the infrastructure problems on the side where you run the model yourself</strong>.</p>
+
+                    <h2>1. What Netflix actually built, and what the structure tells you</h2>
+                    <p>The published architecture has three layers. At the front sits a JVM-based serving layer that handles routing, feature retrieval, candidate generation, post-processing and logging. Behind it is a shared inference backend called the <strong>Model Scoring Service (MSS)</strong>, and underneath that the NVIDIA Triton Inference Server takes care of model loading, batching and GPU scheduling. Small CPU models run in-process inside the serving layer; larger models are delegated to MSS over a remote call.</p>
+                    <p>The most consequential decision here is not a technology pick but a <strong>placement</strong>. Netflix did not stand up a separate LLM stack. In the words of the original post, they run the full stack themselves inside their existing production environment rather than in a separate ML silo. MSS supports XGBoost, TensorFlow, PyTorch and LLMs behind one interface, and every model is scored through the same gRPC call. The Java control plane that already handled deployment, versioning, health checking, autoscaling and multi-region rollout was reused as-is.</p>
+                    <ul>
+                        <li><strong>The goal was not to build an LLM platform.</strong> The goal was to add LLMs as one more model type inside an existing model serving system.</li>
+                        <li><strong>There are two frontends.</strong> gRPC for the existing serving layer and an OpenAI-compatible HTTP surface for newer applications, both exposed from the same instance.</li>
+                        <li><strong>OpenAI compatibility exists for the migration path, not for convenience.</strong> It minimises code changes when a team graduates from a hosted model to a fine-tuned self-hosted one.</li>
+                        <li><strong>Artifact storage was designed separately.</strong> Instead of pulling large weights from object storage each time, models are materialised onto a high-performance file system at announcement time.</li>
+                        <li><strong>Metrics are merged before they leave the box.</strong> A dedicated proxy combines what the inference engine and the model server each publish into a single endpoint.</li>
+                    </ul>
+                    <p>Invert those five lines and you have the first five entries on any self-hosting evaluation sheet. Where does it attach, what API surface do you expose, how do teams migrate onto it, how do weights reach the node, and where do metrics get merged.</p>
+
+                    <h2>2. Where LLM serving diverges from traditional ML serving</h2>
+                    <p>Teams that already operate an ML platform are the most likely to underestimate this part, because it looks like adding one more model. The divergence runs deeper than it appears, and nearly all of it follows from a single property: <strong>you do not know the output length when the request arrives</strong>.</p>
+                    <table>
+                        <thead><tr><th>Axis</th><th>Traditional ML (trees, small networks)</th><th>LLM</th></tr></thead>
+                        <tbody>
+                            <tr><td>Output length</td><td>Fixed by the schema</td><td>Variable, known only once generation ends</td></tr>
+                            <tr><td>Compute per request</td><td>One forward pass</td><td>One forward pass per output token</td></tr>
+                            <tr><td>Memory profile</td><td>Mostly weights, near constant per request</td><td>Weights plus a KV cache that accumulates per request</td></tr>
+                            <tr><td>Batching</td><td>Group requests and run them together</td><td>Continuous batching that admits and retires each step</td></tr>
+                            <tr><td>Main bottleneck</td><td>Generally compute</td><td>Prefill is compute-bound, decode is memory-bandwidth-bound</td></tr>
+                            <tr><td>Latency definition</td><td>A single response time</td><td>Split into first token and inter-token interval</td></tr>
+                            <tr><td>Capacity limit</td><td>Requests per second</td><td>Concurrent sequences multiplied by context length</td></tr>
+                            <tr><td>Saturation symptom</td><td>Queueing and timeouts</td><td>In-flight requests rolled back when KV cache runs short</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h3>2.1 Prefill and decode are two different jobs</h3>
+                    <p>Each request runs in two phases. <strong>Prefill</strong> reads the whole input at once and builds internal state; <strong>decode</strong> emits tokens one at a time. Prefill parallelises across input tokens, so the compute units stay busy. Decode has to re-read the model weights to produce a single token, so it is bound by memory bandwidth. The fact that the two phases bottleneck on different resources shapes the entire batching design.</p>
+
+                    <h3>2.2 KV cache is the centre of capacity planning</h3>
+                    <p>The KV cache stores keys and values from earlier tokens so decode does not recompute them. It grows <strong>per request and linearly with token count</strong>, a property traditional ML simply does not have. Memory is decided by the total number of live tokens rather than the number of requests, so the familiar requests-per-second capacity metric does not translate directly.</p>
+                    <p>PagedAttention proposed treating this the way an operating system treats virtual memory: split the cache into blocks, place them in non-contiguous physical space to reduce fragmentation, and allow sharing within and across requests. The original paper set out <strong>near-zero waste in KV cache memory</strong> as the target and reported throughput improvements of two to four times over the state-of-the-art systems of the time at comparable latency, with larger gains for longer sequences, larger models and more complex decoding.</p>
+
+                    <h3>2.3 Continuous batching changes what batch size means</h3>
+                    <p>Static batching groups several requests, runs them together, and leaves the remaining slots idle until the slowest one finishes. With wildly varying output lengths that waste is large. Continuous batching moves the scheduling unit down from the batch to the <strong>decoding step</strong>, retiring finished requests immediately and admitting waiting ones into the freed slots. As a result a fixed value such as batch size 32 loses its meaning, and two different knobs appear instead: the token budget per step and the ceiling on concurrent sequences.</p>
+
+                    <h2>3. Engine choice is settled by operational fit, not by a benchmark table</h2>
+                    <p>Netflix started on a compilation-based engine, then re-benchmarked in the summer of 2025 after the workload mix broadened and settled on vLLM as the <strong>paved-path engine</strong>. The post lists four reasons for that choice, and the notable thing is that <strong>none of them is a performance claim</strong>.</p>
+                    <ol>
+                        <li><strong>Custom architectures load without a multi-step compilation pipeline</strong>, which speeds up iteration on non-standard models.</li>
+                        <li><strong>There are extensibility hooks for custom decoding logic</strong>, which the constrained-decoding work described later required.</li>
+                        <li><strong>Failures and intermediate state are easier to inspect</strong> than with the compiled engine of that period.</li>
+                        <li><strong>Research teams were already using it</strong>, which cut the cost of handing work from research into production.</li>
+                    </ol>
+                    <p>The post judged that the raw performance gap had already narrowed by 2025. In other words the decision was made on <strong>which engine fits the way this organisation works, rather than which engine is faster</strong>. The point is not to recommend a particular tool, but to note where the deciding axis actually sat.</p>
+                    <table>
+                        <thead><tr><th>Approach</th><th>Character</th><th>Where it shines</th><th>What it costs</th></tr></thead>
+                        <tbody>
+                            <tr><td>Compilation-based</td><td>Model is built ahead of time into a hardware-specific engine</td><td>Model and hardware are fixed and stay that way for a long time</td><td>A build step enters the release path and internal state is harder to observe</td></tr>
+                            <tr><td>Runtime-based</td><td>Weights are loaded as they are and scheduled at runtime</td><td>Models change often and decoding needs customisation</td><td>A scripting layer stays on the hot path and can become a bottleneck</td></tr>
+                            <tr><td>Model server</td><td>Hosts multiple backends and manages loading, versioning and batching</td><td>Several model types have to live in one server</td><td>Version coupling appears between the server and its backends</td></tr>
+                        </tbody>
+                    </table>
+                    <p>Using this table in practice is simple. Answer the four questions below and pick whichever side the answers cluster on.</p>
+                    <ul>
+                        <li>How often does the model change? If it is once a quarter, a build step is affordable.</li>
+                        <li>Do you need to intervene in decoding? Enforcing an output format requires an extension point.</li>
+                        <li>Who gets paged at three in the morning? That person has to be able to open the stack up.</li>
+                        <li>What are the research and analytics teams already using? Handover cost is larger than it looks.</li>
+                    </ul>
+
+                    <h2>4. Conditions that favour in-house serving, and conditions that rule it out</h2>
+                    <p>The common mistake is to start from cost. Cost is the <strong>last</strong> condition. If the ones before it do not hold, no amount of modelling makes that number real. The preconditions behind the Netflix case are visible in the post itself: a shared inference backend and a Java control plane already existed, and there were engineers able to reimplement a constrained-decoding hot path in C++.</p>
+                    <table>
+                        <thead><tr><th>Axis</th><th>Tilts toward in-house serving</th><th>Tilts toward a hosted API</th></tr></thead>
+                        <tbody>
+                            <tr><td>Data boundary</td><td>Regulation or contract forbids outbound transfer</td><td>No transfer restriction, or one solvable by contract</td></tr>
+                            <tr><td>Model</td><td>You operate fine-tuned or domain-adapted models</td><td>You need the newest frontier model quality</td></tr>
+                            <tr><td>Traffic shape</td><td>Steady and predictable, with flow even overnight</td><td>Spiky, with a large peak-to-average ratio</td></tr>
+                            <tr><td>Output control</td><td>You must intervene inside the decode loop</td><td>Prompting and post-processing are sufficient</td></tr>
+                            <tr><td>Organisation</td><td>GPU operations and MLOps staff already exist</td><td>No dedicated staff, or the role is a side duty</td></tr>
+                            <tr><td>Change cadence</td><td>You keep one model pinned for a long time</td><td>You switch as soon as something better ships</td></tr>
+                            <tr><td>Latency requirement</td><td>You need to control the latency floor yourself</td><td>A vendor SLA is good enough</td></tr>
+                            <tr><td>Scale</td><td>Large enough to keep one instance consistently busy</td><td>Not even one instance would be filled</td></tr>
+                        </tbody>
+                    </table>
+                    <p>Read the table and one thing becomes clear: a single strong hit in the right-hand column weakens the case for in-house serving sharply. <strong>Traffic shape</strong> in particular inverts the whole cost calculation. GPUs bill whether or not they are busy, so instances provisioned to survive the peak sit idle the rest of the time and drive up cost per token by exactly that margin. That item returns in the break-even section below.</p>
+
+                    <h2>5. GPU sizing: count weights and KV cache separately</h2>
+                    <p>Answering how many gigabytes a model needs with the parameter count alone is only half right. The requirement splits into three parts.</p>
+                    <ul>
+                        <li><strong>Weights</strong> — parameter count multiplied by bytes per element; two bytes per parameter for 16-bit floats. Tensor parallelism divides this across cards.</li>
+                        <li><strong>KV cache</strong> — proportional to the number of live tokens. In practice this is what determines concurrency.</li>
+                        <li><strong>Activations and framework overhead</strong> — intermediate tensors, communication buffers and whatever the runtime holds. Hard to predict precisely, so leave it as headroom.</li>
+                    </ul>
+
+                    <h3>5.1 Start from bytes of KV cache per token</h3>
+                    <p>The formula is plain arithmetic. Two sets of vectors, keys and values, stored for every layer, for every KV head, at the head dimension.</p>
+                    <pre><code>KV bytes per token
+  = 2 (key and value)
+  x layers (num_hidden_layers)
+  x KV heads (num_key_value_heads)
+  x head dimension (head_dim)
+  x bytes per element (bf16 = 2)
+
+Example) 32 layers, 8 KV heads, head dim 128, bf16
+  = 2 x 32 x 8 x 128 x 2
+  = 131,072 bytes = 128 KiB per token
+
+One sequence x 8,000 tokens  ->  about 1.0 GiB
+20 concurrent sequences      ->  about 20 GiB</code></pre>
+                    <p>One mistake shows up here again and again. <strong>The head count must be the KV head count, not the attention head count.</strong> Most recent models use grouped-query attention, so the KV head count is far smaller than the attention head count. Substituting 32 attention heads in the example above would overestimate the requirement fourfold. Read the values from the model configuration file rather than assuming them.</p>
+
+                    <h3>5.2 The sizing sequence</h3>
+                    <ol>
+                        <li>Subtract the <strong>weights</strong> from total card memory.</li>
+                        <li>Decide how much the runtime pre-allocates. vLLM reserves GPU cache according to <code>gpu_memory_utilization</code>, and raising it enlarges KV space and reduces preemption.</li>
+                        <li>Divide whatever is left for KV by <strong>bytes per token multiplied by target context length</strong>. That is your concurrency ceiling.</li>
+                        <li>Derive a rough throughput ceiling from concurrency and average handling time. This figure is <strong>an estimate and must be replaced by measurement</strong>.</li>
+                        <li>Divide peak traffic by that ceiling to get instance count, then add redundancy and the deployment overlap share.</li>
+                    </ol>
+                    <ul>
+                        <li>Doubling the context ceiling doubles KV per sequence and roughly halves concurrency on the same card. <strong>Context is not free.</strong></li>
+                        <li>A well-matched prefix cache reduces actual usage below the calculation, but planning to the worst case is safer.</li>
+                        <li>Quantisation shrinks weights; it does not automatically shrink the KV cache. KV quantisation is a separate setting whose quality impact must be measured on its own.</li>
+                        <li>Development and staging GPUs are frequently omitted. Counting production only leaves the model out of step with the real invoice.</li>
+                    </ul>
+
+                    <h2>6. What you actually have to decide in batching and queueing</h2>
+                    <p>Continuous batching reduces tuning to a handful of knobs. The catch is that those knobs <strong>pull against each other</strong>. So the exercise is not finding an optimum but deciding in advance which metric you are willing to sacrifice.</p>
+                    <table>
+                        <thead><tr><th>Decision</th><th>What it governs</th><th>Raising it</th><th>Lowering it</th></tr></thead>
+                        <tbody>
+                            <tr><td>Token budget per step</td><td>Total prefill and decode tokens processed in one step</td><td>Improves time to first token</td><td>Stabilises the interval between tokens</td></tr>
+                            <tr><td>Concurrent sequence ceiling</td><td>How many ways the KV pool is divided</td><td>Raises throughput and rollback risk together</td><td>Reduces rollback, may leave the GPU idle</td></tr>
+                            <tr><td>Maximum context length</td><td>The ceiling one sequence may occupy</td><td>Accommodates long inputs</td><td>Preserves concurrency</td></tr>
+                            <tr><td>Memory pre-allocation ratio</td><td>Overall KV pool size</td><td>Reduces rollback</td><td>Leaves more headroom against out-of-memory</td></tr>
+                            <tr><td>Rollback behaviour</td><td>Whether to recompute or swap</td><td colspan="2">Environment dependent; recent implementations default to recompute</td></tr>
+                            <tr><td>Queue wait ceiling</td><td>When to reject a request</td><td>Fewer rejections, longer tail latency</td><td>Shorter tail latency, more rejections</td></tr>
+                            <tr><td>Priority separation</td><td>How interactive and batch work are split</td><td colspan="2">Mixing them in one pool lets batch work push interactive latency up</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h3>6.1 Why chunked prefill became the default</h3>
+                    <p>When one long prompt arrives, its prefill can occupy an entire step, and requests already streaming answers stall for that duration. To a user it looks like <strong>text appearing and then abruptly stopping</strong>. Chunked prefill splits a long prefill across multiple steps to soften that. The vLLM documentation states that it improves inter-token latency and decode, and that it also raises GPU utilisation by placing compute-bound prefill and memory-bound decode in the same batch. In the newer architecture it is enabled by default wherever possible.</p>
+                    <p>The tuning direction is documented too. A <strong>smaller token budget per step, such as 2048, gives better inter-token latency, while a larger one gives better time to first token.</strong> For maximum throughput the guidance is to go above 8192, especially for smaller models on large GPUs. No single value satisfies all three goals, so deciding whether the service is interactive or batch comes first.</p>
+
+                    <h3>6.2 When rollback warnings start appearing</h3>
+                    <p>When memory runs short the engine reclaims the KV cache of an in-flight request and reschedules it later. Frequent rollback means the same tokens get computed twice, degrading both throughput and tail latency. The order of response suggested by the vLLM documentation is as follows.</p>
+                    <ol>
+                        <li>Raise the memory pre-allocation ratio to widen KV space.</li>
+                        <li>Lower the concurrent sequence ceiling so fewer requests are live at once.</li>
+                        <li>Increase the tensor parallel size.</li>
+                        <li>Increase the pipeline parallel size.</li>
+                    </ol>
+
+                    <h3>6.3 What queueing designs usually forget</h3>
+                    <ul>
+                        <li><strong>Without admission control there is no bound on tail latency.</strong> An unbounded queue delivers an answer eventually, long after the user has left. Rejecting past a wait threshold is the better outcome.</li>
+                        <li><strong>Rejection is a design choice, not a failure.</strong> Decide what a client does on a 429 as well: fall back to another model, return a shortened answer, or retry later.</li>
+                        <li><strong>Define the SLO in terms of first token and inter-token interval.</strong> A single end-to-end target gives you no basis for choosing which way to turn a parameter.</li>
+                        <li><strong>Retry policy amplifies load.</strong> Automatic retries stacking up during saturation make the queue longer. Pair backoff with a retry budget.</li>
+                        <li><strong>The server must notice when a streaming client goes away.</strong> Emitting tokens after the user closed the window is pure waste.</li>
+                    </ul>
+
+                    <h2>7. Packaging and deployment: what breaks when the interface changes</h2>
+                    <p>This is the section practitioners will get the most from. There are two ways to package the same model, and <strong>the difference between them is coupling rather than performance</strong>.</p>
+                    <ul>
+                        <li><strong>Scripted backend</strong> — input and output tensor specifications are declared at packaging time and frozen into the artifact. When a frontend upgrade touches those specifications, the packaging code has to change with it, and requests fail at runtime if it does not.</li>
+                        <li><strong>Engine backend</strong> — the artifact is a configuration file pointing at weights and tokeniser, and the specification is generated dynamically at deployment. Models and frontend can evolve independently, which is why it became the recommended default.</li>
+                    </ul>
+                    <p>The second approach carries its own price: <strong>version coupling</strong> between server and engine. The post gives a concrete example in which a particular server release tried to import a module the engine had already removed, and the backend failed to come up at all. Netflix therefore pins jointly validated combinations together. Models needing custom pre-processing, post-processing, ensemble pipelines or non-standard tokenisation still fall back to the scripted backend, and the post says that escape hatch will likely remain necessary for a subset of models.</p>
+
+                    <h3>7.1 Two deployment strategies and their GPU cost</h3>
+                    <table>
+                        <thead><tr><th>Strategy</th><th>Behaviour</th><th>Suits</th><th>Weakness</th></tr></thead>
+                        <tbody>
+                            <tr><td>Red-black</td><td>New version comes up alongside, traffic shifts in phases after health checks pass, rollback is atomic</td><td>Stable model interfaces</td><td>A schema change causes mismatches mid-migration</td></tr>
+                            <tr><td>Versioned</td><td>Independent deployment per model and version pair, several versions serve at once</td><td>Unavoidable breaking interface changes</td><td>GPU cost rises temporarily during the overlap</td></tr>
+                        </tbody>
+                    </table>
+                    <p>The recommendation in the post is explicit: embed variable configuration such as tensor shapes into the model so the interface becomes <strong>version-agnostic</strong>, and use the cheaper red-black path. Reserve versioned deployment for the rare unavoidable breaking change. Translated into operational language, that means the following.</p>
+                    <ul>
+                        <li>Deploying an LLM is not swapping a container image. Plan capacity around the fact that <strong>GPUs are needed at roughly double for the length of the transition</strong>.</li>
+                        <li>Without version negotiation in the model interface, replacing a model becomes coupled to deploying consumer code. Breaking that coupling is the purpose of a deployment strategy.</li>
+                        <li>Build the rollback path first. You will need the way back more often than the way forward.</li>
+                        <li>Keep a list of validated engine and server combinations. Without it every upgrade is a gamble.</li>
+                    </ul>
+
+                    <h2>8. Six friction points when layering onto an existing ML platform</h2>
+                    <p>These are the collisions that teams with an existing serving stack actually run into. Netflix documented how it handled each, which makes them easy to compare against.</p>
+                    <ol>
+                        <li><strong>Interface contract</strong> — existing platforms assume tensors in, tensors out. LLMs need streaming, variable length and mid-flight cancellation. Rather than unifying them, Netflix ran <strong>two frontends on the same instance</strong>, gRPC and OpenAI-compatible HTTP, so existing consumers stayed put while new ones used the new surface.</li>
+                        <li><strong>Artifact distribution</strong> — existing models load in seconds; LLM weights run to tens of gigabytes. The post notes that downloading directly from object storage or a model hub at startup inflates cold start past what schedulers tolerate, and describes <strong>materialising models onto a high-performance file system at announcement time</strong> instead.</li>
+                        <li><strong>Autoscaling signals</strong> — rules built on requests per second and CPU utilisation react too late for LLMs, because a single request stays alive for a long time. Queue depth, KV cache utilisation and waiting time are the signals that work.</li>
+                        <li><strong>Observability</strong> — the inference engine and the model server are unaware of each other. According to the post the server bridge surfaced <strong>only 9 of more than 40</strong> engine metrics, leaving out exactly the ones that matter, such as token throughput, KV cache utilisation and prefix cache hit rate. Netflix built a lightweight proxy that reads both sources and merges them into one metrics endpoint, so existing dashboards and alerts kept working unmodified.</li>
+                        <li><strong>Silent gaps in the API contract</strong> — the most practically useful warning in the whole post. The OpenAI-compatible frontend <strong>silently dropped</strong> the structured-output field before it reached the engine. Nothing errored, which is why it took a while to notice. Netflix pulled that frontend in and patched it to translate the field into the engine guided-decoding parameters. The lesson is blunt: <strong>OpenAI-compatible is not a guarantee of specification compliance.</strong> Every field you rely on needs a contract test.</li>
+                        <li><strong>Deployment pipeline and node pools</strong> — GPU node pool separation, image size, driver versions and warm-up on node restart all violate assumptions baked into an existing CI/CD setup. Large images in particular lengthen deployments, which feeds back into the strategy choice above.</li>
+                    </ol>
+
+                    <h2>9. What happens when you enforce structured output</h2>
+                    <p>Many services cannot use raw LLM output and need a fixed format. The common approach is to validate after generation and retry on mismatch, which means <strong>paying for the invalid generation first and repairing afterwards</strong>. Netflix pushed the constraint inside the decode loop instead. Because different requests carry different rules, each request gets its own configured processor.</p>
+
+                    <h3>9.1 Why latency ended up bound to the CPU rather than the GPU</h3>
+                    <p>The early implementation exposed a problem: the logits processor ran <strong>per request</strong>. The GPU produced logits for the whole batch, the CPU copied them over, and constraint logic then ran sequentially for each request. Python global interpreter lock semantics prevented that work from parallelising, so CPU time grew linearly with batch size. The post describes the situation precisely: the forward pass batches efficiently on the GPU while <strong>end-to-end latency becomes CPU-bound and tail latencies spike</strong>.</p>
+                    <p>The structural fix arrived with the newer engine generation, which moved logits processing to batch level. Netflix rewrote the processor around batch-level data structures and reimplemented the hot path in C++ with multi-threading to step around the lock, after which <strong>logits processing time stayed flat as batch size grew</strong>. The price is API complexity: batch membership changes have to be tracked explicitly, which is harder to work with than the earlier per-request interface.</p>
+
+                    <h3>9.2 Two problems that only appeared in production</h3>
+                    <p>Two issues invisible in benchmarks surfaced under real concurrency. Both are cases of <strong>a state machine having its assumptions broken</strong>.</p>
+                    <pre><code>[Problem 1] Partial prefill
+  With chunked prefill, one request may be prefilled across several steps.
+  The batch update information alone cannot distinguish a full prefill
+  from a partial one.
+  -> Add internal tracking of progress state
+
+[Problem 2] State reset caused by rollback
+  Under memory pressure the engine evicts the KV cache of an in-flight
+  request and reschedules it later with a different prompt and output
+  token list. The state machine had assumed the output token list only
+  ever grows.
+  -> Detect the token history shrinking between steps, reset the state
+     machine and reinitialise from the new prompt</code></pre>
+
+                    <h3>9.3 Most organisations do not need to go this far</h3>
+                    <p>Copying this section wholesale would be a poor decision. Work that reaches down to kernel level is justified <strong>only when the cost of an invalid generation exceeds the cost of a retry</strong>. Three criteria settle it.</p>
+                    <ul>
+                        <li><strong>Current valid output rate</strong> — what percentage passes with prompting and a schema declaration alone. A high number leaves little room to improve.</li>
+                        <li><strong>Cost of a retry</strong> — the money and latency of running one failed case again. Short outputs make retries cheap.</li>
+                        <li><strong>Latency budget</strong> — whether a retry still fits inside the SLO. For interactive traffic one retry can consume the whole budget.</li>
+                    </ul>
+                    <p>Only when all three land on the unfavourable side does decode-time intervention pay. Otherwise the ordinary combination of prompt design, schema declaration and retry-on-failure is easier to maintain. Whichever path you take, though, a <strong>test verifying that structured-output parameters actually reach the engine</strong> is mandatory. The silent-drop case described earlier occurred at exactly that seam.</p>
+
+                    <h2>10. Operating metrics: what you should be watching</h2>
+                    <p>Wiring up a single p95 response time out of web-service habit tells you almost nothing about LLM serving, because varying output lengths blend the distribution. At minimum the following need to be watched separately.</p>
+                    <table>
+                        <thead><tr><th>Metric</th><th>Definition</th><th>What it tells you</th><th>How to set a target</th></tr></thead>
+                        <tbody>
+                            <tr><td>Time to first token</td><td>Arrival to the first output token</td><td>Queue wait plus prefill</td><td>Perceptual threshold for interactive traffic, unmanaged for batch</td></tr>
+                            <tr><td>Time per output token</td><td>Average interval between output tokens</td><td>Health of the decode phase</td><td>Beyond reading speed the perceived difference is small</td></tr>
+                            <tr><td>End-to-end latency</td><td>Arrival to completion</td><td>Overall experience</td><td>Bucket it by output length before reading it</td></tr>
+                            <tr><td>Output tokens per second per instance</td><td>Tokens generated per second</td><td>Real capacity</td><td>Varies with batch size, so record the load level alongside</td></tr>
+                            <tr><td>KV cache utilisation</td><td>Share of the allocated KV pool in use</td><td>Whether rollback is imminent</td><td>Sustained highs mean lower concurrency or more cards</td></tr>
+                            <tr><td>Prefix cache hit rate</td><td>Proportion of prefill reused</td><td>Effectiveness of prompt design</td><td>Drops sharply when volatile values enter the system prompt</td></tr>
+                            <tr><td>Waiting queue depth</td><td>Requests not yet scheduled</td><td>Whether you are saturated</td><td>Works well as an autoscaling signal</td></tr>
+                            <tr><td>Preemption count</td><td>Requests rolled back by KV reclamation</td><td>Memory pressure</td><td>Aim to keep it close to zero</td></tr>
+                            <tr><td>GPU utilisation</td><td>Compute unit occupancy</td><td>Misleading on its own</td><td>Read alongside others, since decode is bandwidth-bound</td></tr>
+                            <tr><td>Goodput</td><td>Completed requests per second that met the latency target</td><td>Real capability from a service viewpoint</td><td>Define capacity with this instead of throughput</td></tr>
+                        </tbody>
+                    </table>
+                    <ul>
+                        <li><strong>Watch goodput rather than throughput.</strong> Larger batches raise throughput while increasing the number of responses that missed the target. Counting only those that met it is closer to real service capability.</li>
+                        <li><strong>Bucket by length.</strong> Putting short and long responses in one histogram makes the p95 uninterpretable.</li>
+                        <li><strong>Metrics come from both engine and server.</strong> Without a merging layer your existing observability assets cannot be reused, which is the core of the Netflix example.</li>
+                        <li><strong>Record token accounting from day one.</strong> Without per-request input and output token counts in the logs, you cannot reconstruct unit cost later.</li>
+                    </ul>
+
+                    <h2>11. Failure scenarios and the first thing to check</h2>
+                    <p>These are the situations you meet once operations begin. Knowing the likely causes in advance cuts response time considerably.</p>
+                    <table>
+                        <thead><tr><th>Symptom</th><th>Common cause</th><th>First check</th><th>Prevention</th></tr></thead>
+                        <tbody>
+                            <tr><td>Deployment never comes up</td><td>Server and engine version pairing mismatch</td><td>Module import errors in startup logs, roll back to the previous pairing</td><td>Pin validated combinations together</td></tr>
+                            <tr><td>Averages look fine but tail latency spikes</td><td>A CPU stage running sequentially per request</td><td>CPU processing time plotted against batch size</td><td>Move to batch-level processing, isolate the hot path</td></tr>
+                            <tr><td>Fine at first, then gradually slower</td><td>Repeated rollback under KV pressure</td><td>Preemption counter and KV utilisation trend</td><td>Lower the concurrency ceiling, revisit the context ceiling</td></tr>
+                            <tr><td>New nodes fail health checks</td><td>Cold start caused by weight download</td><td>Time spent in each startup phase, artifact path</td><td>Use a warm cache or a dedicated file system</td></tr>
+                            <tr><td>Output format is wrong</td><td>Structured-output parameter lost in an intermediate layer</td><td>Whether the parameter actually reached the engine logs</td><td>Add field-level contract tests to the regression suite</td></tr>
+                            <tr><td>Only certain requests run out of memory</td><td>One long context monopolising the KV pool</td><td>Input length distribution and maximum context setting</td><td>Document an input length cap and rejection policy</td></tr>
+                            <tr><td>Some consumers fail after a model swap</td><td>Input or output schema change</td><td>Changed fields compared against consumer versions</td><td>Versioned deployment or a version-agnostic interface</td></tr>
+                            <tr><td>GPUs run short during deployment</td><td>Double capacity needed during the overlap</td><td>Overlap duration and reserved capacity</td><td>Secure spare capacity in the deployment window</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2>12. How to compute your own break-even</h2>
+                    <p>Numbers along the lines of self-hosting wins above a certain monthly spend, or a certain daily token count being the crossover, circulate widely. The trouble is that those figures are usually presented <strong>without their assumptions</strong>. If you cannot see which GPU under which contract, what utilisation was assumed, or whether staffing was included, the number does not transfer to another organisation. So this article cites no break-even figure and gives <strong>only the framework</strong>.</p>
+                    <pre><code>[Hosted API side]
+  Monthly = (input tokens x input rate + output tokens x output rate)
+            x monthly requests
+            - prompt cache savings - batch discount
+
+[Self-hosted side]
+  Monthly = GPU hourly rate x instances x 730 hours
+            + storage + network + load balancer
+            + operations staffing (FTE equivalent)
+            + development and staging GPUs
+            + extra capacity during deployment overlap
+
+[Basis for comparison]
+  Cost per token = monthly cost / tokens actually served that month
+  Note: the denominator is the whole game. Half the utilisation
+        means double the cost per token.</code></pre>
+                    <p>Work through it in this order.</p>
+                    <ol>
+                        <li><strong>Plot traffic by hour of day first.</strong> The peak-to-average ratio dominates this calculation.</li>
+                        <li><strong>Measure goodput per instance at your target SLO.</strong> Estimating instead of benchmarking makes everything downstream unstable.</li>
+                        <li>Derive the instance count needed to survive the peak, then add the redundancy share.</li>
+                        <li>Calculate how idle those instances are during average hours to get <strong>effective utilisation</strong>.</li>
+                        <li>Divide total cost by monthly tokens served to get cost per token.</li>
+                        <li>Add the human cost. Managing version pairings, tracking engine issues and merging metrics are standing work, not one-off tasks.</li>
+                    </ol>
+                    <p>The items most often left out of the calculation are worth listing separately.</p>
+                    <ul>
+                        <li>GPUs for development and staging environments. Counting production only leaves you out of step with the invoice.</li>
+                        <li>The overlapping instances that run during a deployment transition.</li>
+                        <li>Model artifact storage and the high-performance file system holding it.</li>
+                        <li>Regional redundancy or standby capacity for failure handling.</li>
+                        <li>GPU hours consumed by benchmarking itself. Tuning is never done once.</li>
+                        <li>Overnight and weekend coverage. In-house serving produces failures you cannot hand to a vendor.</li>
+                    </ul>
+                    <p>Three misconceptions are worth naming as well.</p>
+                    <ul>
+                        <li><strong>Open weights so it is free</strong> — the weights are free, the serving is not. Most of the cost is GPU hours and people hours.</li>
+                        <li><strong>Buy one GPU and you are done</strong> — without redundancy that is a single point of failure. A one-card minimum only holds for experiments.</li>
+                        <li><strong>Half the price of the API</strong> — look for the utilisation assumption behind any such claim. A calculation premised on full utilisation does not survive a real traffic distribution.</li>
+                    </ul>
+                    <p>How to manage the unit price of tokens and attribute spend to teams is beyond this article; that is covered in <a href="ai_token_cost_finops_2026.html">token cost governance</a>, while splitting traffic across several models by situation is covered in <a href="weave_router_llm_2026.html">model routing</a>.</p>
+
+                    <h2>13. Conclusion: write the decision list before you build the platform</h2>
+                    <p>What to take from the Netflix case is not the architecture diagram. That architecture was built on the premise of an existing shared inference backend and a JVM serving layer, and an organisation without those premises copying the picture would be worse off. What transfers is <strong>the list of decisions they actually had to make</strong>.</p>
+                    <ol>
+                        <li>Does the LLM get its own stack, or join the existing model serving system as one more model type?</li>
+                        <li>What API surface do you expose, and do you run the existing interface and a standard-compatible one side by side?</li>
+                        <li>Do you pick the engine on performance, or on iteration speed and debuggability?</li>
+                        <li>Which packaging approach do you take, and will you accept version pinning in exchange for lower coupling?</li>
+                        <li>Red-black or versioned deployment, and where does the GPU cost for it sit in the budget?</li>
+                        <li>How do you divide the KV cache budget, and which do you give up, context ceiling or concurrency?</li>
+                        <li>How do you split the SLO between first token and inter-token interval, and what are the wait ceiling and rejection policy?</li>
+                        <li>Do you enforce structured output inside decode, or absorb it with post-processing and retries?</li>
+                        <li>Where do metrics get merged, and will existing dashboards keep working unchanged?</li>
+                        <li>By what path do weights reach a node, and what is the cold start budget?</li>
+                    </ol>
+                    <p>A suggested starting order. Run a <strong>real benchmark</strong> against your own request distribution to obtain goodput per instance. Define the SLO from that number. Then pilot with one model and one workload, but <strong>build metric merging and the deployment strategy during the pilot</strong>. Deferring those two means coming back to them at scale-out time.</p>
+                    <p>One closing note. None of the configurations described here guarantees any particular performance. Engine version, model architecture, request length distribution and card generation each move the numbers. A published case <strong>tells you what has to be decided; it does not tell you the answer</strong>. The answer only comes from measuring against your own traffic, and putting that measurement system in place is the real first step of serving models yourself.</p>
+
+                    <h2>References</h2>
+                    <ul>
+                        <li>Netflix Technology Blog - In-House LLM Serving at Netflix (17 Jul 2026, Model Runtime and Inference teams within AI Platform). Primary source for architecture, engine rationale, packaging, deployment strategy, constrained decoding and metric merging: <a href="https://netflixtechblog.com/in-house-llm-serving-at-netflix-a5a8e799ea2c" target="_blank" rel="noopener">netflixtechblog.com</a></li>
+                        <li>GeekNews - discussion thread that surfaced this topic: <a href="https://news.hada.io/topic?id=31856" target="_blank" rel="noopener">news.hada.io</a></li>
+                        <li>Kwon et al. - Efficient Memory Management for Large Language Model Serving with PagedAttention (SOSP 2023). Original paper on KV cache fragmentation and throughput gains: <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">arxiv.org/abs/2309.06180</a></li>
+                        <li>vLLM documentation - Optimization and Tuning. Memory pre-allocation, token budget per step, chunked prefill and the preemption response order: <a href="https://docs.vllm.ai/en/latest/configuration/optimization.html" target="_blank" rel="noopener">docs.vllm.ai</a></li>
+                        <li>NVIDIA Triton Inference Server documentation - model loading, versioning and backend structure: <a href="https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/index.html" target="_blank" rel="noopener">docs.nvidia.com</a></li>
+                        <li>InfoQ - Netflix Details Its In-House LLM Serving Platform with Triton and vLLM (27 Jul 2026, secondary coverage): <a href="https://www.infoq.com/news/2026/07/netflix-llm-platform/" target="_blank" rel="noopener">infoq.com</a></li>
+                        <li>Related reading: <a href="ai_token_cost_finops_2026.html">Governing AI token spend at the org level</a>, <a href="ai_vendor_lockin_exit_strategy_2026.html">AI vendor lock-in and exit strategy</a>, <a href="weave_router_llm_2026.html">What a model router is really asking</a>, <a href="omniroute_ai_gateway_2026.html">Bundling providers behind an AI gateway</a></li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>Share this article</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">Copy Link</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">Back to list</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Free tools you may find useful</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/json_formatter.html">JSON Formatter</a></li>
+      <li><a href="../static/regex_tester.html">Regex Tester</a></li>
+      <li><a href="../static/jwt_decoder.html">JWT Decoder Generator 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 Encoder/Decoder</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">See all tools &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Related Posts</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="self_hosting_tld_2026.html">.self TLD — A New Top-Level Domain Designed for Self-Hosting: Analysis 2026</a></li>
+      <li><a href="homelab_ai_dev_platform_2026.html">Building Your Own AI Dev Platform on a Homelab - Stack, Hardware, Cost Analysis 2026</a></li>
+      <li><a href="murrdb_ml_cache_redis_alternative_2026.html">murrdb - A Sub-Millisecond Cache for ML/AI Workloads to Replace Redis 2026</a></li>
+      <li><a href="thorvg_vector_animation_2026.html">Choosing a Web Animation Format - ThorVG 1.1, Lottie, SVG and GIF Compared</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('Link copied! Paste it in the Threads app to share.');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('Link copied!'); });
+    });
+    </script>
+</body>
+</html>

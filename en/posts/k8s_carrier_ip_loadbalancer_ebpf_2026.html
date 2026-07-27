@@ -1,0 +1,625 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="en">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Building a Kubernetes LoadBalancer Outside the Cloud - Carrier IPs, ARP and Asymmetric Routing 2026</title>
+    <meta name="description" content="Why a LoadBalancer Service stays pending outside the cloud: allocation versus announcement, choosing L2 or BGP or DIY, and triaging asymmetric routing.">
+    <meta name="keywords" content="Kubernetes LoadBalancer, on-premises load balancer, MetalLB, Cilium L2 Announcements, BGP ECMP, eBPF, XDP, ARP responder, asymmetric routing, rp_filter, policy routing, DHCP lease, DSCP, bare metal Kubernetes, homelab">
+
+    <link rel="canonical" href="https://braindetox.kr/en/posts/k8s_carrier_ip_loadbalancer_ebpf_2026.html">
+
+    <meta property="og:title" content="Building a Kubernetes LoadBalancer Outside the Cloud">
+    <meta property="og:description" content="What actually has to happen when nobody hands you an External IP. Allocation, announcement, return-path symmetry, and a triage order that works.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/en/posts/k8s_carrier_ip_loadbalancer_ebpf_2026.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="en_US">
+    <meta property="article:published_time" content="2026-07-28">
+    <meta property="article:section" content="Dev & Infra">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Building a Kubernetes LoadBalancer Outside the Cloud">
+    <meta name="twitter:description" content="Why EXTERNAL-IP stays pending, how to pick between L2 and BGP and DIY, and how to debug asymmetric routing.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "Building a Kubernetes LoadBalancer Outside the Cloud - Carrier IPs, ARP and Asymmetric Routing",
+      "alternativeHeadline": "From pending EXTERNAL-IP to ARP proxying and return-path symmetry",
+      "datePublished": "2026-07-28",
+      "dateModified": "2026-07-28",
+      "inLanguage": "en-US",
+      "articleSection": "Dev & Infra",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "Kubernetes LoadBalancer, on-premises, MetalLB, Cilium L2 Announcements, BGP ECMP, eBPF, XDP, ARP responder, asymmetric routing, rp_filter, policy routing, DHCP lease",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/en/posts/k8s_carrier_ip_loadbalancer_ebpf_2026.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "Why does EXTERNAL-IP stay pending on an on-premises Kubernetes cluster?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Because Kubernetes itself does not create external IP addresses. The official documentation states that for a Service of type LoadBalancer an external address is provisioned by the cloud provider, and that the provider is responsible for assigning it; the result lands in the Service field status.loadBalancer.ingress. Without cloud provider integration, or a controller that plays the same role, nothing is there to fill that field, so EXTERNAL-IP remains pending indefinitely. This is not a bug but a missing counterparty. On premises you have to supply two separate things: a controller that allocates the address, and a mechanism that announces it to the network."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Should I choose MetalLB layer 2 mode or BGP mode?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "The first fork is whether you control the routers. According to the official documentation, in layer 2 mode one machine takes ownership of the Service and answers ARP or NDP for it, which requires no router configuration, but all traffic for that Service IP goes to a single node, so one node worth of bandwidth is the ceiling. In BGP mode nodes peer with nearby routers and traffic is spread with ECMP, but the documentation explicitly warns that whenever the size of the backend set changes, existing connections are rehashed effectively randomly. In short: offices and homelabs with limited router access start with layer 2, while environments that run their own routers and need more than one node of ingress bandwidth start with BGP."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Can I use an address my carrier hands out over DHCP as a LoadBalancer IP?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Technical feasibility and contractual permission are separate questions, so the first step is to read your circuit contract and terms of service. Plans differ in how many addresses you may use, whether running servers is permitted, and how static addressing is provided. Technically a DHCP address is a lease, not property. RFC 2131 defines the combination of the client identifier or hardware address and the assigned network address as the unique identifier of the lease, and a server may send DHCPNAK when it considers the client notion of its address incorrect or the lease expired. The address can therefore change at any time, and any design that uses it as a service address must treat renewal failure and address change as normal scenarios rather than incidents."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How do I confirm that I am looking at asymmetric routing?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "The symptom is that requests arrive but replies never come back, so the method is to observe both ends at once and find the point where packets disappear. First confirm the request packet actually reaches the server interface. Then check whether the reply leaves through the same interface it arrived on. Next inspect the routing table and any policy routing rules to see which exit the kernel computes for that reply. Finally look at reverse path filtering. The Linux kernel documentation defines rp_filter as 0 for no source validation, 1 for RFC 3704 strict mode and 2 for loose mode, and notes that the value actually applied is the maximum of the all setting and the per interface setting. Under strict mode an asymmetric path is dropped silently, so nothing appears in application logs."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "A LoadBalancer IP is unreachable. Where do I start?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Work upward from the bottom. First, from a client on the same network, check whether anything answers ARP for that address. No answer means the announcement layer is broken; a MAC that keeps changing means more than one party is claiming the address. Second, confirm the request reaches the node interface. If it does not, the problem sits upstream or in a firewall. Third, if requests arrive but replies never return, examine the egress path and reverse path filtering. Fourth, only after all of that, look at forwarding inside the node and at pod state. Starting from the pods is the single most common way to waste an hour on this class of failure."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.2rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background-color: #fff8e6; border-left: 4px solid #f0ad4e; padding: 1rem 1.2rem; margin: 1.5rem 0; border-radius: 0 6px 6px 0; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/k8s_carrier_ip_loadbalancer_ebpf_2026.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/k8s_carrier_ip_loadbalancer_ebpf_2026.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/k8s_carrier_ip_loadbalancer_ebpf_2026.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/k8s_carrier_ip_loadbalancer_ebpf_2026.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/k8s_carrier_ip_loadbalancer_ebpf_2026.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="Building a Kubernetes LoadBalancer Outside the Cloud - Carrier IPs, ARP and Asymmetric Routing">
+                <meta itemprop="datePublished" content="2026-07-28">
+                <meta itemprop="dateModified" content="2026-07-28">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="Kubernetes LoadBalancer, on-premises, MetalLB, Cilium, BGP, eBPF, XDP, ARP, asymmetric routing, rp_filter">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/en/posts/k8s_carrier_ip_loadbalancer_ebpf_2026.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">Building a LoadBalancer Outside the Cloud</h1>
+                    <h2 class="post-subtitle">From a pending EXTERNAL-IP to ARP proxying and asymmetric routing</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-07-28">Jul 28, 2026</span>
+                        <span class="post-category" itemprop="articleSection">Dev &amp; Infra</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+                    <h2>Introduction: the day EXTERNAL-IP would not budge</h2>
+                    <p>Almost everyone who moves from managed Kubernetes to on-premises hardware or a homelab meets the same screen. You create a Service with <code>type: LoadBalancer</code>, and minutes later the <strong>EXTERNAL-IP column is still pending</strong>.</p>
+                    <pre><code>$ kubectl get svc web
+NAME   TYPE           CLUSTER-IP     EXTERNAL-IP   PORT(S)        AGE
+web    LoadBalancer   10.96.31.10    &lt;pending&gt;     80:31942/TCP   12m</code></pre>
+                    <p>Most people start digging through logs at this point. But there is no error to fix here. <strong>This is not a failure; it is the absence of a counterparty.</strong> The Kubernetes documentation is unusually direct about it: if the cloud provider supports load balancers, an external IP address is provisioned for the Service, and <strong>the cloud provider is responsible for assigning that address</strong>. No provider, no address.</p>
+                    <p>A post that surfaced on GeekNews in July 2026 turned this abstract point into something very concrete. To use an IPv4 address leased from a carrier over DHCP as the external address of a Kubernetes LoadBalancer, the author ended up writing a <strong>DHCP client that never puts the address on an interface</strong>, an <strong>eBPF program that answers ARP on its behalf</strong>, and finally a fix for <strong>asymmetric routing</strong>. You can read it as a success story, but I think its real value lies elsewhere: it honestly exposes <strong>how many independent layers hide behind a single checkbox in the cloud</strong>.</p>
+                    <p>So this article is not a tour of one implementation. It decomposes the question <strong>what do you actually have to build to make a LoadBalancer Service work outside a cloud</strong>, layer by layer, spells out the cost attached to each option, and lays out where to look when it breaks. Whether you end up using MetalLB, Cilium, or something you wrote yourself, the structure below makes the decision much faster.</p>
+
+                    <h2>1. Who hands out the IP in the cloud - the real contract behind type LoadBalancer</h2>
+
+                    <h3>1.1 Kubernetes does not create addresses</h3>
+                    <p>Clear one misconception first. <strong>There is no load balancer implementation inside Kubernetes.</strong> Declaring <code>type: LoadBalancer</code> is closer to filing a request than issuing an instruction. What actually happens is this:</p>
+                    <ul>
+                        <li>A user creates a Service of type LoadBalancer</li>
+                        <li>An external controller observes the request; in a cloud that is the cloud-controller-manager</li>
+                        <li>The controller obtains an address in its own environment and provisions whatever load balancing resource it owns</li>
+                        <li>It writes the resulting address into <code>status.loadBalancer.ingress</code> on the Service</li>
+                        <li>Only then does the EXTERNAL-IP column in <code>kubectl get svc</code> fill in</li>
+                    </ul>
+                    <p>EXTERNAL-IP is therefore <strong>a report of a result, not a command</strong>. Accept that, and the on-premises task defines itself: <strong>you must stand up something that fills in that status.</strong></p>
+
+                    <h3>1.2 When you want a specific address</h3>
+                    <p>Historically you asked for a specific address with <code>spec.loadBalancerIP</code>, but that field is now marked <strong>deprecated</strong> in the documentation, because implementations interpreted it inconsistently and it cannot express dual stack. Two mechanisms replaced it:</p>
+                    <ul>
+                        <li><strong>Implementation-specific annotations</strong> — each controller defines its own way to request an address or a pool. Less portable, more expressive</li>
+                        <li><strong><code>spec.loadBalancerClass</code></strong> — selects which implementation should handle this Service when several load balancer controllers coexist in the cluster. Particularly useful on premises when MetalLB shares a cluster with another controller</li>
+                    </ul>
+
+                    <h3>1.3 On premises, two separate jobs appear</h3>
+                    <p>This is the most important distinction in the whole article. What looked like one operation in the cloud splits into <strong>two jobs of completely different character</strong> on premises.</p>
+                    <ul>
+                        <li><strong>Allocation</strong> — which address does this Service get. An IPAM problem: manage a pool and hand out addresses without collisions</li>
+                        <li><strong>Announcement</strong> — how does traffic for that address reach your cluster. Either link-layer ARP and NDP, or a network-layer routing protocol</li>
+                    </ul>
+                    <p>The two are independent, and Cilium exposes that split structurally. Per its documentation, <strong>LB IPAM</strong> only picks addresses from a <code>CiliumLoadBalancerIPPool</code> and assigns them to Services, while advertising those addresses is the job of separate features such as the <strong>BGP control plane</strong> or <strong>L2 Announcements</strong>. MetalLB is built the same way internally.</p>
+                    <p>This is exactly why on-premises troubleshooting is confusing. <strong>An address appearing in EXTERNAL-IP means allocation succeeded; it is no evidence at all that the address is reachable.</strong> The state where an address is assigned but nothing connects almost always lives in the announcement layer.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Layer</th><th>Who does it in the cloud</th><th>Who does it on premises</th><th>Symptom when it fails</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Address allocation (IPAM)</td><td>Cloud provider</td><td>MetalLB pool, Cilium LB IPAM, custom controller</td><td>EXTERNAL-IP stuck pending</td></tr>
+                            <tr><td>Route announcement</td><td>Cloud network fabric</td><td>ARP and NDP replies, or BGP advertisement</td><td>Address assigned but unreachable, no ARP reply</td></tr>
+                            <tr><td>Forwarding inside the node</td><td>Provider data plane</td><td>kube-proxy or an eBPF data plane</td><td>Works only from some nodes</td></tr>
+                            <tr><td>Source IP preservation</td><td>Provider setting or proxy protocol</td><td>Your choice of <code>externalTrafficPolicy</code></td><td>Every client appears as a node IP</td></tr>
+                            <tr><td>Return-path consistency</td><td>Handled by the fabric</td><td>Designed by you</td><td>Requests arrive, replies vanish</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>The last two rows are what actually hurt on premises. Per the documentation, <code>externalTrafficPolicy</code> defaults to <code>Cluster</code>, which routes to all endpoints, while <code>Local</code> routes only to local endpoints and <strong>preserves the client source IP</strong>. Any service that needs real client addresses in its logs needs this setting, and yet, as we will see, <code>Local</code> collides with some announcement mechanisms.</p>
+
+                    <h2>2. Three families of on-premises solutions - L2, BGP, and building it yourself</h2>
+                    <p>There are broadly three ways to solve the announcement problem. It helps to classify them not by product name but by <strong>which layer you tell the fib on</strong>.</p>
+
+                    <h3>2.1 Layer 2 mode - answering on someone else's behalf at the link layer</h3>
+                    <p>This is the most widely deployed approach. To paraphrase MetalLB's own documentation, in this mode <strong>one machine in the cluster takes ownership of the Service and uses standard address discovery protocols, ARP for IPv4 and NDP for IPv6, to make those IPs reachable on the local network</strong>. Technically, that node is made to look as though its interface holds several addresses.</p>
+                    <p>The advantage is decisive: <strong>you do not have to touch a router.</strong> The switch does not need to know either. In offices and homelabs where you have limited rights over network gear, this is effectively the only realistic option. But the documented costs are equally clear.</p>
+                    <ul>
+                        <li><strong>Bandwidth is capped at one node.</strong> In the documentation's words, all traffic for a Service IP goes to one node. Adding nodes does not raise the ingress ceiling for that Service</li>
+                        <li><strong>Failover depends on the clients.</strong> MetalLB sends unsolicited link-layer packets announcing the MAC change; most modern operating systems handle it within seconds, but poorly behaved clients keep using the stale MAC until their cache expires</li>
+                        <li><strong>For planned failover the documentation recommends keeping the old leader alive</strong> for several minutes so it can forward traffic from clients with stale caches</li>
+                        <li><strong>Leader election is stateless.</strong> Each speaker independently computes a sorted list of hashed node-plus-VIP entries and announces if it ranks first. Adding a node may change the leader</li>
+                        <li><strong>Split brain is an acknowledged risk.</strong> If speakers wrongly consider each other inactive during a partition, several speakers, or none, may announce the same VIP</li>
+                    </ul>
+                    <p>Cilium's L2 Announcements lives under the same physics. Its documentation notes that because hosts store only one MAC per IP, <strong>only one node in the cluster may reply</strong>, and so each Service maps to a <strong>Kubernetes Lease</strong> whose holder answers. Several practical conditions come attached:</p>
+                    <ul>
+                        <li>It is documented as <strong>beta</strong>, and <strong>kube-proxy replacement mode must be enabled</strong></li>
+                        <li>Lease acquisition is <strong>first come, first served</strong>, which the documentation says may cause asymmetric load across nodes</li>
+                        <li>It is stated to be <strong>incompatible with <code>externalTrafficPolicy: Local</code></strong>, because Service IPs may be announced on nodes without pods and traffic gets dropped. If you need source IP preservation, avoid this combination from the start</li>
+                        <li>Clients that reject gratuitous ARP will not re-query until their own table entry ages out, so they can experience a longer outage than the lease timings suggest</li>
+                    </ul>
+                    <p>kube-vip works on the same principle in ARP mode: its documentation describes broadcasting gratuitous ARP when the virtual IP moves between nodes to update the IP-to-MAC mapping, with leader election backed by Kubernetes Leases. <strong>Whatever the implementation, the ceiling of what the link layer can do is identical.</strong></p>
+
+                    <h3>2.2 BGP mode - telling the routers about a path</h3>
+                    <p>In BGP mode each node establishes a peering session with nearby routers and advertises the path to the Service IP. The routers treat the nodes as equal-cost next hops and spread traffic with ECMP. The single-node bottleneck disappears, and router policy becomes available as a control surface.</p>
+                    <p>And here sits <strong>the most consistently underestimated trap in on-premises load balancing</strong>, one MetalLB warns about directly. Routers pick a next hop by hashing header fields, commonly a three-tuple of protocol and source and destination IP, or a five-tuple that adds ports. That keeps packets of one session on one node. The problem is what comes next.</p>
+                    <blockquote>Whenever the size of the backend set changes, existing connections will be rehashed effectively randomly. — MetalLB BGP documentation</blockquote>
+                    <p>The moment you reboot one node or one BGP session drops, <strong>connections that had nothing to do with that node get reassigned</strong> to different nodes. The new node holds no state for them, so they break. The mitigations the documentation offers are compromises rather than fixes: use resilient ECMP hashing on the routers, pin deployments to specific nodes, schedule changes during quiet hours, migrate between Services via DNS, add client-side retries, put an ingress controller layer in front, or simply accept occasional resets for non-critical services.</p>
+                    <p>In practice the most workable answer is usually the last two combined: <strong>expose only a handful of ingress controllers over BGP and keep applications behind them</strong>. That confines the blast radius of rehashing to the ingress layer.</p>
+
+                    <h3>2.3 Building it yourself - when the tool's premise does not hold</h3>
+                    <p>The third family is to write your own. It sounds reckless, but when <strong>the assumption a tool is built on simply does not hold in your environment</strong>, it can be the only option left. This case is exactly that.</p>
+                    <p>MetalLB assumes <strong>the operator knows the address pool</strong>. As the documentation puts it, MetalLB cannot create IP addresses out of thin air, so an administrator has to supply pools. In an environment where addresses arrive from a carrier over DHCP, that assumption collapses: you cannot know in advance which addresses you will get, and they may change. Requests for external IPAM and DHCP integration have sat in the project's issue tracker for years, but implementing dynamic allocation would break the assumption that the core logic can stay single-threaded, and reworking that has not been undertaken.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Criterion</th><th>Layer 2 announcement</th><th>BGP announcement</th><th>Custom build</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Router access required</td><td>No</td><td>Yes, peering must be configured</td><td>Depends on the design</td></tr>
+                            <tr><td>Ingress bandwidth per Service</td><td>Capped at one node</td><td>Spread across nodes</td><td>Whatever you design</td></tr>
+                            <tr><td>Environments with changing addresses</td><td>Poor fit, assumes fixed pools</td><td>Poor fit, assumes fixed pools</td><td>Can be handled</td></tr>
+                            <tr><td>Risk during failover</td><td>Stale client caches</td><td>Rehashing breaks unrelated connections</td><td>Entirely dependent on code quality</td></tr>
+                            <tr><td>Operational difficulty</td><td>Low</td><td>Medium, needs network team cooperation</td><td>High, code becomes infrastructure</td></tr>
+                            <tr><td>Bus factor</td><td>Large user base</td><td>Large user base</td><td>Usually one person</td></tr>
+                            <tr><td>Best fit</td><td>Offices, homelabs, small on-prem</td><td>Own routers, high bandwidth demand</td><td>Environments where the usual premises break</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>Take the <strong>bus factor</strong> row seriously. A hand-written daemon runs quietly at the very bottom of the stack until the person who wrote it is unavailable, at which point it becomes a black box nobody dares touch. If you do build one, <strong>writing down how it works and how to diagnose it</strong> is part of the implementation, not an optional extra.</p>
+
+                    <h2>3. What changes on a carrier circuit - the constraints DHCP imposes</h2>
+
+                    <div class="callout">
+                        <p><strong>Before anything else.</strong> How many addresses you may use, whether running servers is permitted, and how static addressing is offered all differ by plan and are defined in your contract and terms of service. <strong>What is technically possible and what is contractually permitted are different questions</strong>, so read the terms and, if needed, ask the provider before you start building. This article covers how the network behaves and how to diagnose it; it does not describe ways to work around provider policy.</p>
+                    </div>
+
+                    <h3>3.1 A DHCP address is a lease, not property</h3>
+                    <p>This is the most fundamental constraint. RFC 2131 defines <strong>the combination of the client identifier or hardware address and the assigned network address as the unique identifier of the lease</strong>. And leases are finite. A client tries to renew by unicast at T1, and if that fails it retries by broadcast at T2. If the server concludes that the client's notion of its address is wrong, or that the lease has expired, it sends a <strong>DHCPNAK</strong>.</p>
+                    <p>Viewed as a service address, that carries weight. <strong>An address changing is not an incident; it is normal operation.</strong> So the design has to include the following as expected scenarios:</p>
+                    <ul>
+                        <li>Renewal can fail and <strong>the address can be reclaimed</strong>. What happens to the Service that was using it</li>
+                        <li>After a reboot or line switch you may <strong>receive a different address</strong>. Who updates DNS</li>
+                        <li>When the address changes, <strong>certificates, firewall allowlists and external registrations</strong> all drift out of sync</li>
+                        <li>If the DHCP client process dies, <strong>the lease expires silently</strong>. Is that process actually monitored</li>
+                    </ul>
+
+                    <h3>3.2 One MAC per address</h3>
+                    <p>The second constraint is identity. Because a lease is bound to an identifier, <strong>obtaining several addresses means issuing several requests under distinct identifiers</strong>. That is why the original case created multiple virtual interfaces, each with its own MAC: there is no clean way to obtain several leases through a single physical interface.</p>
+                    <p>A practical caution follows. Upstream network equipment may limit how many MAC addresses a port may learn, or treat unexpected MACs as an anomaly. <strong>Such policies exist for good reasons, to keep the network stable</strong>, so they are not something to work around but <strong>a design constraint to confirm in advance</strong>.</p>
+
+                    <h3>3.3 The gateway and the firewall are not yours</h3>
+                    <p>The third constraint is where control ends. In a cloud the network is effectively all yours; on a carrier circuit <strong>everything beyond the default gateway belongs to someone else</strong>. That boundary produces several consequences:</p>
+                    <ul>
+                        <li>Packets whose source address does not match expectations <strong>may be filtered upstream</strong>. This is the root of the asymmetric routing problem discussed later</li>
+                        <li>Some ports may be blocked upstream, which no amount of local configuration will reveal</li>
+                        <li>Header fields such as QoS marks <strong>may be rewritten as they cross the boundary</strong>. RFC 2474 assumes codepoints can be re-marked when entering another domain</li>
+                        <li>On circuits that bundle internet and broadcast services, cabling or configuration changes can affect the other service</li>
+                    </ul>
+
+                    <table>
+                        <thead>
+                            <tr><th>Constraint</th><th>Technical basis</th><th>Effect on design</th><th>Direction to take</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Address can be reclaimed</td><td>Lease expiry and DHCPNAK (RFC 2131)</td><td>A service address can vanish</td><td>Monitor renewal, wire address changes through automatically</td></tr>
+                            <tr><td>Allocation per identifier</td><td>Lease keyed by client identifier or hardware address</td><td>One identifier per address needed</td><td>Design virtual interfaces, confirm upstream policy first</td></tr>
+                            <tr><td>No control over the gateway</td><td>Beyond the boundary is provider territory</td><td>Mismatched-source packets may be dropped</td><td>Make the return path match the ingress path</td></tr>
+                            <tr><td>Header fields re-marked</td><td>Codepoints re-marked at a DS domain boundary (RFC 2474)</td><td>QoS marks cannot carry end-to-end meaning</td><td>Keep internal signals inside internal boundaries</td></tr>
+                            <tr><td>Contract and plan terms</td><td>The contract itself</td><td>The whole design may be out of scope</td><td>Read the terms first, ask the provider when unsure</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2>4. Answering ARP on behalf of an address - what breaks and what you gain</h2>
+
+                    <h3>4.1 Why something has to answer</h3>
+                    <p>ARP is the protocol by which an IPv4 host broadcasts the question, whoever owns this IP, please tell me your MAC address. A router or client on the same link cannot send a frame until it receives that reply. Because <strong>a Service IP is not a real device address but a virtual address the cluster claims</strong>, if nobody answers on its behalf, that address effectively does not exist on the link.</p>
+                    <p>The simplest approach is to genuinely put the address on a node interface and let the kernel answer. That brings side effects peculiar to on-premises setups:</p>
+                    <ul>
+                        <li>Since the address is local, <strong>the node may short-circuit traffic to it internally</strong></li>
+                        <li>The kernel may <strong>select it as a source address</strong>, producing unintended source IPs on outbound traffic</li>
+                        <li>If no listener is bound to the port, the kernel <strong>immediately answers with a connection refusal</strong>, even where being silently ignored would be preferable</li>
+                        <li>Putting the same address on multiple nodes produces an <strong>address conflict</strong></li>
+                    </ul>
+                    <p>Hence the phrase quiet DHCP client in the original case. The choice is to <strong>take the lease but never put the address on an interface</strong>. As far as the Linux stack is concerned the address does not exist, so none of the above can happen. In exchange, <strong>nobody is left to answer ARP</strong>, and a separate responder becomes necessary.</p>
+
+                    <h3>4.2 The problems that arrive with proxying</h3>
+                    <p>The moment you take over ARP replies, the following arrive together. The shape is the same regardless of tooling.</p>
+                    <ul>
+                        <li><strong>There must be exactly one truth.</strong> Hosts cache one MAC per IP, so if two parties answer, the later reply wins. A mechanism guaranteeing a single responder, that is leader election, is mandatory</li>
+                        <li><strong>Caches do not update instantly.</strong> After a leader change, clients keep using the old MAC until entries expire, and some implementations ignore gratuitous ARP entirely</li>
+                        <li><strong>Gratuitous ARP is treated with suspicion.</strong> The same technique is used for spoofing, so ignoring it is a common policy. Assuming a broadcast was accepted is unsafe</li>
+                        <li><strong>Security features conflict with it.</strong> Switch features such as dynamic ARP inspection and port security exist precisely to block unauthorised address claims. In such environments, <strong>agreeing the design with the network administrators in advance is mandatory</strong></li>
+                        <li><strong>Node failure equals service failure.</strong> In layer 2 mode, when the answering node dies the address is unreachable until a new leader is elected and caches refresh</li>
+                    </ul>
+                    <p>Linux does expose knobs for neighbour behaviour such as <code>arp_ignore</code>, <code>arp_announce</code> and <code>arp_filter</code>, and in multi-homed setups they genuinely matter. However, <strong>an address that was never put on an interface</strong> is outside the kernel's management entirely, so those switches cannot help. That is exactly why a <strong>separate responder</strong>, in user space or in XDP, is needed.</p>
+
+                    <h2>5. Choosing eBPF and XDP to answer ARP</h2>
+
+                    <h3>5.1 XDP sits in front of the stack</h3>
+                    <p>XDP is a hook that runs an eBPF program at the very start of the driver receive path, that is <strong>before the packet reaches the kernel network stack</strong>. The program's return value decides what the driver does next. The main actions per the kernel documentation are:</p>
+                    <ul>
+                        <li><strong><code>XDP_DROP</code></strong> — drop the packet by recycling it back into the RX ring it arrived on. The simplest and fastest action</li>
+                        <li><strong><code>XDP_PASS</code></strong> — hand it to normal kernel stack processing</li>
+                        <li><strong><code>XDP_TX</code></strong> — <strong>bounce the packet back out the same NIC it arrived on</strong>, usually after modifying its contents</li>
+                        <li><strong><code>XDP_ABORTED</code></strong> — signals a program error and the packet is dropped. Not a value functional code should return</li>
+                    </ul>
+                    <p>It becomes obvious why an ARP responder fits here. Take the ARP request frame, <strong>swap sender and target, rewrite it as a reply, and return <code>XDP_TX</code></strong>: a complete reply leaves on the wire even though the kernel stack has never heard of the address. That dovetails logically with the decision not to put the address on an interface.</p>
+
+                    <h3>5.2 What you gain and what you pay</h3>
+                    <p>The benefits are real:</p>
+                    <ul>
+                        <li><strong>The address is never exposed to the stack.</strong> The source-selection surprises and unwanted connection refusals above simply cannot occur</li>
+                        <li><strong>Any address can be added instantly.</strong> Updating a map is enough, with no interface reconfiguration, which suits environments where addresses change dynamically</li>
+                        <li><strong>No stack overhead.</strong> Broadcast ARP requests are handled at the entrance instead of travelling up the stack</li>
+                    </ul>
+                    <p>The costs are equally definite:</p>
+                    <ul>
+                        <li><strong>Debugging gets much harder.</strong> Nothing appears in <code>ip neigh</code> or <code>ip addr</code>. An address that answers on the wire but does not exist in host configuration is <strong>nearly impossible to reason about without tcpdump</strong></li>
+                        <li><strong>Driver support varies.</strong> Native XDP is not available everywhere, and falling back to generic mode does not deliver the expected performance. Virtualised environments need explicit verification</li>
+                        <li><strong>It sits in a monitoring blind spot.</strong> Most tooling observes metrics above the stack. Anything handled or dropped in XDP is invisible unless you add counters yourself</li>
+                        <li><strong>The staffing bar is higher.</strong> How many people can read this layer at three in the morning is what actually determines recovery time</li>
+                    </ul>
+                    <blockquote>In short, eBPF and XDP are an elegant answer to the question of how to reply to ARP, but the price is that <strong>the truth of the system becomes invisible to standard tools</strong>. That is an operations problem, not a performance one.</blockquote>
+
+                    <h2>6. Asymmetric routing - when replies do not leave by the door they came in</h2>
+
+                    <h3>6.1 Why it happens</h3>
+                    <p>This is the most exhausting stretch of building an on-premises load balancer. The symptom is always similar: <strong>it works from the same building and the same switch, but connections from outside get no response.</strong></p>
+                    <p>The cause is usually simple. The request came in over one path, but <strong>the reply leaves through the server's default route</strong>. A server picks an exit from its routing table based on the destination address alone; by default it does not consider where the request arrived from. In multi-circuit setups, tunnels, or topologies with several routers, that mismatch arises naturally.</p>
+                    <p>Why does the same LAN work? Because the reply reaches the peer directly at the link layer without passing a router. <strong>The path is simply too short for the problem to show.</strong> That difference produces the classic pattern of works internally, fails externally.</p>
+
+                    <h3>6.2 rp_filter - the switch that drops silently</h3>
+                    <p>An asymmetric path is not always a problem in itself. The real problem starts when something in the middle <strong>decides to drop the packet</strong>. In Linux, the canonical mechanism for that decision is reverse path filtering. Per the kernel documentation:</p>
+                    <ul>
+                        <li><strong>0</strong> — no source validation</li>
+                        <li><strong>1</strong> — RFC 3704 <strong>strict mode</strong>. Each incoming packet is tested against the routing information, and <strong>if the interface is not the best reverse path the check fails</strong></li>
+                        <li><strong>2</strong> — RFC 3704 <strong>loose mode</strong>. The check fails only when the source address <strong>is not reachable via any interface</strong></li>
+                    </ul>
+                    <p>Two more facts matter in practice. First, <strong>the value actually applied is the maximum of <code>conf/all</code> and <code>conf/{interface}</code></strong>. Lowering only the per-interface value and then wondering why nothing changed is a recurring incident. Second, the kernel documentation itself states that <strong>loose mode is recommended if you use asymmetric routing or other complicated routing</strong>. Adjusting this is a documented option, not a hack.</p>
+                    <pre><code># the effective value is the max of all and the interface setting
+sysctl net.ipv4.conf.all.rp_filter
+sysctl net.ipv4.conf.eth0.rp_filter
+
+# traces of dropped packets (entries vary by kernel build)
+grep -i martian /proc/net/stat/* 2&gt;/dev/null
+nstat -az | grep -i -E 'InAddrErrors|InNoRoutes'</code></pre>
+                    <p>That said, lowering the value <strong>gives up that much anti-spoofing protection</strong>. So order matters: <strong>first see whether the path can be corrected, and only relax the filter when correction is structurally impossible.</strong> Reverse that order and you hide the symptom while leaving the cause in place.</p>
+
+                    <h3>6.3 The families of fixes</h3>
+                    <p>There are broadly four ways to deal with asymmetry, and the right one depends on the situation.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Approach</th><th>Principle</th><th>Upside</th><th>Downside</th><th>Where it fits</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Collapse to one path</td><td>Funnel ingress through a single path so asymmetry cannot occur</td><td>Simplest and most robust</td><td>Gives up multi-circuit benefits</td><td>Effectively one circuit, or simplicity is the priority</td></tr>
+                            <tr><td>Connection marks plus policy routing</td><td>Record the ingress interface on the connection and restore it to force the exit</td><td>Correct across multiple circuits</td><td>Needs state tracking, rules grow complex</td><td>Two or more circuits both serving traffic</td></tr>
+                            <tr><td>Source address translation</td><td>Rewrite the source at the front so replies must come back</td><td>Easy and certain</td><td>Real client IPs disappear from logs</td><td>Services where source IP does not matter</td></tr>
+                            <tr><td>Relax reverse path filtering</td><td>Lower validation so asymmetry is tolerated</td><td>Immediate effect</td><td>Weaker spoofing defence, cause remains</td><td>A supporting measure when asymmetry is unavoidable</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>The second is what most sites end up using, and the idea is simple: <strong>note where a connection came in, and when replying, read that note back to choose the exit.</strong> On Linux you build it from firewall connection marks and policy routing rules.</p>
+                    <pre><code># minimal form, only enough to show the concept
+# 1) marked packets consult a separate routing table
+ip rule add fwmark 0x64 lookup 100
+
+# 2) that table's default route points at the right circuit
+ip route add default via 203.0.113.1 dev eth1 table 100
+
+# 3) verify
+ip rule show
+ip route show table 100
+
+# 4) compute the actual exit for a given reply
+ip route get 198.51.100.7 from 203.0.113.10 mark 0x64</code></pre>
+                    <p>That last <code>ip route get</code> is the single most useful command in this area, because it <strong>asks the kernel directly instead of guessing</strong>. Setting and restoring the mark is handled at the firewall layer with connection marks, that is storing a value on the connection and restoring it onto reply packets. The concept is identical whether you use nftables or iptables.</p>
+
+                    <h2>7. The path the original case took - DSCP tagging and its price</h2>
+
+                    <h3>7.1 The shape of the problem</h3>
+                    <p>The original setup was more involved. An <strong>edge router</strong> held the carrier addresses, while the cluster sat <strong>elsewhere</strong> across a tunnel. External client requests arrived through the edge router into the cluster, but replies tried to leave straight to the internet from the cluster side. That made <strong>the packet source address inconsistent with the actual exit point</strong>, and upstream filtering discarded them. Clients in the same building worked because their traffic ended at the link layer, which made the failure look even more confusing.</p>
+                    <p>The obvious answer is the second family above, policy routing keyed on source address. According to the write-up, that produced asymmetry in the opposite direction: <strong>replies to local network clients were also pushed back through the edge router</strong>. Source address alone cannot express which door a connection came in through.</p>
+
+                    <h3>7.2 Why DSCP of all things</h3>
+                    <p>So the chosen mechanism was to <strong>carry an ingress-point identifier in the packet's DSCP field</strong>. DSCP is the <strong>six-bit codepoint of the DS field</strong> defined by RFC 2474, originally used to select the per-hop behaviour a packet receives at each node. The flow, summarised:</p>
+                    <ul>
+                        <li>On ingress at the edge, eBPF marks the DSCP value with <strong>which edge the packet entered through</strong></li>
+                        <li>Daemons along the path track the flow using that mark</li>
+                        <li>On the way out, policy routing sends the reply <strong>back through the edge it came in from</strong></li>
+                        <li>Before leaving toward the provider network, <strong>the original DSCP value is restored</strong></li>
+                    </ul>
+                    <p>It is important not to misread the last step. This is not about hiding anything; it is <strong>hygiene that keeps an internal signal inside its internal boundary</strong>. DSCP is a QoS field, so an arbitrary internal value leaking into someone else's network becomes meaningless input to their policy. Moreover RFC 2474 itself assumes <strong>codepoints may be re-marked as packets cross a domain boundary</strong>, which means the value cannot be trusted as an end-to-end signal in the first place. <strong>Using it only inside the boundary and restoring it at the edge is the usage the protocol design intends.</strong></p>
+
+                    <h3>7.3 Do not treat this as the general solution</h3>
+                    <p>It is a clever fix, but consider the following before copying it.</p>
+                    <ul>
+                        <li><strong>The mark space is tiny.</strong> Six bits, some of which carry conventional meanings, so the usable values are fewer still. Add ingress points and you run out quickly</li>
+                        <li><strong>It can collide with existing QoS policy.</strong> If DSCP already manages priority in your organisation, internal signalling and QoS intent become entangled</li>
+                        <li><strong>Preservation is not guaranteed outside the boundary.</strong> Intermediate devices may rewrite the value, so the trust boundary must be stated explicitly</li>
+                        <li><strong>Connection marks are the more standard answer.</strong> If the problem is solvable within one box, there is no reason to put information into the packet header</li>
+                        <li><strong>Diagnostic tools do not surface this value well.</strong> Without a rehearsed procedure, incident analysis slows dramatically</li>
+                    </ul>
+                    <p>In sum, this is <strong>an answer produced under a fairly unusual constraint: carrying flow information across several routers</strong>. Most on-premises environments are fully served by connection marks and policy routing. The principle that <strong>when you borrow someone's solution you must borrow their constraints too</strong> applies here as well.</p>
+
+                    <h2>8. Triage order - where do you point tcpdump first</h2>
+                    <p>The single biggest time sink when this setup breaks is <strong>starting from the pods</strong>. The failure almost always lives far below them. Work upward from the bottom.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Step</th><th>What to check</th><th>Where to look</th><th>Healthy looks like</th><th>Warning sign</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>1</td><td>Address allocation</td><td><code>kubectl get svc</code>, controller logs</td><td>EXTERNAL-IP holds a value</td><td>Still pending, so controller or pool issue</td></tr>
+                            <tr><td>2</td><td>ARP replies</td><td>ARP capture on the client-side link</td><td>Consistent replies from one MAC</td><td>No reply, or the MAC keeps changing</td></tr>
+                            <tr><td>3</td><td>Request arrival</td><td>Node physical interface</td><td>SYN packets visible</td><td>Absent means upstream path or firewall</td></tr>
+                            <tr><td>4</td><td>Reply direction</td><td>Reverse direction at the same point</td><td>Reply leaves the same interface</td><td>A different interface means asymmetry</td></tr>
+                            <tr><td>5</td><td>Kernel decision</td><td><code>ip route get</code>, <code>ip rule show</code>, rp_filter</td><td>The intended path is computed</td><td>Default route computed, so policy rule missing</td></tr>
+                            <tr><td>6</td><td>Forwarding in the node</td><td>Internal interfaces and data plane state</td><td>Traffic reaches the backend</td><td>Fails only on specific nodes</td></tr>
+                            <tr><td>7</td><td>Application</td><td>Pod logs, endpoints</td><td>Requests reach the app</td><td>If you got this far, it is an app problem</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>The commands at each step need not be elaborate. The addresses below are documentation ranges.</p>
+                    <pre><code># step 2 - who claims this address as their own
+tcpdump -ni eth0 arp and host 203.0.113.10
+
+# steps 3-4 - watch request and reply at the same point
+tcpdump -ni eth0 host 203.0.113.10 and tcp port 80
+
+# step 4 follow-up - check whether replies leak out another interface
+tcpdump -ni eth1 host 203.0.113.10 and tcp port 80
+
+# step 5 - ask the kernel instead of guessing
+ip route get 198.51.100.7 from 203.0.113.10
+ip rule show</code></pre>
+                    <p>A few practical habits worth adding:</p>
+                    <ul>
+                        <li><strong>Capture both ends simultaneously.</strong> Looking at one side leaves the discussion stuck at it seems to have been sent but never arrived. Aligning client and server captures by timestamp is what pins down the hop where packets vanish</li>
+                        <li><strong>Start at ARP.</strong> If there is no reply here, nothing above matters. A flapping MAC points at leader election or duplicate claims</li>
+                        <li><strong>Test same-LAN and external separately.</strong> Works inside, fails outside is the textbook fingerprint of asymmetric routing</li>
+                        <li><strong>Do not filter too narrowly.</strong> Filtering by port alone hides ICMP error messages, and path problems often leave their clues there</li>
+                        <li><strong>Check the change log first.</strong> Right after a node addition, a reboot, a kernel update or a firewall rollout, the candidate causes narrow dramatically</li>
+                        <li><strong>Capture packets only on networks you administer.</strong> Recording other people's communications without consent can carry legal consequences</li>
+                    </ul>
+
+                    <h2>9. So what should you pick - decisions by situation</h2>
+                    <p>Turning all of the above into actual choices produces the following. Most environments stop at the first two rows.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Situation</th><th>Recommended starting point</th><th>Why</th><th>Watch out for</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Homelab or small office, no router access</td><td>Layer 2 announcement</td><td>The only approach that works without router config</td><td>One node of bandwidth per Service, cache lag on failover</td></tr>
+                            <tr><td>Own routers, need more than one node of bandwidth</td><td>BGP announcement</td><td>ECMP spreads traffic across nodes</td><td>Backend changes rehash unrelated connections</td></tr>
+                            <tr><td>On-premises rack with static addresses</td><td>Fixed pool plus layer 2 or BGP</td><td>The tools' premises hold as designed</td><td>Keep the pool and the real allocation in sync</td></tr>
+                            <tr><td>Circuit where addresses change dynamically</td><td>Secure a dynamic update path first, then decide</td><td>The fixed-pool premise breaks</td><td>Read terms first, design address change as a normal case</td></tr>
+                            <tr><td>Client IPs must appear in logs</td><td>Consider <code>externalTrafficPolicy: Local</code></td><td>Preserves source IP</td><td>Incompatible with some L2 implementations, watch pod placement skew</td></tr>
+                            <tr><td>Number of services keeps growing</td><td>Introduce an ingress or gateway layer</td><td>One external IP serves many services</td><td>More layers means more failure points</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>The last row deserves emphasis. <strong>Handing out LoadBalancer Services freely on premises means the number of external addresses to manage grows with the number of services.</strong> The scarcer addresses are, the better it is to <strong>keep external entry points few and branch by name behind them</strong>. In most on-premises clusters, one or two LoadBalancer Services in front of an ingress controller are genuinely enough.</p>
+
+                    <h2>10. Correcting the common misconceptions</h2>
+                    <ul>
+                        <li><strong>A pending EXTERNAL-IP is a bug</strong> — No. It is the normal state when no controller owns allocation. On premises you must supply that role</li>
+                        <li><strong>Install MetalLB and it becomes like the cloud</strong> — Allocation and announcement get solved, but return paths, source IP preservation and failover remain your job</li>
+                        <li><strong>BGP is always better than layer 2</strong> — Better on bandwidth, but with the documented limitation that backend changes <strong>break unrelated connections</strong> through rehashing, plus the need for router operations skills</li>
+                        <li><strong>eBPF makes it faster</strong> — In this context the benefit is not speed but <strong>the ability to intervene at a chosen layer without involving the stack</strong>. The trade is that state becomes invisible to standard tools</li>
+                        <li><strong>Setting rp_filter to 0 fixes it</strong> — The symptom may go, but the cause stays and spoofing defence weakens. People also routinely forget that the maximum of the all and interface values applies</li>
+                        <li><strong>It works internally, so it cannot be a firewall issue</strong> — Quite the opposite fingerprint. The same LAN never crosses a router, so path problems stay hidden</li>
+                        <li><strong>An address from DHCP is mine anyway</strong> — It is a lease. It can be reclaimed, and the permitted scope of use is defined by your circuit terms</li>
+                        <li><strong>Inside the cluster I can use QoS fields freely</strong> — They may be re-marked across boundaries and can affect someone else's policy. Internal signals should be restored at the edge</li>
+                    </ul>
+
+                    <h2>Conclusion</h2>
+                    <p>What one line of <code>type: LoadBalancer</code> did in the cloud was in fact <strong>a bundle of at least five jobs</strong>: obtain an address, announce it to the network, pull traffic to a node, forward it to a backend inside the node, and make the reply return by the path it came. The cloud sold the five together, so we assumed it was one thing. <strong>Try to do it yourself and each turns out to be an independent problem.</strong></p>
+                    <p>What makes this case interesting is not the stack but that <strong>it pinpoints exactly where an existing tool's premise breaks</strong>. MetalLB assumes the operator knows the address pool, and that assumption is right almost everywhere. It is not right when addresses arrive dynamically. Working out what has to be built at that point is itself an education in what was hiding under someone else's abstraction.</p>
+                    <p>The practical conclusion is deliberately plain. <strong>Layer 2 announcement is enough for most on-premises and homelab setups, and BGP is the next step if you run your own routers.</strong> A custom build deserves consideration only when both premises clearly break, and even then, <strong>documenting how it works and how to diagnose it</strong> is part of the scope. And if you are building on a carrier circuit, <strong>reading the terms comes before the technical review</strong>. Designs that stay inside the contract are the ones that last.</p>
+                    <p>One final note. Failures in this area <strong>leave no trace in application logs</strong>. Packets disappear quietly in the kernel or upstream, and developers see nothing but a timeout. So if you decide to run this kind of setup, <strong>rehearsing the order in which you check ARP, routes and filters</strong> is more useful preparation than any amount of automation.</p>
+
+                    <h2>References</h2>
+                    <ul>
+                        <li>Kubernetes documentation - Service (type LoadBalancer, status.loadBalancer.ingress, loadBalancerClass, externalTrafficPolicy): <a href="https://kubernetes.io/docs/concepts/services-networking/service/" target="_blank" rel="noopener">kubernetes.io</a></li>
+                        <li>MetalLB documentation - Concepts (address pools, announcement modes): <a href="https://metallb.io/concepts/" target="_blank" rel="noopener">metallb.io/concepts</a></li>
+                        <li>MetalLB documentation - Layer 2 mode (single-node bottleneck, failover, leader election): <a href="https://metallb.io/concepts/layer2/" target="_blank" rel="noopener">metallb.io/concepts/layer2</a></li>
+                        <li>MetalLB documentation - BGP mode (ECMP hashing, rehashing limitation and mitigations): <a href="https://metallb.io/concepts/bgp/" target="_blank" rel="noopener">metallb.io/concepts/bgp</a></li>
+                        <li>MetalLB issue - integration with external IPAMs such as DHCP: <a href="https://github.com/metallb/metallb/issues/157" target="_blank" rel="noopener">github.com/metallb/metallb/issues/157</a></li>
+                        <li>Cilium documentation - L2 Announcements (Lease-based leader election, limitations): <a href="https://docs.cilium.io/en/stable/network/l2-announcements/" target="_blank" rel="noopener">docs.cilium.io</a></li>
+                        <li>Cilium documentation - LoadBalancer IP Address Management: <a href="https://docs.cilium.io/en/stable/network/lb-ipam/" target="_blank" rel="noopener">docs.cilium.io/lb-ipam</a></li>
+                        <li>kube-vip documentation - ARP mode: <a href="https://kube-vip.io/docs/modes/arp/" target="_blank" rel="noopener">kube-vip.io</a></li>
+                        <li>Linux kernel documentation - IP Sysctl (rp_filter 0, 1, 2 and RFC 3704): <a href="https://docs.kernel.org/networking/ip-sysctl.html" target="_blank" rel="noopener">docs.kernel.org</a></li>
+                        <li>XDP action documentation (XDP_TX, XDP_PASS, XDP_DROP): <a href="https://prototype-kernel.readthedocs.io/en/latest/networking/XDP/implementation/xdp_actions.html" target="_blank" rel="noopener">prototype-kernel.readthedocs.io</a> / <a href="https://docs.ebpf.io/linux/program-type/BPF_PROG_TYPE_XDP/" target="_blank" rel="noopener">docs.ebpf.io</a></li>
+                        <li>RFC 2131 - Dynamic Host Configuration Protocol (lease identity, renewal, DHCPNAK): <a href="https://www.rfc-editor.org/rfc/rfc2131.html" target="_blank" rel="noopener">rfc-editor.org/rfc/rfc2131</a></li>
+                        <li>RFC 2474 - Definition of the DS field (six-bit codepoint, re-marking at boundaries): <a href="https://www.rfc-editor.org/rfc/rfc2474" target="_blank" rel="noopener">rfc-editor.org/rfc/rfc2474</a></li>
+                        <li>Original write-up - assigning a carrier IP to a Kubernetes LoadBalancer: <a href="https://attacca.cc/blog/dumbarp/" target="_blank" rel="noopener">attacca.cc/blog/dumbarp</a></li>
+                        <li>GeekNews discussion: <a href="https://news.hada.io/topic?id=31879" target="_blank" rel="noopener">news.hada.io/topic?id=31879</a></li>
+                        <li>Related reading: <a href="kubernetes_gateway_api_nginx_ingress_2026.html">Gateway API and Ingress - Governing Traffic With Standard Resources</a>, <a href="neko_master_network_traffic_dashboard_2026.html">neko-master Traffic Dashboard Reviewed</a>, <a href="docker_k8s_guide_08_pod_deploy_svc.html">Docker &amp; Kubernetes Guide Part 8 - Pod, Deployment and Service</a></li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>Share this article</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">Copy Link</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">Back to list</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Free tools you may find useful</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/json_formatter.html">JSON Formatter</a></li>
+      <li><a href="../static/regex_tester.html">Regex Tester</a></li>
+      <li><a href="../static/jwt_decoder.html">JWT Decoder Generator 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 Encoder/Decoder</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">See all tools &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Related Posts</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="monitor_input_ddc_cli_2026.html">Switching Monitor Inputs From the Command Line - DDC/CI and monitor-input-rs Explained 2026</a></li>
+      <li><a href="thorvg_vector_animation_2026.html">Choosing a Web Animation Format - ThorVG 1.1, Lottie, SVG and GIF Compared</a></li>
+      <li><a href="cerebras_internal_knowledge_platform_2026.html">Designing an Internal Knowledge Platform - Source, Permission, Chunking and Cost Decisions 2026</a></li>
+      <li><a href="api_docs_governance_2026.html">Why API Docs Always Lag Behind Code - From Excel and PDF Specs to a Machine-Readable Contract 2026</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('Link copied! Paste it in the Threads app to share.');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('Link copied!'); });
+    });
+    </script>
+</body>
+</html>

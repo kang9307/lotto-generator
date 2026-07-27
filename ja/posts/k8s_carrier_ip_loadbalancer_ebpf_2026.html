@@ -1,0 +1,625 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ja">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>クラウド外でKubernetesのLoadBalancerを作る - 回線IP・ARP代理応答・非対称ルーティング 2026</title>
+    <meta name="description" content="クラウドの外でLoadBalancerサービスがpendingのまま止まる理由。アドレス払い出しと経路広告の分離、L2・BGP・自作の選択基準、DHCP回線特有の制約、非対称ルーティングの切り分け手順までまとめた。">
+    <meta name="keywords" content="Kubernetes LoadBalancer, オンプレミス ロードバランサー, MetalLB, Cilium L2 Announcements, BGP ECMP, eBPF, XDP, ARP応答, 非対称ルーティング, rp_filter, ポリシールーティング, DHCPリース, DSCP, ベアメタル Kubernetes, ホームラボ">
+
+    <link rel="canonical" href="https://braindetox.kr/ja/posts/k8s_carrier_ip_loadbalancer_ebpf_2026.html">
+
+    <meta property="og:title" content="クラウド外でKubernetesのLoadBalancerを作る - 回線IP・ARP代理応答・非対称ルーティング">
+    <meta property="og:description" content="External IPを誰も配ってくれない環境で実際に何をする必要があるのか。払い出しと広告、戻り経路の整合、そして切り分けの順番。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/ja/posts/k8s_carrier_ip_loadbalancer_ebpf_2026.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ja_JP">
+    <meta property="article:published_time" content="2026-07-28">
+    <meta property="article:section" content="開発・インフラ">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="クラウド外でKubernetesのLoadBalancerを作る">
+    <meta name="twitter:description" content="EXTERNAL-IPがpendingで止まる構造、L2・BGP・自作の選択基準、非対称ルーティングの切り分け手順。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "クラウド外でKubernetesのLoadBalancerを作る - 回線IP・ARP代理応答・非対称ルーティング",
+      "alternativeHeadline": "Building a LoadBalancer Outside the Cloud - Carrier IPs, ARP Proxying and Asymmetric Routing",
+      "datePublished": "2026-07-28",
+      "dateModified": "2026-07-28",
+      "inLanguage": "ja-JP",
+      "articleSection": "開発・インフラ",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "Kubernetes LoadBalancer, オンプレミス, MetalLB, Cilium L2 Announcements, BGP ECMP, eBPF, XDP, ARP応答, 非対称ルーティング, rp_filter, ポリシールーティング, DHCPリース",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/ja/posts/k8s_carrier_ip_loadbalancer_ebpf_2026.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "オンプレミスのKubernetesでEXTERNAL-IPがpendingのままなのはなぜか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Kubernetes自体が外部IPアドレスを作らないからだ。公式ドキュメントは、type LoadBalancerのサービスに対する外部アドレスはクラウドプロバイダーがプロビジョニングし、その割り当ての責任はプロバイダー側にあると述べている。結果はサービスのstatus.loadBalancer.ingressに書き込まれる。プロバイダー連携も、その役割を代行するコントローラーも存在しなければ、この欄を埋める主体がいないためEXTERNAL-IPは無期限に待機したままになる。つまりこれは不具合ではなく、相手方が不在という状態である。オンプレミスではアドレスを払い出すコントローラーと、そのアドレスをネットワークに知らせる広告手段の二つを別々に用意する必要がある。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "MetalLBのL2モードとBGPモードはどちらを選ぶべきか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "最初の分岐はルーターを操作できるかどうかだ。公式ドキュメントによれば、L2モードはクラスター内の一台がサービスの所有権を持ちARPやNDPで応答する方式なのでルーター設定は不要だが、そのサービス宛ての全トラフィックが一つのノードに集まるため、そのノード一台分の帯域が上限になる。BGPモードは各ノードが近隣のルーターとピアリングしECMPで分散するため複数ノードを使えるが、ドキュメントはバックエンド集合のサイズが変わると既存の接続が事実上ランダムに再ハッシュされるという限界を明記している。まとめると、オフィスやホームラボのようにルーターへの権限が限られる環境はL2から、自前でルーターを運用し一台分を超える帯域が必要な環境はBGPから検討するのが出発点になる。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "通信事業者からDHCPで受け取ったIPをLoadBalancerのアドレスに使ってよいか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "技術的な可否と契約上の許容範囲は別問題なので、まず回線の契約内容と利用規約を確認するのが順序である。プランによって利用できるアドレス数、サーバー運用の可否、固定アドレスの提供方式が異なり、それらは約款で定められている。技術的にもDHCPアドレスは所有ではなく貸与だ。RFC 2131はクライアント識別子またはハードウェアアドレスと割り当てられたネットワークアドレスの組み合わせがそのリースの一意な識別子になると定義し、サーバーはクライアントのアドレス認識が誤っている、あるいはリースが満了したと判断した場合にDHCPNAKを返せる。つまりそのアドレスはいつでも変わりうる値であり、サービスアドレスとして使うなら更新失敗とアドレス変更を正常なシナリオとして設計に含める必要がある。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "非対称ルーティングかどうかはどう確認するのか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "要求は届くのに応答が返らないという形で現れるため、両端を同時に観測してどこまで到達したかを切り分けるのが基本になる。まずサーバー側で要求パケットが実際に入ってきているかを確認し、次に応答が出ていくインターフェースが要求の入ってきたインターフェースと同じかを見る。続いてルーティングテーブルとポリシールーティング規則を確認し、応答の出口がどこに計算されるかを調べる。カーネルの逆経路フィルターも併せて見る必要がある。Linuxのドキュメントによればrp_filterは0が検査なし、1がRFC 3704の厳格モード、2が緩やかなモードであり、実際に適用される値はall設定とインターフェース設定のうち大きい方である。厳格モードで非対称経路があるとパケットは静かに破棄されるため、アプリケーションのログには何も残らない。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "LoadBalancerのIPに接続できないとき、どこから見ればよいか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "下から上へ上がる順番が最も速い。第一に、同じネットワークからそのIPに対するARP応答が返るかを見る。応答がなければ広告層の問題であり、MACが揺れているなら複数の主体が同じアドレスを主張している状況だ。第二に、サーバーのインターフェースに要求パケットが到達しているかを確認する。到達していなければ上位経路かファイアウォールの問題である。第三に、到達しているのに応答が返らないなら、応答が出ていく経路と逆経路フィルターを確認する。第四に、ここまで正常ならノード内部の転送経路とポッドの状態を見る。順番を守らずポッドから見始めると、この種の障害では大きく時間を浪費することになる。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.2rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background-color: #fff8e6; border-left: 4px solid #f0ad4e; padding: 1rem 1.2rem; margin: 1.5rem 0; border-radius: 0 6px 6px 0; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/k8s_carrier_ip_loadbalancer_ebpf_2026.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/k8s_carrier_ip_loadbalancer_ebpf_2026.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/k8s_carrier_ip_loadbalancer_ebpf_2026.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/k8s_carrier_ip_loadbalancer_ebpf_2026.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/k8s_carrier_ip_loadbalancer_ebpf_2026.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="クラウド外でKubernetesのLoadBalancerを作る - 回線IP・ARP代理応答・非対称ルーティング">
+                <meta itemprop="datePublished" content="2026-07-28">
+                <meta itemprop="dateModified" content="2026-07-28">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="Kubernetes LoadBalancer, オンプレミス, MetalLB, Cilium, BGP, eBPF, XDP, ARP, 非対称ルーティング, rp_filter">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/ja/posts/k8s_carrier_ip_loadbalancer_ebpf_2026.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">クラウドの外でLoadBalancerを作るということ</h1>
+                    <h2 class="post-subtitle">EXTERNAL-IPがpendingで止まる理由から、ARP代理応答と非対称ルーティングまで</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-07-28">2026年7月28日</span>
+                        <span class="post-category" itemprop="articleSection">開発・インフラ</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+                    <h2>序論: EXTERNAL-IPが動かなかった日</h2>
+                    <p>マネージドKubernetesからオンプレミスやホームラボに降りてきた人が、ほぼ例外なく出会う画面がある。サービスを一つ<code>type: LoadBalancer</code>で作ったのに、数分たっても<strong>EXTERNAL-IPの欄がずっと待機状態</strong>という画面だ。</p>
+                    <pre><code>$ kubectl get svc web
+NAME   TYPE           CLUSTER-IP     EXTERNAL-IP   PORT(S)        AGE
+web    LoadBalancer   10.96.31.10    &lt;pending&gt;     80:31942/TCP   12m</code></pre>
+                    <p>ここで多くの人がログを漁り始める。しかしここに直すべきエラーはない。<strong>これは失敗ではなく、相手方が不在という状態</strong>だ。Kubernetesの公式ドキュメントはこの点を非常にはっきり書いている。クラウドプロバイダーがロードバランサーをサポートしていれば、サービスに外部アドレスが<strong>プロビジョニング</strong>され、<strong>そのアドレスを割り当てる責任はクラウドプロバイダーにある</strong>。相手がいなければ埋まる値もない。</p>
+                    <p>2026年7月にGeekNewsへ上がった記事が、この問題を非常に具体的な形で見せてくれた。通信事業者からDHCPで受け取ったIPv4アドレスをKubernetes LoadBalancerの外部アドレスとして使うために、<strong>アドレスをインターフェースに載せないDHCPクライアント</strong>を作り、<strong>eBPFでARPに代理応答</strong>し、最後には<strong>非対称ルーティング</strong>まで手を入れる必要があったという記録である。華やかな成功談として読むこともできるが、この記事の本当の価値は別のところにあると思う。クラウドではチェックボックス一つで済んでいたことが、<strong>自分でやろうとするとなぜこれほど多くの層に分かれるのか</strong>を正直に示している点だ。</p>
+                    <p>だからこの記事は特定の実装を紹介するものではない。<strong>クラウドではない環境でLoadBalancerタイプのサービスを成立させるには何を自分でやる必要があるのか</strong>を層ごとに分解し、選択肢ごとにどんな代償が付くのか、そして壊れたときにどこから見るのかを整理する。使う道具がMetalLBであれCiliumであれ自作のデーモンであれ、以下の構造を理解していれば判断は格段に速くなる。</p>
+
+                    <h2>1. クラウドでは誰がIPを配るのか - LoadBalancerタイプの実際の契約</h2>
+
+                    <h3>1.1 Kubernetesはアドレスを作らない</h3>
+                    <p>まず誤解を取り除こう。<strong>Kubernetesの中にロードバランサーを作るコードは入っていない。</strong>サービスを<code>type: LoadBalancer</code>と宣言することは、実装の指示というより<strong>要求の表明</strong>に近い。実際に起きていることはこうだ。</p>
+                    <ul>
+                        <li>利用者が<code>type: LoadBalancer</code>のサービスを作る</li>
+                        <li>外部のコントローラーがその要求を観測する。クラウドではcloud-controller-managerがそれにあたる</li>
+                        <li>コントローラーが自分の環境でアドレスを確保し、実際の負荷分散リソースを用意する</li>
+                        <li>確保したアドレスをサービスの<code>status.loadBalancer.ingress</code>に書き込む</li>
+                        <li>そこで初めて<code>kubectl get svc</code>のEXTERNAL-IP欄が埋まる</li>
+                    </ul>
+                    <p>つまりEXTERNAL-IPは<strong>結果を報告する欄</strong>であって命令する欄ではない。この事実を受け入れると、オンプレミスでやるべきことは自動的に決まる。<strong>そのstatusを埋める主体を自分で立てなければならない。</strong></p>
+
+                    <h3>1.2 特定のアドレスを指定したいとき</h3>
+                    <p>かつては<code>spec.loadBalancerIP</code>フィールドで特定のアドレスを要求したが、このフィールドは現在ドキュメント上<strong>非推奨</strong>と表示されている。実装ごとに解釈が分かれ、デュアルスタック環境を表現できないという問題があるためだ。代わりに現在は次の二つを使う。</p>
+                    <ul>
+                        <li><strong>実装ごとのアノテーション</strong> — 各コントローラーが定義した方法でアドレスやプールを指定する。可搬性は低いが表現力は高い</li>
+                        <li><strong><code>spec.loadBalancerClass</code></strong> — クラスターに複数のロードバランサー実装が共存するとき、どの実装がこのサービスを処理するかを指定する。オンプレミスでMetalLBと別のコントローラーを併用する場合に特に有用だ</li>
+                    </ul>
+
+                    <h3>1.3 オンプレミスでは二つの仕事が必要になる</h3>
+                    <p>ここがこの記事で最も重要な区別だ。クラウドでは一塊に見えていたことが、<strong>オンプレミスでは性質のまったく異なる二つの作業</strong>に分かれる。</p>
+                    <ul>
+                        <li><strong>払い出し(allocation)</strong> — どのアドレスをこのサービスに与えるか。アドレスプールを管理し重複なく配るIPAMの問題である</li>
+                        <li><strong>広告(announcement)</strong> — そのアドレス宛てのトラフィックをどうやって自分のクラスターへ引き込むか。リンク層のARPやNDPか、ネットワーク層のルーティングプロトコルである</li>
+                    </ul>
+                    <p>この二つは互いに独立で、Ciliumはその分離を構造として見せている。公式ドキュメントによれば<strong>LB IPAM</strong>は<code>CiliumLoadBalancerIPPool</code>からアドレスを選んでサービスに割り当てる役割だけを担い、そのアドレスを実際に知らせる仕事は<strong>BGPコントロールプレーン</strong>や<strong>L2 Announcements</strong>といった別機能が受け持つ。MetalLBも内部的には同じ構造だ。</p>
+                    <p>オンプレミスのトラブルシューティングが難しい理由はここにある。<strong>EXTERNAL-IPにアドレスが表示されたという事実は払い出しが済んだという意味にすぎず、そのアドレスに接続できる保証にはまったくならない。</strong>アドレスは付いたのに接続できないという状況は、ほとんどが広告層で起きている。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>層</th><th>クラウドでは誰がやるか</th><th>オンプレミスでは誰がやるか</th><th>失敗したときの症状</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>アドレス払い出し(IPAM)</td><td>クラウドプロバイダー</td><td>MetalLBのプール、Cilium LB IPAM、自作コントローラー</td><td>EXTERNAL-IPが待機状態のまま</td></tr>
+                            <tr><td>経路広告</td><td>クラウドのネットワークファブリック</td><td>ARP・NDP応答またはBGP広告</td><td>アドレスは付くが到達不能、ARP無応答</td></tr>
+                            <tr><td>ノード内部の転送</td><td>プロバイダーのデータプレーン</td><td>kube-proxyまたはeBPFデータプレーン</td><td>一部のノードからしか接続できない</td></tr>
+                            <tr><td>送信元IPの保持</td><td>プロバイダー設定またはプロキシプロトコル</td><td><code>externalTrafficPolicy</code>の選択</td><td>すべての接続がノードIPとして記録される</td></tr>
+                            <tr><td>戻り経路の整合</td><td>ファブリックが処理</td><td>運用者が自分で設計</td><td>要求は届き、応答は消える</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>表の最後の二行がオンプレミスで特に人を苦しめる項目だ。公式ドキュメント上<code>externalTrafficPolicy</code>は既定値の<code>Cluster</code>がすべてのエンドポイントへルーティングし、<code>Local</code>はノード上のエンドポイントのみへ送りながら<strong>クライアントの送信元IPを保持</strong>する。アクセスログに実際の接続元IPが必要なサービスならこの選択は必須だが、後述するように<code>Local</code>は広告層と衝突する場合がある。</p>
+
+                    <h2>2. オンプレミス解法の三つの系統 - L2広告、BGP、自作</h2>
+                    <p>オンプレミスで広告の問題を解く方法は大きく三つある。名前ではなく<strong>どの層で嘘をつくか</strong>で分類すると理解が速い。</p>
+
+                    <h3>2.1 L2モード - リンク層で代わりに答える</h3>
+                    <p>最も広く使われている方式だ。MetalLB公式ドキュメントの説明をそのまま移すと、このモードでは<strong>クラスター内の一台がサービスの所有権を持ち、標準的なアドレス探索プロトコル(IPv4はARP、IPv6はNDP)でそのIPをローカルネットワーク上で到達可能にする</strong>。技術的にはそのノードが自分のインターフェースに複数のアドレスを持っているかのように見せることになる。</p>
+                    <p>利点は明確だ。<strong>ルーターに触れる必要がない。</strong>スイッチも知らなくてよい。オフィスやホームラボのようにネットワーク機器への権限が限られる場所では、事実上唯一の現実的な選択肢である。しかしドキュメントが明かしている代償も明確だ。</p>
+                    <ul>
+                        <li><strong>帯域の上限が一台分になる。</strong>ドキュメントの表現で「サービスIP宛ての全トラフィックが一つのノードへ行く」。ノードを増やしてもそのサービスの流入帯域は増えない</li>
+                        <li><strong>フェイルオーバーがクライアント任せになる。</strong>MetalLBはMAC変更を知らせる非要求のリンク層パケットを送るが、多くの現代的なOSは数秒で反映する一方、実装が不十分なクライアントはキャッシュが切れるまで古いMACへ送り続ける</li>
+                        <li><strong>計画的な切り替えでは旧リーダーをしばらく生かしておくこと</strong>をドキュメントが推奨している。キャッシュの古いクライアントのトラフィックを数分間代わりに転送するためだ</li>
+                        <li><strong>リーダー選出がステートレス</strong>である。各スピーカーがノードとVIPをハッシュした整列リストをそれぞれ計算し、一位なら広告する。ノードを追加するとリーダーが変わりうる</li>
+                        <li><strong>ネットワーク分断時の分裂リスク</strong>がドキュメントに明記されている。互いを停止中と誤判断すると、同じVIPを複数が同時に主張する、あるいは誰も主張しない状態になりうる</li>
+                    </ul>
+                    <p>CiliumのL2 Announcementsも同じ物理法則の下にある。ドキュメントは「ARP・NDPの性質上ホストはIPごとにMACを一つしか保存しないため、クラスター内で<strong>一つのノードだけ</strong>が応答しなければならない」と述べ、そのためサービスごとに<strong>Kubernetes Lease</strong>でリーダーを選ぶと説明する。ただしこの機能には実務で引っかかりやすい条件がいくつも付く。</p>
+                    <ul>
+                        <li>ドキュメント上は<strong>ベータ</strong>機能であり、<strong>kube-proxy置き換えモード</strong>が有効である必要がある</li>
+                        <li>Lease取得が<strong>先着順</strong>のため、ノード間の負荷が非対称になりうるとドキュメントが明かしている</li>
+                        <li><strong><code>externalTrafficPolicy: Local</code>とは互換性がない</strong>と明記されている。ポッドのないノードでサービスIPが広告されトラフィックが破棄されうるためだ。送信元IPの保持が必要なサービスなら、この組み合わせは最初から避けるべきである</li>
+                        <li>非要求ARPを受け入れないクライアントは自身のテーブルの寿命が尽きるまで再問い合わせしないため、想定より長い断絶を経験しうる</li>
+                    </ul>
+                    <p>kube-vipもARPモードで同じ原理を使う。ドキュメントによれば仮想IPがノード間を移るときにGratuitous ARPをブロードキャストしてIPとMACの対応を更新し、リーダー選出にはKubernetes Leaseを用いる。<strong>実装が何であれ、リンク層でできることの限界は同じだ。</strong></p>
+
+                    <h3>2.2 BGPモード - ルーターに経路を教える</h3>
+                    <p>BGPモードでは各ノードが近隣のルーターとピアリングセッションを結び、サービスIPへの経路を知らせる。ルーターは複数のノードを等コスト経路と見なしECMPで分散する。L2の単一ノードのボトルネックが消え、ルーターのポリシーを使った細かい制御も可能になる。</p>
+                    <p>ところがここに<strong>オンプレミスの負荷分散で最も頻繁に過小評価される罠</strong>がある。MetalLBのドキュメントが直接警告している内容だ。ルーターはパケットヘッダーの一部フィールドをハッシュして次ホップを選ぶ。3タプル(プロトコル・送信元IP・宛先IP)や、それにポートを加えた5タプルが一般的である。同一セッションのパケットが同じノードへ行くようにするための設計だ。問題はその先にある。</p>
+                    <blockquote>バックエンド集合のサイズが変わると、既存の接続は事実上ランダムに再ハッシュされる。— MetalLB BGPドキュメント</blockquote>
+                    <p>ノードを一台再起動する、あるいはBGPセッションが一つ切れる、その瞬間に<strong>そのノードとは無関係だった接続まで別のノードへ再配置</strong>される。新しいノードにはその接続の状態がないので通信は切れる。ドキュメントが挙げる緩和策は「解決」ではなく「妥協」に近い。ルーター側で復元力のあるECMPハッシュを使う、デプロイを特定ノードに固定する、トラフィックの少ない時間帯に変更する、DNSでサービス間を移行する、クライアント側の再試行ロジックを足す、Ingressコントローラー層を挟む、そして重要でないサービスなら時折の接続リセットを受け入れる、である。</p>
+                    <p>実務で最も現実的な答えは、たいてい最後の二つの組み合わせだ。<strong>BGPではIngressコントローラーだけを数個公開し、実アプリケーションはその後ろに置く</strong>構成である。こうすれば再ハッシュの影響範囲がIngress層に限定される。</p>
+
+                    <h3>2.3 自作 - 既存ツールの前提が成立しないとき</h3>
+                    <p>三つ目の系統は自分で作ることだ。無謀に見えるが、<strong>既存ツールが置いている前提そのものが自分の環境で崩れるとき</strong>は、これしか選択肢がないこともある。今回の事例がまさにそれである。</p>
+                    <p>MetalLBの前提は<strong>運用者がアドレスプールを知っている</strong>ことだ。ドキュメントの表現でMetalLBは「何もないところからIPアドレスを作り出せない」ため管理者がプールを提供する必要がある。ところが通信事業者のDHCPでアドレスを受け取る環境では、この前提が成立しない。どのアドレスを受け取るか事前に分からず、変わりうるからだ。プロジェクトのイシュートラッカーにも外部IPAM・DHCP連携の要望が長く上がっているが、動的な払い出しに対応するにはシングルスレッド前提を含む内部構造を大きく作り直す必要があるという理由で実装されていない。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>基準</th><th>L2広告(ARP・NDP)</th><th>BGP広告</th><th>自作</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>ルーター権限の要否</td><td>不要</td><td>必須(ピアリング設定)</td><td>構成による</td></tr>
+                            <tr><td>サービスごとの流入帯域</td><td>ノード一台分が上限</td><td>複数ノードへ分散</td><td>設計次第</td></tr>
+                            <tr><td>アドレスが動的に変わる環境</td><td>不適合(プール固定前提)</td><td>不適合(プール固定前提)</td><td>対応可能</td></tr>
+                            <tr><td>フェイルオーバー時のリスク</td><td>クライアントのキャッシュ遅延</td><td>ECMP再ハッシュで無関係な接続まで切れる</td><td>実装品質に全面的に依存</td></tr>
+                            <tr><td>運用の難度</td><td>低い</td><td>中程度(ネットワーク担当との協業が必要)</td><td>高い(コードがそのままインフラ)</td></tr>
+                            <tr><td>バス係数</td><td>広い利用者層</td><td>広い利用者層</td><td>たいてい一人</td></tr>
+                            <tr><td>向いている状況</td><td>オフィス・ホームラボ・小規模オンプレ</td><td>自前ルーター運用、帯域要求が大きい</td><td>既存の前提が崩れる特殊環境</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>表の<strong>バス係数</strong>の行は真剣に見ることを勧める。自作のデーモンはインフラの一番下で静かに動き続け、作った人が不在になった瞬間に誰も手を出せないブラックボックスになる。作ると決めたなら、最低限<strong>動作原理と診断手順を文書に残すところまで</strong>が実装の一部である。</p>
+
+                    <h2>3. 通信事業者の回線上で変わるもの - DHCPが作る制約</h2>
+
+                    <div class="callout">
+                        <p><strong>始める前に。</strong>回線プランごとに利用できるアドレス数、サーバー運用の許容範囲、固定アドレスの提供条件が異なり、それらは契約と利用規約で定められる。<strong>技術的に可能なことと契約上許されることは別</strong>なので、構成に入る前に利用規約とサービス条件を確認し、必要なら事業者に問い合わせるのが順序だ。この記事はネットワークの動作原理と診断方法を扱うものであり、事業者のポリシーを迂回する方法は扱わない。</p>
+                    </div>
+
+                    <h3>3.1 DHCPのアドレスは所有ではなく貸与だ</h3>
+                    <p>最も根本的な制約である。RFC 2131は<strong>クライアント識別子またはハードウェアアドレスと、割り当てられたネットワークアドレスの組み合わせがそのリースの一意な識別子</strong>になると定義している。そしてリースは有限だ。クライアントはT1の時点でサーバーへユニキャストで更新を試み、失敗すればT2の時点でブロードキャストで再試行する。サーバーはクライアントのアドレス認識が誤っている、あるいはリースが満了したと判断すると<strong>DHCPNAK</strong>を送って無効を通知する。</p>
+                    <p>サービスアドレスとして使う観点でこの事実が意味するところは重い。<strong>アドレスが変わることは障害ではなく正常動作</strong>である。したがって設計は次を正常なシナリオとして含める必要がある。</p>
+                    <ul>
+                        <li>更新に失敗して<strong>アドレスが回収されうる</strong>。そのとき当該サービスはどうなるのか</li>
+                        <li>再起動や回線切り替えのあとに<strong>別のアドレスを受け取りうる</strong>。DNSの更新は誰がやるのか</li>
+                        <li>アドレスが変わると<strong>証明書・ファイアウォールの許可リスト・外部への登録情報</strong>が一斉にずれる</li>
+                        <li>DHCPクライアントのプロセスが死ぬと<strong>静かにリースが満了</strong>する。監視対象に入れているか</li>
+                    </ul>
+
+                    <h3>3.2 アドレス一つにつきMAC一つ</h3>
+                    <p>二つ目の制約は識別子だ。リースが識別子と結び付いているため、<strong>アドレスを複数受け取るには互いに異なる識別子でそれぞれ要求</strong>する必要がある。元の事例が仮想インターフェースを複数作りそれぞれ異なるMACを持たせた理由がこれだ。一つの物理インターフェースで複数のリースを自然に受け取る方法が乏しいからである。</p>
+                    <p>ここで実務上気を付ける点が生じる。上位のネットワーク機器がポートごとに学習するMAC数を制限したり、想定外のMACの出現を異常と扱うポリシーを置くことがある。<strong>そうしたポリシーはネットワークを安定して保つための正当な仕組み</strong>なので、回避の対象ではなく<strong>設計制約として受け入れ、事前に確認すべき条件</strong>である。</p>
+
+                    <h3>3.3 ゲートウェイとファイアウォールは自分のものではない</h3>
+                    <p>三つ目は統制権の境界だ。クラウドではネットワーク全体が事実上自分の管理領域だが、通信事業者の回線では<strong>デフォルトゲートウェイの向こうはすべて他人の領域</strong>である。この境界のために次が成り立つ。</p>
+                    <ul>
+                        <li>送信元アドレスが想定と異なるパケットは<strong>上位ネットワークで弾かれうる</strong>。後述する非対称ルーティング問題の根源である</li>
+                        <li>一部のポートが上位で遮断されることがあり、これは自分の機器の設定だけでは確認できない</li>
+                        <li>QoS表示のようなヘッダーフィールドは<strong>境界を越える際に書き換えられうる</strong>。RFC 2474はドメイン境界を通る際にコードポイントが再表示されうることを前提にしている</li>
+                        <li>インターネットと放送が結合した回線は、配線や設定の変更が他のサービスに影響しうる</li>
+                    </ul>
+
+                    <table>
+                        <thead>
+                            <tr><th>制約</th><th>技術的根拠</th><th>設計への影響</th><th>対応の方向</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>アドレスが回収されうる</td><td>リース満了・DHCPNAK(RFC 2131)</td><td>サービスアドレスが消えうる</td><td>更新の監視、アドレス変更を自動反映する経路の確保</td></tr>
+                            <tr><td>識別子単位の払い出し</td><td>クライアント識別子・ハードウェアアドレスに基づくリース</td><td>アドレス数だけ識別子が必要</td><td>仮想インターフェースの設計、上位機器のポリシーを事前確認</td></tr>
+                            <tr><td>ゲートウェイを統制できない</td><td>境界の向こうは事業者の管理領域</td><td>送信元不一致のパケットが失われうる</td><td>戻り経路を流入経路と一致させる設計</td></tr>
+                            <tr><td>ヘッダーフィールドの再表示</td><td>DSドメイン境界でコードポイントが再表示(RFC 2474)</td><td>QoS表示を端点間の信号に使えない</td><td>内部信号は内部境界の中だけで使う</td></tr>
+                            <tr><td>規約・プラン条件</td><td>契約書そのもの</td><td>構成自体が許容範囲外でありうる</td><td>着手前に規約を確認、必要なら事業者に問い合わせ</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2>4. ARPに代わって応答するということ - 何が壊れ、何を得るのか</h2>
+
+                    <h3>4.1 なぜ代わりに応答する必要があるのか</h3>
+                    <p>ARPはIPv4ネットワークで「このIPを持つ機器はMACアドレスを教えてほしい」とブロードキャストで問うプロトコルだ。同じリンク上のルーターやクライアントは、この問い合わせへの応答を受け取って初めてフレームを送れる。<strong>サービスIPは実機のアドレスではなくクラスターが主張する仮想アドレス</strong>なので、誰かが代わりに答えてくれなければ、そのアドレスはリンク上で存在しないのと同じである。</p>
+                    <p>最も単純な方法は、そのアドレスをノードのインターフェースに実際に載せることだ。そうすればカーネルが自動的に応答する。ところがこの方式にはオンプレミス特有の副作用が付いてくる。</p>
+                    <ul>
+                        <li>アドレスがローカルに存在するため、<strong>ノード自身がそのアドレス宛てのトラフィックを内部で処理</strong>してしまいうる</li>
+                        <li>カーネルがそのアドレスを<strong>送信元として選択</strong>し、意図しない送信元IPが出ていくことがある</li>
+                        <li>当該ポートにリスナーがなければカーネルが即座に<strong>接続拒否</strong>を返す。静かに無視されたほうがよい状況でもそうなる</li>
+                        <li>複数のノードに同じアドレスを載せると<strong>アドレス衝突</strong>になる</li>
+                    </ul>
+                    <p>元の事例で「静かなDHCPクライアント」という表現が出てくる理由がここにある。アドレスを<strong>借りはするがインターフェースには載せない</strong>という選択だ。Linuxのネットワークスタックから見ればそのアドレスは存在しないので、上の副作用は原理的に生じない。代わりに<strong>ARPに答える者が誰もいなくなる</strong>。そこで別途の応答装置が必要になる。</p>
+
+                    <h3>4.2 代理応答するときに生じる問題</h3>
+                    <p>ARP応答を代行した瞬間、次の問題が一斉に付いてくる。どの道具を使っても性質は同じだ。</p>
+                    <ul>
+                        <li><strong>真実は一つでなければならない。</strong>ホストはIPごとにMACを一つしかキャッシュしないので、二つ以上が応答すると後の応答が勝つ。応答主体がちょうど一つであることを保証する仕組み(リーダー選出)が必ず必要である</li>
+                        <li><strong>キャッシュは即座に変わらない。</strong>リーダーが変わってもクライアントのキャッシュは期限まで古いMACを使う。Gratuitous ARPで知らせても受け入れない実装がある</li>
+                        <li><strong>Gratuitous ARPは疑われる。</strong>同じ手法がなりすましにも使われるため、これを無視するポリシーは一般的だ。「送ったから反映されただろう」という仮定は危険である</li>
+                        <li><strong>セキュリティ機能と衝突する。</strong>動的ARP検査やポートセキュリティといったスイッチの機能は、認可されていないアドレス主張を遮断するために設計されている。こうした環境では<strong>ネットワーク管理者との事前合意が必須</strong>である</li>
+                        <li><strong>ノード障害がそのままサービス障害になる。</strong>L2モードでは応答ノードが落ちると、新しいリーダーが選ばれキャッシュが更新されるまでそのサービスは到達不能だ</li>
+                    </ul>
+                    <p>なおLinuxには近隣キャッシュの挙動を調整する<code>arp_ignore</code>・<code>arp_announce</code>・<code>arp_filter</code>といったパラメータがあり、マルチホーム構成では実際に問題を作ることもある。ただし<strong>インターフェースに載せていないアドレス</strong>はそもそもカーネルの管理対象ではないため、これらのスイッチでは解決しない。ユーザー空間であれXDPであれ<strong>別途の応答器</strong>が必要になる理由である。</p>
+
+                    <h2>5. eBPF・XDPでARPに答えるという選択</h2>
+
+                    <h3>5.1 XDPはスタックより前にある</h3>
+                    <p>XDPはネットワークドライバーの受信経路の入口、つまり<strong>カーネルネットワークスタックにパケットが上がる前</strong>にeBPFプログラムを実行するフックだ。プログラムの戻り値によってドライバーの動作が決まる。カーネルドキュメントに基づく主な動作は次のとおりである。</p>
+                    <ul>
+                        <li><strong><code>XDP_DROP</code></strong> — パケットを捨て、到着した受信リングキューへ戻す。最も単純で速い動作である</li>
+                        <li><strong><code>XDP_PASS</code></strong> — 通常のカーネルスタック処理へ渡す</li>
+                        <li><strong><code>XDP_TX</code></strong> — 受け取ったパケットを<strong>入ってきたまさにそのインターフェースへ送り返す</strong>。通常はパケットの内容を書き換えたうえでこの値を返す</li>
+                        <li><strong><code>XDP_ABORTED</code></strong> — プログラムのエラーを意味し、パケットは捨てられる。正常なコードが返す値ではない</li>
+                    </ul>
+                    <p>ARP応答器がここにぴったり合う理由が見えてくる。ARP要求フレームを受け取り、<strong>送信元と宛先を入れ替えて応答の形に書き換え<code>XDP_TX</code>で送り返せば</strong>、カーネルスタックがそのアドレスを知らない状態でもリンク上では完全な応答が出ていく。インターフェースにアドレスを載せないという決定と論理的に噛み合う構造だ。</p>
+
+                    <h3>5.2 得るものと失うもの</h3>
+                    <p>この方式がもたらす利点は実質的である。</p>
+                    <ul>
+                        <li><strong>アドレスをスタックに露出しない。</strong>先に見た送信元選択の誤りや、望まない接続拒否が生じない</li>
+                        <li><strong>どのアドレスでも即座に応答対象に入れられる。</strong>インターフェース設定の変更なしにマップを更新するだけでよいので、アドレスが動的に変わる環境によく合う</li>
+                        <li><strong>スタックの負担がない。</strong>ブロードキャストのARP要求をスタックまで上げず入口で処理する</li>
+                    </ul>
+                    <p>逆に払う代価も明確だ。</p>
+                    <ul>
+                        <li><strong>デバッグの難度が大きく上がる。</strong><code>ip neigh</code>や<code>ip addr</code>には何の痕跡もない。リンク上では応答するのにホスト設定には存在しないアドレスなので、<strong>tcpdumpなしでは状況把握が難しい</strong></li>
+                        <li><strong>ドライバー依存がある。</strong>ネイティブXDPの対応可否はドライバーごとに異なり、汎用モードに落ちると期待した性能は出ない。仮想環境では特に確認が必要である</li>
+                        <li><strong>観測ツールの死角にある。</strong>ほとんどの監視はスタックより上の指標を見る。XDPで処理・破棄されたものは、別途カウンターを仕込まない限り見えない</li>
+                        <li><strong>運用要員の参入障壁</strong>が高い。障害の時刻にこの層を読める人が何人いるかが、実際の復旧時間を決める</li>
+                    </ul>
+                    <blockquote>まとめるとeBPF・XDPは「ARPにどう応答するか」という問題への優雅な答えだが、その代価として<strong>システムの真実が標準ツールから見えなくなる</strong>。これは性能の問題ではなく運用の問題である。</blockquote>
+
+                    <h2>6. 非対称ルーティング - 入ってきた扉から出ていかないとき</h2>
+
+                    <h3>6.1 なぜ生じるのか</h3>
+                    <p>ここからがオンプレミスのロードバランサー構築で最も人を疲れさせる区間だ。症状はいつも似ている。<strong>同じ建物・同じスイッチではうまくいくのに、外部から接続すると応答がない。</strong></p>
+                    <p>原因はたいてい単純である。要求は特定の経路で入ってきたのに、<strong>応答はサーバーのデフォルト経路から出ていく</strong>。サーバーは宛先アドレスだけを見てルーティングテーブルから出口を選ぶので、「この要求がどこから入ってきたか」は基本的に考慮しない。複数回線、トンネル、複数のルーターを経る構成では、この不一致が自然に発生する。</p>
+                    <p>同じLANではなぜうまくいくのか。応答がルーターを経ずリンク層で直接相手へ届くからだ。<strong>経路が短くて問題が表に出ないだけ</strong>である。この違いによって「内部では動くのに外部だけ動かない」という典型的なパターンが生まれる。</p>
+
+                    <h3>6.2 rp_filter - 静かに捨てるスイッチ</h3>
+                    <p>非対称経路そのものが常に問題なわけではない。本当の問題は、途中の誰かが<strong>このパケットを捨てると</strong>決めたときに起きる。Linuxでその判断を下す代表的な仕組みが逆経路フィルターだ。カーネルドキュメントによれば値の意味は次のとおりである。</p>
+                    <ul>
+                        <li><strong>0</strong> — 送信元の検証を行わない</li>
+                        <li><strong>1</strong> — RFC 3704の<strong>厳格モード</strong>。入ってきたパケットをルーティング情報と照合し、<strong>そのインターフェースが最適な逆経路でなければ検査に失敗</strong>させる</li>
+                        <li><strong>2</strong> — RFC 3704の<strong>緩やかなモード</strong>。送信元アドレスが<strong>どのインターフェースからも到達不能なときだけ</strong>失敗させる</li>
+                    </ul>
+                    <p>実務で必ず知っておくべきことがもう二つある。第一に、<strong>実際に適用される値は<code>conf/all</code>と<code>conf/{インターフェース}</code>のうち大きい方</strong>だ。インターフェース値だけ0に下げて「切ったのになぜ動かない」と迷う事故はここから生まれる。第二に、カーネルドキュメント自身が<strong>非対称ルーティングや複雑なルーティングを使うなら緩やかなモードを推奨</strong>すると書いている。つまりこの値を調整することは裏技ではなく文書化された選択肢である。</p>
+                    <pre><code># 実際に適用される値は all とインターフェース値のうち大きい方
+sysctl net.ipv4.conf.all.rp_filter
+sysctl net.ipv4.conf.eth0.rp_filter
+
+# 捨てられたパケットの痕跡 (カーネルのビルドにより項目は異なりうる)
+grep -i martian /proc/net/stat/* 2&gt;/dev/null
+nstat -az | grep -i -E 'InAddrErrors|InNoRoutes'</code></pre>
+                    <p>ただし値を下げることは<strong>送信元偽装への防御をその分あきらめること</strong>でもある。だから順序が重要だ。<strong>まず経路を正せるかを見て、構造的に不可能なときにフィルターを緩める。</strong>逆にすると原因はそのままに症状だけ隠すことになる。</p>
+
+                    <h3>6.3 解決の系統</h3>
+                    <p>非対称に対処する方法は大きく四つある。状況によって正解が異なる。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>方法</th><th>原理</th><th>利点</th><th>欠点</th><th>適した状況</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>経路の一本化</td><td>流入経路を一つにまとめ非対称そのものをなくす</td><td>最も単純で堅牢</td><td>複数回線の利点を放棄</td><td>実質一回線、または単純さが優先のとき</td></tr>
+                            <tr><td>接続マーク＋ポリシールーティング</td><td>流入インターフェースを接続に記録し応答時に復元して出口を強制</td><td>複数回線でも正確に動く</td><td>状態追跡が必要、規則が複雑化</td><td>回線が二つ以上あり、それぞれで提供するとき</td></tr>
+                            <tr><td>送信元アドレス変換</td><td>前段で送信元を書き換え応答が必ず戻るようにする</td><td>実装が容易で確実</td><td>実際のクライアントIPがログから消える</td><td>送信元IPが重要でないサービス</td></tr>
+                            <tr><td>逆経路フィルターの緩和</td><td>非対称を許容するよう検証水準を下げる</td><td>即効性がある</td><td>偽装防御が弱まり原因は残る</td><td>構造上非対称が避けられないときの補助手段</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>実務で最も多く使われるのは二つ目だ。考え方は単純である。<strong>入ってくるときにどこから入ってきたかを接続に書いておき、出ていくときにその記録を取り出して出口を決める。</strong>Linuxではファイアウォールの接続追跡マークとポリシールーティング規則を組み合わせて実装する。</p>
+                    <pre><code># 概念だけが見える最小の形
+# 1) マークが付いたパケットは別のルーティングテーブルを見るようにする
+ip rule add fwmark 0x64 lookup 100
+
+# 2) そのテーブルのデフォルト経路を該当回線のゲートウェイに指定する
+ip route add default via 203.0.113.1 dev eth1 table 100
+
+# 3) 確認
+ip rule show
+ip route show table 100
+
+# 4) ある応答が実際にどの経路で出ていくかを計算させる
+ip route get 198.51.100.7 from 203.0.113.10 mark 0x64</code></pre>
+                    <p>最後の<code>ip route get</code>はこの区間で最も有用なコマンドだ。<strong>推測せずカーネルに直接尋ねる</strong>方法だからである。マークを付けて復元する部分はファイアウォール層の接続追跡マーク(接続に値を保存しておき応答パケットに復元する機能)で処理する。道具がnftablesであれiptablesであれ考え方は同じだ。</p>
+
+                    <h2>7. 元の事例が選んだ道 - DSCPタグ付けとその代価</h2>
+
+                    <h3>7.1 問題の形</h3>
+                    <p>元の事例の構成はもう少し複雑だった。通信事業者のアドレスを受け取る<strong>エッジルーター</strong>があり、クラスターはトンネルの向こうの<strong>別の場所</strong>にあった。外部クライアントの要求はエッジルーターを経てクラスターへ入るのに、応答はクラスター側の経路からそのままインターネットへ出ようとした。すると<strong>パケットの送信元アドレスと実際に出ていく位置がずれ</strong>、上位ネットワークで弾かれた。同じ建物のクライアントはリンク層で完結するため正常に動き、この違いが問題をいっそう分かりにくくした。</p>
+                    <p>一般的な答えは前節の二つ目、すなわち<strong>送信元アドレスに基づくポリシールーティング</strong>である。ところが元の記録によれば、この方式は逆方向の非対称を作った。<strong>ローカルネットワークのクライアントへの応答までエッジルーターへ回って</strong>しまったのだ。送信元アドレスだけでは「この接続がどの扉から入ってきたか」を区別できないという限界が露呈したわけである。</p>
+
+                    <h3>7.2 なぜよりによってDSCPだったのか</h3>
+                    <p>そこで選ばれたのが<strong>パケットヘッダーのDSCPフィールドに流入地点の識別子を載せて送る</strong>方式だ。DSCPはRFC 2474が定義する<strong>DSフィールドの6ビットのコードポイント</strong>で、本来は各ノードでパケットが受ける処理動作を選ぶために使われる。要約するとこういう流れになる。</p>
+                    <ul>
+                        <li>エッジで流入する際にeBPFが<strong>どのエッジから入ってきたか</strong>をDSCP値として表示する</li>
+                        <li>経路上のデーモンがこの表示でフローを追跡する</li>
+                        <li>応答が出ていくときにポリシールーティングで<strong>入ってきたそのエッジへ戻す</strong></li>
+                        <li>事業者ネットワークへ出る前に<strong>元のDSCP値を復元する</strong></li>
+                    </ul>
+                    <p>最後の段階を誤解しないことが重要だ。これは何かを隠すための措置ではなく、<strong>内部の信号を内部の境界に留める衛生的な措置</strong>である。DSCPは本来QoSポリシーのためのフィールドなので、任意に決めた内部の値が他人のネットワークへ流れ出れば、そちらのポリシーにとって意味のない入力になる。さらにRFC 2474自体が<strong>ドメイン境界を通る際にコードポイントが再表示されうること</strong>を前提としているため、この値はそもそも端点間の信号として信頼できない。<strong>境界の中だけで使い境界で戻すのが、プロトコル設計の趣旨に沿った使い方</strong>である。</p>
+
+                    <h3>7.3 これを一般解にしてはいけない</h3>
+                    <p>賢い解法ではあるが、そのまま真似る前に押さえておくべきことがある。</p>
+                    <ul>
+                        <li><strong>表示できる空間が非常に狭い。</strong>6ビットしかなく、そのうち一部には慣例的な用途があるので実際に使える値はさらに少ない。流入地点が増えればすぐ足りなくなる</li>
+                        <li><strong>既存のQoSポリシーと衝突しうる。</strong>社内で既にDSCPで優先度を管理しているなら、内部の信号とQoSの意図が混ざる</li>
+                        <li><strong>境界の外では保存が保証されない。</strong>中間機器が値を書き換えうるので、信頼区間がどこまでかを明確にする必要がある</li>
+                        <li><strong>接続追跡マークのほうが標準的な答えだ。</strong>同じ機器の中で解決する問題なら、わざわざパケットヘッダーに情報を載せる理由はない</li>
+                        <li><strong>診断ツールがこの値をうまく見せてくれない。</strong>障害の時刻に確認手順を知らなければ原因の把握が大きく遅れる</li>
+                    </ul>
+                    <p>まとめるとこれは<strong>複数のルーターをまたいでフロー情報を伝える必要があるという、かなり特殊な制約の下で出てきた答え</strong>である。ほとんどのオンプレミス環境は前節の接続マークとポリシールーティングで十分だ。<strong>他人の解法を持ってくるときはその人の制約も一緒に持ってくる必要がある</strong>という原則がここにも当てはまる。</p>
+
+                    <h2>8. 障害時の切り分け順序 - どこからtcpdumpするか</h2>
+                    <p>この構成が壊れたとき最も時間を食う失敗は<strong>ポッドから見始めること</strong>だ。ここでの問題はたいていはるかに下で発生する。下から上へ上がる順番を勧める。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>順序</th><th>確認対象</th><th>観測地点</th><th>正常なら</th><th>異常の兆候</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>1</td><td>アドレス払い出し</td><td><code>kubectl get svc</code>、コントローラーのログ</td><td>EXTERNAL-IPに値がある</td><td>待機状態が続く → コントローラー・プールの問題</td></tr>
+                            <tr><td>2</td><td>ARP応答</td><td>クライアント側リンクでのARP観測</td><td>単一のMACで一貫した応答</td><td>無応答、またはMACが変わり続ける</td></tr>
+                            <tr><td>3</td><td>要求の到達</td><td>ノードの物理インターフェース</td><td>SYNが見える</td><td>見えなければ上位経路・ファイアウォールの問題</td></tr>
+                            <tr><td>4</td><td>応答の向き</td><td>同じ地点での逆方向の観測</td><td>同じインターフェースから応答が出る</td><td>別のインターフェースから出るなら非対称</td></tr>
+                            <tr><td>5</td><td>カーネルの判断</td><td><code>ip route get</code>、<code>ip rule show</code>、rp_filter</td><td>意図した経路が計算される</td><td>デフォルト経路が計算される → ポリシー規則の欠落</td></tr>
+                            <tr><td>6</td><td>ノード内部の転送</td><td>ノード内部インターフェース・データプレーンの状態</td><td>バックエンドへ転送される</td><td>特定のノードでだけ失敗する</td></tr>
+                            <tr><td>7</td><td>アプリケーション</td><td>ポッドのログ、エンドポイント</td><td>要求がアプリまで到達</td><td>ここまで来たならアプリの問題</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>各段階で使うコマンドは次の程度で十分だ。例示アドレスは文書用の帯域である。</p>
+                    <pre><code># 段階2 - そのIPを誰が自分のものだと主張しているか
+tcpdump -ni eth0 arp and host 203.0.113.10
+
+# 段階3~4 - 要求と応答を同じ地点でまとめて見る
+tcpdump -ni eth0 host 203.0.113.10 and tcp port 80
+
+# 段階4の補強 - 別のインターフェースへ応答が漏れていないか
+tcpdump -ni eth1 host 203.0.113.10 and tcp port 80
+
+# 段階5 - 推測せずカーネルに直接尋ねる
+ip route get 198.51.100.7 from 203.0.113.10
+ip rule show</code></pre>
+                    <p>実務のコツをいくつか付け加える。</p>
+                    <ul>
+                        <li><strong>両端で同時に取る。</strong>片方だけ見ていると「送ったはずなのに来ない」で議論が止まる。クライアントとサーバー両方のキャプチャを時刻で突き合わせて初めて、どの区間で消えたかが特定できる</li>
+                        <li><strong>ARPから見る。</strong>ここで無応答なら上の層をいくら見ても無駄だ。逆にMACが揺れているならリーダー選出や重複主張の問題である</li>
+                        <li><strong>同一LANと外部を分けて試す。</strong>「内部は動き外部だけ動かない」は非対称ルーティングの代表的な指紋だ</li>
+                        <li><strong>フィルターを狭くしすぎない。</strong>ポートだけで絞るとICMPのエラーメッセージを取り逃す。経路の問題はしばしばそちらに手がかりがある</li>
+                        <li><strong>変更履歴を先に確認する。</strong>ノード追加、再起動、カーネル更新、ファイアウォール規則の配布の直後なら、原因の候補が大きく絞られる</li>
+                        <li><strong>パケットキャプチャは管理権限のあるネットワークでのみ</strong>行う。他人の通信を同意なく記録する行為は法的な問題になりうる</li>
+                    </ul>
+
+                    <h2>9. では何を選ぶのか - 状況別の判断</h2>
+                    <p>ここまでの内容を実際の選択に移すと次のようになる。ほとんどの環境は最初の二行で終わる。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>状況</th><th>推奨する出発点</th><th>理由</th><th>注意点</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>ホームラボ・小規模オフィス、ルーター権限なし</td><td>L2広告方式</td><td>ルーター設定なしで成立する唯一の選択肢</td><td>サービスごとの帯域がノード一台分、切り替え時のキャッシュ遅延</td></tr>
+                            <tr><td>自前ルーター運用、一台分を超える帯域が必要</td><td>BGP広告</td><td>ECMPで複数ノードへ分散</td><td>バックエンド変動時に無関係な接続まで再ハッシュ</td></tr>
+                            <tr><td>固定アドレスのあるオンプレミス設置</td><td>アドレスプール固定＋L2またはBGP</td><td>既存ツールの前提がそのまま成立</td><td>プールと実際の割り当て帯域がずれないよう管理</td></tr>
+                            <tr><td>アドレスが動的に変わる回線</td><td>動的反映の経路を確保してから決める</td><td>プール固定の前提が崩れる</td><td>規約確認が先行、アドレス変更を正常シナリオとして設計</td></tr>
+                            <tr><td>接続元IPをログに残す必要がある</td><td><code>externalTrafficPolicy: Local</code>を検討</td><td>送信元IPを保持する</td><td>一部のL2実装と互換性がない、ポッド配置の偏りに注意</td></tr>
+                            <tr><td>サービスが増え続ける</td><td>Ingress・Gateway層の導入</td><td>外部IP一つで多数のサービスを処理</td><td>層が増えれば障害地点も増える</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>最後の行を特に強調したい。<strong>オンプレミスでLoadBalancerタイプのサービスを乱発すると、管理すべき外部アドレスがサービスの数だけ増える。</strong>アドレスが貴重な環境ほど<strong>外部の入口は少数に保ち、その後ろで名前に基づいて振り分ける</strong>構成のほうがはるかに長持ちする。実際ほとんどのオンプレミスクラスターでは、LoadBalancerタイプはIngressコントローラーの前段に一つか二つあれば十分だ。</p>
+
+                    <h2>10. よくある誤解を正す</h2>
+                    <ul>
+                        <li><strong>「EXTERNAL-IPがpendingなのは不具合だ」</strong> — 違う。払い出しを担うコントローラーがいない正常な状態だ。オンプレミスではその役割を立てる必要がある</li>
+                        <li><strong>「MetalLBを入れればクラウドのようになる」</strong> — アドレスの払い出しと広告の問題は解けるが、戻り経路・送信元IPの保持・フェイルオーバーは依然として運用者の仕事だ</li>
+                        <li><strong>「BGPはL2より無条件に優れている」</strong> — 帯域では優れるが、バックエンド変動時の再ハッシュで<strong>無関係な接続まで切れる</strong>という文書化された限界がある。ルーター運用の力量も必要だ</li>
+                        <li><strong>「eBPFを使えば速くなる」</strong> — この文脈でのeBPFの利点は速度より<strong>スタックに触れずに望む層へ介入できる</strong>点だ。代わりに標準ツールから状態が見えなくなる</li>
+                        <li><strong>「rp_filterを0にすれば解決する」</strong> — 症状は消えても原因は残り、偽装への防御が弱まる。<code>all</code>とインターフェースのうち大きい値が適用される点もよく見落とされる</li>
+                        <li><strong>「内部で動くのだからファイアウォールの問題ではない」</strong> — むしろその逆の指紋だ。同一LANはルーターを経ないので経路の問題が表に出ない</li>
+                        <li><strong>「DHCPで受け取ったアドレスもどうせ自分のものだ」</strong> — 貸与である。回収されうるし、利用範囲は回線の規約で定められる</li>
+                        <li><strong>「どうせクラスターの中だからQoSフィールドは自由に使ってよい」</strong> — 境界を越えれば再表示されうるし、他人のポリシーに影響しうる。内部の信号は境界で戻すのが原則だ</li>
+                    </ul>
+
+                    <h2>結論</h2>
+                    <p>クラウドで<code>type: LoadBalancer</code>の一行がやっていたことは、実は<strong>少なくとも五つの作業の束</strong>だった。アドレスを確保し、そのアドレスをネットワークに知らせ、トラフィックをノードへ引き込み、ノードの中でバックエンドへ転送し、応答が来た道を戻るようにすることである。クラウドはこの五つを一塊で売っていたので、私たちはそれが一つだと思っていた。<strong>自分でやろうとすると、それぞれが独立した問題だという事実が明らかになる。</strong></p>
+                    <p>今回の事例が興味深いのは華やかな技術スタックのためではなく、<strong>既存ツールの前提が崩れる地点を正確に指したから</strong>だ。MetalLBは運用者がアドレスプールを知っていることを前提とし、この前提はほとんどの環境で正しい。しかしアドレスを動的に受け取る環境では成立しない。その地点で何を自分で作る必要があるのかを確認する過程そのものが、他人の作った抽象の下に何があったのかを教えてくれる。</p>
+                    <p>実用的な結論はむしろ淡白だ。<strong>ほとんどのオンプレミス・ホームラボ環境ではL2広告方式で十分であり、ルーターを運用できるならBGPが次の選択</strong>である。自作はその二つの前提が明確に崩れるときにだけ検討することであり、そのときも<strong>動作原理と診断手順を文書に残すところまで</strong>が実装の範囲だ。そして通信事業者の回線上で何かを構成するなら<strong>技術検討より規約の確認が先</strong>である。契約の範囲内で設計することが最も長持ちする構成になる。</p>
+                    <p>最後に一つ。この領域の障害は<strong>アプリケーションのログに何の痕跡も残さない</strong>。パケットはカーネルや上位ネットワークで静かに消え、開発者にはただのタイムアウトとしてしか見えない。だからこうした構成を運用すると決めたなら、<strong>ARP・経路・フィルターを確認する順番をあらかじめ手に馴染ませておくこと</strong>が、どんな自動化よりも実質的な備えになる。</p>
+
+                    <h2>参考資料</h2>
+                    <ul>
+                        <li>Kubernetes公式ドキュメント - Service (type LoadBalancer、status.loadBalancer.ingress、loadBalancerClass、externalTrafficPolicy): <a href="https://kubernetes.io/docs/concepts/services-networking/service/" target="_blank" rel="noopener">kubernetes.io</a></li>
+                        <li>MetalLB公式ドキュメント - Concepts (アドレスプール、広告モード): <a href="https://metallb.io/concepts/" target="_blank" rel="noopener">metallb.io/concepts</a></li>
+                        <li>MetalLB公式ドキュメント - Layer 2モード (単一ノードのボトルネック・フェイルオーバー・リーダー選出): <a href="https://metallb.io/concepts/layer2/" target="_blank" rel="noopener">metallb.io/concepts/layer2</a></li>
+                        <li>MetalLB公式ドキュメント - BGPモード (ECMPハッシュ・再ハッシュの限界と緩和策): <a href="https://metallb.io/concepts/bgp/" target="_blank" rel="noopener">metallb.io/concepts/bgp</a></li>
+                        <li>MetalLBのイシュー - 外部IPAM・DHCP連携の要望: <a href="https://github.com/metallb/metallb/issues/157" target="_blank" rel="noopener">github.com/metallb/metallb/issues/157</a></li>
+                        <li>Cilium公式ドキュメント - L2 Announcements (Leaseによるリーダー選出・制約): <a href="https://docs.cilium.io/en/stable/network/l2-announcements/" target="_blank" rel="noopener">docs.cilium.io</a></li>
+                        <li>Cilium公式ドキュメント - LoadBalancer IP Address Management: <a href="https://docs.cilium.io/en/stable/network/lb-ipam/" target="_blank" rel="noopener">docs.cilium.io/lb-ipam</a></li>
+                        <li>kube-vip公式ドキュメント - ARPモード: <a href="https://kube-vip.io/docs/modes/arp/" target="_blank" rel="noopener">kube-vip.io</a></li>
+                        <li>Linuxカーネルドキュメント - IP Sysctl (rp_filterの0・1・2、RFC 3704): <a href="https://docs.kernel.org/networking/ip-sysctl.html" target="_blank" rel="noopener">docs.kernel.org</a></li>
+                        <li>XDPの動作コードに関する文書 (XDP_TX・XDP_PASS・XDP_DROP): <a href="https://prototype-kernel.readthedocs.io/en/latest/networking/XDP/implementation/xdp_actions.html" target="_blank" rel="noopener">prototype-kernel.readthedocs.io</a> / <a href="https://docs.ebpf.io/linux/program-type/BPF_PROG_TYPE_XDP/" target="_blank" rel="noopener">docs.ebpf.io</a></li>
+                        <li>RFC 2131 - Dynamic Host Configuration Protocol (リースの識別・更新・DHCPNAK): <a href="https://www.rfc-editor.org/rfc/rfc2131.html" target="_blank" rel="noopener">rfc-editor.org/rfc/rfc2131</a></li>
+                        <li>RFC 2474 - DSフィールドの定義 (6ビットのコードポイント・境界での再表示): <a href="https://www.rfc-editor.org/rfc/rfc2474" target="_blank" rel="noopener">rfc-editor.org/rfc/rfc2474</a></li>
+                        <li>事例の原文 - 通信事業者のIPをKubernetes LoadBalancerに割り当てた記録: <a href="https://attacca.cc/blog/dumbarp/" target="_blank" rel="noopener">attacca.cc/blog/dumbarp</a></li>
+                        <li>GeekNewsの議論: <a href="https://news.hada.io/topic?id=31879" target="_blank" rel="noopener">news.hada.io/topic?id=31879</a></li>
+                        <li>関連記事: <a href="kubernetes_gateway_api_nginx_ingress_2026.html">Gateway APIとIngress - 標準リソースでトラフィックを統べる</a>、<a href="neko_master_network_traffic_dashboard_2026.html">neko-masterネットワークトラフィックダッシュボード分析</a>、<a href="docker_k8s_guide_08_pod_deploy_svc.html">Docker &amp; Kubernetesガイド第8回 - Pod・Deployment・Service</a></li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>この記事をシェア</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">スレッズ</button>
+                        <button id="link-copy" class="share-btn link-btn">リンクをコピー</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">一覧に戻る</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">一緒に使うと便利な無料ツール</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/json_formatter.html">JSON フォーマッター</a></li>
+      <li><a href="../static/regex_tester.html">正規表現テスター</a></li>
+      <li><a href="../static/jwt_decoder.html">JWTデコーダー・生成器 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 エンコーダー/デコーダー</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">すべてのツールを見る &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">関連記事</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="monitor_input_ddc_cli_2026.html">コマンドラインでモニター入力を切り替える - DDC/CIとmonitor-input-rs徹底解説 2026</a></li>
+      <li><a href="thorvg_vector_animation_2026.html">Webアニメーション形式の選び方 - ThorVG 1.1とLottie・SVG・GIFの判断基準</a></li>
+      <li><a href="cerebras_internal_knowledge_platform_2026.html">社内ナレッジ基盤の統合設計 - ソース・権限・チャンク・コストの判断 2026</a></li>
+      <li><a href="api_docs_governance_2026.html">API文書はなぜいつもコードより遅れるのか - エクセル・PDF仕様を機械が読む契約へ 2026</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('リンクがコピーされました。Threadsアプリに貼り付けてシェアしてください！');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('リンクがコピーされました！'); });
+    });
+    </script>
+</body>
+</html>

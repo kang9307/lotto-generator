@@ -1,0 +1,642 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ko">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>온프렘 쿠버네티스 LoadBalancer 구현 - 통신사 IP·ARP 대행·비대칭 라우팅 2026</title>
+    <meta name="description" content="클라우드 밖에서 LoadBalancer 타입 서비스가 왜 pending에 머무는가. 주소 배정과 경로 광고의 분리, L2·BGP·직접 구현 선택 기준, 통신사 DHCP 제약, ARP 대행과 비대칭 라우팅 진단 순서를 정리했다.">
+    <meta name="keywords" content="쿠버네티스 LoadBalancer, 온프렘 로드밸런서, MetalLB, Cilium L2 Announcements, BGP ECMP, eBPF, XDP, ARP 응답, 비대칭 라우팅, rp_filter, 정책 라우팅, DHCP 임대, DSCP, 베어메탈 쿠버네티스, 홈랩">
+
+    <link rel="canonical" href="https://braindetox.kr/posts/k8s_carrier_ip_loadbalancer_ebpf_2026.html">
+
+    <meta property="og:title" content="온프렘 쿠버네티스 LoadBalancer 구현 - 통신사 IP·ARP 대행·비대칭 라우팅">
+    <meta property="og:description" content="클라우드에서 공짜로 주어지던 External IP를 직접 만들어야 할 때 무엇이 어려워지는가. 배정과 광고의 분리부터 진단 순서까지.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/posts/k8s_carrier_ip_loadbalancer_ebpf_2026.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ko_KR">
+    <meta property="article:published_time" content="2026-07-28">
+    <meta property="article:section" content="개발/인프라">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="온프렘 쿠버네티스 LoadBalancer 구현 - 통신사 IP·ARP 대행·비대칭 라우팅">
+    <meta name="twitter:description" content="EXTERNAL-IP가 pending에 머무는 구조적 이유, L2·BGP·직접 구현 선택 기준, 비대칭 라우팅 진단 순서 정리.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "온프렘 쿠버네티스 LoadBalancer 구현 - 통신사 IP·ARP 대행·비대칭 라우팅",
+      "alternativeHeadline": "Building a LoadBalancer Outside the Cloud - Carrier IPs, ARP Proxying and Asymmetric Routing",
+      "datePublished": "2026-07-28",
+      "dateModified": "2026-07-28",
+      "inLanguage": "ko-KR",
+      "articleSection": "개발/인프라",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "쿠버네티스 LoadBalancer, 온프렘 로드밸런서, MetalLB, Cilium L2 Announcements, BGP ECMP, eBPF, XDP, ARP 응답, 비대칭 라우팅, rp_filter, 정책 라우팅, DHCP 임대",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/posts/k8s_carrier_ip_loadbalancer_ebpf_2026.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "온프렘 쿠버네티스에서 EXTERNAL-IP가 계속 pending인 이유는 무엇인가?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "쿠버네티스 본체는 외부 IP를 스스로 만들지 않기 때문이다. 공식 문서에 따르면 type LoadBalancer 서비스의 외부 주소는 클라우드 제공자가 배정하며, 그 결과가 서비스의 status.loadBalancer.ingress에 기록된다. 클라우드 제공자 연동이나 그 역할을 대신할 컨트롤러가 없으면 이 값을 채워 줄 주체가 없고, 그래서 EXTERNAL-IP는 무기한 대기 상태로 남는다. 즉 이것은 오류가 아니라 계약 상대가 없는 상태다. 온프렘에서는 주소를 배정하는 컨트롤러와 그 주소를 네트워크에 알리는 광고 수단, 두 가지를 따로 마련해야 한다."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "MetalLB의 L2 모드와 BGP 모드 중 무엇을 골라야 하나?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "라우터를 다룰 수 있는지가 첫 갈림길이다. 공식 문서 기준으로 L2 모드는 한 노드가 서비스 IP의 소유권을 갖고 ARP·NDP로 응답하는 방식이라 라우터 설정이 필요 없지만, 해당 서비스의 모든 트래픽이 한 노드로 몰려 그 노드의 대역폭이 상한이 된다. BGP 모드는 노드들이 라우터와 피어링해 ECMP로 분산하므로 여러 노드를 함께 쓸 수 있지만, 문서는 백엔드 집합의 크기가 바뀌면 기존 연결이 사실상 무작위로 재해싱된다는 한계를 명시한다. 정리하면 사무실·홈랩처럼 라우터 접근이 제한된 환경은 L2, 라우터를 직접 운용하고 노드 단위 대역폭을 넘겨야 하는 환경은 BGP가 출발점이다."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "통신사에서 DHCP로 받은 IP를 LoadBalancer 주소로 써도 되는가?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "기술적 가능성과 계약상 허용 범위는 별개이므로, 회선 약관과 서비스 조건을 먼저 확인하는 것이 순서다. 회선 종류에 따라 사용 가능한 주소 개수, 서버 운용 가능 여부, 고정 IP 제공 방식이 다르고 이는 상품 약관에서 정해진다. 기술적으로도 DHCP 주소는 임대이지 소유가 아니다. RFC 2131은 클라이언트 식별자 또는 하드웨어 주소와 배정된 주소의 조합이 임대를 식별한다고 정하고, 서버가 임대가 유효하지 않다고 판단하면 DHCPNAK로 회수할 수 있다. 즉 그 주소는 언제든 바뀔 수 있는 값이며, 서비스 주소로 쓰려면 갱신 실패와 주소 변경을 정상 시나리오로 설계에 넣어야 한다."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "비대칭 라우팅인지 어떻게 확인하나?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "요청은 도착하는데 응답이 안 돌아오는 형태로 나타나므로, 양쪽 지점에서 동시에 관찰해 어디까지 갔는지를 끊어 보는 것이 기본이다. 먼저 서버 쪽에서 요청 패킷이 실제로 들어오는지 확인하고, 응답이 나가는 인터페이스가 요청이 들어온 인터페이스와 같은지 본다. 그다음 라우팅 테이블과 정책 라우팅 규칙을 확인해 응답의 출구가 어디로 잡히는지 계산해 본다. 커널의 역경로 필터도 함께 봐야 한다. 리눅스 문서에 따르면 rp_filter는 0이 검사 없음, 1이 RFC 3704 엄격 모드, 2가 느슨 모드이며, 실제 적용값은 all 설정과 인터페이스 설정 중 큰 값이 쓰인다. 엄격 모드에서 비대칭 경로가 있으면 패킷이 조용히 버려지므로 애플리케이션 로그에는 아무것도 남지 않는다."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "LoadBalancer IP로 접속이 안 될 때 어디부터 봐야 하나?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "아래에서 위로 올라가는 순서가 가장 빠르다. 첫째, 같은 네트워크에서 그 IP에 대한 ARP 응답이 오는지 본다. 응답이 없으면 광고 계층 문제이고, MAC 주소가 흔들리면 여러 주체가 같은 주소를 주장하는 상황이다. 둘째, 서버 인터페이스에 요청 패킷이 도착하는지 확인한다. 도착하지 않으면 상위 경로나 방화벽 문제다. 셋째, 도착하는데 응답이 없다면 응답이 나가는 경로와 역경로 필터를 확인한다. 넷째, 여기까지 정상이면 그때 노드 안쪽의 서비스 전달 경로와 파드 상태를 본다. 순서를 지키지 않고 파드부터 보면 대개 시간을 크게 낭비하게 된다."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.2rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background-color: #fff8e6; border-left: 4px solid #f0ad4e; padding: 1rem 1.2rem; margin: 1.5rem 0; border-radius: 0 6px 6px 0; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <script src="https://t1.kakaocdn.net/kakao_js_sdk/2.4.0/kakao.min.js" crossorigin="anonymous" defer></script>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/k8s_carrier_ip_loadbalancer_ebpf_2026.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/k8s_carrier_ip_loadbalancer_ebpf_2026.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/k8s_carrier_ip_loadbalancer_ebpf_2026.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/k8s_carrier_ip_loadbalancer_ebpf_2026.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/k8s_carrier_ip_loadbalancer_ebpf_2026.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="온프렘 쿠버네티스 LoadBalancer 구현 - 통신사 IP·ARP 대행·비대칭 라우팅">
+                <meta itemprop="datePublished" content="2026-07-28">
+                <meta itemprop="dateModified" content="2026-07-28">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="쿠버네티스 LoadBalancer, 온프렘, MetalLB, Cilium, BGP, eBPF, XDP, ARP, 비대칭 라우팅, rp_filter">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/posts/k8s_carrier_ip_loadbalancer_ebpf_2026.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">클라우드 밖에서 LoadBalancer를 만든다는 것</h1>
+                    <h2 class="post-subtitle">EXTERNAL-IP가 pending에 머무는 이유부터 ARP 대행·비대칭 라우팅까지</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-07-28">2026-07-28</span>
+                        <span class="post-category" itemprop="articleSection">개발/인프라</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+                    <h2>서론: EXTERNAL-IP가 pending에서 멈춰 있던 날</h2>
+                    <p>클라우드에서 쿠버네티스를 쓰다가 온프렘이나 홈랩으로 내려온 사람이 거의 예외 없이 만나는 화면이 있다. 서비스 하나를 <code>type: LoadBalancer</code>로 만들었는데, 몇 분이 지나도 <strong>EXTERNAL-IP 칸이 계속 대기 상태</strong>인 화면이다.</p>
+                    <pre><code>$ kubectl get svc web
+NAME   TYPE           CLUSTER-IP     EXTERNAL-IP   PORT(S)        AGE
+web    LoadBalancer   10.96.31.10    &lt;pending&gt;     80:31942/TCP   12m</code></pre>
+                    <p>이때 대부분 로그를 뒤지기 시작한다. 그런데 여기에는 고칠 오류가 없다. <strong>이것은 실패가 아니라 계약 상대가 없는 상태</strong>다. 쿠버네티스 공식 문서는 이 지점을 아주 분명하게 적어 두었다. 클라우드 제공자가 로드밸런서를 지원하면 서비스에 외부 주소가 <strong>프로비저닝</strong>되며, <strong>그 주소를 배정하는 책임은 클라우드 제공자에게 있다</strong>. 그 상대가 없으면 채워질 값도 없다.</p>
+                    <p>2026년 7월 GeekNews에 올라온 한 글이 이 문제를 아주 구체적인 형태로 보여 줬다. 통신사에서 DHCP로 받은 IPv4 주소를 쿠버네티스 LoadBalancer의 외부 주소로 쓰기 위해, <strong>주소를 인터페이스에 올리지 않는 DHCP 클라이언트</strong>를 만들고, <strong>eBPF로 ARP에 대신 응답</strong>하고, 마지막에는 <strong>비대칭 라우팅</strong>까지 손봐야 했다는 기록이다. 화려한 성공담으로 읽을 수도 있지만, 나는 이 글의 진짜 가치가 다른 데 있다고 본다. 클라우드에서 체크박스 하나로 끝나던 일이 <strong>직접 하려고 하면 왜 이렇게 여러 계층으로 쪼개지는지</strong>를 정직하게 드러낸다는 점이다.</p>
+                    <p>그래서 이 글은 특정 구현을 소개하는 글이 아니다. <strong>클라우드가 아닌 환경에서 LoadBalancer 타입 서비스를 성립시키려면 무엇을 직접 해야 하는가</strong>를 계층별로 분해하고, 선택지마다 어떤 대가가 붙는지, 그리고 깨졌을 때 어디부터 봐야 하는지를 정리한다. 사용하는 도구가 MetalLB든 Cilium이든 직접 만든 데몬이든, 아래 구조를 이해하면 판단이 훨씬 빨라진다.</p>
+
+                    <h2>1. 클라우드에서는 누가 IP를 주는가 - LoadBalancer 타입의 실제 계약</h2>
+
+                    <h3>1.1 쿠버네티스는 IP를 만들지 않는다</h3>
+                    <p>먼저 오해를 걷어내자. <strong>쿠버네티스에는 로드밸런서를 만드는 코드가 들어 있지 않다.</strong> 서비스를 <code>type: LoadBalancer</code>로 선언하는 것은 구현 지시가 아니라 <strong>요청 표시</strong>에 가깝다. 실제로 벌어지는 일은 이렇다.</p>
+                    <ul>
+                        <li>사용자가 <code>type: LoadBalancer</code> 서비스를 만든다</li>
+                        <li>외부의 컨트롤러(클라우드에서는 cloud-controller-manager)가 이 요청을 관찰한다</li>
+                        <li>컨트롤러가 자기 환경에서 주소를 확보하고 실제 부하 분산 자원을 준비한다</li>
+                        <li>확보한 주소를 서비스의 <code>status.loadBalancer.ingress</code>에 써 넣는다</li>
+                        <li>그제서야 <code>kubectl get svc</code>의 EXTERNAL-IP 칸이 채워진다</li>
+                    </ul>
+                    <p>즉 EXTERNAL-IP는 <strong>결과를 보고하는 칸</strong>이지 명령하는 칸이 아니다. 이 사실을 받아들이면 온프렘에서 해야 할 일이 자동으로 정해진다. <strong>저 status를 채워 줄 주체를 내가 세워야 한다.</strong></p>
+
+                    <h3>1.2 원하는 IP를 지정하고 싶을 때</h3>
+                    <p>과거에는 <code>spec.loadBalancerIP</code> 필드로 특정 주소를 요청했지만, 이 필드는 현재 <strong>사용 중단(deprecated)</strong> 상태로 문서에 표시되어 있다. 구현마다 해석이 갈리고 이중 스택 환경을 표현하지 못한다는 문제 때문이다. 대신 요즘은 다음 두 가지를 쓴다.</p>
+                    <ul>
+                        <li><strong>구현별 애너테이션</strong> — 각 컨트롤러가 정의한 방식으로 주소나 풀을 지정한다. 이식성은 낮지만 표현력이 높다</li>
+                        <li><strong><code>spec.loadBalancerClass</code></strong> — 클러스터에 여러 로드밸런서 구현이 공존할 때 어느 구현이 이 서비스를 처리할지 지정한다. 온프렘에서 MetalLB와 다른 컨트롤러를 함께 쓰는 경우 특히 유용하다</li>
+                    </ul>
+
+                    <h3>1.3 온프렘에서는 두 가지 일이 필요하다</h3>
+                    <p>여기가 이 글에서 가장 중요한 구분이다. 클라우드에서는 한 덩어리로 보였던 일이 <strong>온프렘에서는 성격이 전혀 다른 두 가지 작업</strong>으로 갈라진다.</p>
+                    <ul>
+                        <li><strong>배정(allocation)</strong> — 어떤 주소를 이 서비스에 줄 것인가. 주소 풀을 관리하고 중복 없이 나눠 주는 IPAM의 문제다</li>
+                        <li><strong>광고(announcement)</strong> — 그 주소로 오는 트래픽을 어떻게 내 클러스터로 끌어오는가. 링크 계층의 ARP·NDP거나, 네트워크 계층의 라우팅 프로토콜이다</li>
+                    </ul>
+                    <p>이 둘은 서로 독립이다. Cilium이 이 분리를 구조적으로 드러낸다. 공식 문서에 따르면 <strong>LB IPAM</strong>은 <code>CiliumLoadBalancerIPPool</code>에서 주소를 골라 서비스에 배정하는 역할만 맡고, 그 주소를 실제로 알리는 일은 <strong>BGP 컨트롤 플레인</strong>이나 <strong>L2 Announcements</strong> 같은 별도 기능이 담당한다. MetalLB도 내부적으로는 같은 구조다.</p>
+                    <p>온프렘 트러블슈팅이 어려운 이유가 여기 있다. <strong>EXTERNAL-IP에 주소가 찍혔다는 사실은 배정이 끝났다는 뜻일 뿐, 그 주소에 접속이 된다는 보장이 전혀 아니다.</strong> 주소는 붙었는데 접속이 안 되는 상황은 대부분 광고 계층에서 벌어진다.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>계층</th><th>클라우드에서 누가 하나</th><th>온프렘에서 누가 하나</th><th>실패했을 때 나타나는 현상</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>주소 배정(IPAM)</td><td>클라우드 제공자</td><td>MetalLB 풀, Cilium LB IPAM, 자체 컨트롤러</td><td>EXTERNAL-IP가 대기 상태에서 멈춤</td></tr>
+                            <tr><td>경로 광고</td><td>클라우드 네트워크 패브릭</td><td>ARP·NDP 응답 또는 BGP 광고</td><td>주소는 찍혔는데 접속 불가, ARP 무응답</td></tr>
+                            <tr><td>노드 내부 전달</td><td>제공자 데이터플레인</td><td>kube-proxy 또는 eBPF 데이터플레인</td><td>일부 노드에서만 접속됨</td></tr>
+                            <tr><td>출발지 IP 보존</td><td>제공자 설정 또는 프록시 프로토콜</td><td><code>externalTrafficPolicy</code> 선택</td><td>모든 접속이 노드 IP로 기록됨</td></tr>
+                            <tr><td>반환 경로 정합성</td><td>패브릭이 알아서 처리</td><td>운영자가 직접 설계</td><td>요청은 도착, 응답은 유실</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>표의 마지막 두 줄이 온프렘에서 유독 사람을 괴롭히는 항목이다. <code>externalTrafficPolicy</code>는 공식 문서상 기본값 <code>Cluster</code>가 모든 엔드포인트로 라우팅하고, <code>Local</code>은 노드에 있는 엔드포인트로만 보내면서 <strong>클라이언트 출발지 IP를 보존</strong>한다. 접속 로그에 실제 접속자 IP가 필요한 서비스라면 이 선택이 필수인데, 뒤에서 보겠지만 <code>Local</code>은 광고 계층과 충돌하는 경우가 있다.</p>
+
+                    <h2>2. 온프렘 해법의 세 갈래 - L2 광고, BGP, 직접 구현</h2>
+                    <p>온프렘에서 광고 문제를 푸는 방법은 크게 셋이다. 이름이 아니라 <strong>어느 계층에서 거짓말을 하느냐</strong>로 구분하면 이해가 빠르다.</p>
+
+                    <h3>2.1 L2 모드 - 링크 계층에서 대신 대답한다</h3>
+                    <p>가장 널리 쓰이는 방식이다. MetalLB 공식 문서의 설명을 그대로 옮기면, 이 모드에서는 <strong>클러스터의 한 머신이 서비스의 소유권을 가지고, 표준 주소 탐색 프로토콜(IPv4는 ARP, IPv6는 NDP)로 그 IP를 로컬 네트워크에서 도달 가능하게 만든다</strong>. 기술적으로는 그 노드가 자기 인터페이스에 주소를 여러 개 가진 것처럼 보이게 하는 것이다.</p>
+                    <p>장점은 명확하다. <strong>라우터를 건드릴 필요가 없다.</strong> 스위치도 몰라도 된다. 사무실이나 홈랩처럼 네트워크 장비에 대한 권한이 제한된 곳에서 사실상 유일한 현실적 선택이다. 하지만 문서가 밝힌 대가도 분명하다.</p>
+                    <ul>
+                        <li><strong>대역폭 상한이 한 노드다.</strong> 문서 표현으로 「서비스 IP로 향하는 모든 트래픽이 한 노드로 간다」. 노드를 늘려도 그 서비스의 유입 대역폭은 늘지 않는다</li>
+                        <li><strong>장애 조치가 클라이언트에 달려 있다.</strong> MetalLB는 MAC 변경을 알리는 비요청 링크 계층 패킷을 보내는데, 대부분의 현대 운영체제는 몇 초 안에 반영하지만 구현이 부실한 클라이언트는 캐시가 만료될 때까지 옛 MAC으로 계속 보낸다</li>
+                        <li><strong>계획된 전환에서는 옛 리더를 잠시 살려 두라</strong>고 문서가 권고한다. 캐시가 오래된 클라이언트의 트래픽을 몇 분간 대신 넘겨주기 위해서다</li>
+                        <li><strong>리더 선출이 무상태(stateless)</strong>다. 각 스피커가 노드와 VIP를 해시한 정렬 목록을 각자 계산해 1위면 광고한다. 노드를 추가하면 리더가 바뀔 수 있다</li>
+                        <li><strong>네트워크 분단 시 분열 위험</strong>이 문서에 명시되어 있다. 서로 상대를 죽었다고 오판하면 같은 VIP를 여럿이 동시에 주장하거나 아무도 주장하지 않는 상태가 될 수 있다</li>
+                    </ul>
+                    <p>Cilium의 L2 Announcements도 같은 물리 법칙 아래 있다. 문서는 「ARP·NDP 특성상 호스트는 IP당 MAC을 하나만 저장하므로 클러스터에서 <strong>한 노드만</strong> 응답해야 한다」고 적고, 그래서 서비스마다 <strong>쿠버네티스 Lease</strong>로 리더를 뽑는다고 설명한다. 다만 이 기능에는 실무에서 걸리기 쉬운 조건이 여럿 붙어 있다.</p>
+                    <ul>
+                        <li>문서 기준 <strong>베타</strong> 기능이며 <strong>kube-proxy 대체 모드</strong>가 켜져 있어야 한다</li>
+                        <li>Lease 획득이 <strong>선착순</strong>이라 노드 간 부하가 비대칭이 될 수 있다고 문서가 밝힌다</li>
+                        <li><strong><code>externalTrafficPolicy: Local</code>과 호환되지 않는다</strong>고 명시되어 있다. 파드가 없는 노드에서 서비스 IP가 광고되어 트래픽이 버려질 수 있기 때문이다. 출발지 IP 보존이 필요한 서비스라면 이 조합은 처음부터 피해야 한다</li>
+                        <li>비요청 ARP를 받아들이지 않는 클라이언트는 자체 테이블의 수명이 다할 때까지 재조회하지 않아 예상보다 긴 단절을 겪을 수 있다</li>
+                    </ul>
+                    <p>kube-vip 역시 ARP 모드에서 같은 원리를 쓴다. 문서에 따르면 가상 IP가 노드 사이를 옮겨 갈 때 무상 ARP를 브로드캐스트해 IP와 MAC의 대응을 갱신하고, 리더 선출에는 쿠버네티스 Lease를 사용한다. <strong>구현이 무엇이든 링크 계층에서 할 수 있는 일의 한계는 같다.</strong></p>
+
+                    <h3>2.2 BGP 모드 - 라우터에게 경로를 알려 준다</h3>
+                    <p>BGP 모드에서는 각 노드가 인근 라우터와 피어링 세션을 맺고 서비스 IP로 가는 경로를 알린다. 라우터는 여러 노드를 등가 경로로 보고 ECMP로 분산한다. L2의 단일 노드 병목이 사라지고, 라우터의 정책을 이용한 세밀한 제어도 가능해진다.</p>
+                    <p>그런데 여기에 <strong>온프렘 로드밸런싱에서 가장 자주 과소평가되는 함정</strong>이 있다. MetalLB 문서가 직접 경고하는 내용이다. 라우터는 패킷 헤더의 일부 필드를 해싱해 다음 홉을 고른다. 3튜플(프로토콜·출발지 IP·목적지 IP)이나 5튜플(여기에 포트 추가)이 흔하다. 같은 세션의 패킷이 같은 노드로 가도록 보장하기 위한 설계다. 문제는 그다음이다.</p>
+                    <blockquote>백엔드 집합의 크기가 바뀌면 기존 연결들이 사실상 무작위로 재해싱된다. — MetalLB BGP 문서</blockquote>
+                    <p>노드 하나를 재부팅하거나 BGP 세션 하나가 끊기는 순간, <strong>그 노드와 무관하던 연결들까지 다른 노드로 재배치</strong>된다. 새 노드에는 그 연결의 상태가 없으니 통신이 끊긴다. 문서가 제시하는 완화책은 「해결」이 아니라 「타협」에 가깝다. 라우터의 복원력 있는 ECMP 해싱 사용, 배포를 특정 노드에 고정, 트래픽이 적은 시간대에 변경, DNS로 서비스 간 이전, 클라이언트 재시도 로직 추가, 인그레스 컨트롤러 계층 도입, 그리고 비필수 서비스라면 가끔의 연결 초기화를 감수하는 것이다.</p>
+                    <p>실무에서 가장 현실적인 답은 대개 마지막 두 개의 조합이다. <strong>BGP로 인그레스 컨트롤러 몇 개만 노출하고, 실제 애플리케이션은 그 뒤에 두는</strong> 구성이다. 이러면 재해싱의 영향 범위가 인그레스 계층으로 국한된다.</p>
+
+                    <h3>2.3 직접 구현 - 기존 도구의 전제가 성립하지 않을 때</h3>
+                    <p>세 번째 갈래는 직접 만드는 것이다. 무모해 보이지만, <strong>기존 도구가 깔고 있는 전제 자체가 내 환경에서 깨질 때</strong>는 선택지가 이것밖에 없기도 하다. 이번 사례가 정확히 그 경우다.</p>
+                    <p>MetalLB의 전제는 <strong>운영자가 주소 풀을 알고 있다</strong>는 것이다. 문서 표현으로 MetalLB는 「허공에서 IP 주소를 만들어 낼 수 없기」 때문에 관리자가 풀을 제공해야 한다. 그런데 통신사 DHCP로 주소를 받는 환경에서는 이 전제가 성립하지 않는다. 어떤 주소를 받게 될지 사전에 알 수 없고, 바뀔 수도 있기 때문이다. 프로젝트 이슈 트래커에도 외부 IPAM·DHCP 연동 요청이 오래 올라와 있지만, 동적 배정을 지원하려면 단일 스레드 전제를 포함한 내부 구조를 크게 손봐야 한다는 이유로 구현되지 않은 상태다.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>기준</th><th>L2 광고(ARP·NDP)</th><th>BGP 광고</th><th>직접 구현</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>라우터 권한 필요</td><td>불필요</td><td>필수(피어링 설정)</td><td>구성에 따라 다름</td></tr>
+                            <tr><td>서비스별 유입 대역폭</td><td>노드 1대분이 상한</td><td>여러 노드로 분산</td><td>설계하기 나름</td></tr>
+                            <tr><td>주소가 동적으로 바뀌는 환경</td><td>부적합(풀 고정 전제)</td><td>부적합(풀 고정 전제)</td><td>대응 가능</td></tr>
+                            <tr><td>장애 전환 시 위험</td><td>클라이언트 캐시 지연</td><td>ECMP 재해싱으로 무관한 연결까지 끊김</td><td>구현 품질에 전적으로 의존</td></tr>
+                            <tr><td>운영 난도</td><td>낮음</td><td>중간(네트워크팀 협업 필요)</td><td>높음(코드가 곧 인프라)</td></tr>
+                            <tr><td>버스 팩터</td><td>넓은 사용자층</td><td>넓은 사용자층</td><td>보통 한 사람</td></tr>
+                            <tr><td>권장 상황</td><td>사무실·홈랩·소규모 온프렘</td><td>자체 라우터 운용, 대역폭 요구 큼</td><td>기존 전제가 깨지는 특수 환경</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>표의 <strong>버스 팩터</strong> 행을 진지하게 볼 것을 권한다. 직접 구현한 데몬은 인프라의 가장 아래에서 조용히 돌다가, 만든 사람이 자리를 비운 순간 아무도 손댈 수 없는 블랙박스가 된다. 만들기로 했다면 최소한 <strong>동작 원리와 진단 절차를 문서로 남기는 것</strong>까지가 구현의 일부다.</p>
+
+                    <h2>3. 통신사 회선 위에서 달라지는 것들 - DHCP가 만드는 제약</h2>
+
+                    <div class="callout">
+                        <p><strong>시작하기 전에.</strong> 회선 상품마다 사용 가능한 주소 개수, 서버 운용 허용 범위, 고정 IP 제공 조건이 다르며 이는 계약과 약관에서 정해진다. <strong>기술적으로 가능한 것과 계약상 허용되는 것은 별개</strong>이므로, 구성에 들어가기 전에 이용 약관과 서비스 조건을 확인하고 필요하면 사업자에게 문의하는 것이 순서다. 이 글은 네트워크 동작 원리와 진단 방법을 다루며, 사업자 정책을 우회하는 방법은 다루지 않는다.</p>
+                    </div>
+
+                    <h3>3.1 DHCP 주소는 소유가 아니라 임대다</h3>
+                    <p>가장 근본적인 제약이다. RFC 2131은 <strong>클라이언트 식별자 또는 하드웨어 주소와 배정된 네트워크 주소의 조합이 그 임대의 고유 식별자</strong>가 된다고 정의한다. 그리고 임대는 유한하다. 클라이언트는 T1 시점에 서버에 유니캐스트로 갱신을 시도하고, 실패하면 T2 시점에 브로드캐스트로 재시도한다. 서버가 클라이언트의 주소 인식이 잘못되었다고 판단하거나 임대가 만료되었다고 보면 <strong>DHCPNAK</strong>를 보내 무효를 통지한다.</p>
+                    <p>서비스 주소로 쓰는 관점에서 이 사실이 뜻하는 바는 무겁다. <strong>주소가 바뀌는 것은 장애가 아니라 정상 동작</strong>이다. 따라서 설계는 다음을 정상 시나리오로 포함해야 한다.</p>
+                    <ul>
+                        <li>갱신이 실패해 <strong>주소가 회수될 수 있다</strong>. 이때 그 주소를 쓰던 서비스는 어떻게 되는가</li>
+                        <li>재부팅이나 회선 절체 후 <strong>다른 주소를 받을 수 있다</strong>. DNS 갱신은 누가 하는가</li>
+                        <li>주소가 바뀌면 <strong>인증서·방화벽 허용 목록·외부 등록 정보</strong>가 함께 어긋난다</li>
+                        <li>DHCP 클라이언트 프로세스가 죽으면 <strong>조용히 임대가 만료</strong>된다. 감시 대상에 넣었는가</li>
+                    </ul>
+
+                    <h3>3.2 주소 하나마다 MAC 하나</h3>
+                    <p>둘째 제약은 식별자다. 임대가 식별자와 묶여 있으므로, <strong>주소를 여러 개 받으려면 서로 다른 식별자로 각각 요청</strong>해야 한다. 원문 사례가 가상 인터페이스를 여러 개 만들어 각각 다른 MAC을 갖게 한 이유가 이것이다. 하나의 물리 인터페이스로 여러 임대를 자연스럽게 받아 낼 방법이 마땅치 않기 때문이다.</p>
+                    <p>여기서 실무적으로 조심할 지점이 생긴다. 상위 네트워크 장비가 포트별로 학습하는 MAC 수를 제한하거나, 예상치 못한 MAC의 등장을 이상 징후로 처리하는 정책을 둘 수 있다. <strong>이런 정책은 네트워크를 안정적으로 유지하기 위한 정당한 장치</strong>이므로, 회피 대상이 아니라 <strong>설계 제약으로 받아들이고 사전에 확인해야 할 조건</strong>이다.</p>
+
+                    <h3>3.3 게이트웨이와 방화벽은 내 것이 아니다</h3>
+                    <p>셋째는 통제권의 경계다. 클라우드에서는 네트워크 전체가 사실상 내 관리 영역이지만, 통신사 회선에서는 <strong>기본 게이트웨이 너머가 전부 남의 영역</strong>이다. 이 경계 때문에 다음이 성립한다.</p>
+                    <ul>
+                        <li>출발지 주소가 예상과 다른 패킷은 <strong>상위 네트워크에서 걸러질 수 있다</strong>. 뒤에서 다룰 비대칭 라우팅 문제의 근원이다</li>
+                        <li>일부 포트가 상위에서 차단될 수 있고, 이는 내 장비 설정만으로 확인되지 않는다</li>
+                        <li>QoS 표식 같은 헤더 필드는 <strong>경계를 넘으면서 다시 쓰일 수 있다</strong>. RFC 2474는 도메인 경계를 지나며 코드포인트가 재표시될 수 있음을 전제한다</li>
+                        <li>인터넷과 방송이 결합된 회선은 배선·설정 변경이 다른 서비스에 영향을 줄 수 있다</li>
+                    </ul>
+
+                    <table>
+                        <thead>
+                            <tr><th>제약</th><th>기술적 근거</th><th>설계에 미치는 영향</th><th>대응 방향</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>주소 회수 가능</td><td>임대 만료·DHCPNAK(RFC 2131)</td><td>서비스 주소가 사라질 수 있음</td><td>갱신 감시, 주소 변경을 자동 반영하는 경로 확보</td></tr>
+                            <tr><td>식별자 단위 배정</td><td>클라이언트 식별자·하드웨어 주소 기반 임대</td><td>주소 수만큼 식별자 필요</td><td>가상 인터페이스 설계, 상위 장비 정책 사전 확인</td></tr>
+                            <tr><td>게이트웨이 정책 통제 불가</td><td>경계 너머는 사업자 관리 영역</td><td>출발지 불일치 패킷 유실 가능</td><td>반환 경로를 유입 경로와 일치시키는 설계</td></tr>
+                            <tr><td>헤더 필드 재표시</td><td>DS 도메인 경계에서 코드포인트 재표시(RFC 2474)</td><td>QoS 표식을 종단 간 신호로 못 씀</td><td>내부 신호는 내부 경계 안에서만 사용</td></tr>
+                            <tr><td>약관·상품 조건</td><td>계약 문서</td><td>구성 자체가 허용 범위 밖일 수 있음</td><td>착수 전 약관 확인, 필요 시 사업자 문의</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2>4. ARP를 대신 응답한다는 것 - 무엇이 깨지고 무엇을 얻는가</h2>
+
+                    <h3>4.1 왜 대신 응답해야 하나</h3>
+                    <p>ARP는 IPv4 네트워크에서 「이 IP를 가진 장비는 MAC 주소를 알려 달라」고 브로드캐스트로 묻는 프로토콜이다. 같은 링크에 있는 라우터나 클라이언트는 이 질의에 대한 응답을 받아야 비로소 프레임을 보낼 수 있다. <strong>서비스 IP는 실제 장비의 주소가 아니라 클러스터가 주장하는 가상 주소</strong>이므로, 누군가 대신 대답해 주지 않으면 그 주소는 링크 위에서 존재하지 않는 것과 같다.</p>
+                    <p>가장 단순한 방법은 그 주소를 노드 인터페이스에 실제로 올리는 것이다. 그러면 커널이 알아서 응답한다. 그런데 이 방식에는 온프렘 특유의 부작용이 따른다.</p>
+                    <ul>
+                        <li>주소가 로컬에 존재하므로 <strong>노드 자신이 그 주소로 나가는 트래픽을 내부에서 처리</strong>해 버릴 수 있다</li>
+                        <li>커널이 그 주소를 <strong>출발지로 선택</strong>할 수 있어 의도치 않은 출발지 IP가 나간다</li>
+                        <li>해당 포트에 리스너가 없으면 커널이 즉시 <strong>연결 거부</strong>로 응답한다. 조용히 무시되는 편이 나은 상황에서도 그렇다</li>
+                        <li>여러 노드에 같은 주소를 올리면 <strong>주소 충돌</strong>이 된다</li>
+                    </ul>
+                    <p>원문 사례에서 「조용한 DHCP 클라이언트」라는 표현이 나온 이유가 여기 있다. 주소를 <strong>임대는 받되 인터페이스에는 올리지 않는</strong> 선택이다. 리눅스 네트워크 스택 입장에서 그 주소는 존재하지 않으므로 위의 부작용이 원천적으로 생기지 않는다. 대신 <strong>ARP에 답할 사람이 아무도 없어진다</strong>. 그래서 별도의 응답 장치가 필요해진다.</p>
+
+                    <h3>4.2 대신 응답할 때 생기는 문제들</h3>
+                    <p>ARP 응답을 대행하는 순간, 다음 문제들이 한꺼번에 따라온다. 어느 도구를 쓰든 성격은 같다.</p>
+                    <ul>
+                        <li><strong>진실이 하나여야 한다.</strong> 호스트는 IP당 MAC을 하나만 캐시하므로, 둘 이상이 응답하면 나중 응답이 이긴다. 응답 주체가 정확히 하나임을 보장하는 장치(리더 선출)가 반드시 필요하다</li>
+                        <li><strong>캐시는 즉시 바뀌지 않는다.</strong> 리더가 바뀌어도 클라이언트 캐시는 만료 전까지 옛 MAC을 쓴다. 무상 ARP로 알려도 받아들이지 않는 구현이 있다</li>
+                        <li><strong>무상 ARP는 의심받는다.</strong> 같은 기법이 스푸핑에도 쓰이므로 이를 무시하는 정책이 흔하다. 「보냈으니 반영됐을 것」이라는 가정은 위험하다</li>
+                        <li><strong>보안 기능과 충돌한다.</strong> 동적 ARP 검사나 포트 보안 같은 스위치 기능은 인가되지 않은 주소 주장을 차단하도록 설계돼 있다. 이런 환경에서는 <strong>네트워크 관리자와 사전 협의</strong>가 필수다</li>
+                        <li><strong>노드 장애가 곧 서비스 장애다.</strong> L2 모드에서 응답 노드가 죽으면 새 리더가 뽑히고 캐시가 갱신될 때까지 그 서비스는 도달 불가다</li>
+                    </ul>
+                    <p>참고로 리눅스에는 인접 캐시 동작을 조절하는 <code>arp_ignore</code>·<code>arp_announce</code>·<code>arp_filter</code> 같은 파라미터가 있고, 다중 홈 구성에서는 이 값들이 실제로 문제를 만들기도 한다. 다만 <strong>인터페이스에 올리지 않은 주소</strong>는 애초에 커널의 관리 대상이 아니므로 이 스위치들로는 해결되지 않는다. 사용자 공간이든 XDP든 <strong>별도의 응답기</strong>가 필요한 이유다.</p>
+
+                    <h2>5. eBPF·XDP로 ARP에 답한다는 선택</h2>
+
+                    <h3>5.1 XDP는 스택보다 앞에 있다</h3>
+                    <p>XDP는 네트워크 드라이버의 수신 경로 초입, 즉 <strong>커널 네트워크 스택에 패킷이 올라가기 전</strong>에 eBPF 프로그램을 실행하는 훅이다. 프로그램의 반환값에 따라 드라이버가 할 일이 정해진다. 커널 문서 기준으로 주요 동작은 다음과 같다.</p>
+                    <ul>
+                        <li><strong><code>XDP_DROP</code></strong> — 패킷을 버리고 수신 링 큐로 되돌린다. 가장 단순하고 빠른 동작이다</li>
+                        <li><strong><code>XDP_PASS</code></strong> — 일반적인 커널 스택 처리로 넘긴다</li>
+                        <li><strong><code>XDP_TX</code></strong> — 받은 패킷을 <strong>들어온 바로 그 인터페이스로 되쏜다</strong>. 보통 패킷 내용을 수정한 뒤 이 값을 반환한다</li>
+                        <li><strong><code>XDP_ABORTED</code></strong> — 프로그램 오류를 뜻하며 패킷은 버려진다. 정상 코드가 반환할 값이 아니다</li>
+                    </ul>
+                    <p>ARP 응답기가 여기에 정확히 들어맞는 이유가 보인다. ARP 요청 프레임을 받아 <strong>출발지와 목적지를 뒤바꾸고 응답 형태로 고쳐 <code>XDP_TX</code>로 되쏘면</strong>, 커널 스택이 그 주소를 모르는 상태에서도 링크 위에서는 완전한 응답이 나간다. 인터페이스에 주소를 올리지 않겠다는 결정과 논리적으로 맞물리는 구조다.</p>
+
+                    <h3>5.2 얻는 것과 잃는 것</h3>
+                    <p>이 방식이 주는 이점은 실질적이다.</p>
+                    <ul>
+                        <li><strong>주소를 스택에 노출하지 않는다.</strong> 앞서 본 출발지 선택 오류나 원치 않는 연결 거부가 생기지 않는다</li>
+                        <li><strong>어떤 주소든 즉시 응답 대상에 넣을 수 있다.</strong> 인터페이스 설정 변경 없이 맵만 갱신하면 되므로 주소가 동적으로 바뀌는 환경에 잘 맞는다</li>
+                        <li><strong>스택 부담이 없다.</strong> 브로드캐스트 ARP 요청을 스택까지 올리지 않고 초입에서 처리한다</li>
+                    </ul>
+                    <p>반대로 치르는 비용도 분명하다.</p>
+                    <ul>
+                        <li><strong>디버깅 난도가 크게 오른다.</strong> <code>ip neigh</code>나 <code>ip addr</code>에는 아무 흔적이 없다. 링크 위에서는 응답하는데 호스트 설정에는 존재하지 않는 주소라, <strong>tcpdump 없이는 상황 파악이 어렵다</strong></li>
+                        <li><strong>드라이버 의존성이 있다.</strong> 네이티브 XDP 지원 여부는 드라이버마다 다르고, 일반 모드로 물러나면 기대한 성능이 나오지 않는다. 가상 환경에서는 특히 확인이 필요하다</li>
+                        <li><strong>관측 도구의 사각지대에 있다.</strong> 대부분의 모니터링은 스택 위 지표를 본다. XDP에서 처리·폐기된 것은 별도 카운터를 심지 않으면 보이지 않는다</li>
+                        <li><strong>운영 인력의 진입 장벽</strong>이 높다. 장애 시각에 이 계층을 읽을 수 있는 사람이 몇 명인지가 실제 복구 시간을 결정한다</li>
+                    </ul>
+                    <blockquote>정리하면 eBPF·XDP는 「ARP를 어떻게 응답할 것인가」라는 문제에 대한 우아한 답이지만, 그 대가로 <strong>시스템의 진실이 표준 도구에서 보이지 않게 된다</strong>. 이것은 성능 문제가 아니라 운영 문제다.</blockquote>
+
+                    <h2>6. 비대칭 라우팅 - 들어온 문으로 나가지 않을 때</h2>
+
+                    <h3>6.1 왜 생기는가</h3>
+                    <p>여기서부터가 온프렘 로드밸런서 구축에서 가장 사람을 지치게 하는 구간이다. 증상은 늘 비슷하다. <strong>같은 건물·같은 스위치에서는 잘 되는데, 외부에서 접속하면 응답이 없다.</strong></p>
+                    <p>원인은 대개 단순하다. 요청은 특정 경로로 들어왔는데, <strong>응답은 서버의 기본 경로로 나간다</strong>. 서버는 목적지 주소만 보고 라우팅 테이블에서 출구를 고르므로, 「이 요청이 어디로 들어왔는지」는 기본적으로 고려하지 않는다. 다중 회선, 터널, 여러 라우터를 거치는 구성에서는 이 불일치가 자연스럽게 발생한다.</p>
+                    <p>같은 랜에서는 왜 잘 될까. 응답이 라우터를 거치지 않고 링크 계층에서 바로 상대에게 가기 때문이다. <strong>경로가 짧아서 문제가 드러나지 않을 뿐</strong>이다. 이 차이 때문에 「내부에서는 되는데 외부에서만 안 되는」 전형적인 패턴이 만들어진다.</p>
+
+                    <h3>6.2 rp_filter - 조용히 버리는 스위치</h3>
+                    <p>비대칭 경로 자체가 늘 문제는 아니다. 진짜 문제는 중간의 누군가가 <strong>이 패킷을 버리기로</strong> 결정할 때 생긴다. 리눅스에서 그 결정을 내리는 대표적 장치가 역경로 필터다. 커널 문서에 따르면 값의 의미는 이렇다.</p>
+                    <ul>
+                        <li><strong>0</strong> — 출발지 검증을 하지 않는다</li>
+                        <li><strong>1</strong> — RFC 3704 <strong>엄격 모드</strong>. 들어온 패킷을 라우팅 정보와 대조해 <strong>그 인터페이스가 최적 역경로가 아니면 검사에 실패</strong>시킨다</li>
+                        <li><strong>2</strong> — RFC 3704 <strong>느슨 모드</strong>. 출발지 주소가 <strong>어느 인터페이스로도 도달 불가일 때만</strong> 실패시킨다</li>
+                    </ul>
+                    <p>실무에서 반드시 알아야 할 두 가지가 더 있다. 첫째, <strong>실제 적용값은 <code>conf/all</code>과 <code>conf/{인터페이스}</code> 중 큰 값</strong>이다. 인터페이스 값만 0으로 낮춰 놓고 「껐는데 왜 안 되지」라고 헤매는 사고가 여기서 나온다. 둘째, 커널 문서 자체가 <strong>비대칭 라우팅이나 복잡한 라우팅을 쓴다면 느슨 모드를 권장</strong>한다고 적고 있다. 즉 이 값을 조정하는 것은 편법이 아니라 문서화된 선택지다.</p>
+                    <pre><code># 실제 적용값은 all 과 인터페이스 값 중 큰 쪽이다
+sysctl net.ipv4.conf.all.rp_filter
+sysctl net.ipv4.conf.eth0.rp_filter
+
+# 버려진 패킷의 흔적 (커널 빌드에 따라 항목이 다를 수 있다)
+grep -i martian /proc/net/stat/* 2&gt;/dev/null
+nstat -az | grep -i -E 'InAddrErrors|InNoRoutes'</code></pre>
+                    <p>다만 값을 낮추는 것은 <strong>출발지 위조 방어를 그만큼 포기하는 것</strong>이기도 하다. 그래서 순서가 중요하다. <strong>먼저 경로를 바로잡을 수 있는지 보고, 구조적으로 불가능할 때 필터를 완화한다.</strong> 반대로 하면 원인은 그대로 둔 채 증상만 가리게 된다.</p>
+
+                    <h3>6.3 해결 갈래</h3>
+                    <p>비대칭을 다루는 방법은 크게 넷이다. 상황에 따라 정답이 다르다.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>방법</th><th>원리</th><th>장점</th><th>단점</th><th>적합한 상황</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>경로 단일화</td><td>유입 경로를 하나로 모아 비대칭 자체를 없앰</td><td>가장 단순하고 튼튼함</td><td>다회선 이점을 포기</td><td>회선이 사실상 하나거나 단순함이 우선일 때</td></tr>
+                            <tr><td>연결 표식 + 정책 라우팅</td><td>유입 인터페이스를 연결에 기록하고 응답 때 되살려 출구를 강제</td><td>다회선에서 정확히 동작</td><td>상태 추적 필요, 규칙이 복잡해짐</td><td>회선이 둘 이상이고 각각으로 서비스할 때</td></tr>
+                            <tr><td>출발지 주소 변환</td><td>앞단에서 출발지를 바꿔 응답이 반드시 되돌아오게 함</td><td>구현이 쉽고 확실함</td><td>실제 클라이언트 IP가 로그에서 사라짐</td><td>출발지 IP가 중요하지 않은 서비스</td></tr>
+                            <tr><td>역경로 필터 완화</td><td>비대칭을 허용하도록 검증 수준을 낮춤</td><td>즉시 효과</td><td>위조 방어 약화, 원인은 그대로</td><td>구조상 비대칭이 불가피할 때의 보조 수단</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>실무에서 가장 많이 쓰는 것은 두 번째다. 개념은 간단하다. <strong>들어올 때 어디로 들어왔는지를 연결에 적어 두고, 나갈 때 그 기록을 꺼내 출구를 정한다.</strong> 리눅스에서는 방화벽의 연결 추적 표식과 정책 라우팅 규칙을 조합해 구현한다.</p>
+                    <pre><code># 개념만 보이는 최소 형태
+# 1) 표식이 붙은 패킷은 별도 라우팅 테이블을 보게 한다
+ip rule add fwmark 0x64 lookup 100
+
+# 2) 그 테이블의 기본 경로를 해당 회선의 게이트웨이로 지정한다
+ip route add default via 203.0.113.1 dev eth1 table 100
+
+# 3) 확인
+ip rule show
+ip route show table 100
+
+# 4) 특정 응답이 실제로 어느 경로로 나가는지 계산해 본다
+ip route get 198.51.100.7 from 203.0.113.10 mark 0x64</code></pre>
+                    <p>마지막 <code>ip route get</code>은 이 구간에서 가장 유용한 명령이다. <strong>추측하지 말고 커널에게 직접 물어보는</strong> 방법이기 때문이다. 표식을 붙이고 되살리는 부분은 방화벽 계층에서 연결 추적 표식(연결에 값을 저장했다가 응답 패킷에 복원하는 기능)으로 처리한다. 도구는 nftables든 iptables든 개념은 같다.</p>
+
+                    <h2>7. 원문 사례가 택한 길 - DSCP 태깅과 그 대가</h2>
+
+                    <h3>7.1 문제의 형태</h3>
+                    <p>원문 사례의 구성은 조금 더 복잡했다. 통신사 주소를 받는 <strong>에지 라우터</strong>가 있고, 클러스터는 터널 너머 <strong>다른 위치</strong>에 있었다. 외부 클라이언트의 요청은 에지 라우터를 거쳐 클러스터로 들어가는데, 응답은 클러스터 쪽 경로로 곧장 인터넷으로 나가려 했다. 그러면 <strong>패킷의 출발지 주소와 실제 나가는 위치가 어긋나</strong> 상위 네트워크에서 걸러졌다. 같은 건물의 클라이언트는 링크 계층에서 끝나므로 정상 동작했고, 이 차이가 문제를 더 헷갈리게 만들었다.</p>
+                    <p>일반적인 답은 앞 절의 두 번째 방법, 즉 <strong>출발지 주소 기준 정책 라우팅</strong>이다. 그런데 원문 기록에 따르면 이 방식은 반대 방향의 비대칭을 만들었다. <strong>로컬 네트워크 클라이언트에 대한 응답까지 에지 라우터로 돌아가</strong> 버린 것이다. 출발지 주소만으로는 「이 연결이 어디로 들어왔는지」를 구분할 수 없다는 한계가 드러난 셈이다.</p>
+
+                    <h3>7.2 왜 하필 DSCP였나</h3>
+                    <p>그래서 택한 것이 <strong>패킷 헤더의 DSCP 필드에 유입 지점 식별자를 실어 보내는</strong> 방식이다. DSCP는 RFC 2474가 정의한 <strong>DS 필드의 6비트 코드포인트</strong>로, 원래는 각 노드에서 패킷이 받을 처리 동작을 고르는 데 쓰인다. 요약하면 이런 흐름이다.</p>
+                    <ul>
+                        <li>에지에서 유입될 때 eBPF가 <strong>어느 에지로 들어왔는지</strong>를 DSCP 값으로 표시한다</li>
+                        <li>경로상의 데몬들이 이 표식으로 흐름을 추적한다</li>
+                        <li>응답이 나갈 때 정책 라우팅으로 <strong>들어온 그 에지로 되돌린다</strong></li>
+                        <li>사업자 네트워크로 나가기 전에 <strong>원래 DSCP 값을 복원</strong>한다</li>
+                    </ul>
+                    <p>마지막 단계를 오해하지 않는 것이 중요하다. 이것은 무언가를 숨기기 위한 조치가 아니라, <strong>내부 신호를 내부 경계 안에 가두는 위생 조치</strong>다. DSCP는 원래 QoS 정책을 위한 필드이므로, 임의로 정한 내부 값이 남의 네트워크로 흘러 나가면 그쪽 정책에 의미 없는 입력이 된다. 게다가 RFC 2474 자체가 <strong>도메인 경계를 지나며 코드포인트가 다시 표시될 수 있음</strong>을 전제하므로, 이 값은 애초에 종단 간 신호로 신뢰할 수 없다. <strong>경계 안에서만 쓰고 경계에서 되돌리는 것이 프로토콜 설계 취지에 맞는 사용법</strong>이다.</p>
+
+                    <h3>7.3 이 방식을 일반해로 삼지 말 것</h3>
+                    <p>영리한 해법이지만, 그대로 따라 하기 전에 짚어야 할 것들이 있다.</p>
+                    <ul>
+                        <li><strong>표식 공간이 매우 좁다.</strong> 6비트뿐이고 그중 일부는 관례적 용도가 있어 실제로 쓸 수 있는 값은 더 적다. 유입 지점이 늘어나면 금세 부족해진다</li>
+                        <li><strong>기존 QoS 정책과 충돌할 수 있다.</strong> 사내에서 이미 DSCP로 우선순위를 관리하고 있다면 내부 신호와 QoS 의도가 섞인다</li>
+                        <li><strong>경계 밖에서는 보존이 보장되지 않는다.</strong> 중간 장비가 값을 다시 쓸 수 있으므로 신뢰 구간이 어디까지인지 명확히 해야 한다</li>
+                        <li><strong>연결 추적 표식이 더 표준적인 답이다.</strong> 같은 장비 안에서 해결되는 문제라면 굳이 패킷 헤더에 정보를 실을 이유가 없다</li>
+                        <li><strong>진단 도구가 이 값을 잘 보여주지 않는다.</strong> 장애 시각에 확인 절차를 모르면 원인 파악이 크게 늦어진다</li>
+                    </ul>
+                    <p>정리하면 이것은 <strong>여러 라우터를 가로질러 흐름 정보를 전달해야 하는, 상당히 특수한 제약 아래에서 나온 답</strong>이다. 대부분의 온프렘 환경은 앞 절의 연결 표식과 정책 라우팅으로 충분하다. <strong>남의 해법을 가져올 때는 그 사람의 제약도 함께 가져와야 한다</strong>는 원칙이 여기에도 적용된다.</p>
+
+                    <h2>8. 장애 진단 순서 - 어디부터 tcpdump할 것인가</h2>
+                    <p>이 구성이 깨졌을 때 시간을 가장 많이 잡아먹는 실수는 <strong>파드부터 보는 것</strong>이다. 여기서 문제는 대개 훨씬 아래에서 발생한다. 아래에서 위로 올라가는 순서를 권한다.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>순서</th><th>확인 대상</th><th>관찰 지점</th><th>정상이면</th><th>비정상 신호</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>1</td><td>주소 배정</td><td><code>kubectl get svc</code>, 컨트롤러 로그</td><td>EXTERNAL-IP에 값이 있음</td><td>대기 상태 지속 → 컨트롤러·풀 문제</td></tr>
+                            <tr><td>2</td><td>ARP 응답</td><td>클라이언트 쪽 링크에서 ARP 관찰</td><td>단일 MAC으로 일관된 응답</td><td>무응답 또는 MAC이 계속 바뀜</td></tr>
+                            <tr><td>3</td><td>요청 도달</td><td>노드 물리 인터페이스</td><td>SYN이 보임</td><td>안 보이면 상위 경로·방화벽 문제</td></tr>
+                            <tr><td>4</td><td>응답 방향</td><td>같은 지점에서 역방향 관찰</td><td>같은 인터페이스로 응답이 나감</td><td>다른 인터페이스로 나가면 비대칭</td></tr>
+                            <tr><td>5</td><td>커널 판단</td><td><code>ip route get</code>, <code>ip rule show</code>, rp_filter</td><td>의도한 경로가 계산됨</td><td>기본 경로로 계산됨 → 정책 라우팅 누락</td></tr>
+                            <tr><td>6</td><td>노드 내부 전달</td><td>노드 내부 인터페이스·데이터플레인 상태</td><td>백엔드로 전달됨</td><td>특정 노드에서만 실패</td></tr>
+                            <tr><td>7</td><td>애플리케이션</td><td>파드 로그, 엔드포인트</td><td>요청이 앱까지 도달</td><td>여기까지 왔다면 앱 문제</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>각 단계에서 쓰는 명령은 다음 정도면 충분하다. 예시 주소는 문서용 대역이다.</p>
+                    <pre><code># 2단계 - 그 IP를 누가 자기 것이라고 주장하는가
+tcpdump -ni eth0 arp and host 203.0.113.10
+
+# 3~4단계 - 요청과 응답을 같은 지점에서 함께 본다
+tcpdump -ni eth0 host 203.0.113.10 and tcp port 80
+
+# 4단계 보강 - 다른 인터페이스로 응답이 새는지 확인
+tcpdump -ni eth1 host 203.0.113.10 and tcp port 80
+
+# 5단계 - 추측하지 말고 커널에 직접 묻는다
+ip route get 198.51.100.7 from 203.0.113.10
+ip rule show</code></pre>
+                    <p>실무 요령 몇 가지를 덧붙인다.</p>
+                    <ul>
+                        <li><strong>양쪽에서 동시에 잡는다.</strong> 한쪽만 보면 「보낸 것 같은데 안 온다」에서 논의가 멈춘다. 클라이언트와 서버 양쪽 캡처를 시각으로 맞춰 봐야 어느 구간에서 사라졌는지 특정된다</li>
+                        <li><strong>ARP부터 본다.</strong> 여기서 무응답이면 위 계층을 아무리 봐도 소용없다. 반대로 MAC이 흔들리면 리더 선출이나 중복 주장 문제다</li>
+                        <li><strong>같은 랜과 외부를 나눠서 시험한다.</strong> 「내부는 되고 외부만 안 된다」는 비대칭 라우팅의 대표적 지문이다</li>
+                        <li><strong>필터를 너무 좁게 걸지 않는다.</strong> 포트로만 거르면 ICMP 오류 메시지를 놓친다. 경로 문제는 종종 그쪽에 단서가 있다</li>
+                        <li><strong>변경 이력을 먼저 확인한다.</strong> 노드 추가, 재부팅, 커널 업데이트, 방화벽 규칙 배포 직후라면 원인 후보가 크게 좁혀진다</li>
+                        <li><strong>패킷 캡처는 관리 권한이 있는 네트워크에서만</strong> 수행한다. 타인의 통신을 동의 없이 기록하는 행위는 법적 문제가 될 수 있다</li>
+                    </ul>
+
+                    <h2>9. 그래서 무엇을 고를 것인가 - 상황별 판단</h2>
+                    <p>여기까지의 내용을 실제 선택으로 옮기면 다음과 같다. 대부분의 환경은 첫 두 줄에서 끝난다.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>상황</th><th>권장 출발점</th><th>이유</th><th>주의할 점</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>홈랩·소규모 사무실, 라우터 권한 없음</td><td>L2 광고 방식</td><td>라우터 설정 없이 성립하는 유일한 선택</td><td>서비스당 대역폭이 노드 1대분, 전환 시 캐시 지연</td></tr>
+                            <tr><td>자체 라우터 운용, 노드 대역폭을 넘겨야 함</td><td>BGP 광고</td><td>ECMP로 여러 노드에 분산</td><td>백엔드 변동 시 무관한 연결까지 재해싱</td></tr>
+                            <tr><td>고정 IP가 있는 온프렘 상면</td><td>주소 풀 고정 + L2 또는 BGP</td><td>기존 도구의 전제가 그대로 성립</td><td>풀과 실제 할당 대역이 어긋나지 않게 관리</td></tr>
+                            <tr><td>주소가 동적으로 바뀌는 회선</td><td>동적 반영 경로 확보 후 결정</td><td>풀 고정 전제가 깨짐</td><td>약관 확인이 선행, 주소 변경을 정상 시나리오로 설계</td></tr>
+                            <tr><td>접속자 IP를 로그에 남겨야 함</td><td><code>externalTrafficPolicy: Local</code> 검토</td><td>출발지 IP 보존</td><td>일부 L2 구현과 호환되지 않음, 파드 배치 편중 유의</td></tr>
+                            <tr><td>서비스가 계속 늘어남</td><td>인그레스·게이트웨이 계층 도입</td><td>외부 IP 하나로 다수 서비스 처리</td><td>계층이 늘어 장애 지점도 늘어남</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>마지막 줄을 특히 강조하고 싶다. <strong>온프렘에서 LoadBalancer 타입 서비스를 남발하면 관리해야 할 외부 주소가 서비스 수만큼 늘어난다.</strong> 주소가 귀한 환경일수록 <strong>외부 진입점은 소수로 유지하고 그 뒤에서 이름 기반으로 분기</strong>하는 구성이 훨씬 오래간다. 실제로 대부분의 온프렘 클러스터에서 LoadBalancer 타입은 인그레스 컨트롤러 앞단 한두 개면 충분하다.</p>
+
+                    <h2>10. 자주 하는 오해 바로잡기</h2>
+                    <ul>
+                        <li><strong>「EXTERNAL-IP가 pending인 것은 버그다」</strong> — 아니다. 배정을 담당할 컨트롤러가 없는 정상 상태다. 온프렘에서는 그 역할을 세워야 한다</li>
+                        <li><strong>「MetalLB를 깔면 클라우드처럼 된다」</strong> — 주소 배정과 광고 문제는 풀리지만, 반환 경로·출발지 IP 보존·장애 전환은 여전히 운영자의 몫이다</li>
+                        <li><strong>「BGP가 L2보다 무조건 낫다」</strong> — 대역폭은 낫지만 백엔드 변동 시 재해싱으로 <strong>무관한 연결까지 끊긴다</strong>는 문서화된 한계가 있다. 라우터 운영 역량도 필요하다</li>
+                        <li><strong>「eBPF를 쓰면 빨라진다」</strong> — 이 맥락에서 eBPF의 이점은 속도보다 <strong>스택을 건드리지 않고 원하는 계층에 개입할 수 있다</strong>는 점이다. 대신 표준 도구에서 상태가 보이지 않게 된다</li>
+                        <li><strong>「rp_filter를 0으로 하면 해결된다」</strong> — 증상은 사라질 수 있으나 원인은 남고 위조 방어가 약해진다. <code>all</code>과 인터페이스 중 큰 값이 적용된다는 점도 자주 놓친다</li>
+                        <li><strong>「내부에서 되니 방화벽 문제는 아니다」</strong> — 오히려 그 반대의 지문이다. 같은 랜은 라우터를 안 거치므로 경로 문제가 드러나지 않는다</li>
+                        <li><strong>「DHCP로 받은 주소도 어차피 내 것이다」</strong> — 임대다. 회수될 수 있고, 사용 범위는 회선 약관에서 정해진다</li>
+                        <li><strong>「어차피 클러스터 안이니 QoS 필드는 자유롭게 써도 된다」</strong> — 경계를 넘으면 다시 표시될 수 있고, 남의 정책에 영향을 줄 수 있다. 내부 신호는 경계에서 되돌리는 것이 원칙이다</li>
+                    </ul>
+
+                    <h2>결론</h2>
+                    <p>클라우드에서 <code>type: LoadBalancer</code> 한 줄이 하던 일은 사실 <strong>최소 다섯 가지 작업의 묶음</strong>이었다. 주소를 확보하고, 그 주소를 네트워크에 알리고, 트래픽을 노드로 끌어오고, 노드 안에서 백엔드로 전달하고, 응답이 온 길로 되돌아가게 하는 일이다. 클라우드는 이 다섯을 한 덩어리로 팔았기 때문에 우리는 그것이 하나인 줄 알았다. <strong>직접 하려고 하면 각각이 독립된 문제라는 사실이 드러난다.</strong></p>
+                    <p>이번 사례가 흥미로운 것은 화려한 기술 스택 때문이 아니라, <strong>기존 도구의 전제가 깨지는 지점을 정확히 짚었기 때문</strong>이다. MetalLB는 운영자가 주소 풀을 안다고 전제하고, 이 전제는 대부분의 환경에서 옳다. 그러나 주소를 동적으로 받는 환경에서는 성립하지 않는다. 그 지점에서 무엇을 직접 만들어야 하는지 확인하는 과정 자체가, 남이 만든 추상 아래에 무엇이 있었는지를 알려 준다.</p>
+                    <p>실용적인 결론은 오히려 담백하다. <strong>대부분의 온프렘·홈랩 환경에서는 L2 광고 방식으로 충분하고, 라우터를 운용할 수 있다면 BGP가 다음 선택</strong>이다. 직접 구현은 그 둘의 전제가 명확히 깨질 때만 고려할 일이며, 그때도 <strong>동작 원리와 진단 절차를 문서로 남기는 것까지</strong>가 구현 범위다. 그리고 통신사 회선 위에서 무언가를 구성한다면 <strong>기술 검토보다 약관 확인이 먼저</strong>다. 계약 범위 안에서 설계하는 것이 가장 오래가는 구성이다.</p>
+                    <p>마지막으로 한 가지. 이 영역의 장애는 <strong>애플리케이션 로그에 아무 흔적을 남기지 않는다</strong>. 패킷은 커널이나 상위 네트워크에서 조용히 사라지고, 개발자에게는 그저 타임아웃으로만 보인다. 그래서 이런 구성을 운영하기로 했다면 <strong>ARP·경로·필터를 확인하는 순서를 미리 손에 익혀 두는 것</strong>이 어떤 자동화보다 실질적인 대비가 된다.</p>
+
+                    <h2>참고 자료</h2>
+                    <ul>
+                        <li>Kubernetes 공식 문서 - Service (type LoadBalancer, status.loadBalancer.ingress, loadBalancerClass, externalTrafficPolicy): <a href="https://kubernetes.io/docs/concepts/services-networking/service/" target="_blank" rel="noopener">kubernetes.io</a></li>
+                        <li>MetalLB 공식 문서 - Concepts (주소 풀, 광고 모드): <a href="https://metallb.io/concepts/" target="_blank" rel="noopener">metallb.io/concepts</a></li>
+                        <li>MetalLB 공식 문서 - Layer 2 모드 (단일 노드 병목·장애 전환·리더 선출): <a href="https://metallb.io/concepts/layer2/" target="_blank" rel="noopener">metallb.io/concepts/layer2</a></li>
+                        <li>MetalLB 공식 문서 - BGP 모드 (ECMP 해싱·재해싱 한계와 완화책): <a href="https://metallb.io/concepts/bgp/" target="_blank" rel="noopener">metallb.io/concepts/bgp</a></li>
+                        <li>MetalLB 이슈 - 외부 IPAM·DHCP 연동 요청: <a href="https://github.com/metallb/metallb/issues/157" target="_blank" rel="noopener">github.com/metallb/metallb/issues/157</a></li>
+                        <li>Cilium 공식 문서 - L2 Announcements (Lease 리더 선출·제약): <a href="https://docs.cilium.io/en/stable/network/l2-announcements/" target="_blank" rel="noopener">docs.cilium.io</a></li>
+                        <li>Cilium 공식 문서 - LoadBalancer IP Address Management: <a href="https://docs.cilium.io/en/stable/network/lb-ipam/" target="_blank" rel="noopener">docs.cilium.io/lb-ipam</a></li>
+                        <li>kube-vip 공식 문서 - ARP 모드: <a href="https://kube-vip.io/docs/modes/arp/" target="_blank" rel="noopener">kube-vip.io</a></li>
+                        <li>Linux 커널 문서 - IP Sysctl (rp_filter 0·1·2, RFC 3704): <a href="https://docs.kernel.org/networking/ip-sysctl.html" target="_blank" rel="noopener">docs.kernel.org</a></li>
+                        <li>XDP 동작 코드 문서 (XDP_TX·XDP_PASS·XDP_DROP): <a href="https://prototype-kernel.readthedocs.io/en/latest/networking/XDP/implementation/xdp_actions.html" target="_blank" rel="noopener">prototype-kernel.readthedocs.io</a> / <a href="https://docs.ebpf.io/linux/program-type/BPF_PROG_TYPE_XDP/" target="_blank" rel="noopener">docs.ebpf.io</a></li>
+                        <li>RFC 2131 - Dynamic Host Configuration Protocol (임대 식별·갱신·DHCPNAK): <a href="https://www.rfc-editor.org/rfc/rfc2131.html" target="_blank" rel="noopener">rfc-editor.org/rfc/rfc2131</a></li>
+                        <li>RFC 2474 - DS 필드 정의 (6비트 코드포인트·경계 재표시): <a href="https://www.rfc-editor.org/rfc/rfc2474" target="_blank" rel="noopener">rfc-editor.org/rfc/rfc2474</a></li>
+                        <li>사례 원문 - 통신사 IP를 쿠버네티스 LoadBalancer에 붙인 기록: <a href="https://attacca.cc/blog/dumbarp/" target="_blank" rel="noopener">attacca.cc/blog/dumbarp</a></li>
+                        <li>GeekNews 토론: <a href="https://news.hada.io/topic?id=31879" target="_blank" rel="noopener">news.hada.io/topic?id=31879</a></li>
+                        <li>관련 글: <a href="kubernetes_gateway_api_nginx_ingress_2026.html">Gateway API와 인그레스 - 표준 리소스로 트래픽 다스리기</a>, <a href="neko_master_network_traffic_dashboard_2026.html">neko-master 네트워크 트래픽 대시보드 분석</a>, <a href="docker_k8s_guide_08_pod_deploy_svc.html">Docker &amp; Kubernetes 가이드 8편 - Pod·Deployment·Service</a></li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>이 글 공유하기</h3>
+                    <div class="social-share">
+                        <button id="kakao-share" class="share-btn kakao-btn"><img src="https://developers.kakao.com/assets/img/about/logos/kakaolink/kakaolink_btn_small.png" alt="카카오톡">카카오톡</button>
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(트위터)</button>
+                        <button id="threads-share" class="share-btn threads-btn">쓰레드</button>
+                        <button id="link-copy" class="share-btn link-btn">링크 복사</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">목록으로 돌아가기</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">함께 쓰면 좋은 무료 도구</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/json_formatter.html">JSON 포맷터</a></li>
+      <li><a href="../static/regex_tester.html">정규식 테스트기</a></li>
+      <li><a href="../static/jwt_decoder.html">JWT 디코더·생성기 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 인코더/디코더</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">전체 도구 보기 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">관련 글</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="monitor_input_ddc_cli_2026.html">모니터 입력을 커맨드라인에서 전환하기 - DDC/CI와 monitor-input-rs 완전 정리 2026</a></li>
+      <li><a href="thorvg_vector_animation_2026.html">움직이는 그래픽 하나를 넣는다는 결정</a></li>
+      <li><a href="cerebras_internal_knowledge_platform_2026.html">사내 지식 플랫폼 통합 설계 - Cerebras 사례로 본 소스·권한·청킹·비용 결정</a></li>
+      <li><a href="api_docs_governance_2026.html">API 문서는 왜 항상 코드보다 늦는가 - 엑셀·PDF 명세를 기계가 읽는 계약으로</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const kakaoShareBtn = document.getElementById('kakao-share');
+        if (kakaoShareBtn) {
+            kakaoShareBtn.addEventListener('click', function() {
+                if (!window.Kakao) return;
+                if (!window.Kakao.isInitialized()) window.Kakao.init('e06d0ee93e450a11bc6451d46e09cd88');
+                if (window.Kakao.Share) {
+                    window.Kakao.Share.sendDefault({
+                        objectType: 'feed',
+                        content: { title: document.title, description: document.querySelector('meta[name="description"]')?.content || '', imageUrl: 'https://braindetox.kr/site_logo.png', link: { mobileWebUrl: location.href, webUrl: location.href } },
+                        buttons: [{ title: '웹으로 보기', link: { mobileWebUrl: location.href, webUrl: location.href } }]
+                    });
+                }
+            });
+        }
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('링크가 복사되었습니다. 쓰레드 앱에 붙여넣기하여 공유하세요!');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('링크가 복사되었습니다!'); });
+    });
+    </script>
+</body>
+</html>

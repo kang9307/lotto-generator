@@ -1,0 +1,625 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>在云之外自建Kubernetes LoadBalancer - 运营商IP、ARP代答与非对称路由 2026</title>
+    <meta name="description" content="为什么在云之外LoadBalancer类型的服务会一直停留在pending。本文拆解地址分配与路由通告的分离、二层与BGP与自研三条路径的选择标准、运营商DHCP带来的限制，以及ARP代答与非对称路由的排查顺序。">
+    <meta name="keywords" content="Kubernetes LoadBalancer, 本地部署负载均衡, MetalLB, Cilium L2 Announcements, BGP ECMP, eBPF, XDP, ARP应答, 非对称路由, rp_filter, 策略路由, DHCP租约, DSCP, 裸金属Kubernetes, 家庭实验室">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/k8s_carrier_ip_loadbalancer_ebpf_2026.html">
+
+    <meta property="og:title" content="在云之外自建Kubernetes LoadBalancer - 运营商IP、ARP代答与非对称路由">
+    <meta property="og:description" content="当没有人替你发放External IP时，实际需要自己完成哪些事。分配与通告、回程路径一致性，以及可复用的排查顺序。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/k8s_carrier_ip_loadbalancer_ebpf_2026.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-07-28">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="在云之外自建Kubernetes LoadBalancer">
+    <meta name="twitter:description" content="EXTERNAL-IP为何停在pending、L2与BGP与自研如何取舍、非对称路由如何排查。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "在云之外自建Kubernetes LoadBalancer - 运营商IP、ARP代答与非对称路由",
+      "alternativeHeadline": "Building a LoadBalancer Outside the Cloud - Carrier IPs, ARP Proxying and Asymmetric Routing",
+      "datePublished": "2026-07-28",
+      "dateModified": "2026-07-28",
+      "inLanguage": "zh-CN",
+      "articleSection": "开发/基础设施",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "Kubernetes LoadBalancer, 本地部署, MetalLB, Cilium L2 Announcements, BGP ECMP, eBPF, XDP, ARP应答, 非对称路由, rp_filter, 策略路由, DHCP租约",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/k8s_carrier_ip_loadbalancer_ebpf_2026.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "本地部署的Kubernetes中EXTERNAL-IP为什么一直是pending",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "因为Kubernetes本身并不创建外部IP地址。官方文档指出，type LoadBalancer服务的外部地址由云提供商配置，分配该地址的责任在云提供商一侧，结果会写入服务的status.loadBalancer.ingress字段。如果没有云提供商集成，也没有代行该职责的控制器，就没有主体来填这个字段，EXTERNAL-IP便会无限期停留在等待状态。也就是说这不是故障，而是缺少对手方。在本地环境中需要分别准备两样东西：分配地址的控制器，以及把该地址通告到网络的手段。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "MetalLB的二层模式和BGP模式该选哪一个",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "第一个分岔点是能否操作路由器。按官方文档，二层模式由集群中的一台机器取得服务所有权并以ARP或NDP应答，因此无需路由器配置，但该服务的全部流量会集中到一个节点，单节点带宽成为上限。BGP模式让各节点与邻近路由器建立对等会话并通过ECMP分担，可以用上多个节点，但文档明确指出后端集合规模变化时现有连接会被近乎随机地重新哈希。归纳起来，办公室与家庭实验室这类对路由器权限受限的环境从二层模式起步，自行运维路由器且需要超过单节点带宽的环境从BGP起步。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "可以把运营商通过DHCP下发的IP用作LoadBalancer地址吗",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "技术可行性与合同允许范围是两回事，因此第一步是查看线路合同与服务条款。不同套餐在可用地址数量、是否允许运行服务器、静态地址的提供方式上都不相同，这些都由条款约定。从技术上看DHCP地址也是租用而非拥有。RFC 2131把客户端标识符或硬件地址与所分配网络地址的组合定义为该租约的唯一标识，服务器在认为客户端对地址的认知有误或租约已到期时可以发送DHCPNAK。也就是说这个地址随时可能改变，若要作为服务地址使用，就必须把续租失败与地址变更当作正常场景纳入设计。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "如何确认遇到的是非对称路由",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "症状表现为请求能到达而响应回不来，所以基本做法是同时观察两端，切分出数据包在哪一段消失。先确认请求报文确实进入了服务器接口，再看响应离开的接口是否与请求进入的接口相同。接着检查路由表与策略路由规则，看内核为该响应计算出的出口在哪里。还要一并查看内核的反向路径过滤。Linux内核文档定义rp_filter为0表示不做源校验，1为RFC 3704严格模式，2为宽松模式，并说明实际生效值取all设置与接口设置中的较大者。在严格模式下存在非对称路径时数据包会被静默丢弃，应用日志里不会留下任何痕迹。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "无法访问LoadBalancer的IP时应该从哪里查起",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "自下而上的顺序最快。第一，在同一网络中查看是否有人对该IP作出ARP应答。没有应答说明通告层出了问题，MAC地址反复变化则说明有多个主体在主张同一地址。第二，确认请求报文是否到达服务器接口。若未到达，问题在上游路径或防火墙。第三，若能到达却没有响应，就检查响应离开的路径以及反向路径过滤。第四，以上都正常之后再看节点内部的转发路径与容器组状态。不按顺序而从容器组查起，通常会在这类故障上浪费大量时间。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.2rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background-color: #fff8e6; border-left: 4px solid #f0ad4e; padding: 1rem 1.2rem; margin: 1.5rem 0; border-radius: 0 6px 6px 0; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/k8s_carrier_ip_loadbalancer_ebpf_2026.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/k8s_carrier_ip_loadbalancer_ebpf_2026.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/k8s_carrier_ip_loadbalancer_ebpf_2026.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/k8s_carrier_ip_loadbalancer_ebpf_2026.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/k8s_carrier_ip_loadbalancer_ebpf_2026.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="在云之外自建Kubernetes LoadBalancer - 运营商IP、ARP代答与非对称路由">
+                <meta itemprop="datePublished" content="2026-07-28">
+                <meta itemprop="dateModified" content="2026-07-28">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="Kubernetes LoadBalancer, 本地部署, MetalLB, Cilium, BGP, eBPF, XDP, ARP, 非对称路由, rp_filter">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/k8s_carrier_ip_loadbalancer_ebpf_2026.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">在云之外自建LoadBalancer意味着什么</h1>
+                    <h2 class="post-subtitle">从EXTERNAL-IP停在pending，到ARP代答与非对称路由</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-07-28">2026年7月28日</span>
+                        <span class="post-category" itemprop="articleSection">开发/基础设施</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+                    <h2>引言：EXTERNAL-IP一动不动的那天</h2>
+                    <p>从托管Kubernetes转到本地机房或家庭实验室的人，几乎都会遇到同一个画面。创建了一个<code>type: LoadBalancer</code>的服务，过了好几分钟，<strong>EXTERNAL-IP那一列仍然是等待状态</strong>。</p>
+                    <pre><code>$ kubectl get svc web
+NAME   TYPE           CLUSTER-IP     EXTERNAL-IP   PORT(S)        AGE
+web    LoadBalancer   10.96.31.10    &lt;pending&gt;     80:31942/TCP   12m</code></pre>
+                    <p>多数人此时开始翻日志。但这里并没有需要修的错误。<strong>这不是失败，而是缺少对手方。</strong>Kubernetes官方文档把这一点写得很明白：如果云提供商支持负载均衡器，就会为服务配置一个外部地址，而<strong>分配该地址的责任在云提供商</strong>。没有这个对手方，也就没有可填的值。</p>
+                    <p>2026年7月出现在GeekNews上的一篇文章，把这个抽象问题变得非常具体。为了把运营商通过DHCP下发的IPv4地址用作Kubernetes LoadBalancer的外部地址，作者写了一个<strong>不把地址挂到网卡上的DHCP客户端</strong>，用<strong>eBPF代为应答ARP</strong>，最后还得处理<strong>非对称路由</strong>。这可以当作一篇成功记录来读，但我认为它真正的价值在别处：它诚实地展示了<strong>云上一个复选框背后，究竟藏着多少互相独立的层</strong>。</p>
+                    <p>所以本文不是某个实现的介绍。它把<strong>在非云环境中要让LoadBalancer类型的服务成立，究竟需要自己完成什么</strong>逐层拆开，说明每个选项各自要付出的代价，以及出问题时该从哪里看起。无论最终用的是MetalLB、Cilium还是自己写的守护进程，理解下面这套结构都会让判断快得多。</p>
+
+                    <h2>1. 云上是谁发放IP - type LoadBalancer的真实约定</h2>
+
+                    <h3>1.1 Kubernetes并不创建地址</h3>
+                    <p>先澄清一个误解。<strong>Kubernetes里面并没有实现负载均衡器的代码。</strong>把服务声明为<code>type: LoadBalancer</code>，与其说是下达指令，不如说是<strong>提交一份请求</strong>。实际发生的过程是这样的：</p>
+                    <ul>
+                        <li>用户创建一个type LoadBalancer的服务</li>
+                        <li>外部控制器观察到这个请求，在云上就是cloud-controller-manager</li>
+                        <li>控制器在自己的环境中取得地址，并准备真正的负载均衡资源</li>
+                        <li>把取得的地址写入服务的<code>status.loadBalancer.ingress</code></li>
+                        <li>这时<code>kubectl get svc</code>的EXTERNAL-IP列才被填上</li>
+                    </ul>
+                    <p>也就是说EXTERNAL-IP是<strong>汇报结果的一栏</strong>，而不是下达命令的一栏。接受这一点之后，本地环境要做的事就自动确定了：<strong>必须自己立起一个能填上这个状态字段的主体。</strong></p>
+
+                    <h3>1.2 想指定特定地址的时候</h3>
+                    <p>过去可以用<code>spec.loadBalancerIP</code>请求特定地址，但该字段目前在文档中标记为<strong>已弃用</strong>，原因是各实现的解释不一致，且无法表达双栈场景。现在改用下面两种方式：</p>
+                    <ul>
+                        <li><strong>各实现自定义的注解</strong> — 按每个控制器定义的方式指定地址或地址池。可移植性差，但表达力强</li>
+                        <li><strong><code>spec.loadBalancerClass</code></strong> — 当集群中同时存在多个负载均衡实现时，指定由哪一个来处理该服务。在本地环境中让MetalLB与其他控制器共存时尤其有用</li>
+                    </ul>
+
+                    <h3>1.3 本地环境里出现了两件事</h3>
+                    <p>这是全文最重要的区分。在云上看起来是一整块的事情，<strong>到了本地就分成性质完全不同的两项工作</strong>。</p>
+                    <ul>
+                        <li><strong>分配</strong> — 给这个服务哪个地址。这是IPAM问题：管理地址池并且不重复地发放</li>
+                        <li><strong>通告</strong> — 怎样把发往该地址的流量牵引到自己的集群。要么是链路层的ARP与NDP，要么是网络层的路由协议</li>
+                    </ul>
+                    <p>两者互相独立，而Cilium把这种分离做成了结构。按其官方文档，<strong>LB IPAM</strong>只负责从<code>CiliumLoadBalancerIPPool</code>中挑选地址并分配给服务，真正把地址通告出去的工作由<strong>BGP控制平面</strong>或<strong>L2 Announcements</strong>这类独立功能承担。MetalLB在内部也是同样的结构。</p>
+                    <p>本地排障之所以困难，原因就在这里。<strong>EXTERNAL-IP出现了地址，只说明分配完成，完全不能保证这个地址可以访问。</strong>地址有了却连不上的情形，绝大多数发生在通告层。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>层次</th><th>云上由谁完成</th><th>本地由谁完成</th><th>失败时的症状</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>地址分配（IPAM）</td><td>云提供商</td><td>MetalLB地址池、Cilium LB IPAM、自研控制器</td><td>EXTERNAL-IP卡在等待状态</td></tr>
+                            <tr><td>路由通告</td><td>云网络底层</td><td>ARP与NDP应答，或BGP通告</td><td>地址已分配但不可达，ARP无应答</td></tr>
+                            <tr><td>节点内部转发</td><td>提供商数据平面</td><td>kube-proxy或eBPF数据平面</td><td>只有部分节点能访问</td></tr>
+                            <tr><td>源IP保留</td><td>提供商配置或代理协议</td><td>由你选择<code>externalTrafficPolicy</code></td><td>所有访问都记录为节点IP</td></tr>
+                            <tr><td>回程路径一致性</td><td>由底层网络处理</td><td>由运维人员自行设计</td><td>请求到达，响应消失</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>表中最后两行是本地环境里最折磨人的项目。按官方文档，<code>externalTrafficPolicy</code>默认值<code>Cluster</code>会路由到所有端点，而<code>Local</code>只发往本节点上的端点，同时<strong>保留客户端源IP</strong>。需要在访问日志中记录真实来访地址的服务离不开这个设置，但正如后文所述，<code>Local</code>有时会与通告层冲突。</p>
+
+                    <h2>2. 本地方案的三条路径 - 二层通告、BGP与自研</h2>
+                    <p>在本地解决通告问题的方法大致有三种。按<strong>在哪一层替别人说话</strong>来分类，比按产品名分类更容易理解。</p>
+
+                    <h3>2.1 二层模式 - 在链路层代为应答</h3>
+                    <p>这是使用最广的方式。照搬MetalLB官方文档的说法，在这种模式下<strong>集群中的一台机器取得服务的所有权，并使用标准的地址发现协议（IPv4用ARP，IPv6用NDP）让这些IP在本地网络上可达</strong>。技术上就是让那个节点看起来像在自己的网卡上持有多个地址。</p>
+                    <p>优点很明确：<strong>不需要动路由器。</strong>交换机也不必知情。在办公室或家庭实验室这类对网络设备权限受限的场景中，这实际上是唯一现实的选择。但文档指出的代价同样明确。</p>
+                    <ul>
+                        <li><strong>带宽上限就是一个节点。</strong>用文档的话说，发往某个服务IP的全部流量都会去往一个节点。增加节点并不会提高该服务的入向带宽</li>
+                        <li><strong>故障切换取决于客户端。</strong>MetalLB会发送非请求的链路层报文来通告MAC变更，多数现代操作系统能在数秒内生效，但实现不佳的客户端会一直向旧MAC发送，直到缓存过期</li>
+                        <li><strong>对于计划内切换，文档建议让旧的主节点再存活一段时间</strong>，以便替缓存陈旧的客户端转发几分钟流量</li>
+                        <li><strong>主节点选举是无状态的。</strong>每个speaker各自计算一份对节点与VIP做哈希后的有序列表，排第一就负责通告。新增节点可能导致主节点变更</li>
+                        <li><strong>文档明确提到网络分区时的脑裂风险。</strong>若彼此误判对方已失效，可能出现多个speaker同时通告同一个VIP，或者没有任何一个通告</li>
+                    </ul>
+                    <p>Cilium的L2 Announcements处在同样的物理规律之下。其文档写明，由于ARP与NDP的特性，主机对每个IP只保存一个MAC，因此集群中<strong>只能有一个节点</strong>应答，于是每个服务对应一个<strong>Kubernetes Lease</strong>，由持有者负责应答。不过这个功能附带了不少在实践中容易踩到的条件：</p>
+                    <ul>
+                        <li>文档标注为<strong>测试版</strong>，且必须启用<strong>kube-proxy替代模式</strong></li>
+                        <li>Lease的获取是<strong>先到先得</strong>，文档指出这可能造成节点之间负载不均</li>
+                        <li>明确写明<strong>与<code>externalTrafficPolicy: Local</code>不兼容</strong>，因为服务IP可能在没有容器组的节点上被通告，导致流量被丢弃。如果需要保留源IP，这个组合从一开始就应当回避</li>
+                        <li>不接受免费ARP的客户端要等到自身表项老化才会重新查询，因此可能经历比租约时长更久的中断</li>
+                    </ul>
+                    <p>kube-vip在ARP模式下也使用同样的原理。按其文档，虚拟IP在节点之间迁移时会广播免费ARP以更新IP与MAC的对应关系，主节点选举同样基于Kubernetes Lease。<strong>无论实现是什么，链路层能做到的事情，上限都是一样的。</strong></p>
+
+                    <h3>2.2 BGP模式 - 把路径告诉路由器</h3>
+                    <p>在BGP模式下，每个节点与邻近路由器建立对等会话，通告通往服务IP的路径。路由器把多个节点视为等价路径并用ECMP分担。二层模式的单节点瓶颈随之消失，还能借助路由器策略做更细的控制。</p>
+                    <p>但这里藏着<strong>本地负载均衡中最常被低估的陷阱</strong>，MetalLB文档对此直接提出了警告。路由器通过对报文头部的若干字段做哈希来选择下一跳，常见的是三元组（协议、源IP、目的IP）或再加上端口的五元组，目的是让同一会话的报文落到同一个节点。问题出在下一步。</p>
+                    <blockquote>后端集合的规模一旦变化，现有连接会被近乎随机地重新哈希。—— MetalLB BGP文档</blockquote>
+                    <p>重启一个节点，或者一条BGP会话断开，就在那一刻，<strong>与该节点毫无关系的连接也会被重新分配</strong>到别的节点。新节点上没有这些连接的状态，通信随即中断。文档给出的缓解手段更像是妥协而非解决：在路由器上使用具有弹性的ECMP哈希、把工作负载固定到特定节点、在流量低谷期做变更、通过DNS在服务之间迁移、增加客户端重试逻辑、引入入口控制器层，以及对非关键服务接受偶发的连接重置。</p>
+                    <p>实践中最可行的答案通常是最后两项的组合：<strong>只用BGP暴露少数几个入口控制器，把真正的应用放在它们后面</strong>。这样重新哈希的影响范围就被限制在入口层。</p>
+
+                    <h3>2.3 自研 - 当既有工具的前提不成立时</h3>
+                    <p>第三条路径是自己动手。听起来鲁莽，但当<strong>工具所依赖的前提在自己的环境里根本不成立</strong>时，有时也只剩这一个选择。本次的案例正是如此。</p>
+                    <p>MetalLB的前提是<strong>运维人员知道地址池</strong>。用文档的话说，MetalLB无法凭空造出IP地址，所以必须由管理员提供地址池。而在通过运营商DHCP获取地址的环境中，这个前提不成立：事先无法知道会拿到哪些地址，而且它们还可能变化。项目的问题跟踪里长期挂着对接外部IPAM与DHCP的诉求，但要支持动态分配就得改动包括单线程假设在内的内部结构，因此一直没有实现。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>判断标准</th><th>二层通告（ARP与NDP）</th><th>BGP通告</th><th>自研</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>是否需要路由器权限</td><td>不需要</td><td>必需，要配置对等会话</td><td>取决于设计</td></tr>
+                            <tr><td>单个服务的入向带宽</td><td>上限为一个节点</td><td>分担到多个节点</td><td>取决于设计</td></tr>
+                            <tr><td>地址会动态变化的环境</td><td>不适合，前提是固定地址池</td><td>不适合，前提是固定地址池</td><td>可以应对</td></tr>
+                            <tr><td>故障切换时的风险</td><td>客户端缓存滞后</td><td>ECMP重新哈希会切断无关连接</td><td>完全取决于实现质量</td></tr>
+                            <tr><td>运维难度</td><td>低</td><td>中，需要与网络团队协作</td><td>高，代码即基础设施</td></tr>
+                            <tr><td>公交因子</td><td>用户基数大</td><td>用户基数大</td><td>通常只有一个人</td></tr>
+                            <tr><td>适用场景</td><td>办公室、家庭实验室、小规模本地部署</td><td>自行运维路由器，带宽需求大</td><td>既有前提被打破的特殊环境</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>建议认真看待表中的<strong>公交因子</strong>一行。自研的守护进程会在基础设施的最底层静静运行，直到写它的人不在，它就变成谁也不敢碰的黑盒。如果决定要做，<strong>把工作原理与排查步骤写成文档</strong>也是实现的一部分，而不是可选项。</p>
+
+                    <h2>3. 运营商线路上会变的东西 - DHCP带来的限制</h2>
+
+                    <div class="callout">
+                        <p><strong>开始之前。</strong>不同线路套餐在可用地址数量、是否允许运行服务器、静态地址的提供条件上都不相同，这些由合同与服务条款约定。<strong>技术上可行与合同上允许是两回事</strong>，因此在动手搭建之前先阅读条款，必要时向运营商咨询，才是正确顺序。本文讲的是网络的工作原理与排查方法，不涉及绕开运营商政策的做法。</p>
+                    </div>
+
+                    <h3>3.1 DHCP地址是租用而非拥有</h3>
+                    <p>这是最根本的限制。RFC 2131把<strong>客户端标识符或硬件地址与所分配网络地址的组合，定义为该租约的唯一标识</strong>。而租约是有期限的。客户端在T1时刻以单播方式尝试续租，失败则在T2时刻改用广播重试。服务器若判断客户端对地址的认知有误，或租约已到期，就会发送<strong>DHCPNAK</strong>告知无效。</p>
+                    <p>从服务地址的角度看，这个事实分量很重。<strong>地址发生变化不是故障，而是正常运行。</strong>因此设计必须把下面这些当作正常场景纳入：</p>
+                    <ul>
+                        <li>续租可能失败，<strong>地址可能被收回</strong>。那么使用该地址的服务会怎样</li>
+                        <li>重启或线路切换之后<strong>可能拿到另一个地址</strong>。DNS由谁来更新</li>
+                        <li>地址一变，<strong>证书、防火墙白名单、对外登记信息</strong>会同时失配</li>
+                        <li>DHCP客户端进程一旦退出，<strong>租约会悄无声息地过期</strong>。它在监控范围内吗</li>
+                    </ul>
+
+                    <h3>3.2 一个地址对应一个MAC</h3>
+                    <p>第二个限制是标识。既然租约与标识绑定，<strong>要拿到多个地址就得用不同的标识分别发起请求</strong>。原文案例之所以创建多个虚拟网卡并让它们各持不同的MAC，原因正在于此：通过单个物理网卡自然地取得多份租约并没有现成的办法。</p>
+                    <p>由此产生一个实务上需要留意的点。上游网络设备可能限制每个端口可学习的MAC数量，或把意料之外的MAC视为异常。<strong>这类策略是为了维持网络稳定而存在的正当机制</strong>，因此不应被当作规避对象，而应当<strong>作为设计约束接受，并事先确认</strong>。</p>
+
+                    <h3>3.3 网关与防火墙不属于你</h3>
+                    <p>第三个限制是控制权的边界。在云上，整个网络实际上都在自己的管理范围内；而在运营商线路上，<strong>默认网关之外全是别人的地盘</strong>。这条边界带来以下后果：</p>
+                    <ul>
+                        <li>源地址与预期不符的报文<strong>可能在上游被过滤掉</strong>。这正是后文非对称路由问题的根源</li>
+                        <li>某些端口可能在上游被阻断，而这一点仅凭本地设备的配置无法确认</li>
+                        <li>诸如QoS标记之类的头部字段<strong>可能在跨越边界时被改写</strong>。RFC 2474本身就假定码点可以在进入另一个域时被重新标记</li>
+                        <li>在互联网与广播业务捆绑的线路上，改动布线或配置可能影响到另一项业务</li>
+                    </ul>
+
+                    <table>
+                        <thead>
+                            <tr><th>限制</th><th>技术依据</th><th>对设计的影响</th><th>应对方向</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>地址可能被收回</td><td>租约到期与DHCPNAK（RFC 2131）</td><td>服务地址可能消失</td><td>监控续租，打通地址变更的自动生效路径</td></tr>
+                            <tr><td>按标识分配</td><td>租约以客户端标识符或硬件地址为键</td><td>有多少地址就需要多少标识</td><td>设计虚拟网卡，事先确认上游设备策略</td></tr>
+                            <tr><td>无法控制网关</td><td>边界之外属于运营商管理范围</td><td>源地址不匹配的报文可能被丢弃</td><td>让回程路径与入向路径保持一致</td></tr>
+                            <tr><td>头部字段被重新标记</td><td>在DS域边界重新标记码点（RFC 2474）</td><td>QoS标记无法承载端到端语义</td><td>内部信号只在内部边界内使用</td></tr>
+                            <tr><td>条款与套餐条件</td><td>合同本身</td><td>整个方案可能超出许可范围</td><td>动手前先看条款，不确定就问运营商</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2>4. 代替地址应答ARP - 会坏掉什么，又能得到什么</h2>
+
+                    <h3>4.1 为什么必须有人代答</h3>
+                    <p>ARP是IPv4网络中以广播方式发问的协议：持有这个IP的设备，请告诉我你的MAC地址。同一链路上的路由器或客户端要收到这个应答，才能发出以太网帧。由于<strong>服务IP并不是真实设备的地址，而是集群所主张的虚拟地址</strong>，如果没有人代它作答，这个地址在链路上就等同于不存在。</p>
+                    <p>最简单的办法是把该地址真正挂到节点网卡上，让内核自动应答。但这种方式会带来本地环境特有的副作用：</p>
+                    <ul>
+                        <li>由于地址在本机存在，<strong>节点自身可能在内部就把发往该地址的流量处理掉</strong></li>
+                        <li>内核可能<strong>把它选为源地址</strong>，导致出站报文带上意料之外的源IP</li>
+                        <li>如果对应端口没有监听者，内核会立刻返回<strong>连接拒绝</strong>，哪怕在静默丢弃更合适的场景下也是如此</li>
+                        <li>把同一个地址挂到多个节点上就会造成<strong>地址冲突</strong></li>
+                    </ul>
+                    <p>这就是原文案例中出现安静的DHCP客户端这一说法的由来。选择是<strong>只取得租约，但绝不把地址挂到网卡上</strong>。在Linux网络栈看来这个地址并不存在，上述副作用自然无从发生。代价是<strong>再也没有人来应答ARP</strong>，于是需要一个独立的应答装置。</p>
+
+                    <h3>4.2 代答之后随之而来的问题</h3>
+                    <p>一旦接管ARP应答，下面这些问题会同时到来。无论用什么工具，性质都一样。</p>
+                    <ul>
+                        <li><strong>真相必须只有一个。</strong>主机对每个IP只缓存一个MAC，两个以上同时应答时后到者胜出。因此必须有机制保证应答者恰好只有一个，也就是主节点选举</li>
+                        <li><strong>缓存不会立刻更新。</strong>主节点变了，客户端缓存在过期前仍会使用旧MAC，而且有些实现根本不接受免费ARP</li>
+                        <li><strong>免费ARP会被怀疑。</strong>同样的手法也用于地址欺骗，因此忽略它是常见策略。发出去就以为已经生效，这个假设很危险</li>
+                        <li><strong>会与安全功能冲突。</strong>动态ARP检测、端口安全这类交换机功能，本来就是为了阻止未经授权的地址主张而设计的。在这类环境中<strong>必须事先与网络管理员达成一致</strong></li>
+                        <li><strong>节点故障就是服务故障。</strong>二层模式下应答节点一旦宕机，在新主节点选出且缓存刷新之前，该服务不可达</li>
+                    </ul>
+                    <p>顺带一提，Linux确实有<code>arp_ignore</code>、<code>arp_announce</code>、<code>arp_filter</code>等调节邻居缓存行为的参数，在多宿主配置中它们也确实会制造麻烦。但<strong>从未挂到网卡上的地址</strong>根本不在内核的管理范围内，这些开关帮不上忙。这正是需要一个<strong>独立应答器</strong>的原因，无论它跑在用户态还是XDP里。</p>
+
+                    <h2>5. 选择用eBPF与XDP来应答ARP</h2>
+
+                    <h3>5.1 XDP位于协议栈之前</h3>
+                    <p>XDP是在网卡驱动接收路径的最前端，也就是<strong>报文进入内核网络栈之前</strong>执行eBPF程序的钩子。程序的返回值决定驱动接下来的动作。按内核文档，主要动作如下：</p>
+                    <ul>
+                        <li><strong><code>XDP_DROP</code></strong> — 丢弃报文并把它放回它到达时的接收环队列。最简单也最快</li>
+                        <li><strong><code>XDP_PASS</code></strong> — 交给常规的内核协议栈处理</li>
+                        <li><strong><code>XDP_TX</code></strong> — 把收到的报文<strong>从它进来的那张网卡原路弹回去</strong>，通常在修改报文内容之后返回该值</li>
+                        <li><strong><code>XDP_ABORTED</code></strong> — 表示程序出错，报文会被丢弃。正常代码不应返回这个值</li>
+                    </ul>
+                    <p>为什么ARP应答器正好契合这里，也就一目了然了。收到ARP请求帧后，<strong>交换发送方与目标方、改写成应答格式，再以<code>XDP_TX</code>弹回去</strong>，即使内核协议栈根本不认识这个地址，链路上也会出现一份完整的应答。这与不把地址挂到网卡上的决定在逻辑上严丝合缝。</p>
+
+                    <h3>5.2 得到什么，付出什么</h3>
+                    <p>这种方式带来的好处是实打实的：</p>
+                    <ul>
+                        <li><strong>地址不会暴露给协议栈。</strong>前面提到的源地址选择错误与非预期的连接拒绝都不会发生</li>
+                        <li><strong>任何地址都能立刻纳入应答范围。</strong>无需改动网卡配置，更新映射表即可，很适合地址动态变化的环境</li>
+                        <li><strong>没有协议栈负担。</strong>广播的ARP请求在入口就被处理，不必一路上送</li>
+                    </ul>
+                    <p>反过来，代价同样明确：</p>
+                    <ul>
+                        <li><strong>调试难度大幅上升。</strong><code>ip neigh</code>和<code>ip addr</code>里没有任何痕迹。一个在链路上会应答、却不存在于主机配置中的地址，<strong>离开tcpdump几乎无从判断</strong></li>
+                        <li><strong>存在驱动依赖。</strong>原生XDP的支持情况因驱动而异，退回通用模式就达不到预期性能。虚拟化环境尤其需要确认</li>
+                        <li><strong>处在观测工具的盲区。</strong>多数监控看的是协议栈之上的指标。在XDP里处理或丢弃的东西，不自己埋计数器就看不见</li>
+                        <li><strong>运维人员的门槛更高。</strong>故障发生的那个时刻，有几个人能读懂这一层，直接决定实际恢复时间</li>
+                    </ul>
+                    <blockquote>归纳起来，eBPF与XDP对于如何应答ARP这个问题是个优雅的答案，但代价是<strong>系统的真实状态在标准工具中变得不可见</strong>。这是运维问题，不是性能问题。</blockquote>
+
+                    <h2>6. 非对称路由 - 响应不走来时的那扇门</h2>
+
+                    <h3>6.1 为什么会发生</h3>
+                    <p>从这里开始，是本地负载均衡搭建中最耗人的一段。症状总是相似：<strong>同一栋楼、同一台交换机下都正常，从外网访问就没有响应。</strong></p>
+                    <p>原因通常很简单。请求从某条路径进来，<strong>响应却从服务器的默认路由出去</strong>。服务器只看目的地址就在路由表中选择出口，默认并不考虑这个请求是从哪里进来的。在多线路、隧道、经过多台路由器的拓扑中，这种不一致会自然出现。</p>
+                    <p>同一个局域网内为什么正常？因为响应不经过路由器，直接在链路层送达对端。<strong>只是路径太短，问题没有暴露出来而已。</strong>这种差异造就了内网正常、外网不通这一典型模式。</p>
+
+                    <h3>6.2 rp_filter - 那个静静丢包的开关</h3>
+                    <p>路径非对称本身并不总是问题。真正的问题始于中间某一方<strong>决定丢弃这个报文</strong>的时候。在Linux上作出这个决定的典型机制是反向路径过滤。按内核文档，各取值的含义是：</p>
+                    <ul>
+                        <li><strong>0</strong> — 不做源地址校验</li>
+                        <li><strong>1</strong> — RFC 3704的<strong>严格模式</strong>。把入向报文与路由信息比对，<strong>如果该接口不是最佳反向路径就判定校验失败</strong></li>
+                        <li><strong>2</strong> — RFC 3704的<strong>宽松模式</strong>。只有当源地址<strong>经由任何接口都不可达</strong>时才判定失败</li>
+                    </ul>
+                    <p>实践中还有两点必须知道。第一，<strong>实际生效的值是<code>conf/all</code>与<code>conf/{接口}</code>中的较大者</strong>。只把接口值调成0，然后困惑于关掉了为什么还不行，事故往往由此而来。第二，内核文档本身就说明<strong>若使用非对称路由或其他复杂路由，推荐使用宽松模式</strong>。也就是说调整这个值是有文档依据的选项，而不是旁门左道。</p>
+                    <pre><code># 实际生效值取 all 与接口设置中的较大者
+sysctl net.ipv4.conf.all.rp_filter
+sysctl net.ipv4.conf.eth0.rp_filter
+
+# 被丢弃报文的痕迹（条目随内核构建而异）
+grep -i martian /proc/net/stat/* 2&gt;/dev/null
+nstat -az | grep -i -E 'InAddrErrors|InNoRoutes'</code></pre>
+                    <p>不过调低这个值，也意味着<strong>相应地放弃了对源地址伪造的防护</strong>。所以顺序很重要：<strong>先看路径能不能纠正，只有在结构上确实做不到时才放宽过滤。</strong>顺序反过来，就成了原因照旧、只把症状掩盖起来。</p>
+
+                    <h3>6.3 解决方案的几条路径</h3>
+                    <p>应对非对称大致有四种办法，正确答案随场景而变。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>方法</th><th>原理</th><th>优点</th><th>缺点</th><th>适用场景</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>收敛为单一路径</td><td>把入向路径合并为一条，从根上消除非对称</td><td>最简单也最稳固</td><td>放弃多线路的好处</td><td>实际只有一条线路，或以简单为先</td></tr>
+                            <tr><td>连接标记加策略路由</td><td>把入向接口记录在连接上，回程时还原以强制出口</td><td>在多线路下也能准确工作</td><td>需要状态跟踪，规则会变复杂</td><td>有两条以上线路且都对外提供服务</td></tr>
+                            <tr><td>源地址转换</td><td>在前端改写源地址，使响应必定折返</td><td>实现容易且确定</td><td>真实客户端IP从日志中消失</td><td>源IP并不重要的服务</td></tr>
+                            <tr><td>放宽反向路径过滤</td><td>降低校验强度以容忍非对称</td><td>立竿见影</td><td>削弱防伪造能力，原因仍在</td><td>结构上无法避免非对称时的辅助手段</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>实践中用得最多的是第二种，思路很简单：<strong>进来时把从哪里进来记在连接上，出去时取出这条记录来决定出口。</strong>在Linux上用防火墙的连接跟踪标记与策略路由规则组合实现。</p>
+                    <pre><code># 只保留能看清概念的最小形式
+# 1) 带标记的报文去查另一张路由表
+ip rule add fwmark 0x64 lookup 100
+
+# 2) 把该表的默认路由指向对应线路的网关
+ip route add default via 203.0.113.1 dev eth1 table 100
+
+# 3) 确认
+ip rule show
+ip route show table 100
+
+# 4) 计算某个响应实际会从哪条路径出去
+ip route get 198.51.100.7 from 203.0.113.10 mark 0x64</code></pre>
+                    <p>最后那条<code>ip route get</code>是这一段里最有用的命令，因为它<strong>不靠猜测，而是直接问内核</strong>。打标记与还原标记的部分在防火墙层用连接跟踪标记完成，也就是把值存在连接上、再在回程报文上还原。无论用nftables还是iptables，思路完全一致。</p>
+
+                    <h2>7. 原文案例选择的路 - DSCP打标及其代价</h2>
+
+                    <h3>7.1 问题的形状</h3>
+                    <p>原文案例的拓扑更复杂一些。有一台接收运营商地址的<strong>边缘路由器</strong>，而集群位于隧道另一端的<strong>另一个位置</strong>。外部客户端的请求经边缘路由器进入集群，响应却试图从集群这侧直接走向互联网。于是<strong>报文的源地址与实际出口位置对不上</strong>，在上游网络被过滤掉。同一栋楼里的客户端因为在链路层就完成了通信，所以一切正常，这个差异让问题更加难以捉摸。</p>
+                    <p>常规答案是上一节的第二种，即<strong>基于源地址的策略路由</strong>。但按原文记录，这种做法造成了反方向的非对称：<strong>发往本地网络客户端的响应也被绕回了边缘路由器</strong>。仅凭源地址无法表达这条连接是从哪扇门进来的，这个局限就此暴露。</p>
+
+                    <h3>7.2 为什么偏偏是DSCP</h3>
+                    <p>于是选定的方案是<strong>把入向点标识写进报文头部的DSCP字段</strong>。DSCP是RFC 2474定义的<strong>DS字段中的6位码点</strong>，原本用于选择报文在每一跳上获得的处理行为。流程概括如下：</p>
+                    <ul>
+                        <li>在边缘入向时，由eBPF把<strong>报文从哪个边缘进入</strong>标记到DSCP值上</li>
+                        <li>路径上的守护进程依据这个标记跟踪流</li>
+                        <li>响应出去时用策略路由<strong>送回它进来的那个边缘</strong></li>
+                        <li>在离开进入运营商网络之前<strong>还原原本的DSCP值</strong></li>
+                    </ul>
+                    <p>不要误读最后一步。这不是为了隐藏什么，而是<strong>把内部信号约束在内部边界之内的卫生措施</strong>。DSCP本是服务于QoS策略的字段，随意约定的内部取值一旦流入别人的网络，对对方的策略而言就是毫无意义的输入。何况RFC 2474本身就假定<strong>码点可能在跨越域边界时被重新标记</strong>，这个值从一开始就不能当作端到端信号来信任。<strong>只在边界内使用、并在边界处还原，才符合协议的设计意图。</strong></p>
+
+                    <h3>7.3 不要把它当成通用解</h3>
+                    <p>这是个聪明的解法，但照搬之前需要先掂量以下几点。</p>
+                    <ul>
+                        <li><strong>可用的标记空间非常小。</strong>只有6位，其中一部分还有约定俗成的用途，实际可用取值更少。入向点一多很快就不够用</li>
+                        <li><strong>可能与既有QoS策略冲突。</strong>若组织内已经用DSCP管理优先级，内部信号就会与QoS意图混在一起</li>
+                        <li><strong>边界之外无法保证保留。</strong>中间设备可能改写该值，因此必须明确信任区间到哪里为止</li>
+                        <li><strong>连接跟踪标记才是更标准的答案。</strong>如果问题能在同一台设备内解决，就没有理由把信息塞进报文头部</li>
+                        <li><strong>诊断工具对这个值的呈现并不友好。</strong>故障当下若不知道查看步骤，定位会明显变慢</li>
+                    </ul>
+                    <p>总之，这是<strong>在需要跨越多台路由器传递流信息这一相当特殊约束下得出的答案</strong>。绝大多数本地环境用上一节的连接标记加策略路由就已足够。<strong>借用别人的解法时，必须连同他的约束一起借来</strong>，这条原则在这里同样适用。</p>
+
+                    <h2>8. 故障排查顺序 - 先在哪里抓包</h2>
+                    <p>这套方案坏掉时最浪费时间的做法是<strong>从容器组开始查</strong>。这里的问题往往发生在低得多的位置。建议自下而上推进。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>顺序</th><th>检查对象</th><th>观察位置</th><th>正常表现</th><th>异常信号</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>1</td><td>地址分配</td><td><code>kubectl get svc</code>、控制器日志</td><td>EXTERNAL-IP有值</td><td>持续等待，说明控制器或地址池有问题</td></tr>
+                            <tr><td>2</td><td>ARP应答</td><td>在客户端侧链路观察ARP</td><td>来自单一MAC的一致应答</td><td>无应答，或MAC不断变化</td></tr>
+                            <tr><td>3</td><td>请求到达</td><td>节点物理网卡</td><td>能看到SYN</td><td>看不到则是上游路径或防火墙问题</td></tr>
+                            <tr><td>4</td><td>响应方向</td><td>在同一位置观察反方向</td><td>响应从同一张网卡出去</td><td>从另一张网卡出去即为非对称</td></tr>
+                            <tr><td>5</td><td>内核判断</td><td><code>ip route get</code>、<code>ip rule show</code>、rp_filter</td><td>算出的是预期路径</td><td>算成默认路由，说明缺少策略规则</td></tr>
+                            <tr><td>6</td><td>节点内部转发</td><td>节点内部网卡与数据平面状态</td><td>能转发到后端</td><td>只在特定节点上失败</td></tr>
+                            <tr><td>7</td><td>应用</td><td>容器组日志、端点</td><td>请求到达了应用</td><td>走到这一步就是应用的问题</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>每一步用到的命令大致如下，示例地址取自文档专用网段。</p>
+                    <pre><code># 第2步 - 谁在主张这个地址属于自己
+tcpdump -ni eth0 arp and host 203.0.113.10
+
+# 第3至4步 - 在同一位置一并观察请求与响应
+tcpdump -ni eth0 host 203.0.113.10 and tcp port 80
+
+# 第4步补充 - 确认响应有没有从别的网卡漏出去
+tcpdump -ni eth1 host 203.0.113.10 and tcp port 80
+
+# 第5步 - 不要猜，直接问内核
+ip route get 198.51.100.7 from 203.0.113.10
+ip rule show</code></pre>
+                    <p>再补充几条实务经验。</p>
+                    <ul>
+                        <li><strong>两端同时抓。</strong>只看一侧，讨论就会卡在看起来发出去了却没收到。把客户端与服务器的抓包按时间对齐，才能确定报文在哪一段消失</li>
+                        <li><strong>从ARP看起。</strong>这里无应答的话，再怎么看上层都是白费。反之MAC来回跳动，就是主节点选举或重复主张的问题</li>
+                        <li><strong>把同网段与外网分开测试。</strong>内网通、外网不通是非对称路由的典型指纹</li>
+                        <li><strong>过滤条件不要设得太窄。</strong>只按端口过滤会漏掉ICMP错误报文，而路径问题的线索常常就在那里</li>
+                        <li><strong>先查变更记录。</strong>如果刚做过节点扩容、重启、内核升级或防火墙规则下发，原因候选会大幅收窄</li>
+                        <li><strong>只在自己有管理权限的网络中抓包。</strong>未经同意记录他人通信可能带来法律问题</li>
+                    </ul>
+
+                    <h2>9. 那么该怎么选 - 按场景判断</h2>
+                    <p>把上述内容落到实际选择上，结果如下。绝大多数环境在前两行就结束了。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>场景</th><th>推荐起点</th><th>理由</th><th>注意事项</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>家庭实验室或小型办公室，没有路由器权限</td><td>二层通告</td><td>唯一无需路由器配置即可成立的方案</td><td>每个服务只有单节点带宽，切换时缓存滞后</td></tr>
+                            <tr><td>自行运维路由器，需要超过单节点的带宽</td><td>BGP通告</td><td>用ECMP分担到多个节点</td><td>后端变动会重新哈希无关连接</td></tr>
+                            <tr><td>拥有静态地址的本地机房</td><td>固定地址池加二层或BGP</td><td>既有工具的前提原样成立</td><td>管理好地址池与实际分配段不要错位</td></tr>
+                            <tr><td>地址会动态变化的线路</td><td>先打通动态生效路径再决定</td><td>固定地址池的前提被打破</td><td>先看条款，把地址变更设计为正常场景</td></tr>
+                            <tr><td>需要在日志中保留来访IP</td><td>考虑<code>externalTrafficPolicy: Local</code></td><td>可以保留源IP</td><td>与部分二层实现不兼容，注意容器组分布不均</td></tr>
+                            <tr><td>服务数量持续增长</td><td>引入入口或网关层</td><td>一个外部IP服务于多个服务</td><td>层次一多，故障点也随之增多</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>最后一行尤其值得强调。<strong>在本地环境滥用LoadBalancer类型服务，需要管理的外部地址会随服务数量线性增长。</strong>地址越稀缺，越应当<strong>把对外入口保持在少数，再在其后按域名分流</strong>，这样的结构要耐用得多。实际上在多数本地集群中，入口控制器前面放一两个LoadBalancer类型服务就足够了。</p>
+
+                    <h2>10. 纠正常见误解</h2>
+                    <ul>
+                        <li><strong>EXTERNAL-IP显示pending是个缺陷</strong> — 不是。这是没有控制器负责分配时的正常状态。本地环境需要自己立起这个角色</li>
+                        <li><strong>装上MetalLB就跟云上一样了</strong> — 分配与通告的问题解决了，但回程路径、源IP保留、故障切换依然是运维人员的活</li>
+                        <li><strong>BGP无条件优于二层</strong> — 带宽上确实更优，但存在文档记载的局限：后端变动时重新哈希会<strong>切断无关连接</strong>，而且需要路由器运维能力</li>
+                        <li><strong>用了eBPF就会变快</strong> — 在这个语境下eBPF的好处不是速度，而是<strong>不触碰协议栈也能在想要的层次介入</strong>。代价是状态在标准工具中不再可见</li>
+                        <li><strong>把rp_filter设成0就解决了</strong> — 症状可能消失，但原因仍在，防伪造能力被削弱。人们还经常忘记生效值取<code>all</code>与接口值中的较大者</li>
+                        <li><strong>内网能通，所以不是防火墙问题</strong> — 恰恰是相反的指纹。同网段不经过路由器，路径问题自然不会暴露</li>
+                        <li><strong>DHCP拿到的地址反正也是我的</strong> — 那是租用。它可能被收回，可用范围由线路条款约定</li>
+                        <li><strong>反正在集群内部，QoS字段可以随便用</strong> — 跨越边界可能被重新标记，还可能影响别人的策略。内部信号应当在边界处还原</li>
+                    </ul>
+
+                    <h2>结论</h2>
+                    <p>云上那一行<code>type: LoadBalancer</code>所做的事情，其实是<strong>至少五项工作的打包</strong>：取得地址、把地址通告到网络、把流量牵引到节点、在节点内部转发到后端、让响应沿来路返回。云把这五件事打包出售，所以我们以为它是一件事。<strong>一旦自己动手，就会发现每一件都是独立的问题。</strong></p>
+                    <p>这个案例之所以有意思，不在于技术栈有多花哨，而在于<strong>它准确指出了既有工具的前提在哪里破裂</strong>。MetalLB假定运维人员知道地址池，这个假定在绝大多数环境中都成立；但在地址动态获取的环境中就不成立了。确认在那个点上需要自己造什么的过程本身，就是在了解别人构建的抽象之下究竟有什么。</p>
+                    <p>实用的结论反而很朴素。<strong>多数本地与家庭实验室环境用二层通告就够了，能运维路由器的话BGP是下一个选择。</strong>自研只在这两个前提明确破裂时才值得考虑，而且即便如此，<strong>把工作原理与排查步骤写成文档</strong>也属于实现范围。至于在运营商线路上搭建方案，<strong>确认条款要排在技术评估之前</strong>。在合同范围内设计出来的结构，才是最耐用的。</p>
+                    <p>最后再说一点。这个领域的故障<strong>不会在应用日志里留下任何痕迹</strong>。报文在内核或上游网络中悄然消失，开发者看到的只是超时。所以如果决定运行这类方案，<strong>把检查ARP、路径与过滤的顺序事先练熟</strong>，比任何自动化都更实在。</p>
+
+                    <h2>参考资料</h2>
+                    <ul>
+                        <li>Kubernetes官方文档 - Service（type LoadBalancer、status.loadBalancer.ingress、loadBalancerClass、externalTrafficPolicy）：<a href="https://kubernetes.io/docs/concepts/services-networking/service/" target="_blank" rel="noopener">kubernetes.io</a></li>
+                        <li>MetalLB官方文档 - Concepts（地址池、通告模式）：<a href="https://metallb.io/concepts/" target="_blank" rel="noopener">metallb.io/concepts</a></li>
+                        <li>MetalLB官方文档 - 二层模式（单节点瓶颈、故障切换、主节点选举）：<a href="https://metallb.io/concepts/layer2/" target="_blank" rel="noopener">metallb.io/concepts/layer2</a></li>
+                        <li>MetalLB官方文档 - BGP模式（ECMP哈希、重新哈希的局限与缓解）：<a href="https://metallb.io/concepts/bgp/" target="_blank" rel="noopener">metallb.io/concepts/bgp</a></li>
+                        <li>MetalLB议题 - 对接外部IPAM与DHCP的诉求：<a href="https://github.com/metallb/metallb/issues/157" target="_blank" rel="noopener">github.com/metallb/metallb/issues/157</a></li>
+                        <li>Cilium官方文档 - L2 Announcements（基于Lease的主节点选举与限制）：<a href="https://docs.cilium.io/en/stable/network/l2-announcements/" target="_blank" rel="noopener">docs.cilium.io</a></li>
+                        <li>Cilium官方文档 - LoadBalancer IP Address Management：<a href="https://docs.cilium.io/en/stable/network/lb-ipam/" target="_blank" rel="noopener">docs.cilium.io/lb-ipam</a></li>
+                        <li>kube-vip官方文档 - ARP模式：<a href="https://kube-vip.io/docs/modes/arp/" target="_blank" rel="noopener">kube-vip.io</a></li>
+                        <li>Linux内核文档 - IP Sysctl（rp_filter的0、1、2与RFC 3704）：<a href="https://docs.kernel.org/networking/ip-sysctl.html" target="_blank" rel="noopener">docs.kernel.org</a></li>
+                        <li>XDP动作码文档（XDP_TX、XDP_PASS、XDP_DROP）：<a href="https://prototype-kernel.readthedocs.io/en/latest/networking/XDP/implementation/xdp_actions.html" target="_blank" rel="noopener">prototype-kernel.readthedocs.io</a> / <a href="https://docs.ebpf.io/linux/program-type/BPF_PROG_TYPE_XDP/" target="_blank" rel="noopener">docs.ebpf.io</a></li>
+                        <li>RFC 2131 - 动态主机配置协议（租约标识、续租、DHCPNAK）：<a href="https://www.rfc-editor.org/rfc/rfc2131.html" target="_blank" rel="noopener">rfc-editor.org/rfc/rfc2131</a></li>
+                        <li>RFC 2474 - DS字段定义（6位码点、边界重新标记）：<a href="https://www.rfc-editor.org/rfc/rfc2474" target="_blank" rel="noopener">rfc-editor.org/rfc/rfc2474</a></li>
+                        <li>案例原文 - 把运营商IP分配给Kubernetes LoadBalancer的记录：<a href="https://attacca.cc/blog/dumbarp/" target="_blank" rel="noopener">attacca.cc/blog/dumbarp</a></li>
+                        <li>GeekNews讨论：<a href="https://news.hada.io/topic?id=31879" target="_blank" rel="noopener">news.hada.io/topic?id=31879</a></li>
+                        <li>相关文章：<a href="kubernetes_gateway_api_nginx_ingress_2026.html">Gateway API与Ingress - 用标准资源治理流量</a>、<a href="neko_master_network_traffic_dashboard_2026.html">neko-master网络流量看板分析</a>、<a href="docker_k8s_guide_08_pod_deploy_svc.html">Docker &amp; Kubernetes指南第8篇 - Pod、Deployment与Service</a></li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>分享本文</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">返回列表</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/json_formatter.html">JSON 格式化工具</a></li>
+      <li><a href="../static/regex_tester.html">正则表达式测试器</a></li>
+      <li><a href="../static/jwt_decoder.html">JWT解码生成器 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 编码器/解码器</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="monitor_input_ddc_cli_2026.html">用命令行切换显示器输入源 - DDC/CI与monitor-input-rs完全解析 2026</a></li>
+      <li><a href="thorvg_vector_animation_2026.html">网页动画格式怎么选 - ThorVG 1.1 与 Lottie、SVG、GIF 的判断标准</a></li>
+      <li><a href="cerebras_internal_knowledge_platform_2026.html">企业内部知识平台的整合设计 - 数据源、权限、切块与成本的决策 2026</a></li>
+      <li><a href="api_docs_governance_2026.html">API 文档为什么总是落后于代码 - 把 Excel 与 PDF 规格换成机器可读的契约 2026</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制！请粘贴到Threads应用中分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制！'); });
+    });
+    </script>
+</body>
+</html>
