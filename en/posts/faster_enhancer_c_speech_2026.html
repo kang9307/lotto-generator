@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<!--
+ * Tech blog post template
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="en">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>What Actually Makes a C Rewrite Faster - Lowering Speech Enhancement Inference to the Metal</title>
+    <meta name="description" content="A pure C rewrite of a speech enhancement model, used to separate where inference speedups really come from - and when paying for a rewrite is justified.">
+    <meta name="keywords" content="speech enhancement, noise suppression, FastEnhancer, C rewrite, low-level optimization, SIMD, int8 quantization, real-time factor, algorithmic latency, STFT, on-device inference, edge inference, ONNX Runtime, ggml, RNNoise, numerical equivalence, regression gate, inference optimization">
+
+    <link rel="canonical" href="https://braindetox.kr/en/posts/faster_enhancer_c_speech_2026.html">
+
+    <meta property="og:title" content="What Actually Makes a C Rewrite Faster">
+    <meta property="og:description" content="The speedup is not because it is C. Removed runtime overhead, allocation control, SIMD and discarded generality each contribute - and each has a price.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/en/posts/faster_enhancer_c_speech_2026.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="en_US">
+    <meta property="article:published_time" content="2026-07-29">
+    <meta property="article:section" content="Tech &amp; IT">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="What Actually Makes a C Rewrite Faster">
+    <meta name="twitter:description" content="The same code on the same device reports RTF 0.069 and 0.286. Why a speed claim without conditions is not information, and how to verify a rewrite.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "What Actually Makes a C Rewrite Faster - Lowering Speech Enhancement Inference to the Metal",
+      "alternativeHeadline": "The Real Source of a Speedup Is Not the Language",
+      "datePublished": "2026-07-29",
+      "dateModified": "2026-07-29",
+      "inLanguage": "en-US",
+      "articleSection": "Tech & IT",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "speech enhancement, noise suppression, FastEnhancer, C rewrite, low-level optimization, SIMD, int8 quantization, real-time factor, algorithmic latency, STFT, on-device inference, ONNX Runtime, ggml, RNNoise, numerical equivalence",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/en/posts/faster_enhancer_c_speech_2026.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "Does rewriting inference code in C really make it faster?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "It often does, but the cause is not the language. The real gains come from four separate places. First, removing the fixed cost that a general purpose inference runtime pays on every call: graph interpretation, per node kernel selection, tensor descriptor checks and execution provider boundary crossings all cost something regardless of the arithmetic. The smaller the model and the more frequent the calls, the larger that share becomes. Second, allocation control. When nothing is allocated during execution, what shrinks is not the average but the tail, and in an audio callback the number that decides quality is the upper percentile rather than the mean. Third, SIMD and integer arithmetic, although this gain belongs to the hardware. The official ONNX Runtime documentation states that the performance improvement from 8 bit inference depends on the model and hardware, and that old hardware has none or few of the instructions needed. Fourth, discarding generality that is never used. Fixing one model, one sample rate and one frame size removes the cost of paths nobody takes. Given the same algorithm, the same precision and the same instructions, another compiled language would emit broadly similar code. Most of what a rewrite really does is decide what not to do."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Can the 3.3x figure in the repository description be quoted as evidence?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Better not. That number appears only in the one line repository description, and the performance section of the README contains no speed comparison against ONNX Runtime at all. Where ONNX does appear in the README is the quality section, and there the 32 bit floating point graph of the same weights serves as an accuracy baseline rather than a speed target. So the multiplier carries no stated hardware, no thread count for the baseline, no input length and no baseline build settings. A multiplier without conditions can neither be reproduced nor disputed, which is why it cannot function as evidence. By contrast, the numbers the README puts in its own table do carry conditions: measurements on 5,569 frame clips, steady state percentiles after discarding the first 200 frames, and medians over repeats. Two kinds of claim coexist in one document, one verifiable and one not. This is not a question of the author being careless. A one line description is one line, and measurement conditions do not fit there. The habit worth building belongs to the reader: look at the conditions column before the multiplier."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "If the real-time factor is low, does that mean latency is low too?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "No. The two measure different things. The real-time factor is processing time divided by the duration of the input audio, which is how the original paper defines it, and it is a throughput measure. Algorithmic latency is the delay created by the structure itself. This rewrite states that its short time Fourier transform alignment adds a fixed 704 samples, or 14.67 milliseconds. That figure has nothing to do with how fast the arithmetic runs. Moving to a faster core drives the real-time factor down but does not remove a single microsecond of that alignment delay. Reducing latency means changing the structure, not speeding up the computation. That is exactly why the original paper notes that causal convolutions with a time axis kernel size greater than one introduce latency, and states that the model uses only convolutions with a time axis kernel size of one in order to keep latency minimal. In other words, the absence of look ahead was nailed down at design time. When working on real-time audio, always report both numbers separately and never let one stand in for the other."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Does dropping to 8 bit hurt audio quality?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "It can, which is why the loss must be measured and placed next to the improvement. The official ONNX Runtime documentation states plainly that quantization is not a loss-less transformation and may negatively affect a model's accuracy. So the question is not whether quality degrades but by how much, and whether that amount is acceptable. The comparison table published with this rewrite is a good template. On an 824 utterance test set, PESQ was 1.967 for the noisy input, 3.060 for the 32 bit floating point ONNX graph and 3.054 for the 8 bit engine. STOI was 0.9211, 0.9512 and 0.9509 respectively. What matters is that both columns are present. Without the noisy input column there is no way to know how much the model improves things in the first place, and without that improvement there is no scale against which to judge the quantization loss. Next to a jump from 1.967 to 3.060, a difference of 0.006 is small. A loss figure without a denominator cannot be read. The documentation also notes that dynamic quantization is recommended for RNNs and transformer based models while static quantization suits convolutional models."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Should our team rewrite its inference pipeline?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "For most teams, not yet. What justifies a rewrite is a constraint, not a desire for speed. The cases that genuinely qualify are roughly four: edge or on-device targets where the framework itself will not fit, hard real-time work with a fixed deadline where the upper percentile decides product quality, products where download size and startup time are stated requirements, and environments where the dependency list itself is the bottleneck in a supply chain or import review. The signals against are clearer still. If the model is still changing, a rewrite pins weights and graph structure down by hand, so every architectural change forces the kernels to be reworked while research waits. If there is no accuracy verification setup, there is no way to prove the rewrite is even correct, and a speedup measured in that state is hope rather than measurement. If one person maintains it, hand written vector kernels become fast code nobody can fix once that person leaves. If the bottleneck has not been located, a rewrite usually optimizes something that was never hot. The correct order is profiling, runtime option tuning, quantization, then narrowing generality, with a rewrite only after all of that falls short."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/faster_enhancer_c_speech_2026.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/faster_enhancer_c_speech_2026.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/faster_enhancer_c_speech_2026.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/faster_enhancer_c_speech_2026.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/faster_enhancer_c_speech_2026.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="What Actually Makes a C Rewrite Faster - Lowering Speech Enhancement Inference to the Metal">
+                <meta itemprop="datePublished" content="2026-07-29">
+                <meta itemprop="dateModified" content="2026-07-29">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="speech enhancement, noise suppression, C rewrite, SIMD, int8 quantization, real-time factor, algorithmic latency, STFT, on-device inference, numerical equivalence">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/en/posts/faster_enhancer_c_speech_2026.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">What Actually Makes a C Rewrite Faster</h1>
+                    <h2 class="post-subtitle">Where the gains come from when you lower speech enhancement inference, and what becomes fragile</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-07-29">2026-07-29</span>
+                        <span class="post-category" itemprop="articleSection">Tech &amp; IT</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+                    <h2>Introduction: The Half of That Sentence Nobody Reads</h2>
+                    <p><strong>We rewrote it in C and it got several times faster</strong> is a sentence that comes back around every so often. And it always has <strong>two parts</strong>. The first is the <strong>result</strong>, the second is the <strong>conditions</strong>. The trouble is that only the first part travels. A multiplier stripped of its conditions <strong>stops being information and becomes an impression.</strong></p>
+                    <p>A fresh example appeared recently: a neural network for speech enhancement, the task of recovering speech from noisy audio, <strong>reimplemented in pure C</strong>. This article is not a project write-up. The repository already does that job well. The two questions here are different. <strong>Why does rewriting inference code at a lower level make it faster</strong>, and <strong>when is that worth paying for?</strong></p>
+                    <p>Let me state the direction of the conclusion up front. <strong>The speedup is not because it is C.</strong> The real gains come from removing runtime overhead, controlling memory allocation, using vector instructions, and <strong>discarding generality that is never used</strong>. The language merely offers a comfortable place to do those things. Miss that distinction and you will <strong>prescribe the same treatment to entirely the wrong project.</strong></p>
+                    <p>Every technical statement below comes from <strong>the repositories, the paper, and the official ONNX Runtime documentation, checked directly on 29 July 2026</strong>. Figures that could not be verified were left out, and <strong>speed claims published without conditions were not used as evidence.</strong> Section 2 explains why. All scenarios in the body are <strong>generalized, hypothetical examples</strong>.</p>
+
+                    <h2>1. What Can Actually Be Verified - The Original and the Rewrite</h2>
+                    <p>There are two repositories in play: <strong>the original model</strong> and <strong>a C reimplementation of it</strong>. Different authors, different goals.</p>
+                    <p>The <strong>original</strong> is <code>FastEnhancer</code>, hosted at <code>github.com/aask1357/fastenhancer</code>, with a paper on arXiv as <code>2509.21867</code> that reports acceptance to ICASSP 2026. According to the paper the architecture is an <strong>encoder-decoder built around RNNFormer blocks</strong>, with five size variants running from 22 thousand to 1.105 million parameters. The license is MIT.</p>
+                    <p>The <strong>rewrite</strong> is <code>github.com/kdrkdrkdr/faster-enhancer.c</code>. It describes itself as a <strong>dependency-free C and SIMD integer runtime for FastEnhancer-Medium at 48 kHz</strong>. The license is also MIT, and the repository was created on 27 July 2026, which makes it <strong>very new</strong>.</p>
+                    <p>The <strong>single most important fact</strong> here is what was rewritten. <strong>The model architecture did not change.</strong> What was rewritten is the <strong>runtime</strong>, and its scope is not some preprocessing corner but <strong>the entire inference path</strong>.</p>
+                    <table>
+                        <thead><tr><th>Item</th><th>What the repository or paper states</th><th>How this article treats it</th></tr></thead>
+                        <tbody>
+                            <tr><td>Original model</td><td>Encoder-decoder with RNNFormer blocks. Masking based</td><td>Architecture unchanged</td></tr>
+                            <tr><td>Scope of rewrite</td><td>Causal STFT and inverse STFT (1024-point real FFT), convolutions, GRU, multi-head attention, activations</td><td>Whole inference, not just preprocessing</td></tr>
+                            <tr><td>Numeric format</td><td>8-bit weights and activations, post-training quantization with no retraining</td><td>A major axis of the speedup</td></tr>
+                            <tr><td>Kernels</td><td>Six tiers: ARM NEON, DOTPROD, I8MM and x86 AVX2, AVX-VNNI, AVX-512 VNNI</td><td>The SIMD contribution</td></tr>
+                            <tr><td>Dependencies</td><td>No inference framework, no external libraries</td><td>Not even BLAS</td></tr>
+                            <tr><td>Artifacts</td><td>162 KiB static library on macOS arm64, 565,108-byte weight blob</td><td>The deployment size argument</td></tr>
+                            <tr><td>Scale</td><td>511,754 parameters</td><td>The small model premise</td></tr>
+                            <tr><td>Memory</td><td>Allocation-free after init, all state in one 432,384-byte block</td><td>Tail latency suppression</td></tr>
+                            <tr><td>Streaming</td><td>320 samples in and out per frame, 6.667 ms cadence, no look-ahead</td><td>The real shape of the constraint</td></tr>
+                            <tr><td>Maturity</td><td>One fixed model only. No scalar fallback path</td><td>New, with narrow applicability</td></tr>
+                        </tbody>
+                    </table>
+                    <p>The rows worth staring at are <strong>the last two</strong>. This project is <strong>specialized to a single model</strong>, and on a host that does not meet the baseline instruction set it <strong>fails at initialization rather than running slowly</strong>. That is not a defect, it is a <strong>choice</strong>. And that choice is precisely where the speed comes from. More on this below.</p>
+
+                    <h2>2. Where the 3.3x Figure Is Written, and Where It Is Not</h2>
+                    <p>This is the most practically useful section in the article. The <strong>one line repository description</strong> reads: <strong>3.3x faster than the ONNX Runtime graph, same quality</strong>. It is an eye-catching claim, and it is a large part of why the project circulated.</p>
+                    <p>And yet <strong>the performance section of the README contains no speed comparison against ONNX Runtime.</strong> The place ONNX appears in the README is the <strong>quality section</strong>, and there the ONNX graph serves <strong>not as a speed target but as an accuracy baseline</strong>: a 32-bit floating point graph of the same weights, against which the 8-bit engine's output is checked.</p>
+                    <p>So <strong>that multiplier has no conditions beside it.</strong> Which device, how many threads the baseline used, how long the input was, what settings the baseline build carried, none of it is stated. <strong>A multiplier without conditions can be neither reproduced nor refuted.</strong> This article therefore <strong>mentions the number but does not rest anything on it.</strong></p>
+                    <p>By contrast, <strong>the values the README puts in its own table do come with conditions</strong>. It specifies measurements on 5,569-frame clips, <strong>steady state percentiles after discarding the first 200 frames</strong>, taken as <strong>medians over repeats</strong>.</p>
+                    <table>
+                        <thead><tr><th>Device</th><th>Kernel tier</th><th>RTF p50</th><th>RTF p99</th><th>Time per frame</th></tr></thead>
+                        <tbody>
+                            <tr><td>Apple M2</td><td>I8MM</td><td>0.069</td><td>0.084</td><td>0.458 ms</td></tr>
+                            <tr><td>Galaxy S23+</td><td>I8MM</td><td>0.096</td><td>0.105</td><td>0.640 ms</td></tr>
+                        </tbody>
+                    </table>
+                    <p>This table reports <strong>its own real-time headroom</strong>. It says <strong>nothing about how much faster it is than any other runtime</strong>. Two kinds of claim coexist in the same document: one carries conditions and is checkable, the other does not and is not.</p>
+                    <p>Reading this as a failure of the author's honesty teaches you nothing. <strong>A one line description is one line</strong>, and measurement conditions do not fit in it. The real problem starts <strong>on the reading side</strong>. That line gets quoted, and the quote gets requoted, and <strong>the conditions never once come along.</strong> Which suggests a habit: <strong>when you see a speed claim, read the conditions column before the multiplier.</strong> If the conditions column is empty, the number has not said anything yet.</p>
+
+                    <h2>3. Splitting the Speedup Into Four Sources</h2>
+                    <p>Now the mechanics. <strong>The gain from a low-level rewrite is not one lump.</strong> It splits into at least four sources, each contributing a different amount, and each differing in <strong>whether you could have obtained it without changing languages at all.</strong></p>
+                    <h3>a. Removing runtime overhead</h3>
+                    <p>A general purpose inference runtime <strong>interprets a graph</strong>, <strong>selects a kernel</strong> per node, validates tensor descriptors, and crosses execution provider boundaries. That work is paid <strong>every single call, regardless of the arithmetic</strong>. And here is the key point: <strong>this fixed cost does not scale with model size.</strong></p>
+                    <p>Which turns it into a <strong>question of ratio</strong>. In this case the per-frame budget is 6.667 ms and the actual arithmetic is on the order of 0.458 ms. When the arithmetic is that small, <strong>the per-call fixed cost becomes a relatively large share.</strong> In a large model that spends hundreds of milliseconds per call, the very same fixed cost is <strong>rounding error</strong>. That is why <strong>an identical rewrite wins big on small models and barely wins at all on large ones.</strong> Miss this asymmetry and you will spend effort in the wrong place.</p>
+                    <h3>b. Controlling memory allocation</h3>
+                    <p>The repository states that it is <strong>allocation-free after initialization</strong> and that all state lives in a <strong>single 432,384-byte structure</strong>. What this design reduces is <strong>the tail, not the average</strong>.</p>
+                    <p>In audio that distinction decides everything. <strong>However good the average is, one frame that misses its deadline produces an audible dropout.</strong> People do not hear mean latency, they <strong>hear the glitch.</strong> Which is why the number to read in the table above is not p50 but <strong>p99</strong>. Against 0.069, a p99 of 0.084 means the tail sits <strong>tightly packed</strong>. Allocation during execution is what pries that gap open, and so do garbage collection pauses and just-in-time warm-up, since <strong>anything that occasionally takes a long time</strong> shows up right here.</p>
+                    <h3>c. SIMD and integer arithmetic</h3>
+                    <p>The third axis is <strong>instructions</strong>. The repository states that it hand-wrote 8-bit integer matrix multiply kernels in <strong>six variants, one per instruction set</strong>. But <strong>the gain here belongs to the hardware, not the language.</strong></p>
+                    <p>The official ONNX Runtime documentation is explicit about this. The performance improvement <strong>depends on your model and hardware</strong>, and <strong>old hardware has none or few of the instructions needed to perform efficient inference in int8</strong>. It further notes that <strong>x86-64 with VNNI</strong> and <strong>Arm-based processors with dot-product instructions</strong> generally achieve better performance.</p>
+                    <p>Invert that statement and you get a working rule. <strong>If the target hardware is not fixed, you cannot count this axis in your estimate at all.</strong> And this axis is one you can largely obtain <strong>without changing languages</strong>, because a general runtime's quantization path already reaches for the same instructions.</p>
+                    <h3>d. Discarding generality you never use</h3>
+                    <p>The most underrated axis, and in practice probably <strong>the largest contributor</strong>. A general runtime <strong>prepares for the unknown</strong>: arbitrary operators, dynamic shapes, multiple precisions, arbitrary batch sizes. That preparation is not free.</p>
+                    <p>This repository threw all of it away. It fixed <strong>one model, one sample rate, one frame size</strong>. The price is that <strong>there is not even a scalar fallback</strong>: a host that does not meet the baseline instruction set fails at initialization. <strong>The speed was bought with surrendered flexibility</strong>, and that trade is hard to reverse.</p>
+                    <h3>So how much does the language itself contribute?</h3>
+                    <p>Honestly, it is <strong>hard to isolate and usually overstated.</strong> Given the same algorithm, the same precision and the same instructions, <strong>another compiled language would emit broadly similar machine code.</strong> What C provided was not magic but <strong>a comfortable place to do the four things above</strong>: an environment where controlling allocation directly, dictating memory layout, and reaching instructions through intrinsics all feel natural.</p>
+                    <p>Deciding whether to switch languages at all is a separate axis, covered in <a href="rextio_python_to_rust_2026.html">Moving Python to Rust</a>. This article stays on a different problem: <strong>reimplementing the same model on a different runtime, and proving it still produces the same answer.</strong></p>
+                    <table>
+                        <thead><tr><th>Source of gain</th><th>Mechanism</th><th>How this repository handles it</th><th>Obtainable without a language change?</th></tr></thead>
+                        <tbody>
+                            <tr><td>Runtime overhead</td><td>Graph interpretation, dispatch and boundary crossing repeat every call</td><td>Removed the inference framework entirely</td><td>Partly - session options and operator fusion reduce it</td></tr>
+                            <tr><td>Memory allocation</td><td>Allocation during execution creates tails, not averages</td><td>Allocation-free after init, state in one block</td><td>Partly - buffer reuse and arena allocation</td></tr>
+                            <tr><td>SIMD and integers</td><td>Integer multiply-accumulate instructions raise throughput</td><td>Six hand-written kernel tiers per ISA</td><td>Mostly yes - runtime quantization paths already use them</td></tr>
+                            <tr><td>Narrowed generality</td><td>Unused paths still cost branches and validation</td><td>Fixed model, sample rate and frame size</td><td>Hard - it conflicts with why general runtimes exist</td></tr>
+                            <tr><td>The language itself</td><td>Emit the same instructions and you get similar results</td><td>No data isolating its contribution</td><td>Not applicable</td></tr>
+                        </tbody>
+                    </table>
+                    <p>The last column is <strong>the point of the table</strong>. Of five rows, <strong>only one is genuinely exclusive to a rewrite</strong>. The rest are <strong>largely reachable inside the runtime you already use.</strong> Which is why a rewrite should be a <strong>last resort rather than a first move</strong>.</p>
+
+                    <h2>4. Get the Signal Processing Right First</h2>
+                    <p>Before continuing with speed, it is worth being precise about <strong>what is being processed</strong>. Skim this layer and every measurement and verification that follows will wobble.</p>
+                    <h3>STFT - frames and hops</h3>
+                    <p>Most speech enhancement models do not consume the waveform directly. They go through a <strong>short-time Fourier transform</strong>, in three steps: cut the waveform into fixed-length <strong>frames</strong>, multiply each frame by a <strong>window function</strong>, and apply a discrete Fourier transform. Frames are cut overlapping, and the non-overlapping advance between them is the <strong>hop length</strong>.</p>
+                    <ul>
+                        <li><strong>Frame length</strong> sets frequency resolution. Longer frames separate frequencies better and smear time.</li>
+                        <li><strong>Hop length</strong> sets the frame rate. Shorter hops mean more frames per second and <strong>proportionally more computation.</strong></li>
+                        <li><strong>The window function</strong> softens the discontinuity at frame edges. Analysis and synthesis windows must be paired with the hop so that amplitude is restored when frames are added back together.</li>
+                        <li>The values this rewrite states are a <strong>1024-point real FFT</strong>, <strong>320 samples</strong> in and out per frame, and a <strong>6.667 ms cadence</strong>. At 48 kHz, 320 samples is exactly 6.667 ms.</li>
+                        <li>The original paper gives a transform size of <strong>512</strong> for the 16 kHz models and varies the hop size across model variants.</li>
+                    </ul>
+                    <h3>Masking versus direct waveform generation</h3>
+                    <p>This is <strong>where reimplementation difficulty is decided</strong>, so it matters more than it looks.</p>
+                    <p>According to the original paper the model <strong>predicts a two-channel mask</strong> and multiplies it with the input spectrogram to produce the enhanced spectrogram. In other words it is <strong>mask based</strong>. The model decides <strong>how much of what to keep</strong>, and the sound itself comes from the input.</p>
+                    <ul>
+                        <li><strong>Property of mask based models</strong> - the output is a <strong>deterministic function</strong> of the input. The same input must yield the same output, which makes <strong>reimplementation comparison easy.</strong> Feed both implementations the same file and compare numbers.</li>
+                        <li><strong>Property of direct generation</strong> - if sampling is involved, the same input may produce different outputs. At that point <strong>numeric comparison stops being available as a method</strong>, and you must fall back on perceptual metrics and statistical comparison. Verification cost jumps a level.</li>
+                        <li><strong>Practical implication</strong> - before planning a rewrite, <strong>check whether the model is deterministic.</strong> If it is not, the plan to confirm they match must be redesigned from scratch.</li>
+                    </ul>
+                    <h3>There are two real-time measures, not one</h3>
+                    <p>Here are the two numbers that get conflated most often.</p>
+                    <pre><code class="language-text">RTF = processing time / duration of the input audio
+
+  one frame = 320 samples @ 48 kHz = 6.667 ms
+  if one frame takes 0.458 ms to process
+      RTF = 0.458 / 6.667 = 0.069
+
+  RTF &lt; 1     there is headroom
+  RTF &gt;= 1    the deadline is missed - audio drops out
+
+  Note: RTF is throughput. Algorithmic latency is structure.
+    Even driving RTF toward zero leaves the
+    704 samples (14.67 ms) added by STFT alignment untouched.</code></pre>
+                    <p>The <strong>real-time factor</strong> is processing time divided by input audio duration, which is how the original paper defines it, and it is a <strong>throughput</strong> measure. <strong>Algorithmic latency</strong> is instead <strong>the delay created by the structure</strong>. This rewrite states that STFT alignment adds a fixed <strong>704 samples, or 14.67 ms</strong>.</p>
+                    <p>Their relationship fits in one sentence. <strong>Buying a faster chip lowers RTF and does not lower algorithmic latency by a single microsecond.</strong> Cutting latency means <strong>changing the structure</strong>. That is exactly why the original paper observes that causal convolutions with a time-axis kernel size greater than one introduce latency, and states that it <strong>uses only convolutions with a time-axis kernel size of one to keep latency minimal</strong>. The absence of look-ahead was <strong>nailed down at design time</strong>.</p>
+
+                    <h2>5. The Measurement Trap - A Benchmark Races, an Audio Callback Does Not</h2>
+                    <p>This section carries <strong>the most valuable lesson</strong> in the whole case. Fittingly, the lesson is one <strong>the repository wrote into its own documentation</strong>.</p>
+                    <p>The README line is short: <strong>A benchmark races; an audio callback does not</strong>. That single sentence contains <strong>the most common error in performance measurement</strong>.</p>
+                    <ul>
+                        <li><strong>A benchmark loop</strong> pushes frames in as fast as the core will take them. The core never idles and the clock stays pinned at its ceiling.</li>
+                        <li><strong>A real audio callback</strong> delivers <strong>one frame per 6.667 ms</strong>. The core idles in between, and <strong>the frequency governor responds</strong> by dropping the clock.</li>
+                        <li>The repository measured that difference and published it. On an M2 performance core, <strong>running the same work paced costs 4.2x more per frame, giving an RTF of 0.286</strong>, while using <strong>49% less energy.</strong></li>
+                    </ul>
+                    <p><strong>Same code, same device, same amount of work, and the RTF splits into 0.069 and 0.286.</strong> Neither is a lie. <strong>The conditions simply differ.</strong> It is hard to find a cleaner demonstration of why a speed claim without conditions says nothing. And it takes us <strong>straight back to the 3.3x in section 2</strong>: a multiplier with no stated conditions is a number that can swing by roughly this much.</p>
+                    <table>
+                        <thead><tr><th>Condition</th><th>Why it matters</th><th>Distortion when omitted</th></tr></thead>
+                        <tbody>
+                            <tr><td>Warm-up</td><td>Early frames are slow from cache fills, branch prediction and page faults</td><td>Including the first frames reports worse than reality</td></tr>
+                            <tr><td>Feeding style</td><td>Racing and paced feeding make the governor pick different clocks</td><td>The same code is reported with a 4x spread</td></tr>
+                            <tr><td>Thread count</td><td>Runtime defaults usually equal the physical core count</td><td>A single-thread build gets compared against an all-core baseline</td></tr>
+                            <tr><td>Batch size</td><td>Streaming inference runs at batch one</td><td>Batch throughput gets used to claim real-time headroom</td></tr>
+                            <tr><td>Percentiles</td><td>In audio the upper percentile, not the mean, decides dropouts</td><td>Periodic spikes get swallowed by the average</td></tr>
+                            <tr><td>Input length and repeats</td><td>Short clips never reach steady state</td><td>Measurement noise overturns the result</td></tr>
+                            <tr><td>Hardware and ISA</td><td>Integer gains depend on instruction support</td><td>Nothing reproduces on a different device</td></tr>
+                            <tr><td>Baseline settings</td><td>The comparison target's options drive the outcome</td><td>Beating an untuned baseline gets reported as an achievement</td></tr>
+                        </tbody>
+                    </table>
+                    <p>The <strong>thread row deserves emphasis</strong>. The official ONNX Runtime documentation distinguishes threads that parallelize <strong>inside</strong> an operator from those that parallelize <strong>across</strong> graph nodes, and notes that by default the total for the former equals the <strong>number of physical CPU cores</strong>. It also explains that <strong>spin waiting</strong>, where threads spin waiting for work, provides faster inference but consumes more CPU cycles, resources and power, and offers settings to disable it or bound it in time.</p>
+                    <p>The practical conclusion is blunt. <strong>Put a single-threaded rewrite next to a general runtime left on defaults, and the multiplier you report may be measuring a thread setting rather than runtime quality.</strong> <strong>Tuning the baseline fairly</strong> matters as much as building the rewrite, and it is usually far cheaper.</p>
+
+                    <h2>6. The Real Risk of a Rewrite Is Not Speed, It Is Subtle Numeric Drift</h2>
+                    <p>Now the axis changes. Everything so far has been about <strong>getting faster</strong>; from here it is about <strong>getting it wrong</strong>. In practice a rewrite does not fail by <strong>not working</strong>. If it does not work you find out immediately. The real accidents come from <strong>working, but slightly differently</strong>.</p>
+                    <p>In audio that <strong>slightly</strong> is especially bad. Human ears do not hear mean error, they hear <strong>artifacts</strong>. A value that spikes in one frame barely moves an averaged metric but leaves a <strong>clearly audible click</strong>. So verification <strong>cannot end at a single average</strong> and must be built in layers.</p>
+                    <h3>Layer 1 - Freeze a baseline to disk</h3>
+                    <p>The first task is not optimization but <strong>capturing a baseline</strong>. Dump the original runtime's output <strong>to a file</strong> and record the <strong>runtime version, settings and preprocessing</strong> alongside it. Without this every later comparison is meaningless, because when a difference appears you will have <strong>no way to know which side moved.</strong></p>
+                    <pre><code class="language-bash"># 1) freeze the baseline to a file (record version and settings too)
+ref_infer  --model base.onnx --in clip.wav --out ref.f32
+
+# 2) run the rewrite over the same input
+fe_cli     --in clip.wav --out new.f32
+
+# 3) judge against a tolerance decided in advance
+compare    ref.f32 new.f32 --atol 1e-4 --rtol 1e-3
+#   max_abs_err      = 3.1e-05     pass
+#   frames_over_tol  = 0 / 5569    pass
+#   first_bad_frame  = none        pass</code></pre>
+                    <h3>Layer 2 - Decide the tolerance first</h3>
+                    <p><strong>Order is everything.</strong> Set a tolerance <strong>after seeing the results</strong> and people will invariably set it <strong>to whatever passes</strong>. So write it down before looking at any number. And when setting it, separate two cases.</p>
+                    <ul>
+                        <li><strong>Cases where bit-exactness is a reasonable target</strong> - a port that keeps the same precision and the same order of operations. Here you <strong>can demand exact equality</strong>, and any divergence is a bug.</li>
+                        <li><strong>Cases where it is not</strong> - a rewrite that introduces quantization or reorders arithmetic. Floating point addition is not associative, so <strong>reordering alone changes the last digits.</strong> Here the verdict must come from <strong>metrics, not exact equality</strong>.</li>
+                        <li><strong>What happens if you confuse them</strong> - set an unachievable bar and the team will soon <strong>start ignoring the bar.</strong> An ignored gate is worse than no gate.</li>
+                    </ul>
+                    <h3>Layer 3 - Judge with metrics</h3>
+                    <p>The comparison table this repository published is a <strong>good template</strong>. It sets the 32-bit floating point ONNX graph of the same weights as the baseline and lays four metrics side by side on an <strong>824 utterance test set</strong>.</p>
+                    <table>
+                        <thead><tr><th>Metric</th><th>Noisy input</th><th>fp32 ONNX</th><th>int8 rewrite</th></tr></thead>
+                        <tbody>
+                            <tr><td>PESQ</td><td>1.967</td><td>3.060</td><td>3.054</td></tr>
+                            <tr><td>STOI</td><td>0.9211</td><td>0.9512</td><td>0.9509</td></tr>
+                            <tr><td>SNR (dB)</td><td>8.39</td><td>19.43</td><td>19.35</td></tr>
+                            <tr><td>LSD</td><td>14.72</td><td>12.56</td><td>12.33</td></tr>
+                        </tbody>
+                    </table>
+                    <p>What this table gets right is <strong>keeping the noisy input column</strong>. Without it there is <strong>no basis for judging whether the gap between 3.060 and 3.054 is large or small.</strong> With it, the answer is immediate: the model lifted 1.967 to 3.060, and dropping to 8 bits gave up <strong>0.006</strong>. <strong>A loss figure without a denominator cannot be read.</strong> That is the format to carry into any rewrite report you write.</p>
+                    <p>The official ONNX Runtime documentation also states that <strong>quantization is not a loss-less transformation and may negatively affect a model's accuracy</strong>, and recommends comparing tensors between the original and quantized models to locate problem areas. It further notes that <strong>dynamic quantization is recommended for RNNs and transformer-based models, and static quantization for convolutional models</strong>. The fact that <strong>the recommendation splits by model family</strong> is itself the reason not to apply quantization as a default.</p>
+                    <h3>Layer 4 - Keep a separate determinism gate</h3>
+                    <p>Metric verification alone is <strong>not enough</strong>. Metrics are <strong>averages</strong>, so they <strong>swallow</strong> a rare error that occurs in only one kernel. Hence one more layer.</p>
+                    <p>This repository placed a gate requiring that <strong>every kernel tier produce the same hash per clip</strong>. In the document's own framing, <strong>bit-identity across tiers is a gate, not an aspiration</strong>. Run it on NEON or on I8MM and the output bytes must match to pass.</p>
+                    <pre><code class="language-bash"># output must be identical across kernel tiers
+for tier in neon dotprod i8mm; do
+    fe_cli --tier "$tier" --in clip.wav --out "out_$tier.f32"
+    sha256sum "out_$tier.f32"
+done
+
+# all three hashes equal means pass.
+# any mismatch means that tier's kernel is quietly producing different values.
+# Note: before trusting the gate, deliberately perturb one rounding step
+#   and confirm that it actually turns red.</code></pre>
+                    <p>Those last two lines matter. <strong>A verification system cannot be trusted until you have confirmed it catches something you broke on purpose.</strong> Perturb the rounding in one kernel and watch whether the gate really goes red. If it does not, <strong>every green light up to that point meant nothing.</strong></p>
+                    <p>The <strong>structure of what you are reimplementing matters too</strong>. The layers in this project include <strong>convolutions, GRU and multi-head attention</strong> mixed together. Recurrent layers <strong>carry state forward</strong>, so a small error in one frame <strong>propagates into the next.</strong> Which means that in a model with recurrence you <strong>cannot compare a single frame and call it done.</strong> You have to check on long clips whether the error <strong>grows or decays over time</strong>. That is why the example above counts frames over tolerance across all 5,569 frames.</p>
+                    <p>Below is the <strong>shape of an interface</strong> that makes this kind of verification easy to attach. It is not an implementation but a conceptual sketch of <strong>where to draw the boundary</strong>.</p>
+                    <pre><code class="language-c">/* concept sketch - a frame loop with no allocation after init */
+#include &lt;stdint.h&gt;
+
+typedef struct fe_state fe_state;      /* all state in one block */
+
+int  fe_init(fe_state **s);            /* allocation happens only here */
+void fe_process(fe_state *s,
+                const int16_t *in,     /* 320 samples in  */
+                int16_t *out);         /* 320 samples out */
+
+/* audio callback - invoked once every 6.667 ms */
+void on_frame(fe_state *s, const int16_t *in, int16_t *out) {
+    fe_process(s, in, out);   /* no malloc, no locks, no exceptions */
+}</code></pre>
+                    <p>The advantage of this shape is that it is <strong>easy to verify</strong>. State in one block is <strong>easy to dump and diff</strong>, and a callback close to a pure function makes it <strong>easy to demand the same output for the same input.</strong> An implementation with state scattered everywhere may be fast but is <strong>hard to prove equivalent.</strong> In a rewrite, <strong>provability should itself be a design goal</strong>.</p>
+
+                    <h2>7. Other Verifiable Cases - A Lineage, Not a Ranking</h2>
+                    <p>This approach is <strong>not a new idea.</strong> Below are only the things confirmable from official repositories and documentation. <strong>No ranking is implied.</strong> The three sit at different layers.</p>
+                    <ul>
+                        <li><strong>RNNoise</strong> - <code>github.com/xiph/rnnoise</code>. A noise suppression library based on a recurrent neural network, <strong>implemented in C</strong> with Python used for training and model conversion. It is BSD-3-Clause and handles 48 kHz 16-bit mono PCM, describing itself as a <strong>hybrid DSP and deep learning approach</strong>. The documentation recommends using <strong>an architecture with AVX2 support, or enabling x86 runtime CPU dispatch</strong>, for performance. Here too what gets named as the source of the gain is not the language but the <strong>instruction set</strong>.</li>
+                        <li><strong>ggml</strong> - <code>github.com/ggml-org/ggml</code>. A tensor library for machine learning, MIT licensed. Its README lists among its own features <strong>no third-party dependencies</strong>, <strong>zero memory allocations during runtime</strong>, and <strong>integer quantization support</strong>, side by side. That is <strong>three of the four axes from section 3 written down as library-level design goals</strong>. The well-known local speech recognition and language model projects sit on top of it.</li>
+                        <li><strong>ONNX Runtime</strong> - the official documentation. This is <strong>the opposite choice</strong>: a documented path for <strong>extracting remaining performance without rewriting anything</strong>. The quantization page splits <strong>which quantization suits which model family</strong> and states that improvement <strong>depends on the model and hardware</strong>. The threading page separates intra-operator from inter-operator parallelism and offers <strong>spin-wait controls</strong>.</li>
+                    </ul>
+                    <p>Line the three up and <strong>one sentence remains</strong>. <strong>The gain comes not from the name of a language but from what you decline to do and which instructions you use.</strong> ggml advertising <strong>no</strong> and <strong>zero</strong> as features, the RNNoise docs naming instruction sets first, and ONNX Runtime spelling out hardware dependence are all the same statement.</p>
+
+                    <h2>8. When Is It Worth Paying For?</h2>
+                    <p>Now the judgement. A rewrite is <strong>not free.</strong> Maintaining it costs more than building it, and that bill is issued <strong>every time the model changes</strong>.</p>
+                    <h3>Signals that it is worth it</h3>
+                    <ul>
+                        <li><strong>You must fit on edge or on-device targets</strong> - some environments simply cannot host a framework. The gap between a <strong>162 KiB</strong> static library and a typical inference framework is <strong>not a question of fast versus slow but of fits versus does not fit</strong>. Here there is often no alternative.</li>
+                        <li><strong>You have a hard real-time deadline</strong> - a fixed budget like 6.667 ms where <strong>the upper percentile decides product quality</strong>. Architectures where allocation, garbage collection or JIT warm-up create tails are <strong>structurally disadvantaged</strong>.</li>
+                        <li><strong>Deployment size and startup time are requirements</strong> - products where processes start and stop constantly, or where download size directly affects conversion.</li>
+                        <li><strong>The dependencies themselves are the bottleneck</strong> - in environments requiring import review or supply chain audit, <strong>zero dependencies</strong> <strong>sharply reduces audit cost</strong>. This is the rare case where a rewrite is justified for reasons unrelated to performance.</li>
+                        <li><strong>The model is frozen</strong> - discussed again below, but this is <strong>effectively the most important precondition of all</strong>.</li>
+                    </ul>
+                    <h3>Signals to stop</h3>
+                    <ul>
+                        <li><strong>The model is still changing</strong> - a rewrite <strong>pins the weights and graph down by hand</strong>. Add a layer next week and the kernels must be reworked, while <strong>the research side waits on the rewrite.</strong> The moment optimization starts eating experiment velocity, the economics usually invert.</li>
+                        <li><strong>There is no accuracy verification setup</strong> - with no baseline output, no test set and no metrics, there is <strong>no way to prove the rewrite is correct.</strong> A speedup measured in that state is <strong>hope</strong>, not measurement.</li>
+                        <li><strong>One person maintains it</strong> - few people can read hand-written vector kernels. When that person leaves, what remains is <strong>fast code nobody can fix</strong>. That is a liability, not an asset.</li>
+                        <li><strong>The bottleneck has not been located</strong> - a rewrite begun without profiling usually optimizes something that <strong>was never hot</strong>. The time may be going into file I/O, resampling or copies.</li>
+                        <li><strong>The target hardware is undecided</strong> - integer gains depend on instruction support. Skip the scalar fallback and <strong>some devices will not run at all</strong>; add one and <strong>it becomes another thing to verify</strong>.</li>
+                        <li><strong>The goal is only to be faster</strong> - if you cannot state numerically how fast is fast enough, <strong>there is no finish line.</strong> Write down the deadline and the target percentile first.</li>
+                    </ul>
+                    <h3>What to try before rewriting</h3>
+                    <p>In order of <strong>cheapest and most reversible first</strong>.</p>
+                    <ol>
+                        <li><strong>Profiling</strong> - find out where the time actually goes. Arithmetic, dispatch, copies or I/O. Without this answer every later step is guesswork.</li>
+                        <li><strong>Runtime options</strong> - pin the thread count explicitly, control spin waiting, and check the graph optimization level. <strong>A single configuration line genuinely can be worth weeks of rewriting.</strong></li>
+                        <li><strong>Quantization</strong> - start with what works without retraining, choosing the approach the documentation recommends <strong>for your model family</strong>. And always record <strong>the loss next to the improvement</strong>.</li>
+                        <li><strong>Narrowing generality</strong> - fix input shapes, pin batch size to one, and remove needless copies and dtype conversions in pre and post processing. This axis is <strong>largely reachable without changing runtimes at all</strong>.</li>
+                        <li><strong>Then rewrite</strong> - after all of the above still misses the deadline, and the model is frozen, and the verification setup exists. <strong>Only when all three hold at once.</strong></li>
+                    </ol>
+
+                    <h2>9. Decision Table - From Situation to Conclusion</h2>
+                    <p>Finally, compressed into a usable form. <strong>The right column matters more than the middle one</strong>, because in most situations the answer is not a rewrite but <strong>the step before it</strong>.</p>
+                    <table>
+                        <thead><tr><th>Situation</th><th>Value of rewriting</th><th>What to do first</th></tr></thead>
+                        <tbody>
+                            <tr><td>MCU or embedded, the framework will not fit</td><td>High - often there is no alternative</td><td>Fix the target ISA and confirm integer path support first</td></tr>
+                            <tr><td>Mobile app, size and battery are the problem</td><td>Medium to high</td><td>Model reduction and quantization first, runtime specialization after</td></tr>
+                            <tr><td>Desktop real-time audio, p99 spikes</td><td>Medium</td><td>Allocation, threads and spin waiting first. Locate the cause of the tail</td></tr>
+                            <tr><td>Server batch inference, throughput is the goal</td><td>Low</td><td>Batching, parallelism, accelerators. Per-call fixed cost is already a small share</td></tr>
+                            <tr><td>The model is still being researched</td><td>Very low</td><td>Protect experiment velocity. A rewrite slows experiments down</td></tr>
+                            <tr><td>No baseline outputs and no test set</td><td>None - precondition unmet</td><td>Build the baseline, tolerance and metrics first</td></tr>
+                            <tr><td>One person will maintain it</td><td>Low</td><td>Stay on the general runtime and keep maintenance cost down</td></tr>
+                            <tr><td>Import review or supply chain audit is the bottleneck</td><td>Medium to high</td><td>Shrink the dependency list first. A rewrite is the last resort</td></tr>
+                            <tr><td>The model is generative, so output is not deterministic</td><td>Low</td><td>Redesign the verification method. Numeric comparison does not apply</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2>Conclusion: Going Low-Level Means Making Fewer Promises</h2>
+                    <p>Start with <strong>what this case actually demonstrated</strong>. A small streaming speech model can run on a fraction of a CPU core <strong>with no inference framework at all</strong>; dropping to 8 bits can cost <strong>a metric loss that is small relative to the improvement</strong>; and that fact can be left behind <strong>in a provable form, across two layers of metrics and hashes</strong>. All of that is confirmable from documentation and tables.</p>
+                    <p>Be equally clear about <strong>what it did not demonstrate</strong>. <strong>The conditions behind the 3.3x figure appear nowhere in the public documentation.</strong> And whether this approach yields the same value <strong>on large models or on models that change often</strong> is outside what this case can answer. It is also worth weighing that the repository is only days old.</p>
+                    <p>Three things to take away.</p>
+                    <ol>
+                        <li><strong>Read the conditions column before the multiplier.</strong> Without conditions the number is not information. This very repository documented that the same code on the same device can yield RTF 0.069 and 0.286.</li>
+                        <li><strong>What justifies a rewrite is a constraint, not speed.</strong> When it must fit and does not, when there is a deadline and the tail spikes, when the dependencies themselves block approval. <strong>Wanting it faster is not a constraint.</strong></li>
+                        <li><strong>Build the way you will judge completion before you start.</strong> Baseline outputs, a tolerance fixed in advance, metrics reported next to the improvement, and a regression gate validated by breaking it on purpose. Without those four the project <strong>does not end.</strong></li>
+                    </ol>
+                    <p>One last line. <strong>The essence of going low-level is not changing languages but withdrawing promises.</strong> The promise to accept any model, the promise to accept any shape, the promise to run on any device, taken back one at a time. <strong>You get faster in proportion to the promises withdrawn, and more brittle in exactly the same proportion.</strong> Asking whether that trade fits the product in front of you should come <strong>long before</strong> choosing which language to rewrite it in.</p>
+
+                    <h2>References</h2>
+                    <ul>
+                        <li>faster-enhancer.c repository - self-description as a dependency-free C and SIMD integer runtime, scope of the rewrite, six ISA kernel tiers, the RTF table and its measurement conditions, the 4.2x per-frame cost and 49% energy reduction when paced, the quality comparison table, the cross-tier hash gate, one fixed model with no scalar fallback, MIT license (checked 2026-07-29): <a href="https://github.com/kdrkdrkdr/faster-enhancer.c" target="_blank" rel="noopener">github.com/kdrkdrkdr/faster-enhancer.c</a></li>
+                        <li>FastEnhancer official repository - the original model, ONNX Runtime export and RTF measurement, MIT license (checked 2026-07-29): <a href="https://github.com/aask1357/fastenhancer" target="_blank" rel="noopener">github.com/aask1357/fastenhancer</a></li>
+                        <li>FastEnhancer paper - encoder-decoder with RNNFormer blocks, mask prediction, the RTF definition and single-thread measurement conditions, the rationale for a time-axis kernel size of one, per-variant parameter counts (checked 2026-07-29): <a href="https://arxiv.org/abs/2509.21867" target="_blank" rel="noopener">arxiv.org/abs/2509.21867</a></li>
+                        <li>RNNoise repository - C implementation with Python training, BSD-3-Clause, 48 kHz 16-bit mono PCM, hybrid DSP and deep learning approach, AVX2 and runtime CPU dispatch recommendation (checked 2026-07-29): <a href="https://github.com/xiph/rnnoise" target="_blank" rel="noopener">github.com/xiph/rnnoise</a></li>
+                        <li>ggml repository - no third-party dependencies, zero memory allocations during runtime and integer quantization support stated as design goals. MIT license (checked 2026-07-29): <a href="https://github.com/ggml-org/ggml" target="_blank" rel="noopener">github.com/ggml-org/ggml</a></li>
+                        <li>ONNX Runtime documentation - quantization. The integer representation, recommended targets for dynamic and static quantization, the explicit statement that it is not loss-less, the dependence of gains on model and hardware, and the mention of VNNI and dot-product instructions (checked 2026-07-29): <a href="https://onnxruntime.ai/docs/performance/model-optimizations/quantization.html" target="_blank" rel="noopener">onnxruntime.ai/docs/performance/model-optimizations/quantization.html</a></li>
+                        <li>ONNX Runtime documentation - thread management. The distinction between intra-operator and inter-operator parallelism, the default thread count equalling physical cores, and spin-wait controls (checked 2026-07-29): <a href="https://onnxruntime.ai/docs/performance/tune-performance/threading.html" target="_blank" rel="noopener">onnxruntime.ai/docs/performance/tune-performance/threading.html</a></li>
+                        <li>Related posts: <a href="rextio_python_to_rust_2026.html">Moving Python to Rust</a>, <a href="esp32_tiny_llm_on_mcu_2026.html">Running an LLM on an $8 Microcontroller - Where On-Device Inference Breaks</a>, <a href="mimalloc_performance_allocator_2026.html">mimalloc Deep Dive - The Performance an Allocator Decides</a>, <a href="netflix_llm_serving_platform_2026.html">Deciding to Serve LLMs Yourself</a></li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>Share this post</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">Copy Link</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">Back to list</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Free tools you may find useful</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/llm_price_calculator.html">LLM API Price Calculator</a></li>
+      <li><a href="../static/token_counter.html">Token Counter</a></li>
+      <li><a href="../static/pdf_toolkit.html">PDF Toolkit</a></li>
+      <li><a href="../static/qr_code_generator.html">QR Code Generator</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">See all tools &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Related Posts</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="korean_regex_syllable_trap.html">The Korean Regex Trap - There Is No 아니 Inside 아닙니다 2026</a></li>
+      <li><a href="esp32_tiny_llm_on_mcu_2026.html">Running a 28.9M-Parameter LLM on an $8 Microcontroller - Where ESP32-S3 Inference Actually Breaks 2026</a></li>
+      <li><a href="rextio_python_to_rust_2026.html">Moving Python to Rust - The Line an Automatic Converter Draws 2026</a></li>
+      <li><a href="data_tooling_landscape_2026.html">The 2026 Data Tooling Landscape - What Changed and How to Choose Now</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('Link copied. Paste it into the Threads app to share.');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('Link copied!'); });
+    });
+    </script>
+</body>
+</html>

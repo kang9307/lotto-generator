@@ -1,0 +1,1137 @@
+<!DOCTYPE html>
+<!--
+ * 技术博客文章模板
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Shell 退出码与 set -e - 它抓住什么又漏掉什么</title>
+    <meta name="description" content="加上 set -euo pipefail 失败照样溜过去。if 条件、管道、local 赋值等 errexit 抓不住的位置，全部在 bash 5.2 与 dash 上实际运行并用输出确认，最后汇总成一张盲区表。">
+    <meta name="keywords" content="shell 退出码, exit code, set -e, errexit, pipefail, PIPESTATUS, set -u, nounset, trap ERR, trap EXIT, inherit_errexit, shell 错误处理, bash 脚本, POSIX sh, CI 失败检测">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/shell_exit_code_pipefail.html">
+
+    <meta property="og:title" content="Shell 退出码与 set -e - 它抓住什么又漏掉什么">
+    <meta property="og:description" content="errexit、pipefail、nounset 各自抓住什么又漏掉什么，用 bash 5.2 与 POSIX sh 的实际运行输出逐一区分，并汇总成一张盲区表。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/shell_exit_code_pipefail.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-07-29">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Shell 退出码与 set -e - 它抓住什么又漏掉什么">
+    <meta name="twitter:description" content="用实际运行输出确认 errexit 的全部盲区，并汇总成一张表。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "Shell 退出码与 set -e - 它抓住什么又漏掉什么",
+      "alternativeHeadline": "Shell Exit Codes and set -e - What It Catches and What It Misses",
+      "datePublished": "2026-07-29",
+      "dateModified": "2026-07-29",
+      "inLanguage": "zh-CN",
+      "articleSection": "开发/基础设施",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "shell 退出码, set -e, errexit, pipefail, PIPESTATUS, set -u, trap ERR, inherit_errexit, POSIX sh",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/shell_exit_code_pipefail.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "开启 set -e 之后，命令失败就一定会停下来吗?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "不是。Bash 手册自己列出了例外。位于 if 语句条件部分的命令、紧跟 while 或 until 的命令列表、由两个与号或两个竖线连接的列表中非最后一条命令、管道中非最后一条命令、以及被感叹号取反的命令，失败时都不会终止 shell。这些我全部用运行验证过。把六处塞进同一个脚本里跑，没有一处被拦住，一直执行到最后一行。更重要的是手册的最后一段。如果函数或复合命令在忽略该选项的上下文中执行，其中所有命令都不受该选项影响。也就是说，把函数放进 if 条件的那一刻，整个函数体都失去了保护。实测中函数内失败命令的下一行照常执行了。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "为什么用 local 声明变量会让退出码消失?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "因为留下来的是 local 这个内建命令自身的退出码，而不是赋值式的。用实测区分就很清楚。普通赋值会把命令替换的退出码原样传上来，替换一个以 7 结束的命令就得到 7。但在前面加上 local 就变成 0。declare、typeset、export、readonly 也完全一样，五个都返回 0。结果就是即使在 set -e 之下脚本也不会死。解决办法是把声明和赋值拆成两行。先用 local 只创建名字，下一行再赋值，赋值式的退出码就活过来了。实测中写在一行的形式直接通过，拆开的形式则以退出码 7 正确地终止了。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "开启 pipefail 就能抓住管道的所有失败吗?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "大部分能抓住，但有代价。默认行为下管道的退出码取自最后一条命令，所以把失败接进 tee 之后，tee 的 0 留了下来，失败就消失了。实测中把失败命令接进 tee 得到 0，开启 pipefail 后变成 1。pipefail 返回非零退出码中最靠右的那个，把退出码 3 和退出码 4 并排放会得到 4。不过提前结束的管道会成为问题。把 yes 接进 head 时前段会因 SIGPIPE 而死，得到退出码 141，而 pipefail 会把它当作失败上报。行为完全正常，构建却被判失败。要准确查看每一段的退出码就用 PIPESTATUS 数组，并且必须在管道之后立刻复制。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "加上 set -euo pipefail 脚本就安全了吗?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "不是。我复现了一个三个选项全开却照样放行错误值的脚本。它用 local 赋值从配置文件读取键，而文件里并没有这些键。结果是两个空字符串，脚本以退出码 0 结束。拼装出来的命令行丢掉了路径和数字，只剩下删除选项。CI 亮了绿灯。即使加上让命令替换继承 errexit 的 shopt 选项，结果依然相同，因为 local 更早地吞掉了退出码。解决办法不是选项而是校验。改成读取之后直接确认值是否为空、否则返回错误的写法，脚本就以退出码 3 正确地失败了。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "退出码应该用哪些数字表示什么含义?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "POSIX 只规定了三件事。找不到命令是 127，找到了但无法执行是 126，被信号终止则是大于 128 的值。实测中不存在的命令是 127，试图执行目录是 126，强制终止信号是 137，终止信号是 143。其余都属于约定的范畴。实务中广泛使用的形式是三分支，把 0 分配给成功、1 分配给错误、2 分配给存在差异。关键在于让调用方能够区分这三者。在 set -e 之下直接调用会让所有非零值杀死脚本，用 if 包起来则会让 1 和 2 落进同一个分支。把退出码接进变量再用 case 分开才是答案。退出码还会被截断为 8 位，所以超过 256 就变成 0，这一点也用实测确认过。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .danger { background:#fdecea; border-left:4px solid #d9534f; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/shell_exit_code_pipefail.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/shell_exit_code_pipefail.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/shell_exit_code_pipefail.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/shell_exit_code_pipefail.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/shell_exit_code_pipefail.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="Shell 退出码与 set -e - 它抓住什么又漏掉什么">
+                <meta itemprop="datePublished" content="2026-07-29">
+                <meta itemprop="dateModified" content="2026-07-29">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="shell 退出码, set -e, errexit, pipefail, PIPESTATUS, set -u, trap ERR, POSIX sh">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/shell_exit_code_pipefail.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">Shell 退出码与 set -e - 它抓住什么又漏掉什么</h1>
+                    <h2 class="post-subtitle">用实际运行输出逐一打开 errexit、pipefail 与 nounset 的盲区</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-07-29">2026-07-29</span>
+                        <span class="post-category" itemprop="articleSection">开发/基础设施</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <h2>引言: CI 是绿的，部署下去的值却是空的</h2>
+                    <p>有一个脚本，开头写着 <code>set -euo pipefail</code>。它从配置文件读两个值，拼出一条清理命令。我在配置文件里<strong>没有</strong>这两个键的状态下运行了它，结果如下。</p>
+                    <pre><code>  target      = []
+  retain_days = []
+  would run: find /srv/backup/ -mtime + -delete
+  DEPLOY OK
+  script rc=0  &lt;- CI sees GREEN</code></pre>
+                    <p>两个没读到的值都成了<strong>空字符串</strong>并一路流了下去。拼出来的命令行路径停在 <code>/srv/backup/</code>，保留天数则彻底消失，只剩下一个 <code>-mtime +</code>。而脚本的退出码是<strong>0</strong>。CI 亮了绿灯，没有人再回头看这次构建。</p>
+                    <p>这个脚本里 <code>set -e</code>、<code>set -u</code>、<code>set -o pipefail</code> 全都开着。就是人们常说的 shell 脚本安全三件套那一行。<strong>那一行挡不住这次事故。</strong>弄清它为什么挡不住、又能挡到哪一步，正是本文的目的。</p>
+                    <p>静默失败之所以可怕，原因很简单。<strong>失败一旦以退出码 0 上报，它就不是失败而是成功。</strong>它不是因为人跳过了日志而被漏掉，而是因为流水线判定为通过才被漏掉。轰轰烈烈死掉的脚本改掉就行，而亮着绿灯做错事的脚本，<strong>连需要改这件事本身都不会被发现。</strong></p>
+                    <p>本文不劝你加 <code>set -euo pipefail</code>。<strong>它先告诉你这行能保护到哪里，之后才让你加。</strong>规则依据 GNU Bash Reference Manual 与 POSIX 规范核对，行为全部在临时目录里直接运行。正文中的所有输出都是屏幕上真实出现过的。第 15 节的<strong>盲区表</strong>就是本文的结论。</p>
+                    <p>先把边界划开。同一个脚本能否跑第二遍在<a href="shell_readonly_idempotent_script.html">跑两遍也安全的脚本</a>，运行前能否预知结果在<a href="shell_dry_run_design.html">如何做出真正的 --dry-run</a>。如果说那篇讲的是<strong>如何传达计划与应用的结果</strong>，这篇讲的就是更前面的一步，<strong>失败究竟该怎么被检测到</strong>。给变量加引号的语法在<a href="shell_quoting_rules_guide.html">Shell 引号规则</a>。</p>
+
+                    <h2>1. 运行环境与本文的依据</h2>
+                    <p>正文中的所有输出都是<strong>实际运行的结果</strong>。复现环境如下。</p>
+                    <ul>
+                        <li><strong>操作系统</strong>: Windows 10 Pro 10.0.19045 之上的 MSYS2 系 Unix 环境</li>
+                        <li><strong>bash</strong>: GNU bash 5.2.37(1)-release (x86_64-pc-msys)</li>
+                        <li><strong>POSIX sh</strong>: dash，用作确认 bash 分歧点的对照组</li>
+                        <li><strong>工具</strong>: GNU coreutils 8.32</li>
+                        <li><strong>工作位置</strong>: 新建的临时目录，每个实验新建子文件夹以隔离</li>
+                    </ul>
+                    <p>正文中出现的路径全都是 <code>/tmp/demo</code> 这样的<strong>占位符</strong>。实际运行是在隔离的临时文件夹中进行的。退出码与 <code>set</code> 选项的行为<strong>源自 shell 语言本身</strong>，因此移到 Linux 或 macOS 上也一样。不过这个环境里<strong>有一项没能复现</strong>，先写在前面。</p>
+                    <div class="callout">
+                        <strong>环境上出现分歧的地方 — 可执行位</strong><br>
+                        POSIX 规定「找到了但无法执行」为 126。在 Linux 上运行一个去掉可执行位的文件会得到 126。但这个环境位于 NTFS 之上，<code>chmod 644</code> 并不会被真正强制，因此去掉可执行位之后<strong>脚本照样运行并返回 0</strong>。所以 126 我改用<strong>试图执行目录</strong>的情形来确认，这一侧正常地返回了 126。这就是正文中 126 的例子用目录而不是权限的原因。
+                    </div>
+                    <p>规则核对只用一手资料。本文中没有「通常是这样」这类表述。</p>
+                    <ul>
+                        <li><strong>GNU Bash Reference Manual</strong> — The Set Builtin(<code>-e</code>、<code>-u</code>、<code>pipefail</code>)与 The Shopt Builtin(<code>inherit_errexit</code>)</li>
+                        <li><strong>The Open Group Base Specifications Issue 8</strong> — Shell Command Language 2.8.2 Exit Status and Errors</li>
+                        <li><strong>正在运行的 bash 自身</strong> — 用 <code>help set</code> 直接查看这个二进制对选项的说明</li>
+                    </ul>
+
+                    <h2>2. 退出码基础 - 0、1、126、127、128+N</h2>
+                    <p>每条命令结束时都会留下一个 0 到 255 之间的整数，shell 把它放进 <code>$?</code>。规则只有一条。<strong>0 是成功，其余全是失败。</strong>要点在于不是「1 表示失败」，而是「不为 0 就是失败」。</p>
+                    <pre><code>$ true;  echo $?
+0
+$ false; echo $?
+1
+$ no_such_command_xyz 2&gt;/dev/null; echo $?
+127
+$ ./sandbox 2&gt;/dev/null; echo $?        # 试图执行一个目录
+126
+$ bash -c 'exit 3'; echo $?
+3</code></pre>
+                    <p>127 与 126 是 POSIX 直接规定的值。规范 2.8.2 节这样写道。</p>
+                    <blockquote>If the command is not found, the exit status shall be 127. (…) if the command name is found, but it is not an executable utility, the exit status shall be 126.</blockquote>
+                    <p>因此<strong>127 几乎总是拼写错误或 PATH 问题</strong>。不是命令失败了，而是根本没找到命令。区分这两者能大幅缩短读 CI 日志的时间。</p>
+                    <p>被信号杀死的情形会加上 128。我实际制造出来确认了。</p>
+                    <pre><code>$ sleep 30 &amp; pid=$!; kill -9 "$pid"; wait "$pid" 2&gt;/dev/null; echo $?
+137
+$ sleep 30 &amp; pid=$!; kill -TERM "$pid"; wait "$pid" 2&gt;/dev/null; echo $?
+143</code></pre>
+                    <p>137 是 128+9(SIGKILL)，143 是 128+15(SIGTERM)。<strong>容器因内存超限被杀时显示 137</strong> 就是这个算法的结果。不过 POSIX 的措辞比想象中宽松。</p>
+                    <blockquote>If the command terminated due to the receipt of a signal, the shell shall assign it an exit status greater than 128. The exit status shall identify, in an implementation-defined manner, which signal terminated the command.</blockquote>
+                    <p>也就是说<strong>规范只保证到「大于 128」，而正好是 128+N 属于实现自行决定的惯例</strong>。实务中主流 shell 都用 128+N，可以放心依赖，但不要误当成规定。</p>
+                    <p>退出码会被截断成 8 位。这一点也实测了。</p>
+                    <pre><code>$ bash -c 'exit 256'; echo $?
+0
+$ bash -c 'exit -1' 2&gt;/dev/null; echo $?
+255
+$ sh -c 'exit 300'; echo $?
+44</code></pre>
+                    <p><strong><code>exit 256</code> 变成了 0。</strong>为了表示失败而挑了个大数字，结果被上报为成功，事故就出在这里。把错误条数直接当退出码用的脚本尤其危险，错误正好 256 条就是绿灯。</p>
+                    <p>最后，0 与 1 也并非总是成功与失败。每个工具都有自己的约定。</p>
+                    <pre><code>$ printf 'alpha\nbeta\n' &gt; /tmp/demo/data.txt
+$ grep -q alpha /tmp/demo/data.txt; echo $?
+0
+$ grep -q zzzzz /tmp/demo/data.txt; echo $?
+1
+$ grep -q alpha /tmp/demo/nope.txt 2&gt;/dev/null; echo $?
+2</code></pre>
+                    <p><code>grep</code> 用<strong>0 表示找到、1 表示没找到、2 表示出错</strong>。没找到是正常结果而不是错误。但 <code>set -e</code> 把 1 和 2 一视同仁地当作失败。<strong>在 <code>set -e</code> 之下裸调用 <code>grep</code>，「没有」这个正常结果就会杀死脚本。</strong>第 13 节会再讲。</p>
+                    <table>
+                        <thead>
+                            <tr><th>退出码</th><th>含义</th><th>出处</th><th>实测确认</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>0</code></td><td>成功</td><td>POSIX</td><td><code>true</code></td></tr>
+                            <tr><td><code>1</code></td><td>一般性失败(惯例)</td><td>惯例</td><td><code>false</code></td></tr>
+                            <tr><td><code>2</code></td><td>用法错误或「存在差异」(惯例)</td><td>惯例</td><td><code>grep</code> 出错</td></tr>
+                            <tr><td><code>126</code></td><td>找到了但无法执行</td><td>POSIX 2.8.2</td><td>执行目录</td></tr>
+                            <tr><td><code>127</code></td><td>找不到命令</td><td>POSIX 2.8.2</td><td>不存在的命令</td></tr>
+                            <tr><td><code>137</code></td><td>128+9，被 SIGKILL 终止</td><td>实现惯例</td><td><code>kill -9</code></td></tr>
+                            <tr><td><code>143</code></td><td>128+15，被 SIGTERM 终止</td><td>实现惯例</td><td><code>kill -TERM</code></td></tr>
+                            <tr><td><code>256 以上</code></td><td>截断为 8 位，256 变成 0</td><td>实测</td><td><code>exit 256</code></td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2>3. set -e 的规定 - 手册自己列出了例外</h2>
+                    <p><code>set -e</code>(<code>errexit</code>)在 <code>help set</code> 里只有一行说明。</p>
+                    <blockquote>-e  Exit immediately if a command exits with a non-zero status.</blockquote>
+                    <p>只读这一行，就会理解成「失败就无条件停下」。<strong>而这个理解正是本文中所有事故的起点。</strong>Bash Reference Manual 的完整表述要长得多，而且<strong>自己把例外列了出来</strong>。</p>
+                    <blockquote>The shell does not exit if the command that fails is part of the command list immediately following a <code>while</code> or <code>until</code> reserved word, part of the test in an <code>if</code> statement, part of any command executed in a <code>&amp;&amp;</code> or <code>||</code> list except the command following the final <code>&amp;&amp;</code> or <code>||</code>, any command in a pipeline but the last (subject to the state of the <code>pipefail</code> shell option), or if the command's return status is being inverted with <code>!</code>.</blockquote>
+                    <p>一共五条。<code>while</code>、<code>until</code> 之后的命令列表，<code>if</code> 的条件，<code>&amp;&amp;</code> 与 <code>||</code> 列表中非最后一条命令，管道中非最后一条命令，以及被 <code>!</code> 取反的命令。到这里还算广为人知。<strong>真正的陷阱是后面那一段。</strong></p>
+                    <blockquote>If a compound command or shell function executes in a context where <code>-e</code> is being ignored, none of the commands executed within the compound command or function body will be affected by the <code>-e</code> setting, even if <code>-e</code> is set and a command returns a failure status.</blockquote>
+                    <p>展开来说就是这样。<strong>把函数放进 <code>if</code> 条件的那一刻，这个函数的整个函数体就走出了 <code>set -e</code> 的保护范围。</strong>处在条件位置上的只有函数调用这一行，效力却波及函数内的每一行。下一节用运行来展示。</p>
+
+                    <h2>4. set -e 抓不住的位置 - 全部用运行验证</h2>
+                    <p>只读规则太抽象。我把<strong>所有盲区塞进同一个脚本</strong>，开头加上 <code>set -e</code> 后运行。只要有一处被拦住，脚本就会死在那里。</p>
+                    <p>先看基准线，确认 <code>set -e</code> <strong>正常工作</strong>的情形。</p>
+                    <pre><code>== A. baseline: set -e DOES stop here ==
+  inner script died, rc=1  (NOT REACHED never printed)</code></pre>
+                    <p>裸的 <code>false</code> 确实会被抓住。接下来是盲区。以下是<strong>同一次运行中连续输出的内容</strong>。</p>
+                    <pre><code>== B. condition of if ==
+  survived: if-condition
+
+== C. while condition ==
+  survived: while-condition
+
+== D. left side of &amp;&amp; / || ==
+  survived: false &amp;&amp;
+  ran RHS of ||
+  survived: false ||
+
+== E. negated with ! ==
+  survived: ! true
+
+== F. non-final command of a pipeline ==
+  survived: false | cat   rc=0
+
+== G. function failing inside a condition ==
+  ...function continued past its own false
+  survived: function under if
+
+== H. local x=$(failing) hides the status ==
+  local v=$(false) -&gt; rc=0  (local's own status wins)
+  split declaration caught it -&gt; rc=1
+
+== J. arithmetic that evaluates to zero ==
+  (( c++ )) returned nonzero because the OLD value was 0; c is now 1
+
+== ALL BLIND SPOTS PASSED THROUGH; script still alive ==</code></pre>
+                    <p><strong>一处都没被拦住。</strong>能走到最后一行，就意味着 <code>set -e</code> 全程开着却放过了上面所有失败。逐条来看。</p>
+                    <ul>
+                        <li><strong>B 与 C</strong> — <code>if false; then …; fi</code> 和 <code>while false; do …; done</code>。条件本来就是允许失败的位置。这很自然，因为失败正是承载「假」这个含义的方式</li>
+                        <li><strong>D</strong> — <code>false &amp;&amp; echo x</code> 和 <code>false || echo …</code> 都活了下来。<strong><code>|| true</code> 这个惯用写法就是从这里来的。</strong>方便，但代价很大。第 13 节会再看</li>
+                        <li><strong>E</strong> — <code>! true</code> 最终结果是失败(1)却照样通过。被取反的命令写在例外清单里</li>
+                        <li><strong>F</strong> — <code>false | cat</code> 的退出码是<strong>0</strong>。管道的退出码取自末尾，而 <code>cat</code> 成功了。这是第 7 节的主题</li>
+                        <li><strong>G</strong> — 最危险的一条。函数内 <code>false</code> 的下一行<strong>照常执行了</strong>。这正是第 3 节手册最后那一段。把函数放进 <code>if</code>，整个函数体就变得毫无防护</li>
+                        <li><strong>H</strong> — <code>local</code> 吞掉了退出码。第 5 节单独讲</li>
+                        <li><strong>J</strong> — <code>(( c++ ))</code> 在<strong>运算结果为 0 时返回退出码 1</strong>。计数器从 0 开始的话，第一次自增就会杀死脚本。改用 <code>(( ++c ))</code> 或 <code>c=$((c+1))</code> 可以避开</li>
+                    </ul>
+                    <div class="danger">
+                        <strong>⚠ G 在实务中长什么样</strong><br>
+                        「用函数包起来再用 <code>if</code> 检查」是非常自然的结构。写下 <code>if deploy_app; then …</code> 这一行的瞬间，<code>deploy_app</code> 内部的<strong>所有失败都被忽略了。</strong>即使中间步骤全部失败，只要最后一行成功，函数就返回 0，<code>if</code> 就判定为真。如果你在函数内部依赖着 <code>set -e</code>，这份依赖会仅仅因为调用方式而消失。
+                    </div>
+
+                    <h2>5. local 会吞掉退出码</h2>
+                    <p>第 4 节的 H 在 <code>set -e</code> 的各种陷阱中最常摧毁实务代码。原理很简单。<strong><code>local</code> 是内建命令而不是赋值语法</strong>，而命令的退出码是 <code>local</code> 自己的。无论内部的命令替换以什么结束，<code>local</code> 都会以「变量创建成功」的含义返回 0。</p>
+                    <p>先看<strong>普通赋值</strong>的行为。这一侧是正常的。</p>
+                    <pre><code>== plain assignment: status comes FROM the substitution ==
+  v=$(false)      -&gt; rc=1
+  v=$(exit 7)     -&gt; rc=7
+  v="pre-$(exit 7)-post" -&gt; rc=7  v=[pre--post]</code></pre>
+                    <p>赋值式的退出码是<strong>命令替换的退出码原样传上来</strong>。即使夹在字符串中间，7 也活了下来。所以 <code>set -e</code> 能正常抓住这种写法。现在在前面加一个声明关键字看看。</p>
+                    <pre><code>== declaration builtins SWALLOW it ==
+  local    v=$(exit 7) -&gt; rc=0
+  declare  v=$(exit 7) -&gt; rc=0
+  typeset  v=$(exit 7) -&gt; rc=0
+  export   v=$(exit 7) -&gt; rc=0
+  readonly r=$(exit 7) -&gt; rc=0</code></pre>
+                    <p><strong>五个全是 0。</strong>这不是 <code>local</code> 独有的问题，而是<strong>声明类内建命令整体的性质</strong>。<code>export PATH_X=$(some_command)</code> 同样会吞掉失败。</p>
+                    <p>我确认了与 <code>set -e</code> 搭配时，究竟哪种写法会真正杀死脚本。</p>
+                    <pre><code>== under set -e: which one actually kills the script? ==
+  rc=7   out=[]
+     form: v=$(exit 7); echo ALIVE
+  rc=0   out=[ALIVE-in-func
+ALIVE]
+     form: f(){ local v=$(exit 7); echo "ALIVE-in-func"; }; f; echo ALIVE
+  rc=7   out=[]
+     form: f(){ local v; v=$(exit 7); echo "ALIVE-in-func"; }; f; echo ALIVE</code></pre>
+                    <p>只有中间那种活了下来，打印了两次 <code>ALIVE</code>。第一和第三种都以退出码 7 正确地终止了。<strong>差别仅仅在于声明与赋值是写在一行还是拆成两行。</strong></p>
+                    <p>一行声明多个变量会更加安静。</p>
+                    <pre><code>== the multi-declaration variant is worse ==
+  three locals, rc=0  b=[]</code></pre>
+                    <p>只有中间那个失败了，却<strong>完全没有办法知道是哪一个失败的。</strong>退出码是 0，只有失败的那个变量静静地成了空值。</p>
+                    <div class="callout">
+                        <strong>如果只记一条规则</strong><br>
+                        <code>local x=$(cmd)</code> <strong>永远拆成两行。</strong>先用 <code>local x</code> 只创建名字，下一行再写 <code>x=$(cmd)</code> 赋值。<code>declare</code>、<code>export</code>、<code>readonly</code> 同理。这一条规则就能消掉相当一部分 <code>set -e</code> 事故。
+                    </div>
+
+                    <h2>6. 命令替换不继承 errexit</h2>
+                    <p>还有一处盲区。<strong><code>$( )</code> 内部默认是一个关掉了 <code>set -e</code> 的独立世界。</strong>运行确认如下。</p>
+                    <pre><code>$ shopt inherit_errexit
+inherit_errexit	off
+
+== A. WITHOUT inherit_errexit ==
+  out=[LEAKED]  rc=0
+  script continued
+  rc=0</code></pre>
+                    <p>我在开着 <code>set -e</code> 的脚本里执行了 <code>out=$( false; echo "LEAKED" )</code>。内部的 <code>false</code> <strong>没能让子 shell 停下</strong>，后面的 <code>echo</code> 执行了，<code>LEAKED</code> 进了变量。如果你习惯在 <code>$( )</code> 里连写多条命令，<strong>前面全部失败也没关系，只要最后一条成功就会产出一个值。</strong></p>
+                    <p>bash 4.4 起有了修正它的选项。手册的表述如下。</p>
+                    <blockquote>If set, command substitution inherits the value of the <code>errexit</code> option, instead of unsetting it in the subshell environment. This option is enabled when POSIX mode is enabled.</blockquote>
+                    <p>打开它再跑同样的代码，结果就分开了。</p>
+                    <pre><code>== B. WITH inherit_errexit ==
+  rc=1
+
+== C. POSIX mode also turns it on ==
+  rc=1</code></pre>
+                    <p><strong>两者都死在了内部的 <code>false</code> 上。</strong>正如手册所述，用 <code>--posix</code> 启动也得到了同样的效果。于是实务上的建议就变成这样。</p>
+                    <pre><code>set -euo pipefail
+shopt -s inherit_errexit    # bash 4.4 以上</code></pre>
+                    <p>但<strong>这同样不是万能的。</strong>第 12 节会给出即使开着 <code>inherit_errexit</code> 也照样通过的例子。因为当 <code>local</code> 更早吞掉退出码时，<code>inherit_errexit</code> 根本没有介入的机会。</p>
+
+                    <h2>7. set -o pipefail - 找回管道的真实状态</h2>
+                    <p>管道的退出码默认是<strong>末尾那条命令的</strong>。前面的无论死于什么都被忽略。</p>
+                    <pre><code>== 1. pipeline status = LAST command, by default ==
+  false | true   -&gt; rc=0
+  true  | false  -&gt; rc=1
+  false | cat    -&gt; rc=0</code></pre>
+                    <p><code>false | true</code> 是<strong>成功</strong>。前面失败了结果却是 0。打开 <code>pipefail</code> 就不一样了。</p>
+                    <pre><code>== 2. same pipelines with pipefail on ==
+  false | true   -&gt; rc=1
+  true  | false  -&gt; rc=1
+  false | cat    -&gt; rc=1</code></pre>
+                    <p>三种情形都变成了失败。正在运行的 bash 自己的说明是这样。</p>
+                    <blockquote>pipefail — the return value of a pipeline is the status of the last command to exit with a non-zero status, or zero if no command exited with a non-zero status</blockquote>
+                    <p>意思是「非零退出码中<strong>最靠右的那个</strong>」。确认过了。</p>
+                    <pre><code>== 3. pipefail returns the RIGHTMOST nonzero ==
+  (exit 3)|(exit 4)|true -&gt; rc=4
+  (exit 3)|true|true     -&gt; rc=3</code></pre>
+                    <p>实务中这一点咬得最狠的地方是 <code>tee</code>。为了留日志接进管道的那一刻，失败就消失了。</p>
+                    <pre><code>== 5. the classic: cmd | tee log ==
+  no pipefail: rc=0  PIPESTATUS=(1 0)   &lt;- failure vanished
+  pipefail   : rc=1  PIPESTATUS=(1 0)</code></pre>
+                    <p><strong>同一条管道，上面是成功下面是失败。</strong>把构建命令用 <code>| tee build.log</code> 包起来是极常见的写法，没有 <code>pipefail</code> 的话<strong>构建坏了 CI 也照样通过。</strong></p>
+                    <p>不过 <code>pipefail</code> 有反方向的代价。<strong>它会把正常的提前结束变成失败。</strong></p>
+                    <pre><code>== 8. pipefail cannot see a head that quits early (SIGPIPE) ==
+  yes | head -1 -&gt; rc=141  PIPESTATUS=(141 0)</code></pre>
+                    <p><code>head -1</code> 读一行就关闭时，<code>yes</code> 会因 SIGPIPE 而死，得到<strong>141</strong>(128+13)。完全没有问题的正常行为，<code>pipefail</code> 却把它当失败上报。如果你用了 <code>grep -q</code> 或 <code>head</code> 截断前段的管道，这个位置需要单独处理。</p>
+
+                    <h2>8. PIPESTATUS - 逐段读取并立即保存</h2>
+                    <p><code>pipefail</code> 会把一切压成一个退出码。要知道<strong>是哪一段失败的</strong>，就用 bash 的 <code>PIPESTATUS</code> 数组。</p>
+                    <pre><code>== 4. PIPESTATUS keeps every stage ==
+  rc=0  PIPESTATUS=(3 0 4 0)</code></pre>
+                    <p>四段的退出码全都保留了下来。退出码跟随末尾因而是 0，但看数组就能直接看出<strong>第 1 段和第 3 段失败了</strong>。</p>
+                    <p>不过这个数组有一个<strong>致命的性质</strong>。它会被紧接着的下一条命令覆盖。</p>
+                    <pre><code>== 6. PIPESTATUS is clobbered by the very next command ==
+  first read : PIPESTATUS=(3 4)
+  second read: PIPESTATUS=(0)   &lt;- the echo above overwrote it</code></pre>
+                    <p>第一个 <code>echo</code> 成功的瞬间，数组就变成了 <code>(0)</code>。<strong>没办法读第二次。</strong>所以务必在管道之后紧接着的那一行复制下来。</p>
+                    <pre><code>== 7. save it immediately ==
+  saved copy : (3 4)  stage0=3 stage1=4</code></pre>
+                    <p>实务写法是这样。在管道之后立刻整体复制数组，之后只看副本。</p>
+                    <pre><code>curl -fsS "$url" | gzip -d | psql "$dsn"
+st=("${PIPESTATUS[@]}")          # 必须是紧接着的下一行
+if [ "${st[0]}" -ne 0 ]; then echo "下载失败 (${st[0]})" &gt;&amp;2; exit 1; fi
+if [ "${st[1]}" -ne 0 ]; then echo "解压失败 (${st[1]})" &gt;&amp;2; exit 1; fi
+if [ "${st[2]}" -ne 0 ]; then echo "导入失败 (${st[2]})"     &gt;&amp;2; exit 1; fi</code></pre>
+                    <p>只开 <code>pipefail</code> 的话只能知道「某处失败了」，这样写则能<strong>把「下载失败了」留进日志。</strong>三段以上的管道里，这个差别很大。</p>
+
+                    <h2>9. set -u - 未定义变量与空数组</h2>
+                    <p><code>set -u</code>(<code>nounset</code>)在引用未定义变量时立即终止。它是阻止拼写错误产生的空值流进命令行的机制。</p>
+                    <pre><code>== 1. plain unset reference ==
+  echo "[$nope]"     rc=127 bash: line 1: nope: unbound variable
+  echo "[${nope}]"   rc=127 bash: line 1: nope: unbound variable</code></pre>
+                    <p>这里的退出码很有意思。<strong>同样的错误，调用方式不同数值也不同。</strong>四种组合我全部确认了。</p>
+                    <pre><code>$ bash -u -c 'echo "[$nope]"'   ; echo $?
+127
+$ bash -u script.sh             ; echo $?
+1
+$ dash -u -c 'echo "[$nope]"'   ; echo $?
+2
+$ dash script.sh                ; echo $?
+2</code></pre>
+                    <p>bash 用 <code>-c</code> 调用是 127，跑脚本文件是 1。dash 两种都是 2，消息也不同，是 <code>parameter not set</code>。<strong>不要试图用特定退出码来识别 <code>set -u</code> 产生的失败。</strong>没有可移植性。</p>
+                    <p>规避靠默认值语法，有没有冒号意义不同。</p>
+                    <pre><code>== 2. defaults let you opt out ==
+  ${nope:-fallback}        rc=0   [fallback]
+  ${nope-fallback}         rc=0   [fallback]
+  ${nope:?must be set}     rc=127 bash: line 1: nope: must be set
+
+== 3. set vs empty are different ==
+  empty="" then ${empty:-d}   rc=0   [d]
+  empty="" then ${empty-d}    rc=0   []</code></pre>
+                    <p><strong>有冒号是「未设置或为空」，没有冒号是「未设置」。</strong>如果空字符串必须算作有效值就去掉冒号。<code>${var:?消息}</code> 在强制必填参数时很好用，不用自己写 <code>if</code>，一行就够。</p>
+                    <p>接下来是常被搞混的<strong>空 <code>$@</code> 与空数组</strong>。这部分曾随 bash 版本而分歧，所以连同本环境的版本一起记录。<strong>确认的版本是 GNU bash 5.2.37</strong>。</p>
+                    <pre><code>== 4. empty $@ and $1 ==
+  no args, "$@"        rc=0   argc=0 / REACHED
+  no args, "$1"        rc=127 bash: line 1: $1: unbound variable
+  no args, "${1:-def}" rc=0   [def] / REACHED
+
+== 5. empty arrays ==
+  declare -a arr=(); "${arr[@]}"   rc=0   n=0 / REACHED
+  unset arr; "${arr[@]}"           rc=0   REACHED
+  declare -a arr=(); "${arr[0]}"   rc=127 bash: line 1: arr[0]: unbound variable
+  empty array + ${arr[@]:-}        rc=0   x=[] / REACHED</code></pre>
+                    <p>整理一下就是。在 bash 5.2.37 上，<strong>无参数时的 <code>"$@"</code> 与空数组的 <code>"${arr[@]}"</code> 是安全的。</strong>反之，<strong>像 <code>"$1"</code> 和 <code>"${arr[0]}"</code> 这样去取单个元素就会炸。</strong>分界线在于「是展开整体，还是去取特定元素」。</p>
+                    <div class="callout">
+                        <strong>关于旧版 bash 的提醒</strong><br>
+                        曾经有一段时期，空 <code>"$@"</code> 与空数组在 <code>set -u</code> 下会报错(bash 4.4 之前)。上面的结果是<strong>在 5.2.37 上直接确认的</strong>，由于这个环境里没有旧版 bash，过去的行为并未复现。如果你的目标是 macOS 自带的 bash 3.2 这类旧 shell，用 <code>"${arr[@]:-}"</code> 的写法防御会更保险。
+                    </div>
+                    <p>最后确认一点，<code>set -u</code> 与<strong>失败的命令毫无关系</strong>。</p>
+                    <pre><code>== 6. -u alone does not stop a FAILING command ==
+  -u only, false   rc=0   REACHED
+  -eu, false       rc=1   (no output)</code></pre>
+                    <p>只开 <code>-u</code> 的话 <code>false</code> 杀不死脚本。<strong>三个选项各做各的事，谁也替代不了谁。</strong></p>
+
+                    <h2>10. trap - 用 ERR 定位，用 EXIT 收尾</h2>
+                    <p><code>trap</code> 是记录失败点并保证收尾的机制。先看 <code>ERR</code> trap。</p>
+                    <pre><code>== 1. ERR trap reports line and command ==
+  step one
+  ERR: line 5 rc=2 cmd=[grep -q nothing /nonexistent/path]
+  outer saw rc=2</code></pre>
+                    <p>用 <code>LINENO</code>、<code>$?</code>、<code>BASH_COMMAND</code> 三个变量，<strong>第几行、哪条命令、以什么退出码死的</strong>都留在了一行里。比用 <code>set -x</code> 全量打印，日志干净得多。</p>
+                    <p>要让它深入函数内部需要 <code>-E</code>(<code>errtrace</code>)。</p>
+                    <pre><code>== 5. functions need -E (errtrace) to inherit the ERR trap ==
+  without -E: trap did not fire inside f
+  with -E: trap fired inside f</code></pre>
+                    <p>这就是<strong>写 <code>set -eE</code> 而不是 <code>set -e</code> 的理由</strong>。没有 <code>-E</code>，<code>ERR</code> trap 在函数、子 shell、命令替换内部都不会触发。</p>
+                    <p>但它有一个决定性的局限。<strong><code>ERR</code> trap 拥有与 <code>set -e</code> 完全相同的盲区。</strong>我把第 4 节的盲区原样放到 <code>ERR</code> trap 下跑了一遍。</p>
+                    <pre><code>== 4. ERR trap has the SAME blind spots as set -e ==
+  reached the end with no ERR trap firing
+  outer saw rc=0</code></pre>
+                    <p><code>if false</code>、<code>false || true</code>、<code>! true</code>、<code>false | cat</code>、<code>local v=$(exit 7)</code> 全部执行了，<strong>trap 却一次都没有触发。</strong>「挂了 <code>ERR</code> trap 所以失败都能抓到」这种期待并不成立。</p>
+                    <p><code>EXIT</code> trap 性质不同。无论成功还是失败它都<strong>一定会执行</strong>，因此适合清理临时文件。</p>
+                    <pre><code>== 2. EXIT trap always runs; use it for cleanup ==
+  workdir created: yes
+  cleanup: removing workdir
+  outer saw rc=5  (EXIT trap did not change it)</code></pre>
+                    <p>脚本以退出码 5 死掉，清理照样执行了，而且<strong>退出码保持为 5</strong>。这里我用实测区分了一个常见的误解。</p>
+                    <pre><code>== 3. an EXIT trap CAN silently rewrite the exit code ==
+  cleanup running
+  outer saw rc=9
+  cleanup running
+  outer saw rc=9
+  ...now a cleanup with an explicit exit in the trap:
+  cleanup running
+  outer saw rc=0   &lt;- the real failure was erased</code></pre>
+                    <p>这个区分很重要。<strong>trap 内最后一条命令是失败还是成功，本身并不会改变退出码。</strong>前两种情形里 9 都原样保留了。<strong>只有在 trap 内显式调用 <code>exit</code> 时退出码才会被覆盖。</strong>第三种里真实的失败 9 被抹成了 0。</p>
+                    <div class="danger">
+                        <strong>⚠ 不要在清理函数里调用 <code>exit</code></strong><br>
+                        如果 <code>trap cleanup EXIT</code> 的 <code>cleanup</code> 里有 <code>exit 0</code>，<strong>所有失败都会被上报为成功。</strong>实测中以退出码 9 死掉的脚本最终以 0 结束。清理函数应该只做清理然后安静返回。如果确实需要处理退出码，就在入口用 <code>rc=$?</code> 接住，最后再用 <code>exit "$rc"</code> 还回去。
+                    </div>
+
+                    <h2>11. 子 shell 与函数的边界</h2>
+                    <p>整理一下 <code>set -e</code> 跨越边界时会怎样。手册写明它对 shell 环境和每个子 shell 环境<strong>分别</strong>生效。运行确认如下。</p>
+                    <pre><code>== 1. set -e is inherited by subshells ==
+  rc=1
+
+== 2. ...but not if the subshell sits in a condition ==
+  subshell CONTINUED past false
+  subshell failure absorbed by ||
+  script alive, rc=0</code></pre>
+                    <p>子 shell 会继承 <code>set -e</code>，但<strong>一旦这个子 shell 处在条件位置上，它的内部就整个失去防护</strong>。与第 4 节的 G 同理。</p>
+                    <p>命令替换如第 6 节所见默认不继承。下面是没开 <code>inherit_errexit</code> 时的结果。</p>
+                    <pre><code>== 3. command substitution: -e does NOT apply inside by default ==
+  out=[SHOULD-NOT-APPEAR]
+  rc=0
+
+== 5. the killer: substitution inside a declaration ==
+  local out=[SHOULD-NOT-APPEAR] rc=0
+  script survived
+  rc=0</code></pre>
+                    <p>函数的返回值是<strong>最后执行的那条命令的退出码</strong>。不写 <code>return</code> 的话返回的就是它。</p>
+                    <pre><code>== 6. a function without an explicit return ==
+  f -&gt; 1       # f(){ true; false; }   最后是 false
+  g -&gt; 0       # g(){ false; true; }   最后是 true
+  h -&gt; 0       # h(){ echo "..."; }    echo 成功了</code></pre>
+                    <p><code>g</code> 是危险的那个。<strong>内部失败了，但最后一行成功，于是返回 0。</strong>习惯性地在校验函数末尾加一行 <code>echo</code> 或 <code>log</code>，就意味着<strong>那个函数永远成功。</strong>这类函数必须显式写 <code>return</code>。</p>
+                    <pre><code>== 7. exit inside a subshell only leaves the subshell ==
+  after subshell, rc=4  (parent still running)
+  parent rc=0</code></pre>
+                    <p>圆括号里的 <code>exit 4</code> <strong>只结束了子 shell</strong>。父进程继续跑，最终退出码是 0。把「校验失败就 <code>exit</code>」写在子 shell 或管道里，脚本是不会停的。</p>
+                    <p>管道的每一段也是子 shell，所以变量赋值会丢失。</p>
+                    <pre><code>== 8. a pipeline runs its stages in subshells ==
+  after while-in-pipeline: count=0  (child's copy was discarded)
+  with process substitution: count=3</code></pre>
+                    <p>用 <code>printf … | while read …</code> 数出来的值是<strong>0</strong>。那是子进程里的变量，回不到父进程。改成进程替换就得到 3。<strong>先数错误条数、最后再判定的脚本经常掉进这个陷阱。</strong>它永远以「错误 0 条」结束。</p>
+
+                    <h2>12. 开着 set -euo pipefail，错误的值照样通过</h2>
+                    <p>回到引言里的脚本。把前面的碎片拼起来，就能解释它为什么通过了。脚本是这样的。</p>
+                    <pre><code>#!/usr/bin/env bash
+set -euo pipefail
+
+read_key() {
+  local value=$(grep -m1 "^$1=" "$2" | cut -d= -f2)
+  echo "$value"
+}
+
+target=$(read_key target /tmp/demo/app.conf)
+retain=$(read_key retain_days /tmp/demo/app.conf)
+
+echo "  target      = [$target]"
+echo "  retain_days = [$retain]"
+echo "  would run: find /srv/backup/$target -mtime +$retain -delete"
+echo "  DEPLOY OK"</code></pre>
+                    <p>配置文件里只有 <code>name</code> 和 <code>owner</code>，<code>target</code> 与 <code>retain_days</code> <strong>并不存在</strong>。运行结果如下。</p>
+                    <pre><code>=== run 1: the 'safe' version ===
+  target      = []
+  retain_days = []
+  would run: find /srv/backup/ -mtime + -delete
+  DEPLOY OK
+  script rc=0  &lt;- CI sees GREEN</code></pre>
+                    <p>失败被<strong>抹掉了三层</strong>。逐条来说是这样。</p>
+                    <ul>
+                        <li><code>grep</code> 没找到键，以 1 结束，但后面接着 <code>| cut</code>，于是<strong>管道的退出码变成 <code>cut</code> 的 0</strong>。因为开着 <code>pipefail</code>，到这一步还能作为 1 活下来</li>
+                        <li>但那条管道位于 <code>local value=$(…)</code> 之内。<strong><code>local</code> 吞掉退出码把它变成 0</strong>(第 5 节)</li>
+                        <li>函数以 <code>echo "$value"</code> 结束。<code>echo</code> 会成功，所以<strong>函数的返回值也是 0</strong>(第 11 节)</li>
+                        <li>结果 <code>target=$(read_key …)</code> 收到的是 0，<code>set -e</code> 没有理由介入。<strong><code>set -u</code> 也帮不上忙</strong>，因为变量不是「未定义」，而是<strong>「被定义为空字符串」</strong></li>
+                    </ul>
+                    <p>那加上第 6 节学到的 <code>inherit_errexit</code> 会怎样？我在同一个脚本里只加了 <code>shopt -s inherit_errexit</code> 这一行然后运行。</p>
+                    <pre><code>=== run 2: same script, inherit_errexit added ===
+  target      = []
+  retain_days = []
+  would run: find /srv/backup/ -mtime + -delete
+  DEPLOY OK</code></pre>
+                    <p><strong>结果完全一样。</strong><code>inherit_errexit</code> 是让命令替换内部的 <code>errexit</code> 活过来的选项，但这里<strong><code>local</code> 比它更早吞掉了退出码</strong>，所以它没有介入的机会。这说明靠多开选项是防不住这类事故的。</p>
+                    <p>解决办法不是选项而是<strong>校验</strong>。读到值之后，直接确认「读到了吗」和「是不是空的」。</p>
+                    <pre><code>read_key() {
+  local value
+  if ! value=$(grep -m1 "^$1=" "$2"); then
+    printf 'config key missing: %s\n' "$1" &gt;&amp;2
+    return 3
+  fi
+  value=${value#*=}
+  if [ -z "$value" ]; then
+    printf 'config key empty: %s\n' "$1" &gt;&amp;2
+    return 3
+  fi
+  printf '%s\n' "$value"
+}</code></pre>
+                    <pre><code>=== run 3: validated version ===
+config key missing: target
+  run3 rc=3</code></pre>
+                    <p><strong>以退出码 3 正确地失败了，并且消息里留下了缺哪个键。</strong>改动有四处。拆开了 <code>local</code> 的声明与赋值，用 <code>if !</code> 直接接住 <code>grep</code> 的失败，用参数展开代替 <code>cut</code> 从而去掉了管道，以及显式检查了空值。</p>
+                    <div class="danger">
+                        <strong>⚠ 本节的结论</strong><br>
+                        <code>set -euo pipefail</code> 是<strong>用来抓住「命令失败了」的机制</strong>。<strong>它抓不住「命令成功了但值是错的」。</strong>而实务事故里相当一部分属于后者。空字符串、与预期不符的格式、0 条的列表，全都是<strong>成功命令的正常输出</strong>。值的有效性只能由人亲自去检查。
+                    </div>
+
+                    <h2>13. 退出码设计 - 要向调用方传达什么</h2>
+                    <p>到目前为止讲的是<strong>检测</strong>失败的问题，接下来是把检测到的东西<strong>传达</strong>出去的问题。状态有三种以上时，0 和 1 就不够用了。广泛使用的形式是三分支。</p>
+                    <table>
+                        <thead>
+                            <tr><th>退出码</th><th>含义</th><th>调用方要做的事</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>0</code></td><td>正常 — 没有问题</td><td>通过</td></tr>
+                            <tr><td><code>2</code></td><td>存在差异 — 检查成功了但结果不同</td><td>看内容判断并批准</td></tr>
+                            <tr><td><code>1</code></td><td>错误 — 检查本身没能执行</td><td>立即失败并告警</td></tr>
+                            <tr><td><code>64 以上</code></td><td>用法错误等更细分的状态</td><td>修正调用方式</td></tr>
+                        </tbody>
+                    </table>
+                    <p>我做了一个会给出三种状态的检查器，以及接收它的一方，然后运行。</p>
+                    <pre><code>  PASS  : no differences
+    -&gt; caller exits 0
+  DRIFT : 3 files differ  (gate: fail the build, keep the log)
+    -&gt; caller exits 2
+  ERROR : checker itself failed
+    -&gt; caller exits 1
+  USAGE : bad invocation
+    -&gt; caller exits 64</code></pre>
+                    <p>接收方的骨架是这样。<strong>因为在 <code>set -e</code> 之下直接调用会让所有非零值杀死脚本</strong>，所以把退出码接进变量再用 <code>case</code> 分开。</p>
+                    <pre><code>rc=0
+out=$(./check.sh "$1") || rc=$?     # 不死掉，只接住退出码
+case "$rc" in
+  0)  echo "  PASS  : $out" ;;
+  2)  echo "  DRIFT : $out" ;;
+  1)  echo "  ERROR : checker itself failed" ;;
+  64) echo "  USAGE : bad invocation" ;;
+  *)  echo "  UNKNOWN rc=$rc" ;;
+esac
+exit "$rc"</code></pre>
+                    <p>这里 <code>|| rc=$?</code> 是核心。正如第 4 节 D 所见，<code>||</code> 的左侧是 <code>set -e</code> 的盲区，所以脚本不会死，<strong>退出码则原样留在变量里。</strong>这是把盲区当作工具而不是问题来用的场合。</p>
+                    <p>反过来，<strong><code>|| true</code> 在同一个位置上销毁信息。</strong></p>
+                    <pre><code>== 3. the anti-pattern: '|| true' erases the state ==
+  after || true, rc=0  &lt;- error is gone
+
+== 4. '|| true' vs capturing the code ==
+  captured rc=1  &lt;- still known, still recoverable</code></pre>
+                    <p>人们加 <code>|| true</code> 是想表达「这条命令允许失败」，但它实际宣告的是<strong>「我永远不会知道这条命令是怎么结束的」</strong>。允许失败和不需要知道失败是两回事。用 <code>|| rc=$?</code> 接住就能同时满足两者。</p>
+                    <p>对于 <code>grep</code> 这类「没有」是 1 的工具，这样包起来。</p>
+                    <pre><code>if grep -q "$pattern" "$file"; then
+    echo "找到了"
+elif [ $? -eq 1 ]; then
+    echo "没找到 — 属于正常"
+else
+    echo "grep 执行出错" &gt;&amp;2; exit 1
+fi</code></pre>
+                    <p>需要快速定位失败点时 <code>set -x</code> 很有用，它会把实际执行的命令原样打印出来。</p>
+                    <pre><code>== 5. set -x shows the failing command ==
+  + grep -q token /nonexistent/file.txt
+  grep: /nonexistent/file.txt: No such file or directory</code></pre>
+                    <p>优点是能看到展开之后的<strong>最终形态</strong>。变量是不是空的、路径是怎么拼起来的，都会立刻显现。不过输出量很大，所以只把可疑区间用 <code>set -x</code> … <code>set +x</code> 包起来更好。</p>
+                    <p>最后，别忘了把接到的退出码<strong>原样还回去</strong>。即使有清理 trap，退出码也会被保留。</p>
+                    <pre><code>== 6. exit with the code you were given ==
+  propagating rc=2
+  cleaning up
+  outer sees 2</code></pre>
+                    <p>在区分计划与应用的结构中如何接线这套约定，在<a href="shell_dry_run_design.html">如何做出真正的 --dry-run</a>的退出码一节里讲得更详细。</p>
+
+                    <h2>14. 与 POSIX sh 分歧的地方</h2>
+                    <p>如果脚本第一行是 <code>#!/bin/sh</code>，上面讲的一半都不存在。我把同样的代码分别喂给 bash 和 dash 做了对照。</p>
+                    <table>
+                        <thead>
+                            <tr><th>功能</th><th>bash 5.2.37</th><th>dash</th><th>实测消息</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>set -o pipefail</code></td><td>可用</td><td><strong>没有</strong></td><td><code>Illegal option -o pipefail</code></td></tr>
+                            <tr><td><code>PIPESTATUS</code></td><td><code>(3 4)</code></td><td><strong>没有</strong></td><td><code>Bad substitution</code></td></tr>
+                            <tr><td>数组</td><td><code>n=3</code></td><td><strong>没有</strong></td><td><code>Syntax error: "(" unexpected</code></td></tr>
+                            <tr><td><code>trap … ERR</code></td><td>触发</td><td><strong>没有</strong></td><td><code>trap: ERR: bad trap</code></td></tr>
+                            <tr><td><code>trap … EXIT</code></td><td>触发，rc=5</td><td>触发，rc=5</td><td>两边相同</td></tr>
+                            <tr><td>进程替换</td><td><code>hello</code></td><td><strong>没有</strong></td><td><code>Syntax error: redirection unexpected</code></td></tr>
+                            <tr><td><code>local</code></td><td>可用</td><td><strong>可用</strong></td><td>两边都是 <code>v=1</code></td></tr>
+                            <tr><td><code>local</code> 吞掉退出码</td><td>rc=0</td><td><strong>rc=0</strong></td><td>两边同样吞掉</td></tr>
+                            <tr><td><code>set -e</code> + 函数 + <code>if</code></td><td>通过</td><td>通过</td><td>两边都是 <code>CONTINUED ALIVE</code></td></tr>
+                            <tr><td><code>exit 300</code></td><td>rc=44</td><td>rc=44</td><td>两边都按 8 位截断</td></tr>
+                        </tbody>
+                    </table>
+                    <p>该怎么读这张表。</p>
+                    <ul>
+                        <li><strong>没有 <code>pipefail</code>。</strong>要在 POSIX sh 脚本里抓住管道失败，就只能避开管道本身，写进临时文件、确认退出码之后再交给下一步</li>
+                        <li><strong>既没有 <code>PIPESTATUS</code> 也没有数组。</strong>实际上没有办法查看分段状态</li>
+                        <li><strong>没有 <code>ERR</code> trap。</strong><code>EXIT</code> trap 两边都能用，退出码也同样是 5。清理逻辑可移植，失败日志则不可</li>
+                        <li><strong>dash 里也有 <code>local</code>。</strong>而且<strong>连吞掉退出码的性质都一模一样。</strong>第 5 节的陷阱在 <code>#!/bin/sh</code> 下同样成立</li>
+                        <li><strong><code>set -e</code> 的盲区完全相同。</strong>把函数放进 <code>if</code>，两边都通过了。这不是 bash 的特殊行为，而是<strong>shell 语言的规定</strong></li>
+                    </ul>
+                    <p>概括起来就是<strong>安全装置是 bash 专有的，陷阱则是两边共通的</strong>。需要可移植性就意味着失去工具却只留下陷阱，所以选 <code>#!/bin/sh</code> 时应当有相应的理由。</p>
+
+                    <h2>15. 盲区表 - 从情形到替代方案</h2>
+                    <p>这是本文的结论。遇到左侧的情形时 <code>set -e</code> <strong>什么也不会做</strong>，必须改用右侧的做法。</p>
+                    <table>
+                        <thead>
+                            <tr><th>情形</th><th><code>set -e</code> 抓得住吗</th><th>该改用什么</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>裸的失败命令</td><td><strong>抓得住</strong></td><td>保持原样即可</td></tr>
+                            <tr><td><code>if cmd; then</code> 的条件</td><td>抓不住</td><td>这是预期行为。要在条件内区分错误与「假」，就直接看 <code>$?</code></td></tr>
+                            <tr><td><code>while cmd; do</code> 的条件</td><td>抓不住</td><td>在循环体内单独检查</td></tr>
+                            <tr><td><code>cmd &amp;&amp; …</code> / <code>cmd || …</code> 的左侧</td><td>抓不住</td><td>用 <code>|| rc=$?</code> 接住退出码再用 <code>case</code> 分支</td></tr>
+                            <tr><td><code>! cmd</code></td><td>抓不住</td><td>用 <code>if ! cmd; then</code> 的写法明示意图</td></tr>
+                            <tr><td>管道中非最后一条命令</td><td>抓不住</td><td><code>set -o pipefail</code> 加上立即复制 <code>PIPESTATUS</code></td></tr>
+                            <tr><td><code>cmd | tee log</code></td><td>抓不住</td><td><code>set -o pipefail</code>。没有它构建失败也会通过</td></tr>
+                            <tr><td><strong>把函数放进 <code>if</code> 或 <code>||</code></strong></td><td><strong>抓不住 — 整个函数体无防护</strong></td><td>在函数内逐步检查并显式写 <code>return</code></td></tr>
+                            <tr><td><code>local x=$(cmd)</code></td><td>抓不住</td><td><strong>拆成两行</strong>，<code>local x</code> 与 <code>x=$(cmd)</code></td></tr>
+                            <tr><td><code>declare</code>、<code>export</code>、<code>readonly</code> 赋值</td><td>抓不住</td><td>同上。把声明与赋值分开</td></tr>
+                            <tr><td><code>$( )</code> 内部的失败</td><td>抓不住(默认)</td><td><code>shopt -s inherit_errexit</code>(bash 4.4+)</td></tr>
+                            <tr><td>子 shell 处在条件位置时</td><td>抓不住</td><td>在子 shell 内部直接检查</td></tr>
+                            <tr><td>函数最后一行是 <code>echo</code> 时</td><td>抓不住 — 永远是 0</td><td>用 <code>return</code> 明示想要的退出码</td></tr>
+                            <tr><td><code>(( c++ ))</code> 且 c 为 0</td><td>假阳性 — 会死掉</td><td><code>(( ++c ))</code> 或 <code>c=$((c+1))</code></td></tr>
+                            <tr><td><code>cmd | while read</code> 内的计数器</td><td>不适用 — 值会丢失</td><td>进程替换 <code>done &lt; &lt;(cmd)</code></td></tr>
+                            <tr><td>命令成功了但<strong>值是空字符串</strong></td><td><strong>抓不住 — 任何选项都不行</strong></td><td>用 <code>[ -z "$v" ]</code> 之类<strong>直接校验</strong></td></tr>
+                            <tr><td>子 shell 内的 <code>exit</code></td><td>只结束子 shell</td><td>在父进程接住退出码后再次 <code>exit</code></td></tr>
+                            <tr><td>清理 trap 内的 <code>exit 0</code></td><td>把所有失败覆盖成 0</td><td>不要在 trap 里调用 <code>exit</code></td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2>16. 模板 - 它保证什么又不保证什么</h2>
+                    <p>下面是反映了以上内容的起步骨架。<strong>把这个模板不保证什么也一并写出来</strong>，才是本节的要点。</p>
+                    <pre><code>#!/usr/bin/env bash
+set -Eeuo pipefail
+shopt -s inherit_errexit 2&gt;/dev/null || true   # 仅限 bash 4.4+
+
+readonly WORKDIR=$(mktemp -d)
+cleanup() {
+    rm -rf "$WORKDIR"        # 不要在这里调用 exit(第 10 节)
+}
+trap cleanup EXIT
+trap 'echo "失败: line $LINENO rc=$? cmd=[$BASH_COMMAND]" &gt;&amp;2' ERR
+
+need() {                     # 校验必填值(第 12 节)
+    local name="$1" value="$2"
+    if [ -z "$value" ]; then
+        echo "缺少必填值: $name" &gt;&amp;2
+        return 3
+    fi
+}
+
+run_stage() {
+    local rc                 # 声明与赋值分开(第 5 节)
+    local out
+    out=$(some_command "$1") || rc=$?
+    : "${rc:=0}"
+    case "$rc" in
+        0) printf '%s\n' "$out" ;;
+        *) echo "阶段失败: $1 (rc=$rc)" &gt;&amp;2; return "$rc" ;;
+    esac
+}
+
+main() {
+    local value
+    value=$(run_stage fetch)
+    need "value" "$value"    # 即使成功也要校验值
+    echo "正常完成"
+}
+
+main "$@"</code></pre>
+                    <p><strong>这个模板保证的东西</strong>如下。</p>
+                    <ul>
+                        <li>在裸的失败命令处立即停下(<code>-e</code>)</li>
+                        <li>管道中间的失败不会消失(<code>pipefail</code>)</li>
+                        <li>在拼写错误造成的未定义变量引用处停下(<code>-u</code>)</li>
+                        <li>命令替换内部的失败也能抓住(<code>inherit_errexit</code>)</li>
+                        <li>函数内部 <code>ERR</code> trap 也会触发，失败点会留进日志(<code>-E</code>)</li>
+                        <li>无论以哪条路径结束，临时目录都会被清理(<code>EXIT</code> trap)</li>
+                        <li>清理 trap 不会覆盖退出码(trap 内没有 <code>exit</code>)</li>
+                    </ul>
+                    <p><strong>不保证的东西</strong>更重要。</p>
+                    <ul>
+                        <li><strong>把函数放进 <code>if</code> 或 <code>||</code>，整个函数体就走出了保护范围。</strong>模板自己的 <code>run_stage</code> 也不例外</li>
+                        <li><strong>命令成功了但值是错的，它抓不住。</strong>所以才单独放了 <code>need</code>。校验是人写的，不是选项替你做的</li>
+                        <li><strong>0 条、空列表、与预期不符的格式，全都是正常的成功。</strong>「应该要有结果」这个条件必须自己写</li>
+                        <li>由于 <code>pipefail</code>，用 <code>head</code> 截断前段的管道可能以 141 失败(第 7 节)。这类位置要单独处理</li>
+                        <li><code>set -u</code> <strong>不会阻止空字符串。</strong>被定义为空的变量并不是未定义</li>
+                        <li>外部命令失败了却返回 0 的话，shell 无从知晓。<strong>退出码不准确的工具必须靠输出来校验</strong></li>
+                    </ul>
+                    <p>最后是几条自查命令，用于在既有脚本里寻找本文提到的陷阱。</p>
+                    <pre><code>### 声明与赋值粘在一起的位置
+$ grep -rnE '(local|declare|typeset|export|readonly)[[:space:]]+[A-Za-z_]+=\$\(' .
+
+### 接进管道后失败可能消失的位置
+$ grep -rn '| *tee' .
+
+### 清理 trap 内的 exit
+$ grep -rnE 'trap .*(exit|EXIT)' .
+
+### 完全没有安全选项的脚本
+$ grep -rLE 'set -[a-zA-Z]*e' --include='*.sh' .</code></pre>
+
+                    <h2>结论: 没被检测到的失败不是失败，而是虚假的成功</h2>
+                    <p>压缩成规则就是四句话。</p>
+                    <ul>
+                        <li><strong><code>set -e</code> 只抓「裸的失败命令」。</strong>条件、取反、逻辑运算、管道中段全都是例外，而这不是 bug，是手册自己列出的规定</li>
+                        <li><strong>把函数放进条件位置，整个函数体就失去保护。</strong>实测中函数内失败命令的下一行照常执行了。这是盲区里最宽的一处</li>
+                        <li><strong><code>local</code>、<code>declare</code>、<code>export</code> 会吞掉退出码。</strong>五个声明类内建命令全都返回 0。仅仅把声明与赋值拆成两行就能解决</li>
+                        <li><strong>最危险的是命令成功了但值是错的。</strong>任何 <code>set</code> 选项都抓不住，校验只能手写</li>
+                    </ul>
+                    <p>把用运行确认过的内容再梳理一遍。九处盲区塞进一个脚本、开着 <code>set -e</code> 运行，结果<strong>一处都没被拦住就走到了最后。</strong>前面加上 <code>local</code> 之后退出码 7 变成了 0，五个声明类内建命令表现一致。<code>false | tee</code> 在没有 <code>pipefail</code> 时被上报为成功。<code>PIPESTATUS</code> 被随后的一个 <code>echo</code> 抹掉了。清理 trap 内的 <code>exit 0</code> 把真实的失败 9 覆盖成了 0。而一个开着 <code>set -euo pipefail</code> 外加 <code>inherit_errexit</code> 的脚本，<strong>放行了两个空值并以退出码 0 结束。</strong></p>
+                    <p>最后这个例子就是本文的要点。<strong>安全选项是用来抓「命令失败了」的机制，而不是保证「结果是对的」的机制。</strong>一旦把这两者当成同一回事，开启了选项这件事本身就会成为跳过校验的借口。事实上，写下引言那个脚本的人，很可能<em>正是因为</em>加了 <code>set -euo pipefail</code> 才省掉了值的校验。</p>
+                    <p>所以把顺序倒过来。<strong>先写下什么地方可能出错，再写检查它的代码，最后才加上安全选项。</strong><code>set -euo pipefail</code> 是<strong>地板而不是天花板。</strong>如果第 15 节表里右列非空的行，在你的脚本中哪怕只出现一行，那一行就是下一次事故发生的地方。</p>
+
+                    <h2>参考资料</h2>
+                    <ul>
+                        <li>GNU Bash Reference Manual, The Set Builtin(<code>-e</code> 不适用的上下文的完整清单，以及关于在被忽略的上下文中执行的函数体的规定): <a href="https://www.gnu.org/software/bash/manual/html_node/The-Set-Builtin.html" target="_blank" rel="noopener">gnu.org/software/bash</a></li>
+                        <li>GNU Bash Reference Manual, The Shopt Builtin(<code>inherit_errexit</code> 让命令替换继承 <code>errexit</code>，并在 POSIX 模式下自动开启的规定): <a href="https://www.gnu.org/software/bash/manual/html_node/The-Shopt-Builtin.html" target="_blank" rel="noopener">gnu.org/software/bash</a></li>
+                        <li>The Open Group Base Specifications Issue 8, Shell Command Language 2.8.2 Exit Status and Errors(127 与 126 的规定，以及信号终止为大于 128 的值的表述): <a href="https://pubs.opengroup.org/onlinepubs/9799919799/utilities/V3_chap02.html" target="_blank" rel="noopener">pubs.opengroup.org</a></li>
+                        <li>相关文章: <a href="shell_dry_run_design.html">如何做出真正的 --dry-run</a>, <a href="shell_readonly_idempotent_script.html">跑两遍也安全的脚本 - 幂等性设计</a>, <a href="shell_quoting_rules_guide.html">Shell 引号规则 - 哪种引号挡住什么</a>, <a href="find_xargs_whitespace_trap.html">find 与 xargs 的空格和换行陷阱</a>, <a href="linux_server_guide_06_shell_basics.html">Linux 服务器管理 6 - Shell 脚本基础</a></li>
+                    </ul>
+                </div>
+
+                <!-- md-artifact-start -->
+                    <div class="md-artifact" style="margin:2rem 0;border:1px solid #d7dce3;border-radius:10px;overflow:hidden;background:#fbfcfd;">
+                        <div style="display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;justify-content:space-between;padding:.7rem 1rem;background:#eef2f7;border-bottom:1px solid #d7dce3;">
+                            <span style="font-weight:700;font-size:.97rem;">📋 可直接带走的检查清单</span>
+                            <span style="display:flex;gap:.5rem;align-items:center;">
+                                <code style="font-size:.82rem;color:#5a6675;background:transparent;padding:0;">shell_exit_code_pipefail.md</code>
+                                <button type="button" class="md-artifact-copy" style="cursor:pointer;border:1px solid #b9c2cf;background:#fff;color:#2c3e50;font-weight:600;line-height:1.3;border-radius:6px;padding:.32rem .7rem;font-size:.85rem;">复制全部</button>
+                            </span>
+                        </div>
+                        <pre style="margin:0;max-height:420px;overflow:auto;padding:1rem;background:#fbfcfd;font-size:.86rem;line-height:1.62;"><code class="nohighlight" style="background:transparent;padding:0;white-space:pre;"># Shell 退出码与 set -e - 实务参考表
+
+验证环境: GNU bash 5.2.37(1)-release, dash, GNU coreutils 8.32。
+以下数值全部是实际运行确认过的。
+
+---
+
+## 1. 退出码表
+
+| 退出码 | 含义 | 出处 | 实测确认 |
+|---|---|---|---|
+| 0 | 成功 | POSIX | `true` |
+| 1 | 一般性失败(惯例) | 惯例 | `false` |
+| 2 | 用法错误或「存在差异」 | 惯例 | `grep` 出错 |
+| 126 | 找到了但无法执行 | POSIX 2.8.2 | 执行目录 |
+| 127 | 找不到命令 | POSIX 2.8.2 | 不存在的命令 |
+| 137 | 128+9，被 SIGKILL 终止 | 实现惯例 | `kill -9` |
+| 143 | 128+15，被 SIGTERM 终止 | 实现惯例 | `kill -TERM` |
+| 141 | 128+13，SIGPIPE | 实现惯例 | `yes | head -1` |
+| 256 以上 | 截断为 8 位(256 变成 0) | 实测 | `exit 256` |
+
+工具也各有约定。`grep` 用 0=找到、1=没找到、2=出错。
+「没找到」是正常结果，但 `set -e` 把它当作失败。
+
+---
+
+## 2. set -e 盲区清单
+
+以下各项在 `set -e` 开启的状态下全部**会通过**。已用运行验证。
+
+- [ ] `if cmd; then` 的条件 → 通过
+- [ ] `while cmd; do` 的条件 → 通过
+- [ ] `cmd &amp;&amp; ...` 的左侧 → 通过
+- [ ] `cmd || ...` 的左侧 → 通过
+- [ ] `! cmd`(取反)→ 通过
+- [ ] 管道中非最后一条命令 → 通过(`false | cat` 得到 rc=0)
+- [ ] **把函数放进 `if` 或 `||`，整个函数体都无防护** ← 最宽的盲区
+- [ ] `local x=(命令替换)` → `local` 自己的退出码胜出，rc=0
+- [ ] `declare` / `typeset` / `export` / `readonly` 赋值 → 全部 rc=0
+- [ ] 命令替换 `( )` 内部 → 默认不继承 errexit
+- [ ] 处在条件位置的子 shell → 内部也毫无防护
+- [ ] 函数最后一行是 `echo` → 永远返回 0
+- [ ] 子 shell 内的 `exit` → 只结束子 shell
+- [ ] 清理 trap 内的 `exit 0` → 把所有失败覆盖成 0
+- [ ] **命令成功了但值是空字符串** ← 任何选项都抓不住
+
+`(( c++ ))` 是反方向的陷阱。运算结果为 0 时它返回退出码 1，
+所以计数器从 0 开始时第一次自增就会杀死脚本。改用 `(( ++c ))`。
+
+---
+
+## 3. 三个选项各自做什么
+
+| 选项 | 抓得住 | 抓不住 |
+|---|---|---|
+| `set -e` | 裸的失败命令 | 上面清单里的全部 |
+| `set -u` | 未定义变量的引用 | 空字符串、失败的命令 |
+| `set -o pipefail` | 管道中间的失败 | 把 SIGPIPE 提前结束误判为失败 |
+| `shopt -s inherit_errexit` | 命令替换内部的失败 | 若 `local` 先吞掉则无效 |
+| `set -E` | 让 ERR trap 在函数内触发 | 与 `set -e` 相同的盲区 |
+
+`set -u` 实测(bash 5.2.37):
+- 无参数时对参数列表整体的展开、以及空数组的整体展开都是安全的
+- 去取单个元素(第一个位置参数或 `arr[0]`)就会炸
+- 用 `${var:-默认值}` 规避。有冒号是「未设置或为空」，没有则是「未设置」
+- 退出码没有可移植性: bash 脚本 1、bash -c 127、dash 2
+
+---
+
+## 4. PIPESTATUS 要立即保存
+
+只能在管道之后读一次，紧接着的下一条命令就会覆盖它。
+
+```
+curl -fsS "url" | gzip -d | psql "dsn"
+st=("${PIPESTATUS[@]}")          # 必须是紧接着的下一行
+[ "${st[0]}" -ne 0 ] &amp;&amp; echo "下载失败"
+[ "${st[1]}" -ne 0 ] &amp;&amp; echo "解压失败"
+[ "${st[2]}" -ne 0 ] &amp;&amp; echo "导入失败"
+```
+
+---
+
+## 5. 安全的模板
+
+```
+#!/usr/bin/env bash
+set -Eeuo pipefail
+shopt -s inherit_errexit 2&gt;/dev/null || true
+
+readonly WORKDIR=(把 mktemp 的结果赋进来)
+cleanup() {
+    rm -rf "WORKDIR"          # 不要在这里调用 exit
+}
+trap cleanup EXIT
+trap 'echo "失败: line LINENO cmd=[BASH_COMMAND]" &gt;&amp;2' ERR
+
+need() {                      # 即使成功也要校验值
+    local name="1" value="2"
+    if [ -z "value" ]; then
+        echo "缺少必填值: name" &gt;&amp;2
+        return 3
+    fi
+}
+
+run_stage() {
+    local rc                  # 声明与赋值分开
+    local out
+    out=(把命令的执行结果赋进来) || rc=?
+    case "rc" in
+        0) printf '%s\n' "out" ;;
+        *) echo "阶段失败 (rc)" &gt;&amp;2; return "rc" ;;
+    esac
+}
+```
+
+**保证的东西**: 在裸的失败处停下、保留管道失败、拦截未定义变量、
+检测命令替换内部的失败、函数内 ERR trap、清理临时目录、保留退出码。
+
+**不保证的东西**: 把函数放进条件，整个函数体就走出保护范围。
+值为空或格式不符时抓不住。0 条的结果是正常的成功。
+`set -u` 不会阻止空字符串。退出码不准确的外部工具必须靠输出来校验。
+
+---
+
+## 6. 退出码设计约定
+
+| 退出码 | 含义 | 调用方要做的事 |
+|---|---|---|
+| 0 | 正常 | 通过 |
+| 2 | 存在差异(检查成功了) | 查看内容后判断 |
+| 1 | 错误(检查本身失败) | 立即失败并告警 |
+| 64+ | 用法错误等 | 修正调用方式 |
+
+接收方这样写。用 `|| rc=?` 接住，`set -e` 就不会杀掉它。
+
+```
+rc=0
+out=(运行检查命令) || rc=?
+case "rc" in
+  0)  echo "PASS" ;;
+  2)  echo "DRIFT" ;;
+  1)  echo "ERROR" ;;
+  *)  echo "UNKNOWN" ;;
+esac
+exit "rc"
+```
+
+不要用 `|| true`。它宣告的不是「这条命令允许失败」，
+而是「我永远不会知道它是怎么结束的」。
+
+---
+
+## 7. 与 POSIX sh 的差异
+
+| 功能 | bash 5.2.37 | dash |
+|---|---|---|
+| `set -o pipefail` | 可用 | **没有** |
+| `PIPESTATUS` | 可用 | **没有** |
+| 数组 | 可用 | **没有** |
+| `trap ... ERR` | 可用 | **没有** |
+| `trap ... EXIT` | 可用 | 可用 |
+| 进程替换 | 可用 | **没有** |
+| `local` | 可用 | 可用 |
+| `local` 吞掉退出码 | rc=0 | **rc=0(相同)** |
+| `set -e` + 函数 + `if` | 通过 | 通过(相同) |
+
+概括: **安全装置是 bash 专有的，陷阱则是两边共通的。**
+
+---
+
+## 8. 自查命令
+
+```
+### 声明与赋值粘在一起的位置
+grep -rnE '(local|declare|typeset|export|readonly)[[:space:]]+[A-Za-z_]+=' .
+
+### 接进管道后失败可能消失的位置
+grep -rn '| *tee' .
+
+### 清理 trap 内的 exit
+grep -rnE 'trap .*(exit|EXIT)' .
+
+### 完全没有安全选项的脚本
+grep -rLE 'set -[a-zA-Z]*e' --include='*.sh' .
+```
+
+---
+
+## 核心一句话
+
+`set -euo pipefail` 是**用来抓「命令失败了」的机制**，
+**而不是保证「结果是对的」的机制。**它是地板而不是天花板。
+
+出处: GNU Bash Reference Manual (The Set Builtin / The Shopt Builtin),
+The Open Group Base Specifications Issue 8, Shell Command Language 2.8.2。
+</code></pre>
+                        <p style="margin:0;padding:.6rem 1rem;font-size:.82rem;color:#5a6675;border-top:1px solid #e3e8ee;">复制后可直接粘贴到笔记应用或 AI 工具中。</p>
+                    </div>
+                    <script>
+                    (function(){
+                      if (window.__mdArtifactBound) return;
+                      window.__mdArtifactBound = true;
+                      document.addEventListener('click', function(ev){
+                        var btn = ev.target.closest && ev.target.closest('.md-artifact-copy');
+                        if (!btn) return;
+                        var box = btn.closest('.md-artifact');
+                        var code = box && box.querySelector('pre code');
+                        if (!code) return;
+                        var text = code.textContent;
+                        var label = btn.textContent;
+                        var ok = function(){
+                          btn.textContent = "已复制";
+                          setTimeout(function(){ btn.textContent = label; }, 1600);
+                          if (typeof gtag === 'function') {
+                            gtag('event', 'md_copy', { slug: "shell_exit_code_pipefail", lang: "zh", chars: text.length });
+                          }
+                        };
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                          navigator.clipboard.writeText(text).then(ok).catch(function(){ fallback(); });
+                        } else { fallback(); }
+                        function fallback(){
+                          var ta = document.createElement('textarea');
+                          ta.value = text; ta.setAttribute('readonly','');
+                          ta.style.position='fixed'; ta.style.left='-9999px';
+                          document.body.appendChild(ta); ta.select();
+                          try { document.execCommand('copy'); ok(); } catch(e) {}
+                          document.body.removeChild(ta);
+                        }
+                      });
+                    })();
+                    </script>
+                    <!-- md-artifact-end -->
+
+                <div class="share-section">
+                    <h3>分享这篇文章</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">返回列表</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/json_formatter.html">JSON 格式化工具</a></li>
+      <li><a href="../static/regex_tester.html">正则表达式测试器</a></li>
+      <li><a href="../static/jwt_decoder.html">JWT解码生成器 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 编码器/解码器</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="shell_dry_run_design.html">如何做出真正的 --dry-run - 要验证而不是模仿</a></li>
+      <li><a href="shell_quoting_rules_guide.html">Shell 引号规则 - 哪个引号挡住了什么</a></li>
+      <li><a href="topcoat_rust_fullstack_2026.html">Topcoat — 「去掉API层」这个想法实际去掉了什么</a></li>
+      <li><a href="shell_readonly_idempotent_script.html">跑两次也安全的脚本 - 幂等性设计与真正会出问题的六种模式</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制。粘贴到 Threads 应用即可分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制。'); });
+    });
+    </script>
+</body>
+</html>

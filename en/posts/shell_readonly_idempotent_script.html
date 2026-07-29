@@ -1,0 +1,897 @@
+<!DOCTYPE html>
+<!--
+ * Technical blog post template
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="en">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Idempotent Shell Scripts - Six Patterns That Break on the Second Run</title>
+    <meta name="description" content="Re-running a shell script breaks it in ways that never raise an error. Six patterns reproduced with real output, plus marker blocks and hash verification.">
+    <meta name="keywords" content="idempotence, shell script, bash, idempotent, mkdir -p, rm -f, ln -sfn, sed -i, crontab duplicate, marker block, flock, race condition, re-run safety, provisioning, automation script, dry run, state hash">
+
+    <link rel="canonical" href="https://braindetox.kr/en/posts/shell_readonly_idempotent_script.html">
+
+    <meta property="og:title" content="Idempotent Shell Scripts - Six Patterns That Break on the Second Run">
+    <meta property="og:description" content="Not a definition, a reproduction. Real output showing exactly what breaks on the second run, and the marker block pattern whose hash stays identical across three runs.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/en/posts/shell_readonly_idempotent_script.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="en_US">
+    <meta property="article:published_time" content="2026-07-29">
+    <meta property="article:section" content="Dev &amp; Infra">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Idempotent Shell Scripts - Designing for the Second Run">
+    <meta name="twitter:description" content="Six patterns that break when a script runs twice, reproduced end to end, with safe forms and a three-run hash check.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "Idempotent Shell Scripts - Six Patterns That Break on the Second Run",
+      "alternativeHeadline": "Reproduced, Not Theorized - Real Execution Output and Three-Run Hash Comparison",
+      "datePublished": "2026-07-29",
+      "dateModified": "2026-07-29",
+      "inLanguage": "en-US",
+      "articleSection": "Dev & Infra",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "idempotence, shell script, bash, mkdir -p, rm -f, ln -sfn, sed -i, crontab duplicate, marker block, flock, race condition, state hash",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/en/posts/shell_readonly_idempotent_script.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "Does adding mkdir -p and rm -f make a script idempotent?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "No. Those two options only smooth out the exit status. The POSIX specification says of mkdir -p that each dir operand that names an existing directory shall be ignored without error, and says of rm -f that it shall not write a diagnostic message or modify the exit status for operands that do not exist. In other words, they stop a re-run from aborting midway. They still guarantee nothing about whether file contents reached the target state. Reproduced here, a second mkdir returns File exists with exit code 1 and a second rm returns No such file or directory with exit code 1, and under set -e every following step is skipped entirely. The options are only the first button. Appends and substitutions that touch content have to be designed separately."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Is it enough to guard an appended config line with grep?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "The way you check is what matters. Reproducing it exposes two traps. First, when the file contains a commented-out copy of the line, a partial-match grep -qF reports it as already present, so the setting is never applied. Second, when the line contains regex metacharacters such as square brackets, grep -q reads the pattern as a regular expression, it no longer matches the literal text, and three runs leave four copies of the line. Under the same conditions grep -qxF held at one line, because -F forces the pattern to be a fixed string and -x forces a whole-line match. There is one more thing. grep returns 0 on a match, 1 on no match and 2 on an error, and chaining with the || operator makes error 2 behave exactly like no match, so duplicates pile up in a file you cannot read."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Is ln -sf enough when repointing a symbolic link?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Not when the link name points at a directory. In the reproduction, with current pointing at rel_a, the command ln -sf rel_b current succeeds with exit code 0, yet readlink current still returns rel_a. What was actually created is a new link at rel_a/rel_b. The command did not repoint the link, it descended into the directory the link pointed at. The GNU coreutils manual describes -n as treating the link name as a normal file when it is a symbolic link to a directory. So ln -sfn is the correct form, and across three runs readlink stayed pinned to rel_b with nothing added inside rel_a."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How do you prove that a re-run produces the same result?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Folding the state into a hash and comparing is the cheapest method. Sort the list of regular files in the target tree, hash each of them, add the readlink output for every symbolic link, then hash the whole thing again, and an entire tree collapses into a single string. Running the provisioning function three times produced the same hash all three times. Adding a dry run makes it better still. A --check mode that prints what would change without writing anything lets you confirm convergence by looking for changed=0 on the second run. One caveat: if a timestamp or a random value ends up inside a file, hash comparison becomes impossible, so audit logs must be kept separate from state files."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "When is a lock required and when is it unnecessary?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "The deciding question is whether a gap exists between the check and the change. Having eight processes run create-if-absent at the same time produced four or five SEED lines in every one of five rounds, where the expected value is one. By contrast, writing the whole file to a temporary path and swapping it in with mv held at one line even with eight processes racing, because rename replaces the target atomically and there is never a moment when another process cannot find the path. In short, work that ends in a whole-file replacement needs no lock, while read-modify-write and partial updates do. The concurrent read-modify-write experiment lost six of eight increments, ending at two. Where no locking tool exists you can rely on the atomicity of mkdir, which held at one line under the same conditions."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .danger { background:#fdecea; border-left:4px solid #d9534f; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/shell_readonly_idempotent_script.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/shell_readonly_idempotent_script.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/shell_readonly_idempotent_script.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/shell_readonly_idempotent_script.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/shell_readonly_idempotent_script.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="Idempotent Shell Scripts - Six Patterns That Break on the Second Run">
+                <meta itemprop="datePublished" content="2026-07-29">
+                <meta itemprop="dateModified" content="2026-07-29">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="idempotence, shell script, mkdir -p, ln -sfn, sed -i, marker block, race condition, state hash">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/en/posts/shell_readonly_idempotent_script.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">Idempotent Shell Scripts - Six Patterns That Break on the Second Run</h1>
+                    <h2 class="post-subtitle">Reproduced, not theorized - real execution output and three-run hash comparison</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-07-29">Jul 29, 2026</span>
+                        <span class="post-category" itemprop="articleSection">Dev &amp; Infra</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <h2>Introduction: The Script That Cannot Answer 'Can I Just Run It Again?'</h2>
+                    <p>The deployment script died halfway through. The log shows it made it through five of eight steps. The cause was found quickly, and only one question is left. <strong>'Can I just run this again?'</strong></p>
+                    <p>The moment you cannot answer that question on the spot, the night gets long. You have to read the script from the top and work out, line by line and by hand, <em>what this particular line does on a second run</em>. And in most cases you never finish the exercise, because it ends with <strong>'I will just do steps five through eight manually.'</strong> The part you did by hand leaves no record, and the next person has no idea why the server state does not match the script.</p>
+                    <p>Idempotence is the property that lets you <strong>answer yes to that question in half a second</strong>. It is not a matter of memorising a definition. It is a matter of knowing exactly what each line of your script does on its second execution. That is why this article does not open with a definition. It opens with <strong>real output from actually running things twice and watching them break</strong>.</p>
+                    <p>The order of business is as follows. First, <strong>six patterns that genuinely break</strong>, reproduced one at a time, each with its safe form attached. Then <strong>marker blocks</strong> as a general-purpose remedy, and a <strong>procedure for proving with hashes</strong> that a re-run produces the same result. Finally, the design for <strong>resuming after a partial failure</strong> and <strong>the conditions under which a lock is actually required</strong>.</p>
+                    <p>One piece of terminology first. What engineers casually lump together as idempotent is really three distinct layers. Drawing this distinction up front makes everything that follows much simpler.</p>
+                    <table>
+                        <thead><tr><th>Level</th><th>What it guarantees</th><th>What it does not guarantee</th><th>Typical mechanism</th></tr></thead>
+                        <tbody>
+                            <tr><td><strong>(1) Re-run safe</strong></td><td>Running twice <em>does not break</em> (no abort on error)</td><td>That the result is the same</td><td><code>mkdir -p</code>, <code>rm -f</code></td></tr>
+                            <tr><td><strong>(2) Convergent</strong></td><td>Any number of runs reach the <em>same final state</em></td><td>Removal of human-introduced drift</td><td>Check-then-change, marker blocks</td></tr>
+                            <tr><td><strong>(3) Self-healing</strong></td><td>Drifted state is <em>pulled back to the target state</em></td><td>Anything not declared</td><td>Whole-block replacement, whole-file generation</td></tr>
+                        </tbody>
+                    </table>
+                    <p>Most incidents happen when <strong>someone implements only level 1 and believes they have reached level 2</strong>. Swapping in <code>mkdir -p</code> and then declaring the script fixed and idempotent is the classic case. The reproductions below show exactly where that gap sits.</p>
+                    <div class="danger">
+                        <p><strong>Safety notice before you run anything.</strong> Every reproduction in this article was performed <strong>inside a freshly created temporary directory only</strong>. Wherever <code>rm -rf</code> appears in the text, it deletes that temporary directory or a path beneath it, nothing else. <strong>Do not follow along on a real server.</strong> In particular, the form <code>rm -rf "$DIR"</code> becomes <code>rm -rf ""</code> when <code>$DIR</code> is empty, which can sweep through somewhere you never intended, so any deletion driven by a variable must be preceded by a guard such as <code>[ -n "$DIR" ] &amp;&amp; [ "$DIR" != "/" ]</code>. Before a script goes into cron or CI, running it once in a <code>--check</code> style dry-run mode and reading the target paths with your own eyes is the safer habit.</p>
+                    </div>
+
+                    <h2>1. Test Environment and Verification Method</h2>
+                    <p>Every block of output below is <strong>pasted verbatim from a real run</strong>. The reproduction environment was as follows.</p>
+                    <pre><code>===== T0 ENVIRONMENT =====
+MINGW64_NT-10.0-19045 3.5.7-882031da.x86_64
+GNU bash, version 5.2.37(1)-release (x86_64-pc-msys)
+sed (GNU sed) 4.9
+grep (GNU grep) 3.0
+sha256sum (GNU coreutils) 8.32</code></pre>
+                    <p>This is MSYS2 / Git Bash on Windows 10. Because the toolchain is the GNU family, behaviour matches Linux, but <strong>three things are constraints specific to this environment</strong> and are declared up front. They are the information you need in order to judge the results for yourself.</p>
+                    <ul>
+                        <li><strong>Symbolic links</strong> are handled as file copies under the default configuration. To create real links, the runs were performed with <code>MSYS=winsymlinks:sys</code> set.</li>
+                        <li><strong>POSIX permission bits</strong> are not reflected faithfully on NTFS. In practice the mode still displayed as <code>644</code> after a <code>chmod 600</code>. For that reason <strong>no claim about permission idempotence in this article is backed by execution output.</strong> Those items appear only as rules in the checklist.</li>
+                        <li><strong>There is no <code>crontab</code> or <code>flock</code> binary here.</strong> For cron, the text that <code>crontab -l</code> would print was emulated in a file so that only the <em>line manipulation logic</em> was verified, and for locking, the demonstration used <strong>the atomicity of <code>mkdir</code></strong> instead of <code>flock</code>.</li>
+                    </ul>
+                    <p>Verification mixed three signals: <strong>exit status</strong> (did the command succeed), <strong>file contents</strong> (what was left behind), and <strong>SHA-256 hashes</strong> (is the result of repeated runs identical). The hash in particular is <em>the only tool that separates looks the same from is the same</em>, so it recurs throughout.</p>
+
+                    <h2>2. Pattern 1: Appends Accumulate Silently</h2>
+                    <p>This is the most common one, and the one discovered last, because it never raises an error. Take a script that adds a single <code>PATH</code> line to <code>.bashrc</code> and run it twice.</p>
+                    <pre><code>-- run 1 --
+export PATH=/opt/tool/bin:$PATH
+-- run 2 (same command again) --
+export PATH=/opt/tool/bin:$PATH
+export PATH=/opt/tool/bin:$PATH
+lines: 2</code></pre>
+                    <p>The exit status is 0 both times. Nobody tells you anything failed. If the line is a <code>PATH</code> entry, the worst outcome is a duplicated path element, but attach <strong>a cron job that grows the same file a little on every tick</strong> and the config file is thousands of lines long a few months later. Real incidents usually arrive in exactly this shape.</p>
+                    <h3>2.1 The Safe Form: Check for Existence, Then Append</h3>
+                    <pre><code>LINE='export PATH=/opt/tool/bin:$PATH'
+grep -qxF -- "$LINE" safe.conf || printf '%s\n' "$LINE" >> safe.conf</code></pre>
+                    <p>Here is the result over three runs. Both the line count and the hash stay pinned.</p>
+                    <pre><code>run1 -> 1 line(s) | sha=0a0746b7d8c9bd1f
+run2 -> 1 line(s) | sha=0a0746b7d8c9bd1f
+run3 -> 1 line(s) | sha=0a0746b7d8c9bd1f</code></pre>
+                    <h3>2.2 The Trap: One grep Option Flips the Outcome</h3>
+                    <p>The <code>x</code> and the <code>F</code> in <code>-qxF</code> are not decoration. Drop either one and you get <strong>an incident in the opposite direction, respectively</strong>.</p>
+                    <p><strong>Trap A: a comment is mistaken for already configured.</strong> The target file already contains the line, <em>commented out</em>. This is common. Somebody switched it off temporarily and forgot.</p>
+                    <pre><code>file: #export PATH=/opt/tool/bin:$PATH
+grep -qF  -> found (skips append) ... setting is never applied
+grep -qxF -> not found (correct: a comment is not an active setting)</code></pre>
+                    <p>With only <code>-F</code>, which is a substring match, the commented line matches too. The script quietly reports that it is already done on every single run, and <strong>the setting is never applied.</strong> Because there is no error, this can persist for months. It is <code>-x</code> (whole-line match) that prevents it.</p>
+                    <p><strong>Trap B: regex metacharacters let duplicates pile up.</strong> This is the opposite direction. If the line you want to insert contains characters such as <code>[</code>, <code>]</code>, <code>.</code> or <code>*</code>, then <code>grep -q</code> reads them <em>as a regular expression</em>.</p>
+                    <pre><code>file: PATH=/opt/tool[1]/bin
+grep -q   -> NOT found ([1] read as a character class) -> duplicate append
+grep -qxF -> found (correct)
+after 3 runs: grep -q => 4 lines | grep -qxF => 1 lines</code></pre>
+                    <p><code>[1]</code> is a character class meaning the single character 1, so it does not match the literal text <code>[1]</code>. The check therefore reports not found every time, and three runs leave four lines. It is <code>-F</code> (fixed string) that prevents this one.</p>
+                    <h3>2.3 An Even Quieter Trap: grep Exit Code 2</h3>
+                    <p>This one you only learn from the manual. <code>grep</code> returns three different exit codes. These are the values observed directly.</p>
+                    <pre><code>match      -> 0
+no match   -> 1
+read error -> 2  (|| append treats this like 'no match')</code></pre>
+                    <p>The form <code>grep -qxF ... || append</code> <strong>cannot distinguish 1 (no match) from 2 (error).</strong> When the file is unreadable or the path is wrong, the script concludes the line is absent and keeps appending. To be precise you have to branch on the exit status.</p>
+                    <pre><code>grep -qxF -- "$LINE" "$F"; rc=$?
+case $rc in
+  0) : ;;                                   # already present
+  1) printf '%s\n' "$LINE" >> "$F" ;;       # absent -> append
+  *) echo "grep failed (rc=$rc): $F" >&amp;2; exit 1 ;;   # error -> stop
+esac</code></pre>
+
+                    <h2>3. Pattern 2: Exit Codes from mkdir and rm Cut the Script in Half</h2>
+                    <p>This is the best known item, so it gets a short treatment, with the space spent on <strong>the lesser known side effect</strong>.</p>
+                    <pre><code>-- mkdir d1 (run 1) --
+exit=0
+-- mkdir d1 (run 2) --
+mkdir: cannot create directory 'd1': File exists
+exit=1
+-- mkdir -p d1 (run 3) --
+exit=0
+
+-- rm f1 (run 1) --
+exit=0
+-- rm f1 (run 2) --
+rm: cannot remove 'f1': No such file or directory
+exit=1
+-- rm -f f1 (run 3) --
+exit=0</code></pre>
+                    <p>The POSIX specification defines this behaviour. Of <code>mkdir -p</code> it says <strong>each dir operand that names an existing directory shall be ignored without error</strong>, and of <code>rm -f</code> it says it <strong>shall not write a diagnostic message or modify the exit status for operands that do not exist</strong>. What the options do is exactly that, and no more.</p>
+                    <h3>3.1 The Real Damage Shows Up When set -e Is Involved</h3>
+                    <p>Exit code 1 by itself is not a big deal. The problem is that in a script running under <code>set -e</code>, <strong>every step after that point disappears</strong>. Here is a three-step script run twice.</p>
+                    <pre><code>-- seq.sh run 1 --
+  [step 2] place config files
+  [step 3] restart service
+exit=0
+-- seq.sh run 2 --
+mkdir: cannot create directory '.../s/stage': File exists
+exit=1  &lt;- steps 2 and 3 never ran</code></pre>
+                    <p>On the re-run it is <strong>blocked at step 1, the directory creation, so neither the config placement nor the service restart happens.</strong> Yet the script only says failed. It does not say how far it got. The operator reads the last line of the log, decides it is a directory problem, and only discovers much later that the service is still running on the old configuration.</p>
+                    <h3>3.2 What the Options Do Not Do for You</h3>
+                    <ul>
+                        <li><code>mkdir -p</code> ignores <strong>existence only</strong>. It does <strong>not</strong> bring an existing directory's <strong>owner or permissions in line with the target values.</strong> Since <code>-m</code> applies only at creation time, guaranteeing permissions means nailing down <code>chmod</code> and <code>chown</code> as separate lines. (As stated earlier, permission bits cannot be verified in this environment, so no execution output is offered for them.)</li>
+                        <li><code>rm -f</code> only looks the other way for <strong>files that do not exist</strong>. If the thing you meant to delete is a <em>directory</em>, it still fails.</li>
+                        <li>Neither one <strong>has any opinion about content.</strong> A directory existing and its interior being in the target state are two different statements.</li>
+                    </ul>
+
+                    <h2>4. Pattern 3: On the Second Run, ln -s Burrows Inside the Link</h2>
+                    <p>This item is the one most worth reproducing in the whole article, because it <strong>leaves a wrong result without ever failing</strong>. It is the code that moves the <code>current</code> symlink to a new release during a zero-downtime deployment.</p>
+                    <pre><code>-- ln -s rel_a current (run 1) --
+exit=0 | readlink=rel_a
+-- ln -s rel_b current (run 2) --
+exit=0</code></pre>
+                    <p>The second run returns <strong>exit code 0</strong>. It looks like success. Let us check what was actually created.</p>
+                    <pre><code>## ln -sf on a symlink that points to a directory
+ln -sf exit=0
+readlink current = rel_a   &lt;- still points at rel_a
+ls current/:
+FROM_A
+rel_b
+what was actually created: lrwxrwxrwx 1 Karyu 197121 5 Jul 29 05:13 rel_a/rel_b -> rel_b
+  -> it did not repoint the link; it created a new link INSIDE the target directory</code></pre>
+                    <p>The last line is the whole point. When <code>current</code> is <em>a symlink pointing at a directory</em>, <code>ln -sf rel_b current</code> <strong>follows <code>current</code> as a directory</strong> and creates a new link named <code>rel_b</code> inside it. <code>readlink current</code> still says <code>rel_a</code>.</p>
+                    <p>Think about what that means in production. The deployment script <strong>returns success</strong>, monitoring is green, and <strong>the service keeps running the old version.</strong> On top of that, an unexplained link accumulates inside the previous release directory. Once per deployment.</p>
+                    <h3>4.1 The Safe Form: ln -sfn</h3>
+                    <p>The GNU coreutils manual describes <code>-n</code> in <code>ln</code> as <strong>treating the link name as a normal file if it is a symbolic link to a directory</strong>. Meaning: do not descend into it. Here is the result over three runs.</p>
+                    <pre><code>run1 -> readlink=rel_b | rel_a contains: FROM_A
+run2 -> readlink=rel_b | rel_a contains: FROM_A
+run3 -> readlink=rel_b | rel_a contains: FROM_A</code></pre>
+                    <p>All three runs stay pinned to <code>rel_b</code>, and <strong>nothing beyond <code>FROM_A</code> was added</strong> inside <code>rel_a</code>. The practical rule collapses to one sentence. <strong>When you swap a symlink that points at a directory, always add <code>-n</code>.</strong> Using <code>-T</code> (<code>--no-target-directory</code>) enforces it even more strictly.</p>
+                    <div class="callout">
+                        <p><strong>An even safer approach.</strong> Making a symlink swap genuinely atomic takes two steps: <em>create the link under a temporary name, then swap it in with <code>mv -T</code></em>. Internally <code>ln -sfn</code> has a moment where it removes and recreates, and in that instant there can be a point at which <code>current</code> does not exist. On a high-traffic path that difference matters.</p>
+                    </div>
+
+                    <h2>5. Pattern 4: sed -i Returns Success and Lies About It</h2>
+                    <p>The re-run safety of <code>sed -i</code> <strong>splits three ways depending on the pattern.</strong> Each was reproduced.</p>
+                    <h3>5.1 Case A: Safe When the Result No Longer Matches the Pattern</h3>
+                    <pre><code>sed -i 's/^timeout = 30$/timeout = 60/' a.conf
+
+run1 sha=ca1a53713b3fbd1d | timeout = 60 retries = 3
+run2 sha=ca1a53713b3fbd1d | timeout = 60 retries = 3
+run3 sha=ca1a53713b3fbd1d | timeout = 60 retries = 3</code></pre>
+                    <p>The substitution result <code>timeout = 60</code> does not overlap with the pattern <code>^timeout = 30$</code>. From the second run onward there is no match and the file does not change. <strong>The hash is identical across all three runs.</strong> This is the case that is idempotent <em>by luck</em>.</p>
+                    <h3>5.2 Case B: Unbounded Growth When the Result Matches Again</h3>
+                    <pre><code>sed -i 's#PATH=#PATH=/opt/bin:#' b.conf
+
+run1: PATH=/opt/bin:/usr/bin
+run2: PATH=/opt/bin:/opt/bin:/usr/bin
+run3: PATH=/opt/bin:/opt/bin:/opt/bin:/usr/bin</code></pre>
+                    <p>The substitution result still contains <code>PATH=</code>, so the next run matches again. <strong>Every run adds another path element.</strong> This is far less visible than the append accumulation earlier, because the line count never grows. You only find it by opening the file and reading one line all the way to the end.</p>
+                    <h3>5.3 Case C: It Does Nothing and Still Reports Success</h3>
+                    <pre><code>sed -i 's/^debug = true$/debug = false/' c.conf
+exit=0 | content=debug = false  &lt;- exit code is not evidence that it applied</code></pre>
+                    <p>The file already contained <code>debug = false</code>, so the pattern matched nothing at all. And yet <code>sed</code> returns <strong>exit code 0</strong>. That is not a defect, it is the design. <code>sed</code> does not report how many substitutions it performed through the exit status.</p>
+                    <p>The practical rule that falls out of this matters. <strong>The exit status of <code>sed -i</code> is not evidence that a change was applied.</strong> To confirm that a setting really took effect you have to <em>read the result back after the substitution</em> and inspect it. Silent failure is the most frightening kind precisely because a typo in the file path or a mismatched anchor also returns 0.</p>
+                    <h3>5.4 The Safe Form: Test the Target State First, Verify Afterwards</h3>
+                    <pre><code>TARGET='PATH=/opt/bin:/usr/bin'
+grep -qxF "$TARGET" d.conf || sed -i 's#^PATH=/usr/bin$#PATH=/opt/bin:/usr/bin#' d.conf
+grep -qxF "$TARGET" d.conf || { echo "not applied"; exit 1; }
+
+run1: PATH=/opt/bin:/usr/bin
+run2: PATH=/opt/bin:/usr/bin
+run3: PATH=/opt/bin:/usr/bin
+post-check: target state reached (0)</code></pre>
+                    <p>Three things happen at once here. <strong>(1) The target state is tested first</strong>, so if it has already been reached nothing is touched; <strong>(2) the pattern is bracketed with <code>^...$</code> anchors</strong> so the result cannot satisfy the pattern again; and <strong>(3) the file is read back after substitution</strong> to confirm the state was actually reached. With all three in place, even <code>sed -i</code> can be used safely.</p>
+
+                    <h2>6. Pattern 5: Cron Registration Multiplies on Every Run</h2>
+                    <p>There is a widespread idiom: <code>(crontab -l; echo "$JOB") | crontab -</code>. Here is what three runs produce.</p>
+                    <pre><code>run1 -> sync.sh lines: 1
+run2 -> sync.sh lines: 2
+run3 -> sync.sh lines: 3
+*/5 * * * * /opt/app/bin/sync.sh >> /var/log/sync.log 2&gt;&amp;1
+*/5 * * * * /opt/app/bin/sync.sh >> /var/log/sync.log 2&gt;&amp;1
+*/5 * * * * /opt/app/bin/sync.sh >> /var/log/sync.log 2&gt;&amp;1
+  -> a job meant to run every 5 minutes now starts 3 times per tick</code></pre>
+                    <p>The severity of this result is in a different class from the other patterns. The earlier ones were about <em>files getting messy</em>; this one is about <strong>multiple copies of the same job starting simultaneously</strong>. A sync script means several processes touching the same files; a backup means bandwidth split three ways with all copies running slow; a database cleanup means lock contention. And because the load becomes <strong>exactly triple</strong> after running provisioning three times, the cause is hard to pin down.</p>
+                    <h3>6.1 The Safe Form: Delete, Then Re-Add</h3>
+                    <p>The right answer is not skip if present but <strong>remove every line that references this script, then insert the new one</strong>. The reason follows shortly.</p>
+                    <pre><code>{ crontab -l 2&gt;/dev/null | grep -vF '/opt/app/bin/sync.sh'
+  printf '%s\n' "$JOB"; } | crontab -
+
+run1 -> lines: 1 | sha=7352c0d47610f2d1
+run2 -> lines: 1 | sha=7352c0d47610f2d1
+run3 -> lines: 1 | sha=7352c0d47610f2d1</code></pre>
+                    <p>One line on all three runs, with an identical hash. <strong>The reason this beats the skip-if-present approach is schedule changes.</strong> An existence-only check will look at <code>*/5</code> changed to <code>*/10</code>, decide it is already there, and leave the old line untouched. The delete-and-insert approach does not. It was also checked against unrelated jobs.</p>
+                    <pre><code>-- schedule changed to */10, with an unrelated job present, run twice --
+0 3 * * * /opt/other/backup.sh
+*/10 * * * * /opt/app/bin/sync.sh >> /var/log/sync.log 2&gt;&amp;1</code></pre>
+                    <p>The <code>backup.sh</code> line survived untouched and only the <code>sync.sh</code> line was refreshed with the new schedule. <strong>The critical question here is how narrowly you scope the filter string.</strong> Filtering on a common name such as <code>sync.sh</code> could wipe out another team's <code>/opt/legacy/sync.sh</code> as well. Using the full absolute path, or the marker block approach below, is safer.</p>
+                    <div class="callout">
+                        <p><strong>There is also the option of not writing to crontab directly.</strong> <strong>Dropping a single complete file</strong> into <code>/etc/cron.d/</code> is itself a whole-file replacement, which makes duplication structurally impossible. Write to a temporary file and swap it in with <code>mv</code> and you get atomicity as well. Do check your distribution's documentation first, because filename rules (names containing a dot are ignored, for example) and whether a user field is required differ between distributions.</p>
+                    </div>
+
+                    <h2>7. Pattern 6: Commands That Look Idempotent but Are Not</h2>
+                    <p>If everything so far was the category of known traps, this section covers <strong>commands most people assume are idempotent</strong>.</p>
+                    <h3>7.1 cp -r: The First Run and Later Runs Produce Different Structures</h3>
+                    <pre><code>cp -r src dst   # three times
+
+run1: dst dst/a.txt
+run2: dst dst/a.txt dst/src dst/src/a.txt
+run3: dst dst/a.txt dst/src dst/src/a.txt
+  -> run 1 produced dst/a.txt; from run 2 on, dst/src/a.txt appeared as well</code></pre>
+                    <p>The cause is that <strong>the meaning of <code>cp -r</code> changes depending on whether the destination exists</strong>. If <code>dst</code> does not exist, it makes <code>dst</code> a copy of <code>src</code> (<code>dst/a.txt</code>). If <code>dst</code> does exist, it puts <code>src</code> <em>inside</em> <code>dst</code> (<code>dst/src/a.txt</code>). Same command, but <strong>a new server and a redeployed server end up different.</strong> This is the perennial cause of the symptom described as a clean install works but an update goes strange.</p>
+                    <p>The safe form is to <strong>name the contents rather than the directory</strong>.</p>
+                    <pre><code>cp -r src/. dst2/   # three times
+
+run1: dst2 dst2/a.txt
+run2: dst2 dst2/a.txt
+run3: dst2 dst2/a.txt</code></pre>
+                    <h3>7.2 mv: The Second Run Simply Fails</h3>
+                    <pre><code>run1 exit=0
+mv: cannot stat 'mvsrc/data.bin': No such file or directory
+run2 exit=1</code></pre>
+                    <p><code>mv</code> is <strong>fundamentally not a repeatable command</strong>, because the source disappears. To make it repeatable you either <em>condition it on the source existing</em>, as in <code>[ -e "$SRC" ] &amp;&amp; mv ...</code>, or replace <code>mv</code> altogether with an approach that <strong>describes the target state</strong> (copy then verify, or decide based on the destination).</p>
+                    <h3>7.3 The sed Insert Command: a Is Just Another Append</h3>
+                    <pre><code>sed -i '/^\[core\]$/a\    autocrlf = input' gitcfg.ini   # three times
+
+run1: [core]|    autocrlf = input|
+run2: [core]|    autocrlf = input|    autocrlf = input|
+run3: [core]|    autocrlf = input|    autocrlf = input|    autocrlf = input|</code></pre>
+                    <p>Using <code>sed</code> does not make something a substitution. The <code>a</code> (append) command is <strong>an append, exactly as its name says</strong>, so it behaves the same as <code>&gt;&gt;</code>. The safe form branches two ways: <strong>replace if present, insert if absent</strong>.</p>
+                    <pre><code>if grep -q '^[[:space:]]*autocrlf[[:space:]]*=' f.ini; then
+  sed -i 's/^[[:space:]]*autocrlf[[:space:]]*=.*/    autocrlf = input/' f.ini
+else
+  sed -i '/^\[core\]$/a\    autocrlf = input' f.ini
+fi
+
+run1 sha=94ff19468316c369 | [core]|    autocrlf = input|
+run2 sha=94ff19468316c369 | [core]|    autocrlf = input|
+run3 sha=94ff19468316c369 | [core]|    autocrlf = input|</code></pre>
+                    <h3>7.4 Timestamps and Random Values: They Destroy Verifiability Itself</h3>
+                    <p>If <code>date</code> output or <code>$RANDOM</code> ends up inside a file, that file <strong>has a different hash on every run.</strong> Regardless of whether the logic is idempotent, <em>you have lost the means of verification.</em> The rule is simple. <strong>Separate state files from audit logs.</strong> Record when and what was done in a separate log, and write only deterministic content into the configuration files the script manages.</p>
+                    <h3>7.5 Summary: Re-Reading the Three Levels of Re-Run Safety</h3>
+                    <ul>
+                        <li><code>mkdir -p</code> and <code>rm -f</code> deliver <strong>level 1, re-run safety</strong>, and nothing beyond it.</li>
+                        <li>A <code>grep -qxF</code> guard before an append, and <code>ln -sfn</code>, reach <strong>level 2, convergence</strong>.</li>
+                        <li>Marker block replacement and whole-file generation go all the way to <strong>level 3, self-healing</strong>. They undo human edits made inside the block.</li>
+                        <li><code>cp -r</code>, <code>mv</code> and <code>sed ... a\</code> <strong>belong to no level at all.</strong> Unwrapped, they are incidents waiting to happen.</li>
+                    </ul>
+
+                    <h2>8. Marker Blocks: Why the Hash Stays the Same Across Three Runs</h2>
+                    <p>Every defence so far has been <strong>line-oriented</strong>. Once you have more than five lines to manage, that approach gets messy fast. That is when you reach for a <strong>marker block</strong>. It is exactly the mechanism Ansible's <code>blockinfile</code> module uses when it defaults to <code># BEGIN ANSIBLE MANAGED BLOCK</code> and <code># END ANSIBLE MANAGED BLOCK</code>.</p>
+                    <p>The idea is simple. <strong>Mark the region you own with markers, and swap out everything between them as a unit.</strong> There is no longer any need to check for the existence of individual lines.</p>
+                    <pre><code>apply_block(){
+  local file="$1" tag="$2" body="$3"
+  local begin="# BEGIN ${tag}" end="# END ${tag}"
+  [ -e "$file" ] || : > "$file"
+  if grep -qxF "$begin" "$file"; then
+    awk -v b="$begin" -v e="$end" -v body="$body" '
+      $0==b { print b; printf "%s", body; skip=1; next }
+      $0==e { print e; skip=0; next }
+      skip==1 { next }
+      { print }' "$file" > "$file.new" &amp;&amp; mv "$file.new" "$file"
+  else
+    { printf '%s\n' "$begin"; printf '%s' "$body"; printf '%s\n' "$end"; } >> "$file"
+  fi
+}</code></pre>
+                    <p>This function was applied <strong>three times</strong> to a file that already contained three hand-maintained lines.</p>
+                    <pre><code>run1 sha256=5d22eee7c5ef0991451ca494fdff31a15f39c10ab6a1626136c7d990f0beb8b6
+run2 sha256=5d22eee7c5ef0991451ca494fdff31a15f39c10ab6a1626136c7d990f0beb8b6
+run3 sha256=5d22eee7c5ef0991451ca494fdff31a15f39c10ab6a1626136c7d990f0beb8b6
+-- resulting file --
+# hand-maintained section
+Port 22
+PermitRootLogin no
+# BEGIN braindetox-keepalive
+ClientAliveInterval 60
+ClientAliveCountMax 3
+# END braindetox-keepalive
+-- content outside the markers --
+OK: the hand-maintained 3 lines are untouched</code></pre>
+                    <p><strong>The hash is completely identical across all three runs</strong>, and the existing configuration outside the markers was not damaged. That is level 2, convergence.</p>
+                    <h3>8.1 When a Value Changes, Only the Block Is Updated</h3>
+                    <pre><code>### ClientAliveInterval 60 -> 30, three more runs
+run4 sha256=1a402ffc0e2c088220b5e90471c69c330f6e4925ab579c3f0db1dc17271f3b18
+run5 sha256=1a402ffc0e2c088220b5e90471c69c330f6e4925ab579c3f0db1dc17271f3b18
+run6 sha256=1a402ffc0e2c088220b5e90471c69c330f6e4925ab579c3f0db1dc17271f3b18
+total lines: 7 (no accumulation)</code></pre>
+                    <p>It re-pins to a <strong>new hash for the new value</strong>. The line count stays at 7. Blocks do not stack up.</p>
+                    <h3>8.2 What Append Can Never Do: Removing an Entry</h3>
+                    <p>This is where the real value of marker blocks lies. Let us <strong>shrink</strong> the managed entries from two lines to one.</p>
+                    <pre><code># BEGIN braindetox-keepalive
+ClientAliveInterval 30
+# END braindetox-keepalive
+  -> append-based approaches cannot do this: a removed entry would linger</code></pre>
+                    <p><code>ClientAliveCountMax</code> is gone. <strong>This is impossible with a skip-if-present approach.</strong> Delete the line from the script and it still lives forever in the file on every already-deployed server. Give it a few years and every server accumulates a different set of settings nobody can explain. With a marker block <strong>the whole block is the declaration</strong>, so the problem cannot arise structurally.</p>
+                    <h3>8.3 Cautions When Using Marker Blocks</h3>
+                    <ul>
+                        <li><strong>Make the tag unique.</strong> Several scripts may insert blocks into the same file. Write the owner and the purpose together, as in <code># BEGIN myapp-nginx-upstream</code>.</li>
+                        <li><strong>Comment characters differ by file format.</strong> If the format uses <code>;</code> or <code>//</code> rather than <code>#</code>, the markers have to follow that syntax too. Otherwise the parser dies.</li>
+                        <li><strong>If a human deletes the markers</strong>, the next run appends a fresh block and you get duplicates. Putting a do-not-edit notice on the first line of the block helps.</li>
+                        <li><strong>Do not use this on structured formats such as JSON or YAML.</strong> Line-based insertion breaks them. Read and write those with a proper parser.</li>
+                        <li><strong>Manage only what is inside the block.</strong> The moment the script starts touching things outside the markers, the advantage of the pattern is gone.</li>
+                    </ul>
+
+                    <h2>9. Proving Re-Run Safety: State Hashes and Dry Runs</h2>
+                    <p>The claim that a script was written idempotently has to be verifiable. The cheapest method is to <strong>fold the entire target tree into a single hash</strong>.</p>
+                    <pre><code>state_hash(){
+  ( cd "$1" &amp;&amp; {
+      find . -type f | LC_ALL=C sort | xargs sha256sum
+      find . -type l | LC_ALL=C sort | while read -r l; do echo "$(readlink "$l")  $l"; done
+    } | sha256sum | awk '{print $1}' )
+}</code></pre>
+                    <p>Regular files are folded by content hash, symbolic links by their <code>readlink</code> result. Pinning the sort order with <code>LC_ALL=C sort</code> is essential; if the order shifts with the locale, the hash shifts with it. Here is the provisioning function run three times.</p>
+                    <pre><code>provision run1  state_hash=219dd1b402f930f92ce94faa467761005c47cb12d740c452e7609d3d6d0d4526
+provision run2  state_hash=219dd1b402f930f92ce94faa467761005c47cb12d740c452e7609d3d6d0d4526
+provision run3  state_hash=219dd1b402f930f92ce94faa467761005c47cb12d740c452e7609d3d6d0d4526</code></pre>
+                    <h3>9.1 Injecting Drift and Re-Running: The Honest Result</h3>
+                    <p>One <strong>uncomfortable result</strong> came out of this, and it is published as is. The state was deliberately knocked out of alignment and the script re-run.</p>
+                    <pre><code>after drift   state_hash=74c1a29f825801f98c4d235c47df56ad943e386df4697f5ffd3b1709e7d3785b
+after re-run  state_hash=3e25756382253f698945962c75d2fd19bc1455d5dc20b79aa672057b3220cb81
+app.env:
+MODE=production
+TZ=Asia/Seoul
+MODE=debug</code></pre>
+                    <p>After the re-run the hash <strong>did not return to the original value (219dd1...).</strong> Let us look at what was restored and what was not.</p>
+                    <ul>
+                        <li><strong>Restored</strong> - the human-created <code>obsolete.conf</code> was deleted by <code>rm -f</code>.</li>
+                        <li><strong>Restored</strong> - the <code>current</code> symlink was repointed at <code>releases/v2</code> by <code>ln -sfn</code>.</li>
+                        <li><strong>Survived</strong> - the hand-added <code>MODE=debug</code> line <strong>is still there.</strong></li>
+                    </ul>
+                    <p>The reason is plain. The <code>grep -qxF ... || append</code> approach <strong>asks only whether the line I want is present, never whether a line I do not want is present.</strong> That is, it reached level 2 convergence but is not level 3 self-healing. If the application reads the file <em>last-wins</em>, this server declares itself <code>production</code> and runs as <code>debug</code>.</p>
+                    <p>Preventing this means <strong>abandoning append and declaring either the whole file or a marker block</strong>. Stop your re-run verification at the hash is identical three times and you will never see this hole. That is exactly why <strong>a procedure that deliberately injects drift and re-runs</strong> is necessary.</p>
+                    <h3>9.2 Dry Run: See What Will Change Before Changing It</h3>
+                    <p>What operations teams actually use more often than hashes is <strong>the trial run</strong>. A <code>--check</code> mode gives you two things: <em>a preview of what will change</em> and <em>a verdict on whether the script has converged</em>.</p>
+                    <pre><code>-- --check (run 1, nothing exists yet) --
+  would add to app.env: MODE=production
+  would add to app.env: TZ=Asia/Seoul
+  changed=1
+-- apply --
+  changed=1
+-- --check (run 2) --
+  changed=0 (already at target state)</code></pre>
+                    <p>The second <code>--check</code> returns <strong><code>changed=0</code></strong>. That is the operational definition of idempotence: <strong>can the script tell you itself that it has nothing left to change on a second run.</strong> It also drops neatly into CI. Run <code>--check</code> once more immediately after applying, and if it reports <code>changed=1</code> then the script has not converged, so break the build.</p>
+                    <p>The key to implementing this is <strong>funnelling every mutation through a single function</strong>. In the example above only <code>want_line</code> needed to look at the <code>CHECK</code> flag. If the mutation points are scattered across the code, the dry run will not stay accurate for long.</p>
+
+                    <h2>10. Resuming After Partial Failure: Step Markers and Their Trap</h2>
+                    <p>Back to the question in the introduction. <strong>When it dies at step 5 of 8</strong>, what should you do?</p>
+                    <h3>10.1 The Bad Design: If an Early Step Is Not Idempotent, You Never Get Past It</h3>
+                    <pre><code>-- run 1 (forced failure) --
+  step 3 failed
+exit=3
+-- remove the cause, run 2 --
+mkdir: cannot create directory 'rbad/data': File exists
+exit=1  &lt;- blocked at step 1 forever</code></pre>
+                    <p>The cause of the failure was fixed, and it is still <strong>blocked at step 1.</strong> In that situation all an operator can do is open the script, comment out the early part and run it. At that moment the premise that deployment happens through the script collapses.</p>
+                    <h3>10.2 The Good Design: Idempotent Steps Plus Completion Markers</h3>
+                    <pre><code>run_step(){
+  local name="$1"; shift
+  if [ -f "$S/$name.done" ]; then echo "  [skip] $name"; return 0; fi
+  "$@" &amp;&amp; : > "$S/$name.done" &amp;&amp; echo "  [done] $name"
+}
+run_step schema s1 &amp;&amp; run_step seed s2 &amp;&amp; run_step release s3</code></pre>
+                    <pre><code>-- run 1 (step 3 fails) --
+  [done] schema
+  [done] seed
+   markers: schema.done seed.done
+-- remove the cause, run 2 --
+  [skip] schema
+  [skip] seed
+  [done] release
+  completed
+-- run 3 (should do nothing) --
+  [skip] schema
+  [skip] seed
+  [skip] release
+  completed
+seed.csv lines: 1 | version: v1</code></pre>
+                    <p>The second run picked up <strong>from the point of failure</strong> and finished, and the third run finished <strong>having done nothing at all</strong>. It also matters that <code>seed.csv</code> is one line. Because each step is itself idempotent, it is safe even without the markers.</p>
+                    <h3>10.3 The Step Marker Trap: A Marker Does Not Guarantee Convergence</h3>
+                    <p>This pattern has a trap. A human deleted the output and the script was re-run.</p>
+                    <pre><code>a human deleted 'version'; re-run:
+  [skip] schema
+  [skip] seed
+  [skip] release
+  completed
+version present? no - the marker made it skip</code></pre>
+                    <p>The script <strong>reported completed, and the output is not there.</strong> It looked only at the marker and never at the actual state. The principle that comes out of this is clear.</p>
+                    <ul>
+                        <li><strong>Step markers are an optimisation for resume speed, not a convergence guarantee.</strong> Use them only to skip heavy steps such as large downloads or migrations.</li>
+                        <li><strong>Do not put markers on cheap steps.</strong> Checking every time is safer and costs nothing.</li>
+                        <li><strong>Invalidate markers when the input changes.</strong> Putting an input hash in the filename (<code>release.$(sha256 of config).done</code>) makes the step re-run automatically when the configuration changes.</li>
+                        <li><strong>Verify the state directly at the end.</strong> Add a final check such as <code>[ -f "$R/version" ]</code> that is independent of the markers.</li>
+                        <li><strong>Choose the marker storage location carefully.</strong> Keeping it on the target server means it vanishes when the server is replaced; keeping it centrally means it cannot reflect per-server state.</li>
+                    </ul>
+
+                    <h2>11. When You Need a Lock and When You Do Not</h2>
+                    <p>Every defence so far has shared one assumption: <strong>that only one copy runs at a time.</strong> Break that assumption and check-then-change collapses on its own. This is the classic <strong>check-then-act</strong> problem.</p>
+                    <h3>11.1 Reproduction: Eight Processes Running Create-If-Absent at Once</h3>
+                    <pre><code>round1: no lock SEED=5 | mkdir lock SEED=1 (expected 1)
+round2: no lock SEED=4 | mkdir lock SEED=1 (expected 1)
+round3: no lock SEED=4 | mkdir lock SEED=1 (expected 1)
+round4: no lock SEED=5 | mkdir lock SEED=1 (expected 1)
+round5: no lock SEED=4 | mkdir lock SEED=1 (expected 1)</code></pre>
+                    <p>All five rounds produced <strong>four or five lines</strong>. The expected value is one. Another process slipped in <em>between</em> the moment of the <code>grep</code> check and the moment of the <code>&gt;&gt;</code> append. The <code>grep -qxF || append</code> we built so carefully in the earlier sections is powerless in the face of concurrency.</p>
+                    <p>What matters is when this situation actually arises in practice. <strong>When a cron job runs every 5 minutes but takes 6 minutes</strong>, when a deployment pipeline <strong>launches the same job twice through a retry</strong>, and when several nodes touch <strong>the same file on shared storage</strong>. All three are common.</p>
+                    <h3>11.2 When No Lock Is Needed: Whole-File Replacement</h3>
+                    <p>Not every case needs a lock. The approach of <strong>writing the whole file to a temporary path and swapping it in with <code>mv</code></strong> came through unharmed with eight processes racing.</p>
+                    <pre><code>printf 'value=42\n' > ".atomic.$i.tmp" &amp;&amp; mv ".atomic.$i.tmp" atomic.txt
+
+lines=1 | content=value=42 | sha=72cc615c7f451bd5</code></pre>
+                    <p>The basis is the guarantee in <code>rename(2)</code>. The manual states that <strong>if newpath already exists it will be atomically replaced, so that there is no point at which another process attempting to access newpath will find it missing</strong>. The only condition to respect is that the temporary file and the destination live on <strong>the same filesystem</strong> (across filesystems it becomes a copy and atomicity is lost).</p>
+                    <h3>11.3 When a Lock Is Mandatory: Read-Modify-Write</h3>
+                    <pre><code>### 8 processes increment count by 1 concurrently
+final count=2  (expected count=8)</code></pre>
+                    <p>Eight increments were <strong>lost down to two</strong>. This is the textbook lost update, where the value you read goes stale before you write it back. Summarised as a decision table:</p>
+                    <table>
+                        <thead><tr><th>Kind of work</th><th>Lock needed</th><th>Why</th><th>Alternative</th></tr></thead>
+                        <tbody>
+                            <tr><td>Rewrite the whole file and swap it in</td><td><strong>No</strong></td><td><code>rename</code> is atomic</td><td>Temp file plus <code>mv</code> (same filesystem)</td></tr>
+                            <tr><td>Directory creation with <code>mkdir -p</code></td><td><strong>No</strong></td><td>The kernel handles it atomically</td><td>Use as is</td></tr>
+                            <tr><td>Append after checking a line exists</td><td><strong>Yes</strong></td><td>Gap between check and change</td><td>Lock, or switch to whole-file replacement</td></tr>
+                            <tr><td>Read-modify-write (counters, lists)</td><td><strong>Yes</strong></td><td>Lost updates</td><td>Lock, or append-only plus aggregation</td></tr>
+                            <tr><td>Preventing duplicate starts of a long job</td><td><strong>Yes</strong></td><td>A run can outlast its own interval</td><td>Acquire the lock at the job entry point</td></tr>
+                            <tr><td>Marker block replacement</td><td><strong>Yes</strong></td><td>It is a read-modify-write structure</td><td>Lock plus temp file <code>mv</code> together</td></tr>
+                        </tbody>
+                    </table>
+                    <h3>11.4 What to Lock With</h3>
+                    <p>On Linux, <code>flock</code> from <code>util-linux</code> is the standard choice. Its manual offers an idiom for a script locking itself.</p>
+                    <pre><code>[ "${FLOCKER}" != "$0" ] &amp;&amp; exec env FLOCKER="$0" flock -en "$0" "$0" "$@" || :</code></pre>
+                    <p>With <code>-n</code> (non-blocking), failing to acquire the lock returns exit code <strong>1</strong> by default (changeable with <code>-E</code>). When putting this in cron you have to decide whether that value counts as normal duplicate suppression or as a failure, or your alerting gets noisy.</p>
+                    <p>In an environment without <code>flock</code>, you can use <strong>the atomicity of <code>mkdir</code></strong>. This is the approach that held at exactly one line in all five rounds of the reproduction.</p>
+                    <pre><code>if mkdir "$LOCKDIR" 2>/dev/null; then
+  trap 'rmdir "$LOCKDIR"' EXIT INT TERM
+  ... critical section ...
+else
+  echo "another instance is running"; exit 0
+fi</code></pre>
+                    <ul>
+                        <li><strong>Always release with <code>trap</code>.</strong> Without it an abnormal exit leaves the lock behind and blocks every future run forever.</li>
+                        <li><strong>Record the PID and a timestamp in the lock directory.</strong> That gives you a basis for deciding whether a leftover lock belongs to a live process.</li>
+                        <li><strong>Define an orphan lock reclamation policy.</strong> Reclaiming automatically on a time threshold is convenient but risks killing a slow but healthy run.</li>
+                        <li><strong>Lock semantics differ on network filesystems such as NFS.</strong> If multiple nodes participate, consider a dedicated coordination mechanism instead of file locks.</li>
+                        <li><strong>A lock is not a substitute for idempotence.</strong> A lock only prevents concurrency. Code that breaks on sequential re-runs still breaks with a lock in place.</li>
+                    </ul>
+
+                    <h2>12. Safe-Form Reference Table by Command</h2>
+                    <p>Everything reproduced above, folded onto one page. When your hands stop mid-script, this table is all you need.</p>
+                    <table>
+                        <thead><tr><th>What you want to do</th><th>Dangerous form</th><th>Safe form</th><th>Observed behaviour on re-run</th></tr></thead>
+                        <tbody>
+                            <tr><td>Create a directory</td><td><code>mkdir d</code></td><td><code>mkdir -p d</code> plus permissions via <code>chmod</code></td><td>Run 2 <code>exit=1</code> -&gt; <code>-p</code> gives 0</td></tr>
+                            <tr><td>Delete a file</td><td><code>rm f</code></td><td><code>rm -f f</code></td><td>Run 2 <code>exit=1</code> -&gt; <code>-f</code> gives 0</td></tr>
+                            <tr><td>Add one config line</td><td><code>echo L &gt;&gt; f</code></td><td><code>grep -qxF -- "$L" f || printf '%s\n' "$L" &gt;&gt; f</code></td><td>Grew to 2 lines -&gt; 1 line and identical hash on all 3 runs</td></tr>
+                            <tr><td>Check for existence</td><td><code>grep -q "$L" f</code></td><td><code>grep -qxF -- "$L" f</code> plus a branch on exit code 2</td><td>4 lines with metacharacters, never applied with a comment -&gt; held at 1 line</td></tr>
+                            <tr><td>Repoint a symlink</td><td><code>ln -s t l</code> / <code>ln -sf t l</code></td><td><code>ln -sfn t l</code> (or temp link plus <code>mv -T</code>)</td><td><code>-sf</code> created a link inside the link -&gt; <code>-sfn</code> identical on 3 runs</td></tr>
+                            <tr><td>Substitute a config value</td><td><code>sed -i 's#A#A+B#'</code></td><td>Pre-check target state with <code>grep</code>, <code>^...$</code> anchors, post-verify</td><td>Triple accumulation over 3 runs -&gt; identical on 3 runs</td></tr>
+                            <tr><td>Insert a line</td><td><code>sed -i '/anchor/a\ LINE'</code></td><td>Replace if present, insert if absent</td><td>Grew to 3 lines -&gt; identical hash on 3 runs</td></tr>
+                            <tr><td>Manage several lines</td><td>Individual append per line</td><td><code># BEGIN tag</code> to <code># END tag</code> block replacement</td><td>Identical hash on 3 runs, removals reflected too</td></tr>
+                            <tr><td>Register a cron job</td><td><code>(crontab -l; echo J) | crontab -</code></td><td>Remove with <code>grep -vF</code> then reinsert, or drop a <code>cron.d</code> file</td><td>Multiplied to 3 -&gt; 1 entry and identical hash on all 3 runs</td></tr>
+                            <tr><td>Copy a directory</td><td><code>cp -r src dst</code></td><td><code>cp -r src/. dst/</code></td><td>Nested <code>dst/src/</code> from run 2 -&gt; identical on 3 runs</td></tr>
+                            <tr><td>Move a file</td><td><code>mv s d</code></td><td><code>[ -e "$s" ] &amp;&amp; mv "$s" "$d"</code></td><td>Run 2 <code>exit=1</code> -&gt; the conditional form passes</td></tr>
+                            <tr><td>Prevent concurrent runs</td><td>Nothing (check then change)</td><td><code>flock -en</code> or a <code>mkdir</code> lock plus <code>trap</code></td><td>4 to 5 lines at 8-way parallelism -&gt; 1 line in all 5 rounds</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2>Conclusion: Idempotence Is a Design Property, Not a Personality Trait</h2>
+                    <p>The incidents reproduced in this article share one trait. <strong>Most of them raise no error.</strong> <code>ln -sf</code> returned 0 and served the old version, <code>sed -i</code> returned 0 and did nothing, and a <code>grep -qF</code> caught on a comment failed to apply a setting for months. <strong>Exit status 0 and reaching the target state are two different statements.</strong> If this article leaves you with that one sentence, it has paid for itself.</p>
+                    <p>The practical rules therefore reduce to three lines. First, <strong>ask of every line what this command does when it runs against a state where it has already been done.</strong> Most incidents happen because nobody asked that question even once. Second, <strong>test for is it in the target state, not for did we do it.</strong> The criterion is current state, not work history. Third, <strong>do not assert, prove.</strong> Running it three times and comparing hashes costs one minute, and that minute buys back two hours at three in the morning.</p>
+                    <p>At scale you end up reaching for a tool like Ansible. What those tools mean when they say idempotent is precisely what this article built by hand. <code>lineinfile</code> is check-then-change, <code>blockinfile</code> is the marker block, <code>--check</code> is the dry run, and the <code>changed</code> value is the convergence verdict. <strong>Even with a tool, not understanding these principles gets you the same incident from a single <code>shell</code> module line.</strong> Organisations where incidents continue after tool adoption are usually stuck at exactly this point.</p>
+                    <p>One last thing you can do today. <strong>Take the script that runs most often, run it three times in a temporary directory, and print the state hash.</strong> If the three values differ, that script is already changing something a little every single day. Nobody has noticed yet.</p>
+
+                    <h2>References</h2>
+                    <ul>
+                        <li>The Open Group Base Specifications Issue 8, <code>mkdir</code> (<code>-p</code> ignores existing directories without error): <a href="https://pubs.opengroup.org/onlinepubs/9799919799/utilities/mkdir.html" target="_blank" rel="noopener">pubs.opengroup.org</a></li>
+                        <li>The Open Group Base Specifications Issue 8, <code>rm</code> (<code>-f</code> does not modify the exit status for missing operands): <a href="https://pubs.opengroup.org/onlinepubs/9799919799/utilities/rm.html" target="_blank" rel="noopener">pubs.opengroup.org</a></li>
+                        <li>The Open Group Base Specifications Issue 8, utility definitions for <code>ln</code>, <code>sed</code> and <code>grep</code>: <a href="https://pubs.opengroup.org/onlinepubs/9799919799/utilities/contents.html" target="_blank" rel="noopener">pubs.opengroup.org</a></li>
+                        <li>GNU Coreutils Manual, <code>ln</code> (<code>-n</code> treats a symlink to a directory as a normal file): <a href="https://www.gnu.org/software/coreutils/manual/html_node/ln-invocation.html" target="_blank" rel="noopener">gnu.org/software/coreutils</a></li>
+                        <li>GNU Grep Manual (<code>-F</code> fixed strings, <code>-x</code> whole-line match, exit codes 0/1/2): <a href="https://www.gnu.org/software/grep/manual/grep.html" target="_blank" rel="noopener">gnu.org/software/grep</a></li>
+                        <li>GNU Sed Manual (<code>-i</code> in-place editing and the <code>a</code> command): <a href="https://www.gnu.org/software/sed/manual/sed.html" target="_blank" rel="noopener">gnu.org/software/sed</a></li>
+                        <li><code>rename(2)</code> man page (atomic replacement guarantee when newpath exists): <a href="https://man7.org/linux/man-pages/man2/rename.2.html" target="_blank" rel="noopener">man7.org</a></li>
+                        <li><code>flock(1)</code> man page (the self-locking shell script idiom, exit code 1 when <code>-n</code> fails): <a href="https://man7.org/linux/man-pages/man1/flock.1.html" target="_blank" rel="noopener">man7.org</a></li>
+                        <li><code>flock(2)</code> man page (the meaning and limits of advisory locks): <a href="https://man7.org/linux/man-pages/man2/flock.2.html" target="_blank" rel="noopener">man7.org</a></li>
+                        <li>Ansible documentation, <code>blockinfile</code> module (default markers <code># BEGIN/END ANSIBLE MANAGED BLOCK</code>): <a href="https://docs.ansible.com/ansible/latest/collections/ansible/builtin/blockinfile_module.html" target="_blank" rel="noopener">docs.ansible.com</a></li>
+                        <li>Ansible documentation, <code>lineinfile</code> module (guaranteeing a line exists): <a href="https://docs.ansible.com/ansible/latest/collections/ansible/builtin/lineinfile_module.html" target="_blank" rel="noopener">docs.ansible.com</a></li>
+                        <li>Bash Reference Manual (the behaviour and exceptions of <code>set -e</code>): <a href="https://www.gnu.org/software/bash/manual/bash.html" target="_blank" rel="noopener">gnu.org/software/bash</a></li>
+                        <li>Related posts: <a href="linux_server_guide_06_shell_basics.html">Linux Server Administration 6 - Shell Script Basics</a>, <a href="linux_server_guide_07_shell_advanced.html">Linux Server Administration 7 - Advanced Shell Scripting</a>, <a href="linux_server_guide_09_backup.html">Linux Server Administration 9 - Backup and Recovery</a>, <a href="linux_rsync_guide.html">The Complete rsync Guide</a></li>
+                    </ul>
+                </div>
+
+                <!-- md-artifact-start -->
+                    <div class="md-artifact" style="margin:2rem 0;border:1px solid #d7dce3;border-radius:10px;overflow:hidden;background:#fbfcfd;">
+                        <div style="display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;justify-content:space-between;padding:.7rem 1rem;background:#eef2f7;border-bottom:1px solid #d7dce3;">
+                            <span style="font-weight:700;font-size:.97rem;">📋 Checklist you can take with you</span>
+                            <span style="display:flex;gap:.5rem;align-items:center;">
+                                <code style="font-size:.82rem;color:#5a6675;background:transparent;padding:0;">shell_readonly_idempotent_script.md</code>
+                                <button type="button" class="md-artifact-copy" style="cursor:pointer;border:1px solid #b9c2cf;background:#fff;color:#2c3e50;font-weight:600;line-height:1.3;border-radius:6px;padding:.32rem .7rem;font-size:.85rem;">Copy all</button>
+                            </span>
+                        </div>
+                        <pre style="margin:0;max-height:420px;overflow:auto;padding:1rem;background:#fbfcfd;font-size:.86rem;line-height:1.62;"><code class="nohighlight" style="background:transparent;padding:0;white-space:pre;"># Idempotent Script Checklist — run through this before you write
+
+&gt; Source: braindetox.kr — Idempotent Shell Scripts
+&gt; Basis: POSIX Issue 8 (mkdir/rm), GNU coreutils (ln -n), rename(2), flock(1)
+&gt; Paste this file into an AI and say 「rewrite our script against this checklist」.
+
+## 1. Safe form per command — copy these shapes
+
+| Goal | Write it this way |
+|---|---|
+| Directory | `mkdir -p "$D"` + set permissions on a separate line: `chmod 0750 "$D"` |
+| Delete file | `rm -f "$F"` (use `rm -rf` for a directory — guard the variable first) |
+| Add a line | `grep -qxF -- "$L" "$F" \|\| printf '%s\n' "$L" &gt;&gt; "$F"` |
+| Remove a line | `grep -vxF -- "$L" "$F" &gt; "$F.t" &amp;&amp; mv "$F.t" "$F"` |
+| Symlink | `ln -sfn "$TARGET" "$LINK"` |
+| Replace a value | `grep -qxF "$WANT" "$F" \|\| sed -i "s#^$OLD\$#$WANT#" "$F"` |
+| Insert a line | branch: replace with `sed -i 's/^key=.*/key=v/'` if present, `a\` if absent |
+| Cron | `{ crontab -l 2&gt;/dev/null \| grep -vF "$ABS_PATH"; echo "$JOB"; } \| crontab -` |
+| Copy a directory | `cp -r "$SRC/." "$DST/"` (NOT `cp -r src dst`) |
+| Move a file | `[ -e "$S" ] &amp;&amp; mv "$S" "$D"` |
+| Write a whole file | `... &gt; "$F.tmp" &amp;&amp; mv "$F.tmp" "$F"` (same filesystem) |
+
+## 2. Ask yourself, line by line
+- [ ] What does this line do when it runs against an **already-done** state?
+- [ ] Am I testing **「is it the target state」** rather than 「did I do it」?
+- [ ] Does the `grep` guard have both `-x` (whole line) and `-F` (fixed string)?
+- [ ] Do I distinguish `grep` exit code **2 (error)** from 1 (no match)?
+- [ ] Can the `sed` replacement result **match the pattern again**?
+- [ ] Am I using `sed -i` exit status as evidence that it applied? (It is not.)
+- [ ] Does every symlink swap carry **`-n`**?
+- [ ] Under `set -e`, does an early failure **swallow all later steps**?
+- [ ] Do timestamps or random values in the file **block hash comparison**?
+- [ ] When I **remove** a managed item, does it disappear from already-deployed files?
+
+## 3. Marker block template — use this past ~5 managed lines
+
+```bash
+apply_block(){                     # apply_block &lt;file&gt; &lt;tag&gt; &lt;body&gt;
+  local file="$1" tag="$2" body="$3"
+  local begin="# BEGIN ${tag}" end="# END ${tag}"
+  [ -e "$file" ] || : &gt; "$file"
+  if grep -qxF "$begin" "$file"; then
+    awk -v b="$begin" -v e="$end" -v body="$body" '
+      $0==b { print b; printf "%s", body; skip=1; next }
+      $0==e { print e; skip=0; next }
+      skip==1 { next }
+      { print }' "$file" &gt; "$file.new" &amp;&amp; mv "$file.new" "$file"
+  else
+    { printf '%s\n' "$begin"; printf '%s' "$body"; printf '%s\n' "$end"; } &gt;&gt; "$file"
+  fi
+}
+apply_block /etc/ssh/sshd_config "myapp-keepalive" \
+  $'ClientAliveInterval 30\nClientAliveCountMax 3\n'
+```
+
+- [ ] Tag names the **owner and purpose** (`myapp-nginx-upstream`)
+- [ ] Marker uses the file's **own comment character** (`#` / `;` / `//`)
+- [ ] **Not** used on structured formats (JSON, YAML)
+- [ ] The script never touches anything **outside** the markers
+
+## 4. Re-run verification — one minute before you commit
+
+```bash
+state_hash(){
+  ( cd "$1" &amp;&amp; {
+      find . -type f | LC_ALL=C sort | xargs sha256sum
+      find . -type l | LC_ALL=C sort | while read -r l; do echo "$(readlink "$l")  $l"; done
+    } | sha256sum | awk '{print $1}' )
+}
+for i in 1 2 3; do ./provision.sh "$ROOT"; echo "run$i $(state_hash "$ROOT")"; done
+```
+
+- [ ] All three hashes are **identical** (if not, something is accumulating)
+- [ ] Sort order pinned with `LC_ALL=C sort`
+- [ ] **Deliberately injected drift**, then re-ran (extra config line, repointed symlink, stray file)
+- [ ] A second `--check` run reports **changed=0**
+- [ ] All testing happened in a **temporary directory**
+
+## 5. When you need a lock
+
+| Situation | Lock | Alternative |
+|---|---|---|
+| Whole-file replacement | Not needed | temp file + `mv` |
+| `mkdir -p` | Not needed | as-is |
+| Check-then-append | **Needed** | switch to whole-file replacement |
+| Read-modify-write | **Needed** | append-only, aggregate later |
+| Cron job slower than its interval | **Needed** | acquire the lock at entry |
+| Marker block replacement | **Needed** | lock + temp file `mv` |
+
+```bash
+# if flock is available
+[ "${FLOCKER}" != "$0" ] &amp;&amp; exec env FLOCKER="$0" flock -en "$0" "$0" "$@" || :
+
+# otherwise rely on mkdir atomicity
+if mkdir "$LOCKDIR" 2&gt;/dev/null; then
+  trap 'rmdir "$LOCKDIR"' EXIT INT TERM
+else
+  echo "another instance is running"; exit 0
+fi
+```
+
+- [ ] The lock is always released via `trap`
+- [ ] The lock directory records **PID and timestamp**
+- [ ] A **stale-lock reclaim policy** is decided
+- [ ] Remember a lock only prevents **concurrency** — sequential re-run bugs survive it
+
+## 6. Resuming after partial failure
+- [ ] Each step is **idempotent on its own** (safe even without a marker)
+- [ ] Markers are attached only to **expensive** steps
+- [ ] Marker filenames embed an **input hash**, so config changes invalidate them
+- [ ] The final check inspects **actual state**, not the markers
+
+---
+Checked: 2026-07. Repro environment: MSYS2 / bash 5.2.37 / GNU sed 4.9 / grep 3.0 / coreutils 8.32.
+Always rehearse destructive commands in a temporary directory first.
+</code></pre>
+                        <p style="margin:0;padding:.6rem 1rem;font-size:.82rem;color:#5a6675;border-top:1px solid #e3e8ee;">Copy and paste it straight into your notes or an AI assistant.</p>
+                    </div>
+                    <script>
+                    (function(){
+                      if (window.__mdArtifactBound) return;
+                      window.__mdArtifactBound = true;
+                      document.addEventListener('click', function(ev){
+                        var btn = ev.target.closest && ev.target.closest('.md-artifact-copy');
+                        if (!btn) return;
+                        var box = btn.closest('.md-artifact');
+                        var code = box && box.querySelector('pre code');
+                        if (!code) return;
+                        var text = code.textContent;
+                        var label = btn.textContent;
+                        var ok = function(){
+                          btn.textContent = "Copied";
+                          setTimeout(function(){ btn.textContent = label; }, 1600);
+                          if (typeof gtag === 'function') {
+                            gtag('event', 'md_copy', { slug: "shell_readonly_idempotent_script", lang: "en", chars: text.length });
+                          }
+                        };
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                          navigator.clipboard.writeText(text).then(ok).catch(function(){ fallback(); });
+                        } else { fallback(); }
+                        function fallback(){
+                          var ta = document.createElement('textarea');
+                          ta.value = text; ta.setAttribute('readonly','');
+                          ta.style.position='fixed'; ta.style.left='-9999px';
+                          document.body.appendChild(ta); ta.select();
+                          try { document.execCommand('copy'); ok(); } catch(e) {}
+                          document.body.removeChild(ta);
+                        }
+                      });
+                    })();
+                    </script>
+                    <!-- md-artifact-end -->
+
+                <div class="share-section">
+                    <h3>Share this article</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">Copy Link</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">Back to List</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Free tools you may find useful</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/json_formatter.html">JSON Formatter</a></li>
+      <li><a href="../static/regex_tester.html">Regex Tester</a></li>
+      <li><a href="../static/jwt_decoder.html">JWT Decoder Generator 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 Encoder/Decoder</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">See all tools &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Related Posts</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="shell_dry_run_design.html">How to Build a Real --dry-run - Verification, Not Imitation</a></li>
+      <li><a href="shell_quoting_rules_guide.html">Shell Quoting Rules - What Each Quote Actually Blocks</a></li>
+      <li><a href="fcm_duplicate_push_debug_2026.html">A Redeploy Resent Already-Sent Notifications - Debugging FCM Duplicate Push 2026</a></li>
+      <li><a href="offline_sync_toggle_distributed_2026.html">One Toggle Becomes a Distributed System - Why Offline Sync Revives Settings You Turned Off</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('Link copied! Paste it in the Threads app to share.');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('Link copied!'); });
+    });
+    </script>
+</body>
+</html>

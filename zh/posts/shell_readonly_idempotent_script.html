@@ -1,0 +1,895 @@
+<!DOCTYPE html>
+<!--
+ * 技术博客文章模板
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>跑两次也安全的脚本 - 幂等性设计与真正会出问题的六种模式</title>
+    <meta name="description" content="重跑就会出问题的 shell 脚本，本文实际跑了一遍来复现：append 累积、mkdir 与 rm 的退出码、ln -sfn、sed 二次替换、crontab 重复登记全部用执行输出确认，并整理了标记块与哈希验证的方法。">
+    <meta name="keywords" content="幂等性, shell 脚本, bash, idempotent, mkdir -p, rm -f, ln -sfn, sed -i, crontab 重复, 标记块, flock, 竞态条件, 重跑安全, 环境准备, 自动化脚本, dry-run, 状态哈希">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/shell_readonly_idempotent_script.html">
+
+    <meta property="og:title" content="跑两次也安全的脚本 - 幂等性设计与真正会出问题的六种模式">
+    <meta property="og:description" content="不是概念讲解，而是复现。用真实输出展示第二次执行时什么会怎样出问题，并整理出三次执行哈希相同的标记块模式。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/shell_readonly_idempotent_script.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-07-29">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="跑两次也安全的脚本 - 幂等性设计">
+    <meta name="twitter:description" content="亲手复现第二次执行时会出问题的六种模式，并整理出安全写法与三次哈希验证法。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "跑两次也安全的脚本 - 幂等性设计与真正会出问题的六种模式",
+      "alternativeHeadline": "Idempotent Shell Scripts - Six Patterns That Break on the Second Run",
+      "datePublished": "2026-07-29",
+      "dateModified": "2026-07-29",
+      "inLanguage": "zh-CN",
+      "articleSection": "开发/基础设施",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "幂等性, shell 脚本, bash, mkdir -p, rm -f, ln -sfn, sed -i, crontab 重复, 标记块, flock, 竞态条件, 状态哈希",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/shell_readonly_idempotent_script.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "只用 mkdir -p 和 rm -f，脚本就变得幂等了吗",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "不是。这两个选项只是把退出码修饰了一下。POSIX 规范对 mkdir -p 写明：以已存在目录为名的每个操作数都会被无错误地忽略；对 rm -f 写明：对于不存在的操作数，不写诊断信息，也不改变退出状态。也就是说，它们能防止重跑时脚本半途中断，却仍然不保证文件内容已经到达目标状态。实际验证也是如此：重跑 mkdir 会以 File exists 返回退出码 1，重跑 rm 会以 No such file or directory 返回退出码 1，而在 set -e 之下，后面的步骤会整段不执行。选项只是第一颗扣子，真正处理内容的 append 与替换必须另行设计。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "追加一行配置时，用 grep 检查一下不就行了吗",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "问题出在检查的方式上。亲手复现会发现两个陷阱。第一，文件里存在被注释掉的同一行时，用部分匹配的 grep -qF 会误判为已存在，于是配置永远不会被应用。第二，行内含有方括号这类正则元字符时，grep -q 会把模式当正则解析，与字面量对不上，跑三次会变成四行。同样条件下 grep -qxF 保持了一行。-F 强制把模式当作固定字符串，-x 强制整行匹配。还有一点：grep 匹配时返回 0，不匹配返回 1，出错返回 2，而用 || 串接会把出错的 2 和不匹配的 1 当成一回事，于是对读不了的文件不断堆积重复行。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "重新挂符号链接时，ln -sf 够用吗",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "如果目标是指向目录的符号链接，就不够用。实际执行会看到：current 指向 rel_a 时，ln -sf rel_b current 以退出码 0 成功，但 readlink current 仍然返回 rel_a。真正被创建出来的是 rel_a/rel_b 这个新链接。它没有改变链接，而是钻进了链接所指向的目录里面。GNU coreutils 的 ln 说明 -n 的作用是：当链接名是指向目录的符号链接时，把它当作普通文件处理。因此必须用 ln -sfn，实测跑三次 readlink 结果都固定为 rel_b，rel_a 里面也没有多出任何东西。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "怎么证明重跑之后结果是一样的",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "把状态折叠成哈希再比对，是成本最低的办法。把目标树中的普通文件列表排序后逐个求哈希，符号链接则把 readlink 的结果一并放进去，最后对整体再求一次哈希，一棵树就变成了一个字符串。实测把环境准备函数跑三次，三次得到的哈希完全相同。在此之上再加 dry-run 会更好。做一个只打印将要变更的内容、实际不写入的 --check 模式，就能用第二次执行是否输出 changed=0 来判断是否收敛。不过一旦时间戳或随机数进入文件，哈希比对本身就不可能了，所以审计日志必须与状态文件分开。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "什么时候需要锁，什么时候不需要",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "判断标准是检查与变更之间是否存在间隙。让 8 个进程同时执行没有就添加，五轮下来 SEED 行出现了 4 到 5 行，而期望值是 1。反过来，把整个文件写到临时文件再用 mv 换上去的方式，即使 8 个进程一起冲上来也保持了一行，因为 rename 是原子替换，不存在其他进程找不到目标路径的时刻。归纳起来：以整体替换收尾的操作不需要锁，读改写或局部更新则需要锁。实测并发读改写时，8 次自增丢失到只剩 2 次。如果环境里没有锁工具，可以利用 mkdir 的原子性，同样条件下它始终保持了一行。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .danger { background:#fdecea; border-left:4px solid #d9534f; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/shell_readonly_idempotent_script.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/shell_readonly_idempotent_script.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/shell_readonly_idempotent_script.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/shell_readonly_idempotent_script.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/shell_readonly_idempotent_script.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="跑两次也安全的脚本 - 幂等性设计与真正会出问题的六种模式">
+                <meta itemprop="datePublished" content="2026-07-29">
+                <meta itemprop="dateModified" content="2026-07-29">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="幂等性, shell 脚本, mkdir -p, ln -sfn, sed -i, 标记块, 竞态条件, 状态哈希">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/shell_readonly_idempotent_script.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">跑两次也安全的脚本 - 幂等性设计与真正会出问题的六种模式</h1>
+                    <h2 class="post-subtitle">不是概念而是复现 - 用执行输出和三次哈希比对验证的安全写法</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-07-29">2026年7月29日</span>
+                        <span class="post-category" itemprop="articleSection">开发/基础设施</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <h2>引言: 回答不了「能再跑一次吗」的脚本</h2>
+                    <p>部署脚本跑到一半死了。翻日志发现八步走到了第五步。原因很快就查清楚了，剩下的问题只有一个。<strong>「这个直接再跑一次行吗？」</strong></p>
+                    <p>答不上这句话的那一刻，当晚就会变长。因为你得从头把脚本读一遍，一行一行地在脑子里推演<em>这行跑第二次会怎样</em>。而结局往往是没推完就变成<strong>「先手工从第五步开始吧」</strong>。手工做的那部分不会留在记录里，下一个人便不知道服务器状态为什么和脚本对不上。</p>
+                    <p>幂等性就是<strong>让你能在半秒内回答「可以」的那种性质</strong>。它不是背定义的问题，而是弄清自己脚本的每一行在第二次执行时到底做了什么的问题。所以本文不从定义开始，而从<strong>真的跑两次把它弄坏之后的输出</strong>开始。</p>
+                    <p>顺序是这样：先逐个复现<strong>真正会出问题的六种模式</strong>，并给每个配上安全写法；接着展示<strong>标记块</strong>这一通用解法，以及<strong>用哈希证明重跑结果相同</strong>的流程；最后整理<strong>部分失败后的续跑</strong>设计与<strong>需要加锁的条件</strong>。</p>
+                    <p>先统一一个术语。实务中被笼统称作「幂等」的东西其实分三个层级。先把这个区分做好，后面的讨论会简单得多。</p>
+                    <table>
+                        <thead><tr><th>层级</th><th>保证什么</th><th>不保证什么</th><th>代表手段</th></tr></thead>
+                        <tbody>
+                            <tr><td><strong>① 重跑安全</strong></td><td>跑两次也<em>不会崩</em>（不会因报错中断）</td><td>结果变得相同</td><td><code>mkdir -p</code>、<code>rm -f</code></td></tr>
+                            <tr><td><strong>② 结果收敛</strong></td><td>不论跑几次都到达<em>相同的最终状态</em></td><td>清除人为造成的漂移</td><td>先确认存在再变更、标记块</td></tr>
+                            <tr><td><strong>③ 自我修复</strong></td><td>状态跑偏时<em>拉回目标状态</em></td><td>没有声明过的项目</td><td>整块替换、整文件生成</td></tr>
+                        </tbody>
+                    </table>
+                    <p>大多数事故发生在<strong>只做到①却以为做到了②</strong>的时候，也就是改成 <code>mkdir -p</code> 之后就说「已经改成幂等的了」。下面的复现会让你看清这道缝隙具体在哪里。</p>
+                    <div class="danger">
+                        <p><strong>执行前的安全提示。</strong> 本文的所有复现都<strong>只在新建的临时目录内</strong>进行。正文中出现 <code>rm -rf</code> 的地方，用途仅限于删除那个临时目录或其中的子路径。<strong>请不要在真实服务器上照着做。</strong> 尤其是 <code>rm -rf "$DIR"</code> 这种形式，一旦 <code>$DIR</code> 为空就会变成 <code>rm -rf ""</code>，可能扫到意料之外的地方，所以在用变量做删除时，务必先加上 <code>[ -n "$DIR" ] &amp;&amp; [ "$DIR" != "/" ]</code> 这类防护。放进 cron 或 CI 之前，先用 <code>--check</code> 之类的试运行把目标路径用眼睛确认一遍会更安全。</p>
+                    </div>
+
+                    <h2>1. 复现环境与验证方式</h2>
+                    <p>下面的输出全部是<strong>实际跑出来的结果原样贴上</strong>。复现环境如下。</p>
+                    <pre><code>===== T0 ENVIRONMENT =====
+MINGW64_NT-10.0-19045 3.5.7-882031da.x86_64
+GNU bash, version 5.2.37(1)-release (x86_64-pc-msys)
+sed (GNU sed) 4.9
+grep (GNU grep) 3.0
+sha256sum (GNU coreutils) 8.32</code></pre>
+                    <p>这是 Windows 10 上的 MSYS2/Git Bash 环境。因为是 GNU 工具系列，行为与 Linux 一致，但<strong>有三点是这个环境特有的限制</strong>，先说明清楚。这是读者判断结果时需要的信息。</p>
+                    <ul>
+                        <li><strong>符号链接</strong>在默认设置下会被当成文件复制处理。为了创建真正的链接，是在设置了 <code>MSYS=winsymlinks:sys</code> 的状态下执行的。</li>
+                        <li><strong>POSIX 权限位</strong>在 NTFS 上无法原样反映。实测执行 <code>chmod 600</code> 之后模式仍显示为 <code>644</code>。因此<strong>与权限相关的幂等性，本文不以执行结果来主张</strong>，相关条目只作为规则留在清单里。</li>
+                        <li><strong>没有 <code>crontab</code> 和 <code>flock</code> 这两个二进制。</strong> cron 部分是把 <code>crontab -l</code> 会输出的文本用文件模拟出来，只验证<em>行操作逻辑</em>；锁则用 <strong><code>mkdir</code> 的原子性</strong>代替 <code>flock</code> 做了实证。</li>
+                    </ul>
+                    <p>验证方式混用了三种：<strong>退出码</strong>（命令是否成功）、<strong>文件内容</strong>（留下了什么）、<strong>SHA-256 哈希</strong>（重复执行结果是否相同）。其中哈希是<em>区分「看着一样」和「就是一样」的唯一工具</em>，所以会反复用到。</p>
+
+                    <h2>2. 模式① append 在悄悄累积</h2>
+                    <p>最常见，也最晚被发现，因为它不报错。把往 <code>.bashrc</code> 里加一行 <code>PATH</code> 的脚本跑两次看看。</p>
+                    <pre><code>-- run 1 --
+export PATH=/opt/tool/bin:$PATH
+-- run 2 (same command again) --
+export PATH=/opt/tool/bin:$PATH
+export PATH=/opt/tool/bin:$PATH
+lines: 2</code></pre>
+                    <p>两次的退出码都是 0，没有任何人告诉你失败了。如果这行是 <code>PATH</code>，顶多是路径重复；可一旦挂上<strong>每次都往同一个文件里加一点的 cron</strong>，几个月后配置文件就变成几千行。真实事故大多是这种形态。</p>
+                    <h3>2.1 安全写法 - 先确认存在再写入</h3>
+                    <pre><code>LINE='export PATH=/opt/tool/bin:$PATH'
+grep -qxF -- "$LINE" safe.conf || printf '%s\n' "$LINE" >> safe.conf</code></pre>
+                    <p>下面是跑三次的结果，行数与哈希都固定不变。</p>
+                    <pre><code>run1 -> 1 line(s) | sha=0a0746b7d8c9bd1f
+run2 -> 1 line(s) | sha=0a0746b7d8c9bd1f
+run3 -> 1 line(s) | sha=0a0746b7d8c9bd1f</code></pre>
+                    <h3>2.2 陷阱 - 一个 grep 选项就能让结果反转</h3>
+                    <p>这里 <code>-qxF</code> 中的 <code>x</code> 和 <code>F</code> 不是装饰。把它们去掉，会分别引发<strong>方向完全相反的两种事故</strong>。</p>
+                    <p><strong>陷阱 A - 把注释误判成「已配置」。</strong> 目标文件里那一行是<em>被注释掉</em>的状态，这很常见，往往是有人临时关掉后忘了。</p>
+                    <pre><code>file: #export PATH=/opt/tool/bin:$PATH
+grep -qF  -> found (skips append) ... setting is never applied
+grep -qxF -> not found (correct: a comment is not an active setting)</code></pre>
+                    <p>只用部分匹配的 <code>-F</code>，注释行也会被匹上。脚本每次都说「已经设好了」然后安静跳过，<strong>配置永远得不到应用</strong>。因为没有报错，能拖上好几个月。<code>-x</code>（整行匹配）挡住的正是这个。</p>
+                    <p><strong>陷阱 B - 正则元字符导致重复堆积。</strong> 这是相反的方向。要写入的行里如果含有 <code>[</code>、<code>]</code>、<code>.</code>、<code>*</code> 这类字符，<code>grep -q</code> 会把它们<em>当作正则</em>来读。</p>
+                    <pre><code>file: PATH=/opt/tool[1]/bin
+grep -q   -> NOT found ([1] read as a character class) -> duplicate append
+grep -qxF -> found (correct)
+after 3 runs: grep -q => 4 lines | grep -qxF => 1 lines</code></pre>
+                    <p><code>[1]</code> 是表示「字符 1 之一」的字符类，与字面量 <code>[1]</code> 匹配不上。于是每次都判为「没有」，跑三次变成四行。<code>-F</code>（固定字符串）挡住的正是这个。</p>
+                    <h3>2.3 更安静的陷阱 - grep 的退出码 2</h3>
+                    <p>这一条得翻文档才知道。<code>grep</code> 会返回三种退出码，下面是实测值。</p>
+                    <pre><code>match      -> 0
+no match   -> 1
+read error -> 2  (|| append treats this like 'no match')</code></pre>
+                    <p><code>grep -qxF ... || append</code> 这种形式<strong>无法区分 1（不匹配）与 2（出错）</strong>。当文件没有读权限或路径写错时，脚本会判断为「没有」然后继续追加。要做准确，就得把退出码分开接住。</p>
+                    <pre><code>grep -qxF -- "$LINE" "$F"; rc=$?
+case $rc in
+  0) : ;;                                   # 已存在
+  1) printf '%s\n' "$LINE" >> "$F" ;;       # 不存在 -> 追加
+  *) echo "grep failed(rc=$rc): $F" >&amp;2; exit 1 ;;   # 出错 -> 中止
+esac</code></pre>
+
+                    <h2>3. 模式② mkdir 与 rm 的退出码把脚本拦腰截断</h2>
+                    <p>这是流传最广的一条，所以简单带过，把篇幅留给<strong>较少被提到的副作用</strong>。</p>
+                    <pre><code>-- mkdir d1 (run 1) --
+exit=0
+-- mkdir d1 (run 2) --
+mkdir: cannot create directory 'd1': File exists
+exit=1
+-- mkdir -p d1 (run 3) --
+exit=0
+
+-- rm f1 (run 1) --
+exit=0
+-- rm f1 (run 2) --
+rm: cannot remove 'f1': No such file or directory
+exit=1
+-- rm -f f1 (run 3) --
+exit=0</code></pre>
+                    <p>这个行为由 POSIX 规范规定。对 <code>mkdir -p</code> 写的是<strong>「以已存在目录为名的每个 dir 操作数都会被无错误地忽略」</strong>，对 <code>rm -f</code> 写的是<strong>「对于不存在的操作数，不写诊断信息，也不改变退出状态」</strong>。选项做的事情精确地就只有这些。</p>
+                    <h3>3.1 真正的伤害出现在遇上 set -e 时</h3>
+                    <p>退出码是 1 本身不算大事。问题在于，在挂了 <code>set -e</code> 的脚本里，<strong>后面的步骤会整段消失</strong>。下面是把一个三步脚本跑两次的结果。</p>
+                    <pre><code>-- seq.sh run 1 --
+  [step 2] place config files
+  [step 3] restart service
+exit=0
+-- seq.sh run 2 --
+mkdir: cannot create directory '.../s/stage': File exists
+exit=1  &lt;- steps 2 and 3 never ran</code></pre>
+                    <p>重跑时<strong>卡在创建目录的第一步，配置投放和服务重启都没有发生</strong>。而脚本只会说「失败」，不会告诉你走到了哪里。运维只看日志最后一行就判断成「目录问题」，至于服务还在用旧配置跑这件事，往往是后来才发现的。</p>
+                    <h3>3.2 选项替不了的事</h3>
+                    <ul>
+                        <li><code>mkdir -p</code> 只忽略<strong>存在与否</strong>。对已存在目录的<strong>属主与权限，它不会调整为目标值</strong>。<code>-m</code> 只在新建时生效，所以要保证权限就得用单独的 <code>chmod</code>、<code>chown</code> 行钉死。（如前所述，本环境无法验证权限位，因此不以执行输出呈现。）</li>
+                        <li><code>rm -f</code> 只对<strong>不存在的文件</strong>睁一只眼。要删的对象若是<em>目录</em>，照样失败。</li>
+                        <li>两者<strong>都不管内容</strong>。目录存在，和目录里面处于目标状态，是两回事。</li>
+                    </ul>
+
+                    <h2>4. 模式③ ln -s 第二次会钻进链接内部</h2>
+                    <p>这一条在本文里最值得复现，因为它<strong>不失败却留下荒唐的结果</strong>。就是无停机部署里把 <code>current</code> 符号链接切到新发布版的那段代码。</p>
+                    <pre><code>-- ln -s rel_a current (run 1) --
+exit=0 | readlink=rel_a
+-- ln -s rel_b current (run 2) --
+exit=0</code></pre>
+                    <p>第二次是<strong>退出码 0</strong>，看起来像成功。那就确认一下实际生成了什么。</p>
+                    <pre><code>## ln -sf on a symlink that points to a directory
+ln -sf exit=0
+readlink current = rel_a   &lt;- still points at rel_a
+ls current/:
+FROM_A
+rel_b
+what was actually created: lrwxrwxrwx 1 Karyu 197121 5 Jul 29 05:13 rel_a/rel_b -> rel_b
+  -> it did not repoint the link; it created a new link INSIDE the target directory</code></pre>
+                    <p>关键是最后一行。当 <code>current</code> 是<em>指向目录的符号链接</em>时，<code>ln -sf rel_b current</code> 会<strong>把 <code>current</code> 当目录跟进去</strong>，在里面建一个叫 <code>rel_b</code> 的新链接。<code>readlink current</code> 依旧是 <code>rel_a</code>。</p>
+                    <p>想想这在运维里意味着什么。部署脚本<strong>返回成功</strong>，监控也是绿灯，而<strong>服务仍然跑在旧版本上</strong>。而且旧发布目录里还会一个个堆起来路不明的链接，每部署一次堆一个。</p>
+                    <h3>4.1 安全写法 - ln -sfn</h3>
+                    <p>GNU coreutils 的 <code>ln</code> 对 <code>-n</code> 的说明是<strong>「当链接名是指向目录的符号链接时，把它当作普通文件处理」</strong>，意思就是别跟进去。下面是跑三次的结果。</p>
+                    <pre><code>run1 -> readlink=rel_b | rel_a contains: FROM_A
+run2 -> readlink=rel_b | rel_a contains: FROM_A
+run3 -> readlink=rel_b | rel_a contains: FROM_A</code></pre>
+                    <p>三次都固定为 <code>rel_b</code>，<code>rel_a</code> 里除了 <code>FROM_A</code> 之外<strong>没有多出任何东西</strong>。实务规则可以概括成一句：<strong>切换指向目录的符号链接时，永远带上 <code>-n</code>。</strong> 用 <code>-T</code>（<code>--no-target-directory</code>）还能强制得更严格。</p>
+                    <div class="callout">
+                        <p><strong>更安全的做法。</strong> 要让符号链接的切换真正原子化，需要<em>先用临时名字建好链接，再用 <code>mv -T</code> 换上去</em>的两步。<code>ln -sfn</code> 内部存在先删再建的瞬间，那一刹那可能出现 <code>current</code> 不存在的时点。对流量大的路径来说，这个差别是有意义的。</p>
+                    </div>
+
+                    <h2>5. 模式④ sed -i 会一边返回成功一边撒谎</h2>
+                    <p><code>sed -i</code> 的重跑安全性<strong>按模式分成三种情形</strong>，逐个复现如下。</p>
+                    <h3>5.1 情形 A - 结果与模式不再重叠就是安全的</h3>
+                    <pre><code>sed -i 's/^timeout = 30$/timeout = 60/' a.conf
+
+run1 sha=ca1a53713b3fbd1d | timeout = 60 retries = 3
+run2 sha=ca1a53713b3fbd1d | timeout = 60 retries = 3
+run3 sha=ca1a53713b3fbd1d | timeout = 60 retries = 3</code></pre>
+                    <p>替换结果 <code>timeout = 60</code> 与模式 <code>^timeout = 30$</code> 不重叠，所以从第二次起没有匹配，文件不再变化，<strong>三次哈希相同</strong>。这属于<em>运气好</em>才幂等的情况。</p>
+                    <h3>5.2 情形 B - 结果再次满足模式就会无限累积</h3>
+                    <pre><code>sed -i 's#PATH=#PATH=/opt/bin:#' b.conf
+
+run1: PATH=/opt/bin:/usr/bin
+run2: PATH=/opt/bin:/opt/bin:/usr/bin
+run3: PATH=/opt/bin:/opt/bin:/opt/bin:/usr/bin</code></pre>
+                    <p>替换结果里仍然留着 <code>PATH=</code>，下一次执行又会命中，<strong>每跑一次路径就多一段</strong>。这比前面的 append 累积更难察觉，因为行数不增加，得把文件打开、把那一行读到底才会发现。</p>
+                    <h3>5.3 情形 C - 什么都没做却返回成功</h3>
+                    <pre><code>sed -i 's/^debug = true$/debug = false/' c.conf
+exit=0 | content=debug = false  &lt;- exit code is not evidence that it applied</code></pre>
+                    <p>文件里本来就是 <code>debug = false</code>，模式一处都没匹配上，可 <code>sed</code> 还是返回<strong>退出码 0</strong>。这不是缺陷而是设计：<code>sed</code> 不会用退出码告诉你「替换了几处」。</p>
+                    <p>由此得出的实务规则很重要：<strong><code>sed -i</code> 的退出码不是「已应用」的证据。</strong> 要确认配置真的生效，必须<em>在替换之后重新读回结果</em>再检查。安静的失败之所以最可怕，是因为文件路径写错、锚点对不上，返回的同样是 0。</p>
+                    <h3>5.4 安全写法 - 先检查目标状态并做事后验证</h3>
+                    <pre><code>TARGET='PATH=/opt/bin:/usr/bin'
+grep -qxF "$TARGET" d.conf || sed -i 's#^PATH=/usr/bin$#PATH=/opt/bin:/usr/bin#' d.conf
+grep -qxF "$TARGET" d.conf || { echo "apply failed"; exit 1; }
+
+run1: PATH=/opt/bin:/usr/bin
+run2: PATH=/opt/bin:/usr/bin
+run3: PATH=/opt/bin:/usr/bin
+post-check: target state reached (0)</code></pre>
+                    <p>这里同时做了三件事：<strong>①先检查目标状态</strong>，已到达就不碰；<strong>②用 <code>^...$</code> 把锚点夹住</strong>，让结果无法再次满足模式；<strong>③替换后重新读回</strong>，确认真的到达。这三样齐备，<code>sed -i</code> 也能安全地用。</p>
+
+                    <h2>6. 模式⑤ crontab 登记每执行一次就翻一番</h2>
+                    <p>有个流传很广的惯用写法：<code>(crontab -l; echo "$JOB") | crontab -</code>。下面是跑三次的结果。</p>
+                    <pre><code>run1 -> sync.sh lines: 1
+run2 -> sync.sh lines: 2
+run3 -> sync.sh lines: 3
+*/5 * * * * /opt/app/bin/sync.sh >> /var/log/sync.log 2&gt;&amp;1
+*/5 * * * * /opt/app/bin/sync.sh >> /var/log/sync.log 2&gt;&amp;1
+*/5 * * * * /opt/app/bin/sync.sh >> /var/log/sync.log 2&gt;&amp;1
+  -> a job meant to run every 5 minutes now starts 3 times per tick</code></pre>
+                    <p>这个结果的危险等级和其他模式不是一个量级。前面那些是<em>文件变脏</em>的问题，而这个是<strong>同一个作业同时起来好几个</strong>的问题。如果是同步脚本，它们会互相碰同一批文件；如果是备份，会分掉带宽让两边都变慢；如果是数据库清理，会出现锁竞争。更麻烦的是，环境准备脚本跑了三次，<strong>负载正好变成三倍</strong>，原因还不容易定位。</p>
+                    <h3>6.1 安全写法 - 先删掉再写入</h3>
+                    <p>正确答案不是「已存在就跳过」，而是<strong>「把引用该脚本的行全部删掉，再重新写入」</strong>。原因马上说明。</p>
+                    <pre><code>{ crontab -l 2&gt;/dev/null | grep -vF '/opt/app/bin/sync.sh'
+  printf '%s\n' "$JOB"; } | crontab -
+
+run1 -> lines: 1 | sha=7352c0d47610f2d1
+run2 -> lines: 1 | sha=7352c0d47610f2d1
+run3 -> lines: 1 | sha=7352c0d47610f2d1</code></pre>
+                    <p>三次都是一行，哈希相同。<strong>这比「已存在就跳过」更好的理由在于调度变更。</strong> 只检查存在性的做法，即使把 <code>*/5</code> 改成 <code>*/10</code>，也会以「已经有了」为由把旧行原封不动留着；删掉再写入的方式则不会。另外也一并确认了它不会碰到别的作业。</p>
+                    <pre><code>-- schedule change is absorbed too (*/5 -> */10), and other jobs survive --
+0 3 * * * /opt/other/backup.sh
+*/10 * * * * /opt/app/bin/sync.sh >> /var/log/sync.log 2&gt;&amp;1</code></pre>
+                    <p><code>backup.sh</code> 那行原样保留，只有 <code>sync.sh</code> 那行更新成了新调度。这里的关键在于<strong>过滤字符串收得有多窄</strong>。用 <code>sync.sh</code> 这种常见名字去过滤，可能连别的团队的 <code>/opt/legacy/sync.sh</code> 一起删掉。写完整的绝对路径，或者改用下面的标记块方式，会更安全。</p>
+                    <div class="callout">
+                        <p><strong>能不直接写 crontab 就不写，也是一个选项。</strong> 往 <code>/etc/cron.d/</code> 里<strong>整个投放一个文件</strong>，这件事本身就是「整体替换」，重复从根源上不可能发生。写到临时文件再用 <code>mv</code> 换上去，还能顺带拿到原子性。不过各发行版对文件名规则（例如带点的名字会被忽略）和是否有用户字段的规定不同，请查阅对应发行版文档后再采用。</p>
+                    </div>
+
+                    <h2>7. 模式⑥ 看着幂等其实不是的那些</h2>
+                    <p>如果说到这里都算「已知的陷阱」，那么这一节是<strong>大多数人误以为幂等的命令</strong>。</p>
+                    <h3>7.1 cp -r - 首次执行与重跑的结果结构不同</h3>
+                    <pre><code>cp -r src dst   # 连续三次
+
+run1: dst dst/a.txt
+run2: dst dst/a.txt dst/src dst/src/a.txt
+run3: dst dst/a.txt dst/src dst/src/a.txt
+  -> run 1 produced dst/a.txt; from run 2 on, dst/src/a.txt appeared as well</code></pre>
+                    <p>原因是<strong><code>cp -r</code> 的含义会随目标是否存在而改变</strong>。<code>dst</code> 不存在时，它把 <code>dst</code> 做成 <code>src</code> 的副本（<code>dst/a.txt</code>）；<code>dst</code> 存在时，它把 <code>src</code> 放<em>进</em> <code>dst</code> 里面（<code>dst/src/a.txt</code>）。同一条命令，<strong>新机器和重新部署的机器结果不一样</strong>。「全新安装没问题，一更新就变怪」这种症状的常见元凶就是它。</p>
+                    <p>安全写法是<strong>指定内容物而不是目录</strong>。</p>
+                    <pre><code>cp -r src/. dst2/   # 连续三次
+
+run1: dst2 dst2/a.txt
+run2: dst2 dst2/a.txt
+run3: dst2 dst2/a.txt</code></pre>
+                    <h3>7.2 mv - 第二次直接失败</h3>
+                    <pre><code>run1 exit=0
+mv: cannot stat 'mvsrc/data.bin': No such file or directory
+run2 exit=1</code></pre>
+                    <p><code>mv</code> 是<strong>本质上无法重跑的命令</strong>，因为源没了。要让它可重跑，就得像 <code>[ -e "$SRC" ] &amp;&amp; mv ...</code> 那样<em>把源的存在作为条件</em>，或者干脆不用 <code>mv</code>，改成<strong>描述目标状态的方式</strong>（复制后验证，或以目的地为准做判断）。</p>
+                    <h3>7.3 sed 的「插入一行」 - a 命令等同于 append</h3>
+                    <pre><code>sed -i '/^\[core\]$/a\    autocrlf = input' gitcfg.ini   # 连续三次
+
+run1: [core]|    autocrlf = input|
+run2: [core]|    autocrlf = input|    autocrlf = input|
+run3: [core]|    autocrlf = input|    autocrlf = input|    autocrlf = input|</code></pre>
+                    <p>用了 <code>sed</code> 并不等于就是替换。<code>a</code>（append）命令<strong>如其名就是追加</strong>，性质与 <code>&gt;&gt;</code> 相同。安全写法是<strong>「有则替换，无则插入」</strong>的两路分支。</p>
+                    <pre><code>if grep -q '^[[:space:]]*autocrlf[[:space:]]*=' f.ini; then
+  sed -i 's/^[[:space:]]*autocrlf[[:space:]]*=.*/    autocrlf = input/' f.ini
+else
+  sed -i '/^\[core\]$/a\    autocrlf = input' f.ini
+fi
+
+run1 sha=94ff19468316c369 | [core]|    autocrlf = input|
+run2 sha=94ff19468316c369 | [core]|    autocrlf = input|
+run3 sha=94ff19468316c369 | [core]|    autocrlf = input|</code></pre>
+                    <h3>7.4 时间戳与随机数 - 让幂等验证本身变得不可能</h3>
+                    <p>文件里一旦混进 <code>date</code> 的输出或 <code>$RANDOM</code>，那个文件<strong>每跑一次哈希都不一样</strong>。这与逻辑是否幂等无关，是<em>验证手段本身丢失了</em>。规则很简单：<strong>把状态文件和审计日志分开。</strong> 何时做了什么另外记日志，脚本管理的配置文件里只写确定性的内容。</p>
+                    <h3>7.5 小结 - 用重跑安全的三个层级重新看</h3>
+                    <ul>
+                        <li><code>mkdir -p</code>、<code>rm -f</code> 只给到<strong>①重跑安全</strong>。</li>
+                        <li><code>grep -qxF</code> 之后 append、<code>ln -sfn</code> 能到达<strong>②结果收敛</strong>。</li>
+                        <li>标记块替换与整文件生成能走到<strong>③自我修复</strong>，人把块内改了也会被拉回来。</li>
+                        <li><code>cp -r</code>、<code>mv</code>、<code>sed ... a\</code> <strong>哪一层都不属于</strong>，不包一层就是事故本身。</li>
+                    </ul>
+
+                    <h2>8. 标记块 - 跑三次哈希也相同的原因</h2>
+                    <p>到目前为止的防御手段都是<strong>按行</strong>的。要管理的行超过五条，这种方式会迅速变脏。这时候用的就是<strong>标记块</strong>。Ansible 的 <code>blockinfile</code> 模块默认使用 <code># BEGIN ANSIBLE MANAGED BLOCK</code> 与 <code># END ANSIBLE MANAGED BLOCK</code>，正是这套做法。</p>
+                    <p>思路很简单：<strong>用标记圈出「我管理的区间」，然后把中间整段换掉。</strong> 这样就不需要逐行确认存在与否了。</p>
+                    <pre><code>apply_block(){
+  local file="$1" tag="$2" body="$3"
+  local begin="# BEGIN ${tag}" end="# END ${tag}"
+  [ -e "$file" ] || : > "$file"
+  if grep -qxF "$begin" "$file"; then
+    awk -v b="$begin" -v e="$end" -v body="$body" '
+      $0==b { print b; printf "%s", body; skip=1; next }
+      $0==e { print e; skip=0; next }
+      skip==1 { next }
+      { print }' "$file" > "$file.new" &amp;&amp; mv "$file.new" "$file"
+  else
+    { printf '%s\n' "$begin"; printf '%s' "$body"; printf '%s\n' "$end"; } >> "$file"
+  fi
+}</code></pre>
+                    <p>把这个函数对一个已经含有三行人工维护内容的文件应用了<strong>三次</strong>。</p>
+                    <pre><code>run1 sha256=5d22eee7c5ef0991451ca494fdff31a15f39c10ab6a1626136c7d990f0beb8b6
+run2 sha256=5d22eee7c5ef0991451ca494fdff31a15f39c10ab6a1626136c7d990f0beb8b6
+run3 sha256=5d22eee7c5ef0991451ca494fdff31a15f39c10ab6a1626136c7d990f0beb8b6
+-- resulting file --
+# hand-maintained section
+Port 22
+PermitRootLogin no
+# BEGIN braindetox-keepalive
+ClientAliveInterval 60
+ClientAliveCountMax 3
+# END braindetox-keepalive
+OK: the hand-maintained 3 lines are untouched</code></pre>
+                    <p><strong>三次执行的哈希完全相同</strong>，标记之外的既有配置也没有受损。这就是②结果收敛。</p>
+                    <h3>8.1 值变了只会更新块内</h3>
+                    <pre><code>## ClientAliveInterval 60 -> 30, three more runs
+run4 sha256=1a402ffc0e2c088220b5e90471c69c330f6e4925ab579c3f0db1dc17271f3b18
+run5 sha256=1a402ffc0e2c088220b5e90471c69c330f6e4925ab579c3f0db1dc17271f3b18
+run6 sha256=1a402ffc0e2c088220b5e90471c69c330f6e4925ab579c3f0db1dc17271f3b18
+total lines: 7 (no accumulation)</code></pre>
+                    <p>它会以新值<strong>重新固定到一个新哈希</strong>上，行数保持 7，块不会堆积。</p>
+                    <h3>8.2 append 方式永远做不到的事 - 删除条目</h3>
+                    <p>这里才是标记块真正的价值。把管理条目从两行<strong>减</strong>到一行看看。</p>
+                    <pre><code># BEGIN braindetox-keepalive
+ClientAliveInterval 30
+# END braindetox-keepalive
+  -> append-based approaches cannot do this: a removed entry would linger</code></pre>
+                    <p><code>ClientAliveCountMax</code> 消失了。<strong>用「存在就跳过」的方式，这件事根本做不到。</strong> 你在脚本里删掉那一行，已部署服务器上的文件里它会永远留着。几年下来，谁也说不清为什么存在的配置就会在各台服务器上以不同形态堆积。标记块因为<strong>整个块本身就是声明</strong>，结构上不会产生这个问题。</p>
+                    <h3>8.3 使用标记块时的注意点</h3>
+                    <ul>
+                        <li><strong>标签要取得唯一。</strong> 同一个文件里可能有多个脚本各自放块。像 <code># BEGIN myapp-nginx-upstream</code> 这样把归属和用途一起写上。</li>
+                        <li><strong>注释符号因文件格式而异。</strong> 如果用的不是 <code>#</code> 而是 <code>;</code> 或 <code>//</code>，标记也必须跟随那套语法，否则解析器会挂。</li>
+                        <li><strong>标记被人删掉</strong>的话，下次执行会新加一个块，从而产生重复。把「请勿改动」的提示一并写在块的第一行会有帮助。</li>
+                        <li><strong>不要用在有结构的格式（JSON、YAML）上。</strong> 基于行的插入会破坏这类格式，必须用专用解析器读写。</li>
+                        <li><strong>只在块内做管理。</strong> 一旦脚本开始碰标记之外的地方，这个模式的优点就消失了。</li>
+                    </ul>
+
+                    <h2>9. 如何证明重跑没问题 - 状态哈希与 dry-run</h2>
+                    <p>「我写成幂等的了」这种主张必须是可验证的。最便宜的办法是<strong>把整棵目标树折叠成一个哈希</strong>。</p>
+                    <pre><code>state_hash(){
+  ( cd "$1" &amp;&amp; {
+      find . -type f | LC_ALL=C sort | xargs sha256sum
+      find . -type l | LC_ALL=C sort | while read -r l; do echo "$(readlink "$l")  $l"; done
+    } | sha256sum | awk '{print $1}' )
+}</code></pre>
+                    <p>普通文件用内容哈希折叠，符号链接用 <code>readlink</code> 的结果折叠。用 <code>LC_ALL=C sort</code> 固定排序顺序很重要，顺序随区域设置变化的话哈希也会跟着变。下面是把环境准备函数跑三次的结果。</p>
+                    <pre><code>provision run1  state_hash=219dd1b402f930f92ce94faa467761005c47cb12d740c452e7609d3d6d0d4526
+provision run2  state_hash=219dd1b402f930f92ce94faa467761005c47cb12d740c452e7609d3d6d0d4526
+provision run3  state_hash=219dd1b402f930f92ce94faa467761005c47cb12d740c452e7609d3d6d0d4526</code></pre>
+                    <h3>9.1 注入漂移再跑一次 - 诚实的结果</h3>
+                    <p>这里出现了一个<strong>不太好看的结果</strong>，原样放上来。先故意把状态弄偏，然后重跑。</p>
+                    <pre><code>after drift   state_hash=74c1a29f825801f98c4d235c47df56ad943e386df4697f5ffd3b1709e7d3785b
+after re-run  state_hash=3e25756382253f698945962c75d2fd19bc1455d5dc20b79aa672057b3220cb81
+MODE=production
+TZ=Asia/Seoul
+MODE=debug</code></pre>
+                    <p>重跑之后哈希<strong>并没有回到原来的值（219dd1...）</strong>。看看什么被修复了、什么留下了。</p>
+                    <ul>
+                        <li><strong>已修复</strong> - 人为造出的 <code>obsolete.conf</code> 被 <code>rm -f</code> 删掉了。</li>
+                        <li><strong>已修复</strong> - <code>current</code> 符号链接被 <code>ln -sfn</code> 重新指回了 <code>releases/v2</code>。</li>
+                        <li><strong>残留</strong> - 人手工加进去的 <code>MODE=debug</code> 那一行<strong>原样留着</strong>。</li>
+                    </ul>
+                    <p>原因很清楚。<code>grep -qxF ... || append</code> 这套只问<strong>「我要的行在不在」，从不问「有没有我不要的行」</strong>。也就是说它到达了②结果收敛，但不是③自我修复。如果应用读文件时<em>以最后一行为准</em>，这台机器就会一边宣称自己是 <code>production</code>，一边跑在 <code>debug</code> 上。</p>
+                    <p>要挡住这个，就得<strong>丢掉 append，改成声明整个文件或整个标记块</strong>。重跑验证如果停在「哈希三次相同」，就看不见这个洞。这正是<strong>需要故意注入漂移再跑一遍</strong>的理由。</p>
+                    <h3>9.2 dry-run - 改之前先看会改什么</h3>
+                    <p>运维中实际用得更多的其实不是哈希，而是<strong>试运行</strong>。<code>--check</code> 模式给你两样东西：<em>预先看到会改什么</em>，以及<em>判定是否已收敛</em>。</p>
+                    <pre><code>-- --check (nothing exists yet) --
+  would add to app.env: MODE=production
+  would add to app.env: TZ=Asia/Seoul
+  changed=1
+-- apply --
+  changed=1
+-- --check again --
+  changed=0 (already at target state)</code></pre>
+                    <p>第二次 <code>--check</code> 返回了 <strong><code>changed=0</code></strong>。这就是幂等性的运维定义：<strong>「它能不能自己说出第二次执行没有东西要改」。</strong> 放进 CI 也很容易：应用之后再跑一次 <code>--check</code>，如果出现 <code>changed=1</code>，说明那个脚本没有收敛，直接让构建失败即可。</p>
+                    <p>实现上的关键是<strong>把所有变更收拢到一个函数里</strong>。上面的例子只让 <code>want_line</code> 一个函数去看 <code>CHECK</code> 标志。变更点一旦散落在代码各处，dry-run 就维持不住。</p>
+
+                    <h2>10. 部分失败后的续跑 - 步骤标记及其陷阱</h2>
+                    <p>回到引言的问题：<strong>八步走到第五步死掉时</strong>该怎么办。</p>
+                    <h3>10.1 坏设计 - 前面的步骤不幂等就永远过不去</h3>
+                    <pre><code>-- bad.sh run 1 (forced failure) --
+  step 3 failed
+exit=3
+-- remove the cause, run 2 --
+mkdir: cannot create directory 'rbad/data': File exists
+exit=1  &lt;- blocked at step 1 forever</code></pre>
+                    <p>失败原因已经修好了，却<strong>卡在第一步</strong>。这种状态下运维能做的只剩打开脚本把前面注释掉再跑。那一刻，「用脚本部署」这个前提就崩了。</p>
+                    <h3>10.2 好设计 - 每一步幂等 + 完成标记</h3>
+                    <pre><code>run_step(){
+  local name="$1"; shift
+  if [ -f "$S/$name.done" ]; then echo "  [skip] $name"; return 0; fi
+  "$@" &amp;&amp; : > "$S/$name.done" &amp;&amp; echo "  [done] $name"
+}
+run_step schema s1 &amp;&amp; run_step seed s2 &amp;&amp; run_step release s3</code></pre>
+                    <pre><code>-- good.sh run 1 (step 3 fails) --
+  [done] schema
+  [done] seed
+   markers: schema.done seed.done
+-- remove the cause, run 2 --
+  [skip] schema
+  [skip] seed
+  [done] release
+  completed
+-- run 3 (should do nothing) --
+  [skip] schema
+  [skip] seed
+  [skip] release
+  completed
+seed.csv lines: 1 | version: v1</code></pre>
+                    <p>第二次<strong>从失败的位置接着</strong>跑完，第三次<strong>什么都没做</strong>就跑完了。<code>seed.csv</code> 是一行这一点也很重要：因为每一步本身就是幂等的，即使没有标记也安全。</p>
+                    <h3>10.3 步骤标记的陷阱 - 标记不保证收敛</h3>
+                    <p>这个模式有个陷阱。试着让人把产物删掉后再重跑。</p>
+                    <pre><code>a human deleted 'version'; re-run:
+  [skip] schema
+  [skip] seed
+  [skip] release
+  completed
+version present? no - the marker made it skip</code></pre>
+                    <p>脚本<strong>报告了「完成」，产物却不存在</strong>，因为它只看标记不看真实状态。由此得出的原则很明确。</p>
+                    <ul>
+                        <li><strong>步骤标记是续跑速度的优化，不是收敛的保证。</strong> 只用来跳过重量级步骤（大文件下载、数据迁移）。</li>
+                        <li><strong>轻量步骤不要打标记。</strong> 每次都确认既安全又没有成本。</li>
+                        <li><strong>输入变了标记就要失效。</strong> 把输入哈希放进文件名（<code>release.$(sha256 of config).done</code>），配置一变就会自动重新执行。</li>
+                        <li><strong>最后要直接验证状态。</strong> 与标记无关，补上 <code>[ -f "$R/version" ]</code> 这类最终确认。</li>
+                        <li><strong>慎重决定标记的存放位置。</strong> 放在目标机器上，换机器就没了；放在中心，又反映不出各机器各自的状态。</li>
+                    </ul>
+
+                    <h2>11. 需要锁的条件，不需要锁的条件</h2>
+                    <p>到此为止的所有防御手段都有一个共同前提：<strong>同一时刻只跑一个</strong>。这个前提一旦破掉，「先确认再变更」本身就垮了，这就是所谓的 <strong>check-then-act</strong> 问题。</p>
+                    <h3>11.1 复现 - 8 个进程同时执行「没有就创建」</h3>
+                    <pre><code>round1: no lock SEED=5 | mkdir lock SEED=1 (expected 1)
+round2: no lock SEED=4 | mkdir lock SEED=1 (expected 1)
+round3: no lock SEED=4 | mkdir lock SEED=1 (expected 1)
+round4: no lock SEED=5 | mkdir lock SEED=1 (expected 1)
+round5: no lock SEED=4 | mkdir lock SEED=1 (expected 1)</code></pre>
+                    <p>五轮全都生成了<strong>4 到 5 行</strong>，而期望值是 1。因为在用 <code>grep</code> 确认的瞬间和用 <code>&gt;&gt;</code> 追加的瞬间<em>之间</em>，别的进程插了进来。上一节里那么费劲做出来的 <code>grep -qxF || append</code>，在并发面前无能为力。</p>
+                    <p>更重要的是这种情况实际何时发生：<strong>cron 周期是 5 分钟而执行要花 6 分钟时</strong>，部署流水线<strong>因重试把同一个作业起了两次时</strong>，多个节点<strong>去碰共享存储上的同一个文件时</strong>。三种都很常见。</p>
+                    <h3>11.2 不需要锁的情况 - 整体替换</h3>
+                    <p>并非所有情况都需要锁。<strong>把整个文件写到临时文件再用 <code>mv</code> 换上去</strong>的方式，8 个进程一起冲上来也毫发无伤。</p>
+                    <pre><code>printf 'value=42\n' > ".atomic.$i.tmp" &amp;&amp; mv ".atomic.$i.tmp" atomic.txt
+
+lines=1 | content=value=42 | sha=72cc615c7f451bd5</code></pre>
+                    <p>依据是 <code>rename(2)</code> 的保证。手册写着<strong>「若 newpath 已存在，它会被原子地替换，因此不存在其他进程试图访问 newpath 时它不存在的时刻」</strong>。只需守住一个条件：临时文件和目的地必须在<strong>同一个文件系统</strong>上（跨文件系统会退化为复制，原子性随之失效）。</p>
+                    <h3>11.3 必须要锁的情况 - 读改写</h3>
+                    <pre><code>## 8 processes increment count by 1 concurrently
+final count=2  (expected count=8)</code></pre>
+                    <p>8 次自增<strong>丢失到只剩 2 次</strong>，这是读到的值在写回之前就过期的典型更新丢失。整理成判断表如下。</p>
+                    <table>
+                        <thead><tr><th>作业形态</th><th>需要锁</th><th>理由</th><th>替代方案</th></tr></thead>
+                        <tbody>
+                            <tr><td>整个文件重写后替换</td><td><strong>不需要</strong></td><td><code>rename</code> 是原子的</td><td>临时文件 + <code>mv</code>（同一文件系统）</td></tr>
+                            <tr><td>创建目录 <code>mkdir -p</code></td><td><strong>不需要</strong></td><td>内核以原子方式处理</td><td>直接使用</td></tr>
+                            <tr><td>确认行存在后 append</td><td><strong>需要</strong></td><td>检查与变更之间有间隙</td><td>加锁，或改为整体替换</td></tr>
+                            <tr><td>读改写（计数器、列表）</td><td><strong>需要</strong></td><td>更新丢失</td><td>加锁，或 append-only 后再聚合</td></tr>
+                            <tr><td>防止长任务重复启动</td><td><strong>需要</strong></td><td>执行时间可能超过周期</td><td>在作业入口处获取锁</td></tr>
+                            <tr><td>标记块替换</td><td><strong>需要</strong></td><td>属于读-改-写结构</td><td>锁 + 临时文件 <code>mv</code> 并用</td></tr>
+                        </tbody>
+                    </table>
+                    <h3>11.4 用什么来加锁</h3>
+                    <p>在 Linux 上，<code>util-linux</code> 的 <code>flock</code> 是标准选择。手册给出了让脚本锁住自身的惯用写法。</p>
+                    <pre><code>[ "${FLOCKER}" != "$0" ] &amp;&amp; exec env FLOCKER="$0" flock -en "$0" "$0" "$@" || :</code></pre>
+                    <p>用 <code>-n</code>（非阻塞）时，拿不到锁会返回默认退出码 <strong>1</strong>（可用 <code>-E</code> 修改）。放进 cron 时要先决定把这个值当成「正常的重复防护」还是「失败」，否则告警会很吵。</p>
+                    <p>如果环境里没有 <code>flock</code>，可以用 <strong><code>mkdir</code> 的原子性</strong>。这次复现中五轮都精确保持一行的就是这个方式。</p>
+                    <pre><code>if mkdir "$LOCKDIR" 2>/dev/null; then
+  trap 'rmdir "$LOCKDIR"' EXIT INT TERM
+  ... 临界区 ...
+else
+  echo "another instance is running"; exit 0
+fi</code></pre>
+                    <ul>
+                        <li><strong>一定要用 <code>trap</code> 释放</strong>。不加的话，异常退出时锁会留下，下一次执行将被永远挡住。</li>
+                        <li><strong>在锁目录里留下 PID 与时间。</strong> 这是判断残留的锁是否属于活着的进程的依据。</li>
+                        <li><strong>定好孤儿锁的回收策略。</strong> 按时间自动回收很省事，但有杀掉正常慢执行的风险。</li>
+                        <li><strong>在 NFS 等网络文件系统上，锁的语义会不同。</strong> 如果有多个节点参与，请考虑用专门的协调手段代替文件锁。</li>
+                        <li><strong>锁不是幂等性的替代品。</strong> 锁只挡并发，顺序重跑就会坏掉的代码，加了锁照样坏。</li>
+                    </ul>
+
+                    <h2>12. 各命令的安全写法对照表</h2>
+                    <p>把到此为止复现的内容折成一页。写脚本写到手停下来时，看这张表就够了。</p>
+                    <table>
+                        <thead><tr><th>要做的事</th><th>危险写法</th><th>安全写法</th><th>重跑时观察到的结果</th></tr></thead>
+                        <tbody>
+                            <tr><td>创建目录</td><td><code>mkdir d</code></td><td><code>mkdir -p d</code> + 权限另用 <code>chmod</code></td><td>第二次 <code>exit=1</code> → <code>-p</code> 为 0</td></tr>
+                            <tr><td>删除文件</td><td><code>rm f</code></td><td><code>rm -f f</code></td><td>第二次 <code>exit=1</code> → <code>-f</code> 为 0</td></tr>
+                            <tr><td>追加一行配置</td><td><code>echo L &gt;&gt; f</code></td><td><code>grep -qxF -- "$L" f || printf '%s\n' "$L" &gt;&gt; f</code></td><td>累积成 2 行 → 三次都是 1 行、哈希相同</td></tr>
+                            <tr><td>存在性检查</td><td><code>grep -q "$L" f</code></td><td><code>grep -qxF -- "$L" f</code> + 退出码 2 分支</td><td>有元字符时 4 行、有注释时不生效 → 保持 1 行</td></tr>
+                            <tr><td>更新符号链接</td><td><code>ln -s t l</code> / <code>ln -sf t l</code></td><td><code>ln -sfn t l</code>（或临时链接 + <code>mv -T</code>）</td><td><code>-sf</code> 在链接内部又建链接 → <code>-sfn</code> 三次相同</td></tr>
+                            <tr><td>替换配置值</td><td><code>sed -i 's#A#A+B#'</code></td><td>先用 <code>grep</code> 检查目标状态 + <code>^...$</code> 锚定 + 事后验证</td><td>三次累积成三重 → 三次相同</td></tr>
+                            <tr><td>插入一行</td><td><code>sed -i '/anchor/a\ LINE'</code></td><td>有则替换、无则插入的分支</td><td>累积成 3 行 → 三次哈希相同</td></tr>
+                            <tr><td>管理多行</td><td>每行单独 append</td><td><code># BEGIN tag</code> ~ <code># END tag</code> 整块替换</td><td>三次哈希相同，删除条目也能反映</td></tr>
+                            <tr><td>注册 cron</td><td><code>(crontab -l; echo J) | crontab -</code></td><td>用 <code>grep -vF</code> 删除后重新写入，或投放 <code>cron.d</code> 文件</td><td>增殖到 3 条 → 三次都是 1 条、哈希相同</td></tr>
+                            <tr><td>复制目录</td><td><code>cp -r src dst</code></td><td><code>cp -r src/. dst/</code></td><td>第二次起出现 <code>dst/src/</code> 嵌套 → 三次相同</td></tr>
+                            <tr><td>移动文件</td><td><code>mv s d</code></td><td><code>[ -e "$s" ] &amp;&amp; mv "$s" "$d"</code></td><td>第二次 <code>exit=1</code> → 条件式可通过</td></tr>
+                            <tr><td>防止并发执行</td><td>无（检查后变更）</td><td><code>flock -en</code> 或 <code>mkdir</code> 锁 + <code>trap</code></td><td>8 并发时 4~5 行 → 五轮都是 1 行</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2>结论: 幂等性不是性格，而是设计</h2>
+                    <p>本文复现的这些事故有个共同点：<strong>大多数都不会报错</strong>。<code>ln -sf</code> 返回 0 却让旧版本继续对外服务，<code>sed -i</code> 返回 0 却什么都没做，被注释匹上的 <code>grep -qF</code> 让配置几个月没有生效。<strong>退出码是 0 和已经到达目标状态，是两回事。</strong> 哪怕只留下这一句，本文也值回票价。</p>
+                    <p>所以实务规则可以缩成三行。第一，<strong>逐行去问「这条命令在已经做过的状态下执行会做什么」</strong>，大部分事故都源于一次都没问过这个问题。第二，<strong>检查的是「是不是目标状态」，而不是「做没做过」</strong>，基准是当前状态而非操作历史。第三，<strong>别主张，去证明</strong>，跑三次比一比哈希只要一分钟，而这一分钟能省下凌晨三点的两个小时。</p>
+                    <p>规模一大，最终还是会走向 Ansible 这类工具。而那些工具所说的「幂等」，其真身正是本文里手工做出来的这些东西：<code>lineinfile</code> 是先确认存在再变更，<code>blockinfile</code> 是标记块，<code>--check</code> 是 dry-run，<code>changed</code> 的值就是是否收敛。<strong>就算用了工具，不懂这些原理，用 <code>shell</code> 模块一行照样能捅出同样的事故。</strong> 实际上引入工具之后事故仍不断的组织，大多卡在这个点上。</p>
+                    <p>最后是今天就能做的一件事：<strong>把跑得最频繁的那个脚本放进临时目录跑三次，打出状态哈希。</strong> 三个值如果不同，那个脚本已经每天都在悄悄改动着什么，只是还没有人察觉而已。</p>
+
+                    <h2>参考资料</h2>
+                    <ul>
+                        <li>The Open Group Base Specifications Issue 8, <code>mkdir</code>（<code>-p</code> 无错误地忽略已存在目录）: <a href="https://pubs.opengroup.org/onlinepubs/9799919799/utilities/mkdir.html" target="_blank" rel="noopener">pubs.opengroup.org</a></li>
+                        <li>The Open Group Base Specifications Issue 8, <code>rm</code>（<code>-f</code> 对不存在的操作数不改变退出状态）: <a href="https://pubs.opengroup.org/onlinepubs/9799919799/utilities/rm.html" target="_blank" rel="noopener">pubs.opengroup.org</a></li>
+                        <li>The Open Group Base Specifications Issue 8, <code>ln</code> · <code>sed</code> · <code>grep</code> 工具定义: <a href="https://pubs.opengroup.org/onlinepubs/9799919799/utilities/contents.html" target="_blank" rel="noopener">pubs.opengroup.org</a></li>
+                        <li>GNU Coreutils Manual, <code>ln</code>（<code>-n</code> 把指向目录的符号链接当作普通文件）: <a href="https://www.gnu.org/software/coreutils/manual/html_node/ln-invocation.html" target="_blank" rel="noopener">gnu.org/software/coreutils</a></li>
+                        <li>GNU Grep Manual（<code>-F</code> 固定字符串 · <code>-x</code> 整行匹配 · 退出码 0/1/2）: <a href="https://www.gnu.org/software/grep/manual/grep.html" target="_blank" rel="noopener">gnu.org/software/grep</a></li>
+                        <li>GNU Sed Manual（<code>-i</code> 原地编辑与 <code>a</code> 命令）: <a href="https://www.gnu.org/software/sed/manual/sed.html" target="_blank" rel="noopener">gnu.org/software/sed</a></li>
+                        <li><code>rename(2)</code> man page（newpath 存在时保证原子替换）: <a href="https://man7.org/linux/man-pages/man2/rename.2.html" target="_blank" rel="noopener">man7.org</a></li>
+                        <li><code>flock(1)</code> man page（脚本自锁惯用写法 · <code>-n</code> 失败时退出码 1）: <a href="https://man7.org/linux/man-pages/man1/flock.1.html" target="_blank" rel="noopener">man7.org</a></li>
+                        <li><code>flock(2)</code> man page（劝告锁的语义与局限）: <a href="https://man7.org/linux/man-pages/man2/flock.2.html" target="_blank" rel="noopener">man7.org</a></li>
+                        <li>Ansible 官方文档, <code>blockinfile</code> 模块（默认标记 <code># BEGIN/END ANSIBLE MANAGED BLOCK</code>）: <a href="https://docs.ansible.com/ansible/latest/collections/ansible/builtin/blockinfile_module.html" target="_blank" rel="noopener">docs.ansible.com</a></li>
+                        <li>Ansible 官方文档, <code>lineinfile</code> 模块（按行保证存在）: <a href="https://docs.ansible.com/ansible/latest/collections/ansible/builtin/lineinfile_module.html" target="_blank" rel="noopener">docs.ansible.com</a></li>
+                        <li>Bash Reference Manual（<code>set -e</code> 的行为与例外）: <a href="https://www.gnu.org/software/bash/manual/bash.html" target="_blank" rel="noopener">gnu.org/software/bash</a></li>
+                        <li>相关文章: <a href="linux_server_guide_06_shell_basics.html">Linux服务器管理完全攻略 第6篇：Shell脚本基础</a>、<a href="linux_server_guide_07_shell_advanced.html">Linux服务器管理完全攻略 第7篇：Shell脚本高级</a>、<a href="linux_server_guide_09_backup.html">Linux服务器管理完全攻略 第9篇：备份与恢复策略</a>、<a href="linux_rsync_guide.html">Linux Rsync 命令完全指南</a></li>
+                    </ul>
+                </div>
+
+                <!-- md-artifact-start -->
+                    <div class="md-artifact" style="margin:2rem 0;border:1px solid #d7dce3;border-radius:10px;overflow:hidden;background:#fbfcfd;">
+                        <div style="display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;justify-content:space-between;padding:.7rem 1rem;background:#eef2f7;border-bottom:1px solid #d7dce3;">
+                            <span style="font-weight:700;font-size:.97rem;">📋 可直接带走的检查清单</span>
+                            <span style="display:flex;gap:.5rem;align-items:center;">
+                                <code style="font-size:.82rem;color:#5a6675;background:transparent;padding:0;">shell_readonly_idempotent_script.md</code>
+                                <button type="button" class="md-artifact-copy" style="cursor:pointer;border:1px solid #b9c2cf;background:#fff;color:#2c3e50;font-weight:600;line-height:1.3;border-radius:6px;padding:.32rem .7rem;font-size:.85rem;">复制全部</button>
+                            </span>
+                        </div>
+                        <pre style="margin:0;max-height:420px;overflow:auto;padding:1rem;background:#fbfcfd;font-size:.86rem;line-height:1.62;"><code class="nohighlight" style="background:transparent;padding:0;white-space:pre;"># 幂等脚本检查清单 — 动手写之前先过一遍
+
+&gt; 来源: braindetox.kr — 跑两次也安全的脚本
+&gt; 依据: POSIX Issue 8 (mkdir/rm)、GNU coreutils (ln -n)、rename(2)、flock(1)
+&gt; 可以把这个文件直接贴给 AI，写「按这份标准帮我改我们的脚本」。
+
+## 1. 各命令的安全写法 — 直接照抄
+
+| 想做的事 | 就这么写 |
+|---|---|
+| 创建目录 | `mkdir -p "$D"`，权限用单独一行 `chmod 0750 "$D"` |
+| 删除文件 | `rm -f "$F"`（目录用 `rm -rf` — 必须先做变量防护） |
+| 追加一行 | `grep -qxF -- "$L" "$F" \|\| printf '%s\n' "$L" &gt;&gt; "$F"` |
+| 删除一行 | `grep -vxF -- "$L" "$F" &gt; "$F.t" &amp;&amp; mv "$F.t" "$F"` |
+| 符号链接 | `ln -sfn "$TARGET" "$LINK"` |
+| 替换取值 | `grep -qxF "$WANT" "$F" \|\| sed -i "s#^$OLD\$#$WANT#" "$F"` |
+| 插入一行 | 有则 `sed -i 's/^key=.*/key=v/'`，无则走 `a\` 分支 |
+| 注册 cron | `{ crontab -l 2&gt;/dev/null \| grep -vF "$ABS_PATH"; echo "$JOB"; } \| crontab -` |
+| 复制目录 | `cp -r "$SRC/." "$DST/"`（不是 `cp -r src dst`） |
+| 移动文件 | `[ -e "$S" ] &amp;&amp; mv "$S" "$D"` |
+| 整体写文件 | `... &gt; "$F.tmp" &amp;&amp; mv "$F.tmp" "$F"`（同一文件系统） |
+
+## 2. 逐行自问
+- [ ] 这一行在**已经做完的状态**下执行会做什么
+- [ ] 检查的是**「是否为目标状态」**，而不是「是否做过」
+- [ ] `grep` 判断同时带了 `-x`（整行）和 `-F`（固定字符串）吗
+- [ ] 有没有把 `grep` 的退出码 **2（出错）** 和 1（不匹配）区分开
+- [ ] `sed` 替换后的结果会不会**再次匹配同一个模式**
+- [ ] 是不是把 `sed -i` 的退出码当作「已生效」的证据了
+- [ ] 每次替换符号链接都带了 **`-n`** 吗
+- [ ] 在 `set -e` 下，前面一步失败会**整段吞掉后续步骤**吗
+- [ ] 文件里混入**时间戳、随机数**，导致无法做哈希比对了吗
+- [ ] 当管理项**减少**时，已经下发的文件里会跟着消失吗
+
+## 3. 标记块模板 — 管理行超过五条就用它
+
+```bash
+apply_block(){                     # apply_block &lt;文件&gt; &lt;标签&gt; &lt;正文&gt;
+  local file="$1" tag="$2" body="$3"
+  local begin="# BEGIN ${tag}" end="# END ${tag}"
+  [ -e "$file" ] || : &gt; "$file"
+  if grep -qxF "$begin" "$file"; then
+    awk -v b="$begin" -v e="$end" -v body="$body" '
+      $0==b { print b; printf "%s", body; skip=1; next }
+      $0==e { print e; skip=0; next }
+      skip==1 { next }
+      { print }' "$file" &gt; "$file.new" &amp;&amp; mv "$file.new" "$file"
+  else
+    { printf '%s\n' "$begin"; printf '%s' "$body"; printf '%s\n' "$end"; } &gt;&gt; "$file"
+  fi
+}
+apply_block /etc/ssh/sshd_config "myapp-keepalive" \
+  $'ClientAliveInterval 30\nClientAliveCountMax 3\n'
+```
+
+- [ ] 标签里写清了**归属方和用途**（`myapp-nginx-upstream`）
+- [ ] 标记符合该文件的**注释符号**（`#` / `;` / `//`）
+- [ ] **不用在** JSON、YAML 这类结构化格式上
+- [ ] 脚本**不碰标记之外**的内容
+
+## 4. 重跑验证流程 — 提交前花一分钟
+
+```bash
+state_hash(){
+  ( cd "$1" &amp;&amp; {
+      find . -type f | LC_ALL=C sort | xargs sha256sum
+      find . -type l | LC_ALL=C sort | while read -r l; do echo "$(readlink "$l")  $l"; done
+    } | sha256sum | awk '{print $1}' )
+}
+for i in 1 2 3; do ./provision.sh "$ROOT"; echo "run$i $(state_hash "$ROOT")"; done
+```
+
+- [ ] 三次哈希**完全一致**（不一致说明某处在累积）
+- [ ] 用 `LC_ALL=C sort` 固定了排序
+- [ ] **故意制造漂移**后再跑一次（多加一行配置、改掉链接指向、放个多余文件）
+- [ ] 第二次 `--check` 返回 **changed=0**
+- [ ] 所有试验只在**临时目录**里进行
+
+## 5. 什么时候需要加锁
+
+| 场景 | 锁 | 替代做法 |
+|---|---|---|
+| 整体替换文件 | 不需要 | 临时文件 + `mv` |
+| `mkdir -p` | 不需要 | 照常使用 |
+| 先检查再追加 | **需要** | 改成整体替换 |
+| 读—改—写 | **需要** | 只追加，事后汇总 |
+| 执行时间超过周期的 cron | **需要** | 在入口处加锁 |
+| 替换标记块 | **需要** | 加锁 + 临时文件 `mv` |
+
+```bash
+# 有 flock 时
+[ "${FLOCKER}" != "$0" ] &amp;&amp; exec env FLOCKER="$0" flock -en "$0" "$0" "$@" || :
+
+# 没有就利用 mkdir 的原子性
+if mkdir "$LOCKDIR" 2&gt;/dev/null; then
+  trap 'rmdir "$LOCKDIR"' EXIT INT TERM
+else
+  echo "已有另一个实例在运行"; exit 0
+fi
+```
+
+- [ ] 一定要用 `trap` 释放锁
+- [ ] 锁目录里留下 **PID 和时间**
+- [ ] 定好了**残留锁的回收策略**
+- [ ] 记住锁只挡**并发** — 顺序重跑的缺陷依然存在
+
+## 6. 部分失败后的续跑
+- [ ] 每一步**本身就是幂等的**（没有标记也安全）
+- [ ] 标记只加在**耗时重的步骤**上
+- [ ] 标记文件名里嵌入**输入哈希**，配置一变就自动失效
+- [ ] 最后校验的是**真实状态**，而不是标记
+
+---
+核对时点: 2026-07。复现环境 MSYS2 / bash 5.2.37 / GNU sed 4.9 / grep 3.0 / coreutils 8.32。
+破坏性命令务必先在临时目录里演练。
+</code></pre>
+                        <p style="margin:0;padding:.6rem 1rem;font-size:.82rem;color:#5a6675;border-top:1px solid #e3e8ee;">复制后可直接粘贴到笔记应用或 AI 工具中。</p>
+                    </div>
+                    <script>
+                    (function(){
+                      if (window.__mdArtifactBound) return;
+                      window.__mdArtifactBound = true;
+                      document.addEventListener('click', function(ev){
+                        var btn = ev.target.closest && ev.target.closest('.md-artifact-copy');
+                        if (!btn) return;
+                        var box = btn.closest('.md-artifact');
+                        var code = box && box.querySelector('pre code');
+                        if (!code) return;
+                        var text = code.textContent;
+                        var label = btn.textContent;
+                        var ok = function(){
+                          btn.textContent = "已复制";
+                          setTimeout(function(){ btn.textContent = label; }, 1600);
+                          if (typeof gtag === 'function') {
+                            gtag('event', 'md_copy', { slug: "shell_readonly_idempotent_script", lang: "zh", chars: text.length });
+                          }
+                        };
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                          navigator.clipboard.writeText(text).then(ok).catch(function(){ fallback(); });
+                        } else { fallback(); }
+                        function fallback(){
+                          var ta = document.createElement('textarea');
+                          ta.value = text; ta.setAttribute('readonly','');
+                          ta.style.position='fixed'; ta.style.left='-9999px';
+                          document.body.appendChild(ta); ta.select();
+                          try { document.execCommand('copy'); ok(); } catch(e) {}
+                          document.body.removeChild(ta);
+                        }
+                      });
+                    })();
+                    </script>
+                    <!-- md-artifact-end -->
+
+                <div class="share-section">
+                    <h3>分享本文</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">返回列表</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/json_formatter.html">JSON 格式化工具</a></li>
+      <li><a href="../static/regex_tester.html">正则表达式测试器</a></li>
+      <li><a href="../static/jwt_decoder.html">JWT解码生成器 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 编码器/解码器</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="shell_dry_run_design.html">如何做出真正的 --dry-run - 要验证而不是模仿</a></li>
+      <li><a href="shell_quoting_rules_guide.html">Shell 引号规则 - 哪个引号挡住了什么</a></li>
+      <li><a href="fcm_duplicate_push_debug_2026.html">重新部署后已发送的推送通知又被重发 - FCM 通知重复发送调试 2026</a></li>
+      <li><a href="offline_sync_toggle_distributed_2026.html">一个开关就是一个分布式系统 - 为什么离线同步会让你关掉的设置又打开</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制！请粘贴到Threads应用中分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制！'); });
+    });
+    </script>
+</body>
+</html>

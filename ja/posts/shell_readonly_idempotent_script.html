@@ -1,0 +1,897 @@
+<!DOCTYPE html>
+<!--
+ * 技術ブログ記事テンプレート
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ja">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>二度実行しても壊れないスクリプト - 冪等性の設計と実際に壊れる六つのパターン</title>
+    <meta name="description" content="再実行すると壊れるシェルスクリプトを実際に走らせて再現した。append累積、mkdir・rmの終了コード、ln -sfn、sedの二重置換、crontab重複を実行出力で確かめ、マーカーブロックとハッシュ検証の手順を整理した。">
+    <meta name="keywords" content="冪等性, シェルスクリプト, bash, idempotent, mkdir -p, rm -f, ln -sfn, sed -i, crontab重複, マーカーブロック, flock, 競合状態, 再実行安全, プロビジョニング, 自動化スクリプト, dry-run, 状態ハッシュ">
+
+    <link rel="canonical" href="https://braindetox.kr/ja/posts/shell_readonly_idempotent_script.html">
+
+    <meta property="og:title" content="二度実行しても壊れないスクリプト - 冪等性の設計と実際に壊れる六つのパターン">
+    <meta property="og:description" content="概念の説明ではなく再現だ。二度目の実行で何がどう壊れるのかを実際の出力で示し、3回実行のハッシュが一致するマーカーブロックのパターンまで整理した。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/ja/posts/shell_readonly_idempotent_script.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ja_JP">
+    <meta property="article:published_time" content="2026-07-29">
+    <meta property="article:section" content="開発・インフラ">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="二度実行しても壊れないスクリプト - 冪等性の設計">
+    <meta name="twitter:description" content="二度目の実行で壊れる六つのパターンを実際に再現し、安全な書き方と3回ハッシュ検証の手順を整理した。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "二度実行しても壊れないスクリプト - 冪等性の設計と実際に壊れる六つのパターン",
+      "alternativeHeadline": "Idempotent Shell Scripts - Six Patterns That Break on the Second Run",
+      "datePublished": "2026-07-29",
+      "dateModified": "2026-07-29",
+      "inLanguage": "ja-JP",
+      "articleSection": "開発・インフラ",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "冪等性, シェルスクリプト, bash, mkdir -p, rm -f, ln -sfn, sed -i, crontab重複, マーカーブロック, flock, 競合状態, 状態ハッシュ",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/ja/posts/shell_readonly_idempotent_script.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "mkdir -p と rm -f を使えばスクリプトは冪等になるのか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "ならない。この二つのオプションは終了コードを整えるだけだ。POSIX仕様は mkdir -p について、既に存在するディレクトリを名前として持つ各オペランドはエラーなしで無視されると記し、rm -f について、存在しないオペランドの場合は診断メッセージを書かず終了ステータスも変えないと記している。つまり再実行のときにスクリプトが途中で止まる問題は防いでくれる。しかしファイルの内容が目標状態に達したかどうかは依然として保証しない。実際に確かめると、mkdir の再実行は File exists で終了コード1、rm の再実行は No such file or directory で終了コード1を返し、set -e の下ではその後の段階が丸ごと実行されない。オプションは第一歩にすぎず、内容を扱う append と置換は別に設計しなければならない。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "設定を一行追加するとき grep で確認すれば十分ではないのか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "確認の方法が問題だ。実際に再現すると二つの罠がある。第一に、コメントアウトされた行があるファイルに部分一致の grep -qF を使うと、既にあると誤判定して設定が永遠に適用されない。第二に、角括弧のような正規表現メタ文字を含む行に grep -q を使うと、パターンが正規表現として解釈されリテラルと食い違い、3回の実行で行が4本に増える。同じ条件で grep -qxF は1行を保った。-F はパターンを固定文字列として、-x は行全体の一致として強制する。もう一つある。grep は一致で0、不一致で1、エラーで2を返すが、|| でつなぐとエラーの2が不一致の1と同じ扱いになり、読めないファイルに重複が積み上がる。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "シンボリックリンクを張り直すとき ln -sf で十分か",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "対象がディレクトリを指すシンボリックリンクなら十分ではない。実行してみると、current が rel_a を指す状態で ln -sf rel_b current は終了コード0で成功するが、readlink current は依然として rel_a を返す。実際に作られたのは rel_a/rel_b という新しいリンクだ。リンクを張り替えたのではなく、リンクが指すディレクトリの中へ潜り込んだのである。GNU coreutils の ln は -n を、リンク名がディレクトリを指すシンボリックリンクである場合にそれを通常のファイルとして扱うと説明している。したがって ln -sfn を使うべきで、実際に3回実行しても readlink の結果は rel_b に固定され、rel_a の中には何も追加されなかった。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "再実行しても結果が同じであることをどう証明するのか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "状態をハッシュに畳んで比較する方法が最も安い。対象ツリーの通常ファイルの一覧を並べ替えてそれぞれのハッシュを取り、シンボリックリンクは readlink の結果を一緒に入れて全体をもう一度ハッシュすれば、ツリー一つが文字列一つになる。実際にプロビジョニング関数を3回実行した結果、三度とも同じハッシュが出た。ここに dry-run を足せばさらに良い。変更の対象を表示するだけで実際には書かない --check モードを作れば、二度目の実行で changed=0 が出るかどうかで収束を確認できる。ただしタイムスタンプや乱数がファイルに入るとハッシュ比較そのものが不可能になるため、監査ログは状態ファイルと分離しなければならない。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "いつロックが必要で、いつ必要ないのか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "判断の基準は検査と変更の間に隙間があるかだ。8つのプロセスに同時に、無ければ追加するを実行させると、5回の繰り返しで SEED の行が4本から5本できた。期待値は1である。逆にファイル全体を一時ファイルに書いてから mv で差し替える方式は、8つが同時に押し寄せても1行を保った。rename は原子的に置き換えられ、他のプロセスが対象パスを見つけられない時点が存在しないからだ。整理すると、全体の差し替えで終わる作業にロックは要らず、読んで直して書き戻す処理や部分更新にはロックが要る。実際に同時の読んで直して書き戻す実験では、8回の加算が2回に失われた。ロック用の道具が無い環境なら mkdir の原子性を利用でき、同じ条件で常に1行を保った。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .danger { background:#fdecea; border-left:4px solid #d9534f; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/shell_readonly_idempotent_script.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/shell_readonly_idempotent_script.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/shell_readonly_idempotent_script.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/shell_readonly_idempotent_script.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/shell_readonly_idempotent_script.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="二度実行しても壊れないスクリプト - 冪等性の設計と実際に壊れる六つのパターン">
+                <meta itemprop="datePublished" content="2026-07-29">
+                <meta itemprop="dateModified" content="2026-07-29">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="冪等性, シェルスクリプト, mkdir -p, ln -sfn, sed -i, マーカーブロック, 競合状態, 状態ハッシュ">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/ja/posts/shell_readonly_idempotent_script.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">二度実行しても壊れないスクリプト - 冪等性の設計と実際に壊れる六つのパターン</h1>
+                    <h2 class="post-subtitle">概念ではなく再現 - 実行出力と3回のハッシュ比較で確かめた安全な書き方</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-07-29">2026年7月29日</span>
+                        <span class="post-category" itemprop="articleSection">開発・インフラ</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <h2>序論: 「もう一度回してもいいですか」に答えられないスクリプト</h2>
+                    <p>デプロイスクリプトが途中で落ちた。ログを見ると8段階のうち5段階までは進んでいる。原因はすぐに掴めた。残った問いは一つだけだ。<strong>「これ、そのままもう一度回していいですか」</strong></p>
+                    <p>この問いに即答できない瞬間、その夜は長くなる。スクリプトを頭から読みながら<em>この行は二度回るとどうなるのか</em>を一行ずつ手で追わなければならないからだ。そしてたいていは全部を追いきれないまま<strong>「とりあえず5段階から手作業でやります」</strong>で終わる。手でやった部分は記録に残らず、次の担当者はサーバーの状態がなぜスクリプトと違うのか分からなくなる。</p>
+                    <p>冪等性とは、この問いに<strong>0.5秒で「はい」と答えられるようにする性質</strong>だ。定義を暗記する問題ではなく、自分のスクリプトの各行が二度目の実行で正確に何をするのかを知っている問題である。だからこの記事は定義から始めない。<strong>実際に二度回して壊してみた出力</strong>から始める。</p>
+                    <p>扱う順序はこうだ。まず<strong>実際に壊れる六つのパターン</strong>を一つずつ再現し、それぞれに安全な書き方を添える。次に<strong>マーカーブロック</strong>という汎用の解法と、再実行の結果が同じであることを<strong>ハッシュで証明する手順</strong>を示す。最後に<strong>部分的な失敗からの再開</strong>の設計と<strong>ロックが必要になる条件</strong>を整理する。</p>
+                    <p>その前に用語を一つだけ整理しておこう。現場で「冪等」と一括りに呼んでいるものは、実は三つの層に分かれる。この区別をしておくと後の議論がずっと簡単になる。</p>
+                    <table>
+                        <thead><tr><th>水準</th><th>保証すること</th><th>保証しないこと</th><th>代表的な手段</th></tr></thead>
+                        <tbody>
+                            <tr><td><strong>①再実行安全</strong></td><td>二度回しても<em>壊れない</em>(エラーで中断しない)</td><td>結果が同じになること</td><td><code>mkdir -p</code>, <code>rm -f</code></td></tr>
+                            <tr><td><strong>②結果の収束</strong></td><td>何度回しても<em>同じ最終状態</em>に到達する</td><td>人が作ったドリフトの除去</td><td>存在を確認してから変更、マーカーブロック</td></tr>
+                            <tr><td><strong>③自己修復</strong></td><td>状態がずれたら<em>目標状態へ戻す</em></td><td>宣言していない項目</td><td>ブロック全体の差し替え、ファイル全体の生成</td></tr>
+                        </tbody>
+                    </table>
+                    <p>事故の大半は<strong>①だけやっておいて②をやったと信じ込むとき</strong>に起きる。<code>mkdir -p</code>に書き換えて「冪等に直した」と言ってしまう場合だ。以下の再現で、その隙間がどこにあるのかがはっきり見える。</p>
+                    <div class="danger">
+                        <p><strong>実行前の安全上の注意。</strong> この記事のすべての再現は<strong>新しく作った一時ディレクトリの中だけ</strong>で行った。本文に<code>rm -rf</code>が登場する箇所は、その一時ディレクトリ、またはその配下のパスを消す用途に限られる。<strong>実際のサーバーで真似しないこと。</strong> とくに<code>rm -rf "$DIR"</code>の形は<code>$DIR</code>が空だと<code>rm -rf ""</code>になり、意図しない場所をさらう可能性があるため、変数を消すコマンドに使うときは<code>[ -n "$DIR" ] &amp;&amp; [ "$DIR" != "/" ]</code>のような防御を必ず前に置く。cronやCIに入れる前には<code>--check</code>のような試験実行で対象パスを目で確かめるほうが安全だ。</p>
+                    </div>
+
+                    <h2>1. 実行環境と検証の方法</h2>
+                    <p>以下の出力はすべて<strong>実際に走らせた結果をそのまま貼ったもの</strong>だ。再現環境は次のとおりである。</p>
+                    <pre><code>===== T0 ENVIRONMENT =====
+MINGW64_NT-10.0-19045 3.5.7-882031da.x86_64
+GNU bash, version 5.2.37(1)-release (x86_64-pc-msys)
+sed (GNU sed) 4.9
+grep (GNU grep) 3.0
+sha256sum (GNU coreutils) 8.32</code></pre>
+                    <p>Windows 10上のMSYS2/Git Bash環境だ。GNUツール系なのでLinuxと挙動は同じだが、<strong>三つはこの環境に固有の制約</strong>なので先に明記しておく。読む側が結果を判断するために必要な情報である。</p>
+                    <ul>
+                        <li><strong>シンボリックリンク</strong>は既定の設定ではファイルのコピーとして処理される。本物のリンクを作るために<code>MSYS=winsymlinks:sys</code>を設定した状態で実行した。</li>
+                        <li><strong>POSIXのパーミッションビット</strong>はNTFS上でそのまま反映されない。実際に<code>chmod 600</code>の後もモードは<code>644</code>と表示された。そのため<strong>パーミッションに関する冪等性はこの記事では実行結果として主張しない。</strong>該当する項目はチェックリストに規則としてだけ残した。</li>
+                        <li><strong><code>crontab</code>と<code>flock</code>のバイナリが無い。</strong>cronは<code>crontab -l</code>が出力するはずのテキストをファイルで模して<em>行操作のロジック</em>だけを検証し、ロックは<code>flock</code>の代わりに<strong><code>mkdir</code>の原子性</strong>を使う方式で実証した。</li>
+                    </ul>
+                    <p>検証は三つを混ぜた。<strong>終了コード</strong>(コマンドが成功したか)、<strong>ファイルの内容</strong>(何が残ったか)、<strong>SHA-256ハッシュ</strong>(繰り返した実行の結果が同じか)。とくにハッシュは<em>「同じに見える」と「同じである」を分ける唯一の道具</em>なので繰り返し使う。</p>
+
+                    <h2>2. パターン① appendが静かに積み上がる</h2>
+                    <p>最も多く、最も遅く見つかる。エラーにならないからだ。<code>.bashrc</code>に<code>PATH</code>を一行入れるスクリプトを二度回してみよう。</p>
+                    <pre><code>-- run 1 --
+export PATH=/opt/tool/bin:$PATH
+-- run 2 (same command again) --
+export PATH=/opt/tool/bin:$PATH
+export PATH=/opt/tool/bin:$PATH
+lines: 2</code></pre>
+                    <p>終了コードは二度とも0だ。誰も失敗したとは言ってくれない。この行が<code>PATH</code>なら経路が重複するだけだが、<strong>同じファイルを毎回少しずつ伸ばすcron</strong>が付くと、数か月後に設定ファイルが数千行になる。実際の事故はたいていこの形で来る。</p>
+                    <h3>2.1 安全な書き方 - 存在を確認してから入れる</h3>
+                    <pre><code>LINE='export PATH=/opt/tool/bin:$PATH'
+grep -qxF -- "$LINE" safe.conf || printf '%s\n' "$LINE" >> safe.conf</code></pre>
+                    <p>3回実行した結果だ。行数もハッシュも固定される。</p>
+                    <pre><code>run1 -> 1 line(s) | sha=0a0746b7d8c9bd1f
+run2 -> 1 line(s) | sha=0a0746b7d8c9bd1f
+run3 -> 1 line(s) | sha=0a0746b7d8c9bd1f</code></pre>
+                    <h3>2.2 罠 - grepのオプション一つで結果がひっくり返る</h3>
+                    <p>ここで<code>-qxF</code>の<code>x</code>と<code>F</code>は飾りではない。二つを外すと<strong>正反対の方向の事故がそれぞれ</strong>起きる。</p>
+                    <p><strong>罠A - コメントを「設定済み」と誤判定する。</strong>配布先のファイルに該当の行が<em>コメントアウトされたまま</em>入っている場合だ。よくある。誰かが一時的に切って忘れたのである。</p>
+                    <pre><code>file: #export PATH=/opt/tool/bin:$PATH
+grep -qF  -> found (skips append) ... setting is never applied
+grep -qxF -> not found (correct: a comment is not an active setting)</code></pre>
+                    <p>部分一致の<code>-F</code>だけを使うとコメント行にも引っかかる。スクリプトは毎回「もう入っている」と静かに素通りし、<strong>設定は永遠に適用されない。</strong>エラーが出ないので数か月続く。<code>-x</code>(行全体の一致)がこれを防ぐ。</p>
+                    <p><strong>罠B - 正規表現メタ文字のせいで重複が積み上がる。</strong>逆の方向だ。入れようとする行に<code>[</code>、<code>]</code>、<code>.</code>、<code>*</code>のような文字があると、<code>grep -q</code>はそれを<em>正規表現として</em>読む。</p>
+                    <pre><code>file: PATH=/opt/tool[1]/bin
+grep -q   -> NOT found ([1] read as a character class) -> duplicate append
+grep -qxF -> found (correct)
+after 3 runs: grep -q => 4 lines | grep -qxF => 1 lines</code></pre>
+                    <p><code>[1]</code>は「文字1が一つ」を意味する文字クラスなので、リテラルの<code>[1]</code>とは一致しない。だから毎回「無い」と判定し、3回の実行で4行になる。<code>-F</code>(固定文字列)がこれを防ぐ。</p>
+                    <h3>2.3 もっと静かな罠 - grepの終了コード2</h3>
+                    <p>これは文書を見ないと分からない。<code>grep</code>は三つの終了コードを返す。実際に確認した値だ。</p>
+                    <pre><code>match      -> 0
+no match   -> 1
+read error -> 2  (|| append treats this like 'no match')</code></pre>
+                    <p><code>grep -qxF ... || append</code>の形は<strong>1(不一致)と2(エラー)を区別できない。</strong>ファイルを読む権限が無かったり、パスが間違っていたりすると、スクリプトは「無いんだな」と判断して追加を続ける。正確にやるには終了コードを分けて受け取る必要がある。</p>
+                    <pre><code>grep -qxF -- "$LINE" "$F"; rc=$?
+case $rc in
+  0) : ;;                                   # 既にある
+  1) printf '%s\n' "$LINE" >> "$F" ;;       # 無い -> 追加
+  *) echo "grep失敗(rc=$rc): $F" >&amp;2; exit 1 ;;   # エラー -> 中断
+esac</code></pre>
+
+                    <h2>3. パターン② mkdir・rmの終了コードがスクリプトを真っ二つにする</h2>
+                    <p>最も広く知られた項目なので短く触れ、<strong>あまり知られていない副作用</strong>に紙面を使う。</p>
+                    <pre><code>-- mkdir d1 (run 1) --
+exit=0
+-- mkdir d1 (run 2) --
+mkdir: cannot create directory 'd1': File exists
+exit=1
+-- mkdir -p d1 (run 3) --
+exit=0
+
+-- rm f1 (run 1) --
+exit=0
+-- rm f1 (run 2) --
+rm: cannot remove 'f1': No such file or directory
+exit=1
+-- rm -f f1 (run 3) --
+exit=0</code></pre>
+                    <p>POSIX仕様がこの挙動を定めている。<code>mkdir -p</code>について<strong>「既に存在するディレクトリを名前として持つ各dirオペランドはエラーなしで無視される」</strong>と記し、<code>rm -f</code>について<strong>「存在しないオペランドの場合、診断メッセージを書いたり終了ステータスを変えたりしない」</strong>と記す。オプションがやることは正確にそれだけだ。</p>
+                    <h3>3.1 本当の被害はset -eと出会ったときに出る</h3>
+                    <p>終了コード1そのものは大したことではない。問題は<code>set -e</code>の掛かったスクリプトで<strong>その後の段階が丸ごと消える</strong>ことだ。3段階のスクリプトを二度回した結果である。</p>
+                    <pre><code>-- seq.sh run 1 --
+  [step 2] place config files
+  [step 3] restart service
+exit=0
+-- seq.sh run 2 --
+mkdir: cannot create directory '.../s/stage': File exists
+exit=1  &lt;- steps 2 and 3 never ran</code></pre>
+                    <p>再実行すると<strong>ディレクトリを作る1段階で止まり、設定の配置もサービスの再起動も起きない。</strong>ところがスクリプトは「失敗」としか言わない。どこまで進んだのかは教えてくれない。運用担当はログの最終行だけを見て「ディレクトリの問題」と判断し、肝心のサービスが古い設定で動いている事実は後から発見する。</p>
+                    <h3>3.2 オプションが肩代わりしてくれないもの</h3>
+                    <ul>
+                        <li><code>mkdir -p</code>は<strong>存在の有無だけ</strong>を無視する。既にあるディレクトリの<strong>所有者やパーミッションを目標値に合わせてはくれない。</strong><code>-m</code>は新規に作るときしか適用されないので、パーミッションを保証したいなら<code>chmod</code>・<code>chown</code>を別の行で明示する必要がある。(前述のとおり、この環境ではパーミッションビットを検証できないため実行出力としては提示しない。)</li>
+                        <li><code>rm -f</code>は<strong>存在しないファイルだけ</strong>を見逃す。消そうとした対象が<em>ディレクトリ</em>なら依然として失敗する。</li>
+                        <li>どちらも<strong>内容には関与しない。</strong>ディレクトリがあることと、その中が目標状態であることは別の話だ。</li>
+                    </ul>
+
+                    <h2>4. パターン③ ln -sは二度目にリンクの中へ潜り込む</h2>
+                    <p>この項目がこの記事で最も再現する価値がある。<strong>失敗しないまま見当違いの結果を残す</strong>からだ。無停止デプロイで<code>current</code>シンボリックリンクを新しいリリースへ移す、あのコードである。</p>
+                    <pre><code>-- ln -s rel_a current (run 1) --
+exit=0 | readlink=rel_a
+-- ln -s rel_b current (run 2) --
+exit=0</code></pre>
+                    <p>2回目が<strong>終了コード0</strong>だ。成功したように見える。実際に何ができたのかを確かめよう。</p>
+                    <pre><code>## ln -sf on a symlink that points to a directory
+ln -sf exit=0
+readlink current = rel_a   &lt;- still points at rel_a
+ls current/:
+FROM_A
+rel_b
+what was actually created: lrwxrwxrwx 1 Karyu 197121 5 Jul 29 05:13 rel_a/rel_b -> rel_b
+  -> it did not repoint the link; it created a new link INSIDE the target directory</code></pre>
+                    <p>肝心なのは最後の行だ。<code>current</code>が<em>ディレクトリを指すシンボリックリンク</em>のとき、<code>ln -sf rel_b current</code>は<code>current</code>を<strong>ディレクトリとして辿り</strong>、その中に<code>rel_b</code>という新しいリンクを作る。<code>readlink current</code>は依然として<code>rel_a</code>のままだ。</p>
+                    <p>運用でこれが何を意味するのか考えてみよう。デプロイスクリプトは<strong>成功を返し</strong>、監視も緑のままで、<strong>サービスは古いバージョンで動き続ける。</strong>おまけに以前のリリースディレクトリの中には正体不明のリンクが一つずつ溜まっていく。デプロイのたびに。</p>
+                    <h3>4.1 安全な書き方 - ln -sfn</h3>
+                    <p>GNU coreutilsの<code>ln</code>は<code>-n</code>を<strong>「リンク名がディレクトリを指すシンボリックリンクである場合、それを通常のファイルとして扱う」</strong>と説明する。辿るなという意味だ。3回実行した結果である。</p>
+                    <pre><code>## correct: ln -sfn (3 runs, same result)
+run1 -> readlink=rel_b | rel_a contains: FROM_A
+run2 -> readlink=rel_b | rel_a contains: FROM_A
+run3 -> readlink=rel_b | rel_a contains: FROM_A</code></pre>
+                    <p>三度とも<code>rel_b</code>に固定され、<code>rel_a</code>の中には<code>FROM_A</code>以外<strong>何も追加されなかった。</strong>実務の規則は一つにまとまる。<strong>ディレクトリを指すシンボリックリンクを差し替えるときは常に<code>-n</code>を付ける。</strong><code>-T</code>(<code>--no-target-directory</code>)を使えば、もっと厳密に強制することもできる。</p>
+                    <div class="callout">
+                        <p><strong>もっと安全な方法。</strong> シンボリックリンクの差し替えを本当に原子的にやるには、<em>一時的な名前でリンクを作ってから<code>mv -T</code>で差し替える</em>2段階が必要だ。<code>ln -sfn</code>は内部的に消してから作り直す瞬間があり、その一瞬<code>current</code>が存在しない時点が生じ得る。トラフィックの多い経路なら、この差は意味を持つ。</p>
+                    </div>
+
+                    <h2>5. パターン④ sed -iは成功を返しながら嘘をつく</h2>
+                    <p><code>sed -i</code>の再実行安全性は<strong>パターンによって三つに分かれる。</strong>一つずつ再現した。</p>
+                    <h3>5.1 ケースA - 結果がパターンと重ならなければ安全</h3>
+                    <pre><code>sed -i 's/^timeout = 30$/timeout = 60/' a.conf
+
+run1 sha=ca1a53713b3fbd1d | timeout = 60 retries = 3
+run2 sha=ca1a53713b3fbd1d | timeout = 60 retries = 3
+run3 sha=ca1a53713b3fbd1d | timeout = 60 retries = 3</code></pre>
+                    <p>置換の結果である<code>timeout = 60</code>はパターン<code>^timeout = 30$</code>と重ならない。だから2回目からはマッチが無く、ファイルは変わらない。<strong>ハッシュが3回とも同一である。</strong>これが<em>運良く</em>冪等になっている場合だ。</p>
+                    <h3>5.2 ケースB - 結果が再びパターンを満たすと無限に積み上がる</h3>
+                    <pre><code>sed -i 's#PATH=#PATH=/opt/bin:#' b.conf
+
+run1: PATH=/opt/bin:/usr/bin
+run2: PATH=/opt/bin:/opt/bin:/usr/bin
+run3: PATH=/opt/bin:/opt/bin:/opt/bin:/usr/bin</code></pre>
+                    <p>置換の結果に<code>PATH=</code>がそのまま残っているので、次の実行でもまた引っかかる。<strong>回すたびに経路が一つずつ増える。</strong>先ほどのappend累積よりずっと目立たない。行数が増えないからだ。ファイルを開いて一行を最後まで読まないと見つからない。</p>
+                    <h3>5.3 ケースC - 何もせずに成功を返す</h3>
+                    <pre><code>sed -i 's/^debug = true$/debug = false/' c.conf
+exit=0 | content=debug = false  &lt;- exit code is not evidence that it applied</code></pre>
+                    <p>ファイルには既に<code>debug = false</code>が入っていて、パターンは一つもマッチしなかった。ところが<code>sed</code>は<strong>終了コード0</strong>を返す。これは欠陥ではなく設計だ。<code>sed</code>は「置換を何件したのか」を終了コードで教えてくれない。</p>
+                    <p>ここから出てくる実務の規則が重要だ。<strong><code>sed -i</code>の終了コードは「適用された」ことの証拠ではない。</strong>設定が実際に反映されたか確かめたければ、<em>置換の後に結果をもう一度読んで</em>検査しなければならない。静かな失敗が最も恐ろしい理由は、ファイルパスの打ち間違いやアンカーの不一致も同じく0を返すからだ。</p>
+                    <h3>5.4 安全な書き方 - 目標状態を先に検査し、事後に検証する</h3>
+                    <pre><code>TARGET='PATH=/opt/bin:/usr/bin'
+grep -qxF "$TARGET" d.conf || sed -i 's#^PATH=/usr/bin$#PATH=/opt/bin:/usr/bin#' d.conf
+grep -qxF "$TARGET" d.conf || { echo "適用に失敗"; exit 1; }
+
+run1: PATH=/opt/bin:/usr/bin
+run2: PATH=/opt/bin:/usr/bin
+run3: PATH=/opt/bin:/usr/bin
+post-check: target state reached (0)</code></pre>
+                    <p>三つを同時にやった。<strong>①目標状態を先に検査</strong>して既に到達していれば触らず、<strong>②アンカーを<code>^...$</code>で囲んで</strong>結果が再びパターンを満たさないようにし、<strong>③置換の後にもう一度読んで</strong>実際に到達したことを確認した。この三つが揃えば<code>sed -i</code>も安全に使える。</p>
+
+                    <h2>6. パターン⑤ crontabの登録が実行のたびに倍になる</h2>
+                    <p>広く出回った慣用句がある。<code>(crontab -l; echo "$JOB") | crontab -</code>。三度回した結果だ。</p>
+                    <pre><code>run1 -> sync.sh lines: 1
+run2 -> sync.sh lines: 2
+run3 -> sync.sh lines: 3
+*/5 * * * * /opt/app/bin/sync.sh >> /var/log/sync.log 2>&amp;1
+*/5 * * * * /opt/app/bin/sync.sh >> /var/log/sync.log 2>&amp;1
+*/5 * * * * /opt/app/bin/sync.sh >> /var/log/sync.log 2>&amp;1
+  -> a job meant to run every 5 minutes now starts 3 times per tick</code></pre>
+                    <p>この結果の危険度は他のパターンとは格が違う。先のものは<em>ファイルが散らかる</em>問題だったが、これは<strong>同じ作業が同時に複数立ち上がる</strong>問題だ。同期スクリプトなら互いに同じファイルを触り、バックアップなら帯域を分け合って両方とも遅くなり、DBの整理作業ならロックの競合が起きる。しかもプロビジョニングを三度回しただけで<strong>負荷が正確に3倍</strong>になるので、原因を突き止めるのも難しい。</p>
+                    <h3>6.1 安全な書き方 - 消してから入れ直す</h3>
+                    <p>「あればスキップ」ではなく<strong>「当該スクリプトを参照する行を全部消して新しく入れる」</strong>が正解だ。理由はすぐ説明する。</p>
+                    <pre><code>{ crontab -l 2>/dev/null | grep -vF '/opt/app/bin/sync.sh'
+  printf '%s\n' "$JOB"; } | crontab -
+
+run1 -> lines: 1 | sha=7352c0d47610f2d1
+run2 -> lines: 1 | sha=7352c0d47610f2d1
+run3 -> lines: 1 | sha=7352c0d47610f2d1</code></pre>
+                    <p>3回とも1行で、ハッシュが同じだ。<strong>「あればスキップ」方式よりこちらが優れている理由はスケジュールの変更にある。</strong>存在だけを確認する方式は<code>*/5</code>を<code>*/10</code>に変えても「もうある」と言って古い行をそのまま残す。消して入れる方式はそうならない。他のジョブを触らないかも一緒に確認した。</p>
+                    <pre><code>-- schedule change is absorbed too (*/5 -> */10), and other jobs survive --
+0 3 * * * /opt/other/backup.sh
+*/10 * * * * /opt/app/bin/sync.sh >> /var/log/sync.log 2>&amp;1</code></pre>
+                    <p><code>backup.sh</code>の行はそのまま残り、<code>sync.sh</code>の行だけが新しいスケジュールに更新された。ここでは<strong>フィルタの文字列をどれだけ狭く取るかが要になる。</strong><code>sync.sh</code>のようなありふれた名前で除くと、他チームの<code>/opt/legacy/sync.sh</code>まで消えかねない。絶対パス全体を使うか、後述のマーカーブロック方式を使うほうが安全だ。</p>
+                    <div class="callout">
+                        <p><strong>できればcrontabを直接書かない選択肢もある。</strong> <code>/etc/cron.d/</code>に<strong>ファイルを一つ丸ごと配置</strong>すれば、それ自体が「全体の差し替え」なので重複が原理的に起こらない。一時ファイルに書いて<code>mv</code>で差し替えれば原子性まで得られる。ただしディストリビューションごとにファイル名の規則(ドットを含む名前は無視されるなど)やユーザーフィールドの有無が異なるので、該当するディストリビューションの文書を確認してから適用する。</p>
+                    </div>
+
+                    <h2>7. パターン⑥ 冪等に見えて実はそうでないもの</h2>
+                    <p>ここまでが「知られた罠」だとすれば、この節は<strong>大半の人が冪等だと思い込んでいるコマンド</strong>たちだ。</p>
+                    <h3>7.1 cp -r - 初回と再実行で結果の構造が違う</h3>
+                    <pre><code>cp -r src dst   # を3回
+
+run1: dst dst/a.txt
+run2: dst dst/a.txt dst/src dst/src/a.txt
+run3: dst dst/a.txt dst/src dst/src/a.txt
+  -> run 1 produced dst/a.txt; from run 2 on, dst/src/a.txt appeared as well</code></pre>
+                    <p>原因は<strong>対象が存在するかどうかで<code>cp -r</code>の意味が変わるから</strong>だ。<code>dst</code>が無ければ<code>dst</code>を<code>src</code>のコピーとして作る(<code>dst/a.txt</code>)。<code>dst</code>があれば<code>src</code>を<code>dst</code>の<em>中へ</em>入れる(<code>dst/src/a.txt</code>)。同じコマンドなのに<strong>新規サーバーと再配布サーバーで結果が違う。</strong>「新規インストールはうまくいくのに、更新すると変になる」という症状の定番の原因だ。</p>
+                    <p>安全な書き方は<strong>ディレクトリではなく中身を指定する</strong>ことである。</p>
+                    <pre><code>cp -r src/. dst2/   # を3回
+
+run1: dst2 dst2/a.txt
+run2: dst2 dst2/a.txt
+run3: dst2 dst2/a.txt</code></pre>
+                    <h3>7.2 mv - 二度目はただ失敗する</h3>
+                    <pre><code>run1 exit=0
+mv: cannot stat 'mvsrc/data.bin': No such file or directory
+run2 exit=1</code></pre>
+                    <p><code>mv</code>は<strong>本質的に再実行できないコマンド</strong>だ。出発点が消えるからである。再実行できるようにするには<code>[ -e "$SRC" ] &amp;&amp; mv ...</code>のように<em>出発点の存在を条件</em>に掛けるか、そもそも<code>mv</code>の代わりに<strong>目標状態を記述する方式</strong>(コピーしてから検証する、あるいは行き先を基準に判断する)へ変えなければならない。</p>
+                    <h3>7.3 sedの「行の追加」 - aコマンドはappendと同じ</h3>
+                    <pre><code>sed -i '/^\[core\]$/a\    autocrlf = input' gitcfg.ini   # を3回
+
+run1: [core]|    autocrlf = input|
+run2: [core]|    autocrlf = input|    autocrlf = input|
+run3: [core]|    autocrlf = input|    autocrlf = input|    autocrlf = input|</code></pre>
+                    <p><code>sed</code>を使ったからといって置換になるわけではない。<code>a</code>(append)コマンドは<strong>名前のとおり追加</strong>なので、<code>&gt;&gt;</code>と性質が同じだ。安全な書き方は<strong>「あれば置換、無ければ挿入」</strong>の二分岐である。</p>
+                    <pre><code>if grep -q '^[[:space:]]*autocrlf[[:space:]]*=' f.ini; then
+  sed -i 's/^[[:space:]]*autocrlf[[:space:]]*=.*/    autocrlf = input/' f.ini
+else
+  sed -i '/^\[core\]$/a\    autocrlf = input' f.ini
+fi
+
+run1 sha=94ff19468316c369 | [core]|    autocrlf = input|
+run2 sha=94ff19468316c369 | [core]|    autocrlf = input|
+run3 sha=94ff19468316c369 | [core]|    autocrlf = input|</code></pre>
+                    <h3>7.4 タイムスタンプと乱数 - 冪等の検証そのものを不可能にする</h3>
+                    <p>ファイルの中に<code>date</code>の出力や<code>$RANDOM</code>が入ると、そのファイルは<strong>回すたびにハッシュが変わる。</strong>ロジックが冪等かどうかとは無関係に<em>検証の手段を失う。</em>規則は単純だ。<strong>状態ファイルと監査ログを分離する。</strong>いつ何をしたのかは別のログに残し、スクリプトが管理する設定ファイルには決定的な内容だけを書く。</p>
+                    <h3>7.5 まとめ - 再実行安全性の3段階で見直す</h3>
+                    <ul>
+                        <li><code>mkdir -p</code>、<code>rm -f</code>は<strong>①再実行安全</strong>までしか与えない。</li>
+                        <li><code>grep -qxF</code>の後のappend、<code>ln -sfn</code>は<strong>②結果の収束</strong>に到達する。</li>
+                        <li>マーカーブロックの差し替えとファイル全体の生成は<strong>③自己修復</strong>まで行く。人がブロックの中を書き換えても元に戻す。</li>
+                        <li><code>cp -r</code>、<code>mv</code>、<code>sed ... a\</code>は<strong>どの層にも属さない。</strong>包まなければそのまま事故だ。</li>
+                    </ul>
+
+                    <h2>8. マーカーブロック - 三度回してもハッシュが同じになる理由</h2>
+                    <p>ここまでの防御策は<strong>行単位</strong>だった。管理する行が五つを超えると、この方式は急激に散らかる。そのときに使うのが<strong>マーカーブロック</strong>だ。Ansibleの<code>blockinfile</code>モジュールが既定値として<code># BEGIN ANSIBLE MANAGED BLOCK</code>と<code># END ANSIBLE MANAGED BLOCK</code>を使う、まさにあの方式である。</p>
+                    <p>発想は単純だ。<strong>「自分が管理する区間」をマーカーで示し、その間を丸ごと差し替える。</strong>行ごとに存在を確認する必要が無くなる。</p>
+                    <pre><code>apply_block(){
+  local file="$1" tag="$2" body="$3"
+  local begin="# BEGIN ${tag}" end="# END ${tag}"
+  [ -e "$file" ] || : > "$file"
+  if grep -qxF "$begin" "$file"; then
+    awk -v b="$begin" -v e="$end" -v body="$body" '
+      $0==b { print b; printf "%s", body; skip=1; next }
+      $0==e { print e; skip=0; next }
+      skip==1 { next }
+      { print }' "$file" > "$file.new" &amp;&amp; mv "$file.new" "$file"
+  else
+    { printf '%s\n' "$begin"; printf '%s' "$body"; printf '%s\n' "$end"; } >> "$file"
+  fi
+}</code></pre>
+                    <p>人が手で管理している3行が既に入っているファイルに、この関数を<strong>3回</strong>適用した。</p>
+                    <pre><code>run1 sha256=5d22eee7c5ef0991451ca494fdff31a15f39c10ab6a1626136c7d990f0beb8b6
+run2 sha256=5d22eee7c5ef0991451ca494fdff31a15f39c10ab6a1626136c7d990f0beb8b6
+run3 sha256=5d22eee7c5ef0991451ca494fdff31a15f39c10ab6a1626136c7d990f0beb8b6
+-- resulting file --
+# hand-maintained section
+Port 22
+PermitRootLogin no
+# BEGIN braindetox-keepalive
+ClientAliveInterval 60
+ClientAliveCountMax 3
+# END braindetox-keepalive
+OK: the hand-maintained 3 lines are untouched</code></pre>
+                    <p><strong>3回実行のハッシュが完全に同一</strong>で、マーカーの外にある既存の設定は壊れていない。これが②結果の収束だ。</p>
+                    <h3>8.1 値が変わればブロックだけが更新される</h3>
+                    <pre><code>## value change updates the block in place (60 -> 30, 3 more runs)
+run4 sha256=1a402ffc0e2c088220b5e90471c69c330f6e4925ab579c3f0db1dc17271f3b18
+run5 sha256=1a402ffc0e2c088220b5e90471c69c330f6e4925ab579c3f0db1dc17271f3b18
+run6 sha256=1a402ffc0e2c088220b5e90471c69c330f6e4925ab579c3f0db1dc17271f3b18
+total lines: 7 (no accumulation)</code></pre>
+                    <p>新しい値で<strong>新しいハッシュに再び固定される</strong>。行数は7のまま保たれる。ブロックが積み上がらない。</p>
+                    <h3>8.2 append方式に絶対できないこと - 項目の削除</h3>
+                    <p>ここがマーカーブロックの真価だ。管理する項目を2行から1行へ<strong>減らして</strong>みよう。</p>
+                    <pre><code># BEGIN braindetox-keepalive
+ClientAliveInterval 30
+# END braindetox-keepalive
+  -> append-based approaches cannot do this: a removed entry would linger</code></pre>
+                    <p><code>ClientAliveCountMax</code>が消えた。<strong>「存在すればスキップ」方式ではこれが不可能だ。</strong>スクリプトからその行を消しても、既に配布されたサーバーのファイルには永遠に残る。何年か経つと、誰も理由を知らない設定がサーバーごとに違う形で溜まっていく。マーカーブロックは<strong>ブロック全体がそのまま宣言</strong>なので、この問題が構造的に発生しない。</p>
+                    <h3>8.3 マーカーブロックを使うときの注意点</h3>
+                    <ul>
+                        <li><strong>タグは固有に</strong>取る。同じファイルに複数のスクリプトがブロックを入れることがある。<code># BEGIN myapp-nginx-upstream</code>のように所有者と用途を併記する。</li>
+                        <li><strong>コメント文字はファイルごとに違う。</strong><code>#</code>ではなく<code>;</code>や<code>//</code>を使う形式なら、マーカーもその文法に従わなければならない。そうしないとパーサーが落ちる。</li>
+                        <li><strong>マーカーを人が消すと</strong>次の実行でブロックが新しく追加され、重複が生じる。「触らないでください」という案内をブロックの先頭行に一緒に入れておくと役に立つ。</li>
+                        <li><strong>構造のある形式(JSON・YAML)には使わない。</strong>行ベースの挿入はこうした形式を壊す。専用のパーサーで読み書きする必要がある。</li>
+                        <li><strong>ブロックの中だけを管理する。</strong>スクリプトがマーカーの外を触り始めると、このパターンの利点は消える。</li>
+                    </ul>
+
+                    <h2>9. 再実行を証明する方法 - 状態ハッシュとdry-run</h2>
+                    <p>「冪等に書いた」という主張は検証できなければならない。最も安い方法は<strong>対象ツリー全体をハッシュ一つに畳むこと</strong>だ。</p>
+                    <pre><code>state_hash(){
+  ( cd "$1" &amp;&amp; {
+      find . -type f | LC_ALL=C sort | xargs sha256sum
+      find . -type l | LC_ALL=C sort | while read -r l; do echo "$(readlink "$l")  $l"; done
+    } | sha256sum | awk '{print $1}' )
+}</code></pre>
+                    <p>通常のファイルは内容のハッシュで、シンボリックリンクは<code>readlink</code>の結果で畳む。<code>LC_ALL=C sort</code>で並び順を固定するのが重要だ。ロケールによって順序が変われば、ハッシュも変わる。プロビジョニング関数を3回回した結果である。</p>
+                    <pre><code>provision run1  state_hash=219dd1b402f930f92ce94faa467761005c47cb12d740c452e7609d3d6d0d4526
+provision run2  state_hash=219dd1b402f930f92ce94faa467761005c47cb12d740c452e7609d3d6d0d4526
+provision run3  state_hash=219dd1b402f930f92ce94faa467761005c47cb12d740c452e7609d3d6d0d4526</code></pre>
+                    <h3>9.1 ドリフトを入れて回し直すと - 正直な結果</h3>
+                    <p>ここで<strong>都合の悪い結果</strong>が一つ出たので、そのまま載せる。状態をわざとずらしてから再実行した。</p>
+                    <pre><code>after drift   state_hash=74c1a29f825801f98c4d235c47df56ad943e386df4697f5ffd3b1709e7d3785b
+after re-run  state_hash=3e25756382253f698945962c75d2fd19bc1455d5dc20b79aa672057b3220cb81
+-- app.env --
+MODE=production
+TZ=Asia/Seoul
+MODE=debug</code></pre>
+                    <p>再実行の後のハッシュが<strong>元の値(219dd1...)に戻らなかった。</strong>何が復旧して何が残ったのかを見てみよう。</p>
+                    <ul>
+                        <li><strong>復旧した</strong> - 人が作った<code>obsolete.conf</code>は<code>rm -f</code>で消えた。</li>
+                        <li><strong>復旧した</strong> - <code>current</code>シンボリックリンクは<code>ln -sfn</code>で<code>releases/v2</code>を指し直した。</li>
+                        <li><strong>残った</strong> - 人が手で入れた<code>MODE=debug</code>の行は<strong>そのまま残った。</strong></li>
+                    </ul>
+                    <p>理由ははっきりしている。<code>grep -qxF ... || append</code>方式は<strong>「自分が望む行があるか」だけを尋ね、「自分が望まない行があるか」は尋ねない。</strong>つまり②結果の収束には到達したが、③自己修復ではない。アプリがファイルを<em>後の行を優先して</em>読むなら、このサーバーは<code>production</code>だと宣言しておきながら<code>debug</code>で動く。</p>
+                    <p>これを防ぐには<strong>appendを捨ててファイル全体かマーカーブロックを宣言</strong>しなければならない。再実行の検証を「ハッシュが3回同じ」で止めると、この穴が見えない。<strong>ドリフトをわざと入れて回してみる手順</strong>が必要な理由だ。</p>
+                    <h3>9.2 dry-run - 変える前に何が変わるかを見る</h3>
+                    <p>運用で実際によく使うのは、ハッシュより<strong>試験実行</strong>だ。<code>--check</code>モードは二つを与える。<em>何が変わるかを先に見ること</em>と<em>収束したかを判定すること</em>である。</p>
+                    <pre><code>-- --check (nothing exists yet) --
+  would add to app.env: MODE=production
+  would add to app.env: TZ=Asia/Seoul
+  changed=1
+-- apply --
+  changed=1
+-- --check again --
+  changed=0 (already at target state)</code></pre>
+                    <p>二度目の<code>--check</code>が<strong><code>changed=0</code></strong>を返す。これが冪等性の運用上の定義だ。<strong>「二度目の実行で変えるものが無いと自分で言えるか」。</strong>CIに入れるのも簡単だ。適用の直後に<code>--check</code>をもう一度回して<code>changed=1</code>が出たら、そのスクリプトは収束していないのでビルドを落とせばよい。</p>
+                    <p>実装の核心は<strong>すべての変更を一つの関数に集めること</strong>だ。上の例では<code>want_line</code>一つだけが<code>CHECK</code>フラグを見ればよいようにした。変更の箇所がコードのあちこちに散らばっていると、dry-runは維持されない。</p>
+
+                    <h2>10. 部分的な失敗からの再開 - ステップマーカーとその罠</h2>
+                    <p>序論の問いに戻ろう。<strong>8段階のうち5段階で落ちたとき</strong>どうするべきか。</p>
+                    <h3>10.1 悪い設計 - 前の段階が冪等でなければ永久に通過できない</h3>
+                    <pre><code>-- bad.sh run 1 (forced failure) --
+  step 3 failed
+exit=3
+-- remove the cause, run 2 --
+mkdir: cannot create directory 'rbad/data': File exists
+exit=1  &lt;- blocked at step 1 forever</code></pre>
+                    <p>失敗の原因を直したのに<strong>1段階で止まる。</strong>この状態で運用担当にできることは、スクリプトを開いて前半をコメントアウトして回すことだけだ。その瞬間、「スクリプトでデプロイする」という前提が崩れる。</p>
+                    <h3>10.2 良い設計 - 各段階を冪等に + 完了マーカー</h3>
+                    <pre><code>run_step(){
+  local name="$1"; shift
+  if [ -f "$S/$name.done" ]; then echo "  [skip] $name"; return 0; fi
+  "$@" &amp;&amp; : > "$S/$name.done" &amp;&amp; echo "  [done] $name"
+}
+run_step schema s1 &amp;&amp; run_step seed s2 &amp;&amp; run_step release s3</code></pre>
+                    <pre><code>-- good.sh run 1 (step 3 fails) --
+  [done] schema
+  [done] seed
+   markers: schema.done seed.done
+-- remove the cause, run 2 --
+  [skip] schema
+  [skip] seed
+  [done] release
+  completed
+-- run 3 (should do nothing) --
+  [skip] schema
+  [skip] seed
+  [skip] release
+  completed
+seed.csv lines: 1 | version: v1</code></pre>
+                    <p>2回目は<strong>失敗した地点から</strong>続けて完走し、3回目は<strong>何もせずに</strong>完走した。<code>seed.csv</code>が1行なのも重要だ。各段階そのものが冪等なので、マーカーが無くても安全である。</p>
+                    <h3>10.3 ステップマーカーの罠 - マーカーは収束を保証しない</h3>
+                    <p>このパターンには罠がある。人が成果物を消してから再実行してみた。</p>
+                    <pre><code>a human deleted 'version'; re-run:
+  [skip] schema
+  [skip] seed
+  [skip] release
+  completed
+version present? no - the marker made it skip</code></pre>
+                    <p>スクリプトは<strong>「完走」と報告したのに、成果物は無い。</strong>マーカーだけを見て実際の状態を見なかったからだ。ここから出てくる原則ははっきりしている。</p>
+                    <ul>
+                        <li><strong>ステップマーカーは再開の速度最適化であって、収束の保証ではない。</strong>重い段階(大容量のダウンロード、マイグレーション)を飛ばす用途にだけ使う。</li>
+                        <li><strong>軽い段階にはマーカーを付けない。</strong>毎回確認するほうが安全で、コストも無い。</li>
+                        <li><strong>マーカーは入力が変われば無効化する。</strong>ファイル名に入力のハッシュを入れれば(<code>release.$(sha256 of config).done</code>)、設定が変わったときに自動で再実行される。</li>
+                        <li><strong>最後には状態を直接検証する。</strong>マーカーとは無関係に<code>[ -f "$R/version" ]</code>のような最終確認を付ける。</li>
+                        <li><strong>マーカーの保存場所を慎重に決める。</strong>対象のサーバーに置けばサーバー交換のときに消え、中央に置けばサーバーごとの状態を反映できない。</li>
+                    </ul>
+
+                    <h2>11. ロックが必要な条件、必要ない条件</h2>
+                    <p>ここまでのすべての防御策には共通の前提があった。<strong>一度に一つだけ走るということ。</strong>この前提が崩れると「確認してから変更」そのものが崩れる。いわゆる<strong>check-then-act</strong>問題だ。</p>
+                    <h3>11.1 再現 - 8つが同時に「無ければ作る」</h3>
+                    <pre><code>round1: no lock SEED=5 | mkdir lock SEED=1 (expected 1)
+round2: no lock SEED=4 | mkdir lock SEED=1 (expected 1)
+round3: no lock SEED=4 | mkdir lock SEED=1 (expected 1)
+round4: no lock SEED=5 | mkdir lock SEED=1 (expected 1)
+round5: no lock SEED=4 | mkdir lock SEED=1 (expected 1)</code></pre>
+                    <p>5回の繰り返しすべてで<strong>4本から5本</strong>の行ができた。期待値は1である。<code>grep</code>で確認する瞬間と<code>&gt;&gt;</code>で追加する瞬間の<em>間</em>に、他のプロセスが割り込んだからだ。前の節であれだけ念入りに作った<code>grep -qxF || append</code>が、同時実行の前では無力である。</p>
+                    <p>実際にこういう状況がいつ起きるのかが重要だ。<strong>cronの周期が5分なのに実行に6分かかるとき</strong>、デプロイのパイプラインが<strong>リトライで同じジョブを二度立ち上げるとき</strong>、複数のノードが<strong>共有ストレージの同じファイル</strong>を触るときだ。三つとも珍しくない。</p>
+                    <h3>11.2 ロックが必要ない場合 - 全体の差し替え</h3>
+                    <p>すべての場合にロックが必要なわけではない。<strong>ファイル全体を一時ファイルに書いてから<code>mv</code>で差し替える</strong>方式は、8つが同時に押し寄せても無事だった。</p>
+                    <pre><code>printf 'value=42\n' > ".atomic.$i.tmp" &amp;&amp; mv ".atomic.$i.tmp" atomic.txt
+
+lines=1 | content=value=42 | sha=72cc615c7f451bd5</code></pre>
+                    <p>根拠は<code>rename(2)</code>の保証だ。マニュアルは<strong>「newpathが既に存在する場合は原子的に置き換えられ、他のプロセスがnewpathへアクセスしようとするときに、それが存在しない時点は存在しない」</strong>と記す。一時ファイルと行き先が<strong>同じファイルシステム</strong>にあること、という条件だけ守ればよい(別のファイルシステムならコピーになり、原子性が崩れる)。</p>
+                    <h3>11.3 ロックが必ず必要な場合 - 読んで直して書き戻す</h3>
+                    <pre><code>### 8 processes increment count by 1 concurrently
+final count=2  (expected count=8)</code></pre>
+                    <p>8回の加算が<strong>2回に失われた。</strong>読んだ値が書く前に古くなる、典型的な更新の喪失だ。判断表にまとめるとこうなる。</p>
+                    <table>
+                        <thead><tr><th>作業の形</th><th>ロックの要否</th><th>理由</th><th>代替</th></tr></thead>
+                        <tbody>
+                            <tr><td>ファイル全体を書き直して差し替え</td><td><strong>不要</strong></td><td><code>rename</code>が原子的</td><td>一時ファイル + <code>mv</code>(同じファイルシステム)</td></tr>
+                            <tr><td>ディレクトリの作成 <code>mkdir -p</code></td><td><strong>不要</strong></td><td>カーネルが原子的に処理</td><td>そのまま使う</td></tr>
+                            <tr><td>行の存在を確認してからappend</td><td><strong>必要</strong></td><td>検査と変更の間に隙間</td><td>ロック、または全体の差し替えへ切り替え</td></tr>
+                            <tr><td>読んで直して書き戻す(カウンター・一覧)</td><td><strong>必要</strong></td><td>更新の喪失</td><td>ロック、またはappend-onlyの後に集計</td></tr>
+                            <tr><td>長時間ジョブの二重起動の防止</td><td><strong>必要</strong></td><td>周期より実行が長くなり得る</td><td>ジョブの入口でロックを取得</td></tr>
+                            <tr><td>マーカーブロックの差し替え</td><td><strong>必要</strong></td><td>読んで直して書き戻す構造</td><td>ロック + 一時ファイル<code>mv</code>の併用</td></tr>
+                        </tbody>
+                    </table>
+                    <h3>11.4 何でロックするか</h3>
+                    <p>Linuxなら<code>util-linux</code>の<code>flock</code>が標準的な選択だ。マニュアルはスクリプト自身をロックする慣用句を示している。</p>
+                    <pre><code>[ "${FLOCKER}" != "$0" ] &amp;&amp; exec env FLOCKER="$0" flock -en "$0" "$0" "$@" || :</code></pre>
+                    <p><code>-n</code>(非ブロッキング)でロックを取れなければ、既定の終了コード<strong>1</strong>を返す(<code>-E</code>で変更できる)。cronに入れるときは、この値を「正常な二重起動の防止」として扱うのか「失敗」と見るのかを決めておかないと、通知が騒がしくなる。</p>
+                    <p><code>flock</code>が無い環境なら<strong><code>mkdir</code>の原子性</strong>を使える。今回の再現で、5回すべて正確に1行を保った方式だ。</p>
+                    <pre><code>if mkdir "$LOCKDIR" 2>/dev/null; then
+  trap 'rmdir "$LOCKDIR"' EXIT INT TERM
+  ... クリティカルセクション ...
+else
+  echo "他のインスタンスが実行中"; exit 0
+fi</code></pre>
+                    <ul>
+                        <li><strong><code>trap</code>で必ず解放する。</strong>入れないと異常終了のときにロックが残り、次の実行が永遠に塞がれる。</li>
+                        <li><strong>ロックのディレクトリにPIDと時刻を残す。</strong>残ったロックが生きているプロセスのものかを判断する根拠になる。</li>
+                        <li><strong>孤児ロックの回収方針</strong>を決める。時間を基準に自動で回収すれば楽だが、遅いだけの正常な実行を殺す危険がある。</li>
+                        <li><strong>NFSなどネットワークファイルシステムではロックの意味が変わる。</strong>複数のノードが参加するなら、ファイルロックではなく専用の調整手段を検討する。</li>
+                        <li><strong>ロックは冪等性の代替品ではない。</strong>ロックは同時実行だけを防ぐ。逐次の再実行で壊れるコードは、ロックを掛けても依然として壊れる。</li>
+                    </ul>
+
+                    <h2>12. コマンド別 安全な書き方の対照表</h2>
+                    <p>ここまで再現した内容を一枚に畳んだ。スクリプトを書いていて手が止まったとき、この表だけ見ればよい。</p>
+                    <table>
+                        <thead><tr><th>やりたいこと</th><th>危険な形</th><th>安全な形</th><th>再実行のときに観測された結果</th></tr></thead>
+                        <tbody>
+                            <tr><td>ディレクトリの作成</td><td><code>mkdir d</code></td><td><code>mkdir -p d</code> + パーミッションは<code>chmod</code>で別途</td><td>2回目 <code>exit=1</code> → <code>-p</code>は0</td></tr>
+                            <tr><td>ファイルの削除</td><td><code>rm f</code></td><td><code>rm -f f</code></td><td>2回目 <code>exit=1</code> → <code>-f</code>は0</td></tr>
+                            <tr><td>設定を一行追加</td><td><code>echo L &gt;&gt; f</code></td><td><code>grep -qxF -- "$L" f || printf '%s\n' "$L" &gt;&gt; f</code></td><td>2行に累積 → 3回とも1行・同一ハッシュ</td></tr>
+                            <tr><td>存在の確認</td><td><code>grep -q "$L" f</code></td><td><code>grep -qxF -- "$L" f</code> + 終了コード2の分岐</td><td>メタ文字で4行、コメントで未適用 → 1行を維持</td></tr>
+                            <tr><td>シンボリックリンクの更新</td><td><code>ln -s t l</code> / <code>ln -sf t l</code></td><td><code>ln -sfn t l</code>(または一時リンク + <code>mv -T</code>)</td><td><code>-sf</code>はリンクの中にリンクを生成 → <code>-sfn</code>は3回同一</td></tr>
+                            <tr><td>設定値の置換</td><td><code>sed -i 's#A#A+B#'</code></td><td>目標状態の<code>grep</code>先行検査 + <code>^...$</code>アンカー + 事後の検証</td><td>3回で三重に累積 → 3回同一</td></tr>
+                            <tr><td>行の挿入</td><td><code>sed -i '/anchor/a\ LINE'</code></td><td>あれば置換、無ければ挿入の分岐</td><td>3行に累積 → 3回同一ハッシュ</td></tr>
+                            <tr><td>複数行の管理</td><td>行ごとに個別のappend</td><td><code># BEGIN tag</code> ~ <code># END tag</code> ブロックの差し替え</td><td>3回同一ハッシュ、項目の削除も反映</td></tr>
+                            <tr><td>cronの登録</td><td><code>(crontab -l; echo J) | crontab -</code></td><td><code>grep -vF</code>で除去してから再挿入、または<code>cron.d</code>へファイルを配置</td><td>3個に増殖 → 3回とも1個・同一ハッシュ</td></tr>
+                            <tr><td>ディレクトリのコピー</td><td><code>cp -r src dst</code></td><td><code>cp -r src/. dst/</code></td><td>2回目から<code>dst/src/</code>が入れ子 → 3回同一</td></tr>
+                            <tr><td>ファイルの移動</td><td><code>mv s d</code></td><td><code>[ -e "$s" ] &amp;&amp; mv "$s" "$d"</code></td><td>2回目 <code>exit=1</code> → 条件付きは通過</td></tr>
+                            <tr><td>同時実行の防止</td><td>無し(確認してから変更)</td><td><code>flock -en</code> または <code>mkdir</code>ロック + <code>trap</code></td><td>8並列で4本から5本 → 5回とも1行</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2>結論: 冪等性は性格ではなく設計だ</h2>
+                    <p>この記事で再現した事故には共通点がある。<strong>大半がエラーを出さない。</strong><code>ln -sf</code>は0を返して古いバージョンを提供し続け、<code>sed -i</code>は0を返して何もせず、コメントに引っかかった<code>grep -qF</code>は数か月にわたって設定を適用しなかった。<strong>終了コードが0であることと、目標状態に到達したことは別の話だ。</strong>この一文だけ残しても、この記事は元が取れる。</p>
+                    <p>だから実務の規則は三行に縮む。第一に、<strong>「このコマンドが既に済んだ状態で実行されたら何をするのか」を行ごとに問う。</strong>事故の大半は、この問いを一度もしないことから生まれる。第二に、<strong>「やったか」ではなく「目標状態か」を検査する。</strong>作業の履歴ではなく、現在の状態が基準だ。第三に、<strong>主張せずに証明する。</strong>三度回してハッシュを比べるのにかかる時間は1分で、その1分が午前3時の2時間を節約する。</p>
+                    <p>規模が大きくなれば、結局Ansibleのような道具へ行き着く。その道具たちが「冪等だ」と言っているものの正体こそ、この記事で手作りしたものだ。<code>lineinfile</code>は存在を確認してからの変更であり、<code>blockinfile</code>はマーカーブロック、<code>--check</code>はdry-run、<code>changed</code>の値は収束したかどうかである。<strong>道具を使っても、この原理を知らなければ<code>shell</code>モジュール一行で同じ事故を起こす。</strong>実際、道具を導入した後も事故が続く組織は、たいていこの地点にいる。</p>
+                    <p>最後に、今日できることを一つ。<strong>最も頻繁に回っているスクリプトを一時ディレクトリで三度回し、状態ハッシュを出してみること。</strong>三つの値が違うなら、そのスクリプトは既に毎日少しずつ何かを変え続けている。まだ誰も気づいていないだけだ。</p>
+
+                    <h2>参考資料</h2>
+                    <ul>
+                        <li>The Open Group Base Specifications Issue 8, <code>mkdir</code>(<code>-p</code>は既存のディレクトリをエラーなしで無視する): <a href="https://pubs.opengroup.org/onlinepubs/9799919799/utilities/mkdir.html" target="_blank" rel="noopener">pubs.opengroup.org</a></li>
+                        <li>The Open Group Base Specifications Issue 8, <code>rm</code>(<code>-f</code>は存在しないオペランドで終了ステータスを変えない): <a href="https://pubs.opengroup.org/onlinepubs/9799919799/utilities/rm.html" target="_blank" rel="noopener">pubs.opengroup.org</a></li>
+                        <li>The Open Group Base Specifications Issue 8, <code>ln</code> · <code>sed</code> · <code>grep</code> ユーティリティの定義: <a href="https://pubs.opengroup.org/onlinepubs/9799919799/utilities/contents.html" target="_blank" rel="noopener">pubs.opengroup.org</a></li>
+                        <li>GNU Coreutils Manual, <code>ln</code>(<code>-n</code>はディレクトリを指すシンボリックリンクを通常のファイルとして扱う): <a href="https://www.gnu.org/software/coreutils/manual/html_node/ln-invocation.html" target="_blank" rel="noopener">gnu.org/software/coreutils</a></li>
+                        <li>GNU Grep Manual(<code>-F</code> 固定文字列 · <code>-x</code> 行全体の一致 · 終了コード 0/1/2): <a href="https://www.gnu.org/software/grep/manual/grep.html" target="_blank" rel="noopener">gnu.org/software/grep</a></li>
+                        <li>GNU Sed Manual(<code>-i</code> その場での編集と <code>a</code> コマンド): <a href="https://www.gnu.org/software/sed/manual/sed.html" target="_blank" rel="noopener">gnu.org/software/sed</a></li>
+                        <li><code>rename(2)</code> man page(newpathが存在する場合の原子的な置き換えの保証): <a href="https://man7.org/linux/man-pages/man2/rename.2.html" target="_blank" rel="noopener">man7.org</a></li>
+                        <li><code>flock(1)</code> man page(シェルスクリプトの自己ロックの慣用句 · <code>-n</code> 失敗時の終了コード1): <a href="https://man7.org/linux/man-pages/man1/flock.1.html" target="_blank" rel="noopener">man7.org</a></li>
+                        <li><code>flock(2)</code> man page(勧告ロックの意味と限界): <a href="https://man7.org/linux/man-pages/man2/flock.2.html" target="_blank" rel="noopener">man7.org</a></li>
+                        <li>Ansible公式文書, <code>blockinfile</code>モジュール(既定のマーカー <code># BEGIN/END ANSIBLE MANAGED BLOCK</code>): <a href="https://docs.ansible.com/ansible/latest/collections/ansible/builtin/blockinfile_module.html" target="_blank" rel="noopener">docs.ansible.com</a></li>
+                        <li>Ansible公式文書, <code>lineinfile</code>モジュール(行単位の存在の保証): <a href="https://docs.ansible.com/ansible/latest/collections/ansible/builtin/lineinfile_module.html" target="_blank" rel="noopener">docs.ansible.com</a></li>
+                        <li>Bash Reference Manual(<code>set -e</code>の挙動と例外): <a href="https://www.gnu.org/software/bash/manual/bash.html" target="_blank" rel="noopener">gnu.org/software/bash</a></li>
+                        <li>関連記事: <a href="linux_server_guide_06_shell_basics.html">Linuxサーバー管理 6 - シェルスクリプト基礎</a>、<a href="linux_server_guide_07_shell_advanced.html">Linuxサーバー管理 7 - シェルスクリプト上級</a>、<a href="linux_server_guide_09_backup.html">Linuxサーバー管理 9 - バックアップと復旧</a>、<a href="linux_rsync_guide.html">rsync完全ガイド</a></li>
+                    </ul>
+                </div>
+
+                <!-- md-artifact-start -->
+                    <div class="md-artifact" style="margin:2rem 0;border:1px solid #d7dce3;border-radius:10px;overflow:hidden;background:#fbfcfd;">
+                        <div style="display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;justify-content:space-between;padding:.7rem 1rem;background:#eef2f7;border-bottom:1px solid #d7dce3;">
+                            <span style="font-weight:700;font-size:.97rem;">📋 そのまま持ち出せるチェックリスト</span>
+                            <span style="display:flex;gap:.5rem;align-items:center;">
+                                <code style="font-size:.82rem;color:#5a6675;background:transparent;padding:0;">shell_readonly_idempotent_script.md</code>
+                                <button type="button" class="md-artifact-copy" style="cursor:pointer;border:1px solid #b9c2cf;background:#fff;color:#2c3e50;font-weight:600;line-height:1.3;border-radius:6px;padding:.32rem .7rem;font-size:.85rem;">全体をコピー</button>
+                            </span>
+                        </div>
+                        <pre style="margin:0;max-height:420px;overflow:auto;padding:1rem;background:#fbfcfd;font-size:.86rem;line-height:1.62;"><code class="nohighlight" style="background:transparent;padding:0;white-space:pre;"># 冪等スクリプト チェックリスト — 書く前に目を通す一覧
+
+&gt; 出典: braindetox.kr — 二度実行しても壊れないスクリプト
+&gt; 根拠: POSIX Issue 8 (mkdir/rm), GNU coreutils (ln -n), rename(2), flock(1)
+&gt; このファイルをそのままAIに貼って「うちのスクリプトをこの基準で直して」と書けます。
+
+## 1. コマンド別の安全な形 — そのまま貼る形
+
+| やりたいこと | この形で書く |
+|---|---|
+| ディレクトリ作成 | `mkdir -p "$D"` + 権限は `chmod 0750 "$D"` を別行で |
+| ファイル削除 | `rm -f "$F"`（ディレクトリなら `rm -rf` — 変数の防御必須） |
+| 行の追加 | `grep -qxF -- "$L" "$F" \|\| printf '%s\n' "$L" &gt;&gt; "$F"` |
+| 行の削除 | `grep -vxF -- "$L" "$F" &gt; "$F.t" &amp;&amp; mv "$F.t" "$F"` |
+| シンボリックリンク | `ln -sfn "$TARGET" "$LINK"` |
+| 値の置換 | `grep -qxF "$WANT" "$F" \|\| sed -i "s#^$OLD\$#$WANT#" "$F"` |
+| 行の挿入 | あれば `sed -i 's/^key=.*/key=v/'`、なければ `a\` で分岐 |
+| cron 登録 | `{ crontab -l 2&gt;/dev/null \| grep -vF "$ABS_PATH"; echo "$JOB"; } \| crontab -` |
+| ディレクトリ複製 | `cp -r "$SRC/." "$DST/"`（`cp -r src dst` ではない） |
+| ファイル移動 | `[ -e "$S" ] &amp;&amp; mv "$S" "$D"` |
+| ファイル全体の書き込み | `... &gt; "$F.tmp" &amp;&amp; mv "$F.tmp" "$F"`（同一ファイルシステム） |
+
+## 2. 書く前の自問（一行ずつ）
+- [ ] この行は**すでに済んだ状態**で実行されたら何をするか
+- [ ] 「やったか」ではなく**「目標状態か」**を検査しているか
+- [ ] `grep` の確認に `-x`（行全体）と `-F`（固定文字列）が両方あるか
+- [ ] `grep` の終了コード **2（エラー）** を 1（不一致）と区別しているか
+- [ ] `sed` の置換結果が**パターンに再び一致**しないか
+- [ ] `sed -i` の終了コードを「適用された」の根拠にしていないか
+- [ ] シンボリックリンクの張り替えに **`-n`** が付いているか
+- [ ] `set -e` の下で前段の失敗が**後続を丸ごと飲み込んで**いないか
+- [ ] ファイルに**タイムスタンプ・乱数**を入れてハッシュ比較を潰していないか
+- [ ] 管理項目を**減らしたとき**、配布済みのファイルからも消えるか
+
+## 3. マーカーブロック テンプレート — 管理行が5本を超えたらこれ
+
+```bash
+apply_block(){                     # apply_block &lt;ファイル&gt; &lt;タグ&gt; &lt;本文&gt;
+  local file="$1" tag="$2" body="$3"
+  local begin="# BEGIN ${tag}" end="# END ${tag}"
+  [ -e "$file" ] || : &gt; "$file"
+  if grep -qxF "$begin" "$file"; then
+    awk -v b="$begin" -v e="$end" -v body="$body" '
+      $0==b { print b; printf "%s", body; skip=1; next }
+      $0==e { print e; skip=0; next }
+      skip==1 { next }
+      { print }' "$file" &gt; "$file.new" &amp;&amp; mv "$file.new" "$file"
+  else
+    { printf '%s\n' "$begin"; printf '%s' "$body"; printf '%s\n' "$end"; } &gt;&gt; "$file"
+  fi
+}
+apply_block /etc/ssh/sshd_config "myapp-keepalive" \
+  $'ClientAliveInterval 30\nClientAliveCountMax 3\n'
+```
+
+- [ ] タグに**所有者と用途**を入れた（`myapp-nginx-upstream`）
+- [ ] ファイルの**コメント文字**に合わせた（`#` / `;` / `//`）
+- [ ] JSON・YAML など**構造のある形式には使わない**
+- [ ] スクリプトが**マーカーの外に触れない**
+
+## 4. 再実行の検証手順 — コミット前の1分
+
+```bash
+state_hash(){
+  ( cd "$1" &amp;&amp; {
+      find . -type f | LC_ALL=C sort | xargs sha256sum
+      find . -type l | LC_ALL=C sort | while read -r l; do echo "$(readlink "$l")  $l"; done
+    } | sha256sum | awk '{print $1}' )
+}
+for i in 1 2 3; do ./provision.sh "$ROOT"; echo "run$i $(state_hash "$ROOT")"; done
+```
+
+- [ ] 3回のハッシュが**すべて同じ**（違えばどこかで累積している）
+- [ ] `LC_ALL=C sort` で並び順を固定した
+- [ ] **わざとドリフトを入れて**再実行した（設定を1行追加・リンク張り替え・余分なファイル）
+- [ ] `--check` の2回目が **changed=0** を返す
+- [ ] 試験は**一時ディレクトリ**でのみ行った
+
+## 5. ロックが必要な条件
+
+| 状況 | ロック | 代替 |
+|---|---|---|
+| ファイル全体の置換 | 不要 | 一時ファイル + `mv` |
+| `mkdir -p` | 不要 | そのまま |
+| 確認してから追記 | **必要** | 全体置換に切り替える |
+| 読んで直して書く | **必要** | 追記のみにして後で集計 |
+| 周期より長いcronジョブ | **必要** | 入口でロック取得 |
+| マーカーブロック置換 | **必要** | ロック + 一時ファイル `mv` |
+
+```bash
+# flock がある場合
+[ "${FLOCKER}" != "$0" ] &amp;&amp; exec env FLOCKER="$0" flock -en "$0" "$0" "$@" || :
+
+# ない場合は mkdir の原子性を使う
+if mkdir "$LOCKDIR" 2&gt;/dev/null; then
+  trap 'rmdir "$LOCKDIR"' EXIT INT TERM
+else
+  echo "別のインスタンスが実行中"; exit 0
+fi
+```
+
+- [ ] `trap` で必ずロックを解放する
+- [ ] ロックディレクトリに **PID・時刻**を残す
+- [ ] **取り残しロックの回収方針**を決めた
+- [ ] ロックは**同時実行だけ**を防ぐ — 逐次再実行の欠陥はそのまま残る
+
+## 6. 部分失敗からの再開
+- [ ] 各ステップが**それ自体で冪等**（目印がなくても安全）
+- [ ] 目印は**重い工程だけ**に付ける
+- [ ] 目印の名前に**入力ハッシュ**を入れ、設定変更で自動的に無効化する
+- [ ] 最後は目印ではなく**実際の状態**を検証する
+
+---
+確認時点: 2026-07。再現環境 MSYS2 / bash 5.2.37 / GNU sed 4.9 / grep 3.0 / coreutils 8.32。
+破壊的なコマンドは必ず一時ディレクトリで先に試してください。
+</code></pre>
+                        <p style="margin:0;padding:.6rem 1rem;font-size:.82rem;color:#5a6675;border-top:1px solid #e3e8ee;">コピーしてメモアプリやAIツールにそのまま貼り付けてください。</p>
+                    </div>
+                    <script>
+                    (function(){
+                      if (window.__mdArtifactBound) return;
+                      window.__mdArtifactBound = true;
+                      document.addEventListener('click', function(ev){
+                        var btn = ev.target.closest && ev.target.closest('.md-artifact-copy');
+                        if (!btn) return;
+                        var box = btn.closest('.md-artifact');
+                        var code = box && box.querySelector('pre code');
+                        if (!code) return;
+                        var text = code.textContent;
+                        var label = btn.textContent;
+                        var ok = function(){
+                          btn.textContent = "コピーしました";
+                          setTimeout(function(){ btn.textContent = label; }, 1600);
+                          if (typeof gtag === 'function') {
+                            gtag('event', 'md_copy', { slug: "shell_readonly_idempotent_script", lang: "ja", chars: text.length });
+                          }
+                        };
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                          navigator.clipboard.writeText(text).then(ok).catch(function(){ fallback(); });
+                        } else { fallback(); }
+                        function fallback(){
+                          var ta = document.createElement('textarea');
+                          ta.value = text; ta.setAttribute('readonly','');
+                          ta.style.position='fixed'; ta.style.left='-9999px';
+                          document.body.appendChild(ta); ta.select();
+                          try { document.execCommand('copy'); ok(); } catch(e) {}
+                          document.body.removeChild(ta);
+                        }
+                      });
+                    })();
+                    </script>
+                    <!-- md-artifact-end -->
+
+                <div class="share-section">
+                    <h3>この記事をシェア</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">スレッズ</button>
+                        <button id="link-copy" class="share-btn link-btn">リンクをコピー</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">一覧に戻る</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">一緒に使うと便利な無料ツール</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/json_formatter.html">JSON フォーマッター</a></li>
+      <li><a href="../static/regex_tester.html">正規表現テスター</a></li>
+      <li><a href="../static/jwt_decoder.html">JWTデコーダー・生成器 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 エンコーダー/デコーダー</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">すべてのツールを見る &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">関連記事</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="shell_dry_run_design.html">まともな --dry-run の作り方 - まねごとではなく検証を</a></li>
+      <li><a href="shell_quoting_rules_guide.html">シェルのクォート規則 - どの引用符が何を止めるのか</a></li>
+      <li><a href="fcm_duplicate_push_debug_2026.html">再デプロイで送信済みのプッシュ通知が再送された - FCM通知重複配信のデバッグ 2026</a></li>
+      <li><a href="offline_sync_toggle_distributed_2026.html">トグル一つが分散システムになる - オフライン同期がオフにした設定を復活させる理由</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('リンクがコピーされました。Threadsアプリに貼り付けてシェアしてください！');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('リンクがコピーされました！'); });
+    });
+    </script>
+</body>
+</html>

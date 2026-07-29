@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<!--
+ * 技術ブログ記事テンプレート
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ja">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>「Cで書き直したら速くなった」の本当の理由 - 音声強調の推論を低レベルに下ろすということ</title>
+    <meta name="description" content="音声強調モデルを純粋なCで再実装した事例を起点に、推論が速くなる理由をランタイム除去・確保制御・SIMD・汎用性の切り捨てに分けて整理した。測定条件の罠と数値同等性の検証手順、そして再実装に値する場面と避けるべき兆候まで扱う。">
+    <meta name="keywords" content="音声強調, speech enhancement, ノイズ抑制, FastEnhancer, C再実装, 低レベル最適化, SIMD, int8量子化, RTF, アルゴリズム遅延, STFT, オンデバイス推論, エッジ推論, ONNX Runtime, ggml, RNNoise, 数値同等性, 回帰テスト, 推論最適化">
+
+    <link rel="canonical" href="https://braindetox.kr/ja/posts/faster_enhancer_c_speech_2026.html">
+
+    <meta property="og:title" content="「Cで書き直したら速くなった」の本当の理由">
+    <meta property="og:description" content="速くなった理由はCだからではない。ランタイム除去・メモリ確保の制御・SIMD・汎用性の切り捨てがそれぞれどこで効くのか、そしていつその代償を払う価値があるのかを分けた。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/ja/posts/faster_enhancer_c_speech_2026.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ja_JP">
+    <meta property="article:published_time" content="2026-07-29">
+    <meta property="article:section" content="IT・技術">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="「Cで書き直したら速くなった」の本当の理由">
+    <meta name="twitter:description" content="同じコードが同じ端末でRTF 0.069と0.286を同時に出す。条件のない速度主張がなぜ情報ではないのか、そして再実装をどう検証するか。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "「Cで書き直したら速くなった」の本当の理由 - 音声強調の推論を低レベルに下ろすということ",
+      "alternativeHeadline": "What Actually Makes a C Rewrite Faster - Lowering Speech Enhancement Inference to the Metal",
+      "datePublished": "2026-07-29",
+      "dateModified": "2026-07-29",
+      "inLanguage": "ja-JP",
+      "articleSection": "IT・技術",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "音声強調, ノイズ抑制, FastEnhancer, C再実装, 低レベル最適化, SIMD, int8量子化, RTF, アルゴリズム遅延, STFT, オンデバイス推論, ONNX Runtime, ggml, RNNoise, 数値同等性",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/ja/posts/faster_enhancer_c_speech_2026.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "推論コードをCで書き直せば本当に速くなるのか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "速くなる場合はあるが、原因は言語ではない。実際の利得は四つに分かれる。第一に、汎用推論ランタイムがフレームごとに繰り返す固定費の除去である。グラフの解釈、ノードごとのカーネル選択、テンソル記述子の確認、実行プロバイダ境界の通過といった作業は、演算そのものとは無関係に毎回かかる。モデルが小さく呼び出しが頻繁なほど、この比率は大きくなる。第二にメモリ確保の制御である。実行中に確保が起きなければ縮むのは平均ではなく裾であり、オーディオコールバックで品質を決めるのは平均ではなく上位パーセンタイルである。第三にSIMDと整数演算だが、この利得はハードウェアに属する。ONNX Runtimeの公式文書は、8ビット推論の性能向上がモデルとハードウェアに依存し、古いハードウェアには必要な命令がないか少ないと明記している。第四に、使わない汎用性の切り捨てである。モデル一つ、標本化周波数一つ、フレーム長一つに固定すれば、誰も通らない経路の費用が消える。同じアルゴリズム、同じ精度、同じ命令を使うなら、他のコンパイル言語もおおむね似た機械語を出す。再実装が実際にやったことの大半は、何をうまくやるかではなく何をやらないかを決めたことである。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "リポジトリに書かれた3.3倍という数値をそのまま引用してよいか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "勧められない。その数値はリポジトリの一行説明にしか現れず、READMEの性能節にはONNXランタイムとの速度比較が載っていない。READMEでONNXが登場するのは品質節であり、そこでは同じ重みの32ビット浮動小数点グラフを速度の比較対象ではなく精度の基準線として使っている。つまりその倍率の横には、どの端末か、基準線が何スレッドか、入力がどれだけ長いか、基準線ビルドの設定が何かが一切書かれていない。条件のない倍率は再現も反証もできないため、根拠として使えない。一方でREADMEが自分の表に載せた値には条件が付いている。5,569フレームのクリップで測り、最初の200フレームを捨てた後の定常状態のパーセンタイルであり、反復測定の中央値だという記述である。同じ文書の中に、条件が付いて検証可能な主張と、条件がなく検証できない主張が同居している。これは著者の誠実さの問題ではなく、書ける欄の大きさの問題である。読む側が条件欄から確認する習慣を持つほうが安全だ。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "RTFが低ければ遅延も低いのか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "違う。二つは別のものを測っている。実時間係数は処理にかかった時間を入力音声の長さで割った値であり、元論文もこの比率で定義している。これはスループット指標である。一方でアルゴリズム遅延は構造が生む遅延である。たとえばこの再実装は、短時間フーリエ変換の整列で704サンプル、すなわち14.67ミリ秒が固定で付くと述べている。この値は処理速度とは無関係だ。より速いコアに替えて実時間係数をゼロに近づけても、その整列遅延は一マイクロ秒も減らない。遅延を減らすには計算を速くするのではなく構造を変える必要がある。元論文が、時間軸のカーネルサイズが1より大きい因果的畳み込みは遅延を生むと述べ、最小遅延のために時間軸カーネルサイズが1の畳み込みだけを使うと明かしているのはそのためである。つまり先読みしないよう設計段階で固定したのだ。実時間音声を扱うときは二つの数値を必ず別々に記し、片方でもう片方を代弁させてはならない。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "8ビットに落とすと音質は悪くならないのか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "悪くなりうるので、損失を数値で測り改善幅と並べて示す必要がある。ONNX Runtimeの公式文書は、量子化が無損失変換ではなくモデルの精度に悪影響を与えうると明記している。したがって問いは悪くなるかではなく、どれだけ悪くなりそれが受け入れられるかに変わるべきだ。この再実装が公開した対照表がよい手本である。824発話のテストセットで、雑音入力のPESQが1.967、32ビット浮動小数点ONNXが3.060、8ビット再実装が3.054だった。STOIはそれぞれ0.9211、0.9512、0.9509である。重要なのは両方の列があることだ。雑音入力の列がなければモデルがそもそもどれだけ改善するのか分からず、その改善幅の横に置いてはじめて量子化損失の大きさを判断できる。1.967から3.060への改善の横で0.006は小さい。分母のない損失値は読めないということだ。文書はさらに、回帰型ニューラルネットワークとトランスフォーマ系には動的量子化を、畳み込み系には静的量子化を勧めると記している。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "自分たちのチームも推論パイプラインを再実装すべきか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "大半のチームにとってはまだ違う。再実装を正当化するのは速度ではなく制約である。価値がある場合はおおむね四つだ。フレームワーク自体が載らないエッジやオンデバイス環境、締め切りが決まっていて上位パーセンタイルが製品品質を決める硬いリアルタイム処理、配布サイズと起動時間が製品要件になっている場合、そして依存関係の一覧そのものが持ち込み審査の詰まりになっている場合である。逆にやめるべき兆候はもっと明確だ。モデルがまだ変わっている最中なら、再実装は重みとグラフに手で釘を打つ作業なので、変更のたびにカーネルを触り直すことになり研究側が待たされる。精度検証の仕組みがなければ再実装が正しいか証明する方法自体がなく、その状態での速度向上は測定ではなく希望である。保守要員が一人なら、手書きのベクトルカーネルはその人が去った後に誰も直せない速いコードとして残る。ボトルネックがどこか分かっていなければ、再実装はたいてい熱くない場所を最適化する。順序はプロファイリング、ランタイム設定の調整、量子化、汎用性の縮小であり、それでも足りないときに最後の手段として再実装だ。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/faster_enhancer_c_speech_2026.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/faster_enhancer_c_speech_2026.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/faster_enhancer_c_speech_2026.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/faster_enhancer_c_speech_2026.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/faster_enhancer_c_speech_2026.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="「Cで書き直したら速くなった」の本当の理由 - 音声強調の推論を低レベルに下ろすということ">
+                <meta itemprop="datePublished" content="2026-07-29">
+                <meta itemprop="dateModified" content="2026-07-29">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="音声強調, ノイズ抑制, C再実装, SIMD, int8量子化, RTF, アルゴリズム遅延, STFT, オンデバイス推論, 数値同等性">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/ja/posts/faster_enhancer_c_speech_2026.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">「Cで書き直したら速くなった」の本当の理由</h1>
+                    <h2 class="post-subtitle">音声強調の推論を低レベルに下ろすとき、利得はどこから来て、何が壊れやすくなるのか</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-07-29">2026-07-29</span>
+                        <span class="post-category" itemprop="articleSection">IT・技術</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+                    <h2>序論: その一文で読まれない半分</h2>
+                    <p><strong>「Cで書き直したら何倍も速くなった」</strong>という一文は周期的に戻ってくる。そしてこの文はいつも<strong>二つの部分</strong>でできている。前半は<strong>結果</strong>で、後半は<strong>条件</strong>だ。問題は前半しか運ばれないことである。条件が外れた倍率は、その瞬間に<strong>情報であることをやめて印象になる。</strong></p>
+                    <p>最近もそんな事例が一つ出た。音声強調、つまり雑音混じりの音から話し声を救い出すニューラルネットワークを<strong>純粋なCで再実装したプロジェクト</strong>である。この記事はそのプロジェクトの紹介文ではない。紹介はリポジトリがすでにうまくやっている。ここで答えたい問いは二つだ。<strong>なぜ推論コードを低レベルで書き直すと速くなるのか</strong>、そして<strong>いつその代償を払う価値があるのか。</strong></p>
+                    <p>先に結論の方向を固定しておく。<strong>速くなる理由は「Cだから」ではない。</strong>実際の利得は、ランタイムのオーバーヘッド除去、メモリ確保の制御、ベクトル命令の利用、そして<strong>使わない汎用性の切り捨て</strong>から来る。言語はそれをやりやすい場所を差し出すだけだ。この区別ができないと、<strong>まったく別のプロジェクトに同じ処方を出すことになる。</strong></p>
+                    <p>技術的な記述は<strong>該当リポジトリと論文、そしてONNX Runtimeの公式文書で2026年7月29日に直接確認したもの</strong>だけを載せた。確認できなかった数値は入れず、<strong>条件が書かれていない速度主張は根拠として使わなかった。</strong>その理由は2節で改めて扱う。本文中の状況例はすべて<strong>一般化した仮想の事例</strong>である。</p>
+
+                    <h2>1. 実際に確認できること - 元モデルと再実装</h2>
+                    <p>出発点は二つのリポジトリだ。<strong>元のモデル</strong>と<strong>そのモデルのC再実装</strong>である。著者も目的も異なる。</p>
+                    <p><strong>元モデル</strong>は<code>FastEnhancer</code>である。リポジトリは<code>github.com/aask1357/fastenhancer</code>、論文はarXivに<code>2509.21867</code>として掲載され、ICASSP 2026への採択を伝えている。論文によれば構造は<strong>エンコーダとデコーダにRNNFormerブロックを載せた形</strong>で、サイズの変種は2万2千から110万5千パラメータまで五種類ある。ライセンスはMITだ。</p>
+                    <p><strong>再実装</strong>は<code>github.com/kdrkdrkdr/faster-enhancer.c</code>である。自ら名乗る正体は<strong>48 kHzのFastEnhancer-Mediumのための依存関係のないC/SIMD整数ランタイム</strong>だ。ライセンスは同じくMITで、リポジトリの作成日は2026年7月27日、つまり<strong>きわめて新しいプロジェクト</strong>である。</p>
+                    <p>ここで<strong>もっとも重要な事実</strong>は、何を書き直したのかという点だ。<strong>モデルのアーキテクチャは変わっていない。</strong>書き直されたのは<strong>ランタイム</strong>であり、その範囲は前処理の一部ではなく<strong>推論経路の全体</strong>である。</p>
+                    <table>
+                        <thead><tr><th>項目</th><th>リポジトリ・論文が述べていること</th><th>本記事での扱い</th></tr></thead>
+                        <tbody>
+                            <tr><td>元モデル</td><td>エンコーダ・デコーダ構造にRNNFormerブロック。マスク方式</td><td>アーキテクチャは不変</td></tr>
+                            <tr><td>再実装の範囲</td><td>因果的STFTと逆STFT(1024点実数FFT)、畳み込み、GRU、多頭注意、活性化</td><td>前処理だけではなく推論全体</td></tr>
+                            <tr><td>数値形式</td><td>重みも活性化も8ビット。再学習なしの事後量子化</td><td>速度利得の大きな軸</td></tr>
+                            <tr><td>カーネル</td><td>ARM NEON・DOTPROD・I8MM、x86 AVX2・AVX-VNNI・AVX-512 VNNIの6段</td><td>SIMDの寄与</td></tr>
+                            <tr><td>依存関係</td><td>推論フレームワークなし、外部ライブラリなし</td><td>BLASすら使わない</td></tr>
+                            <tr><td>成果物</td><td>静的ライブラリ162 KiB(macOS arm64)、重み塊565,108バイト</td><td>配布サイズの論拠</td></tr>
+                            <tr><td>規模</td><td>パラメータ511,754個</td><td>小さいモデルという前提</td></tr>
+                            <tr><td>メモリ</td><td>初期化後は確保なし。状態すべてが432,384バイトの一塊</td><td>裾遅延の抑制</td></tr>
+                            <tr><td>ストリーミング</td><td>フレームあたり320サンプル入出力、6.667 ms周期、先読みなし</td><td>実時間制約の実体</td></tr>
+                            <tr><td>成熟度</td><td>固定モデル一種のみ対応。スカラ代替経路なし</td><td>新しく適用範囲が狭い</td></tr>
+                        </tbody>
+                    </table>
+                    <p>表で注目すべきは<strong>最後の二行</strong>だ。このプロジェクトは<strong>モデル一つに特化</strong>しており、基準命令セットを満たさない端末では<strong>遅く動くのではなく初期化段階で失敗する</strong>。これは欠陥ではなく<strong>選択</strong>である。そしてその選択こそが速度の出どころだ。この話は後で続ける。</p>
+
+                    <h2>2. 「3.3倍」はどこに書かれ、どこに書かれていないか</h2>
+                    <p>この節が本記事でもっとも実務的な部分である。リポジトリの<strong>一行説明</strong>にはこう書かれている。<strong>「3.3x faster than the ONNX Runtime graph, same quality」</strong>。目を引く一文であり、実際このプロジェクトが話題になった理由でもある。</p>
+                    <p>ところが<strong>README本文の性能節にはONNXランタイムとの速度比較がない。</strong>READMEでONNXが登場する場所は<strong>品質節</strong>であり、そこでONNXグラフは<strong>速度の比較対象ではなく精度の基準線</strong>として使われている。同じ重みの32ビット浮動小数点グラフを置いて、8ビットエンジンの出力を照合する用途だ。</p>
+                    <p>つまり<strong>3.3という倍率の横に条件がない。</strong>どの端末か、何スレッドの基準線か、入力がどれだけ長いか、基準線ビルドの設定が何かが書かれていない。<strong>条件のない倍率は再現も反証もできない。</strong>だから本記事はその数値を<strong>紹介はするが根拠にはしない。</strong></p>
+                    <p>逆に、READMEが<strong>自分の表に載せた値には条件が付いている</strong>。5,569フレームのクリップで測定し、<strong>最初の200フレームを捨てた後の定常状態のパーセンタイル</strong>であり、反復測定の<strong>中央値</strong>だと明記している。</p>
+                    <table>
+                        <thead><tr><th>端末</th><th>カーネル段</th><th>RTF p50</th><th>RTF p99</th><th>フレームあたり時間</th></tr></thead>
+                        <tbody>
+                            <tr><td>Apple M2</td><td>I8MM</td><td>0.069</td><td>0.084</td><td>0.458 ms</td></tr>
+                            <tr><td>Galaxy S23+</td><td>I8MM</td><td>0.096</td><td>0.105</td><td>0.640 ms</td></tr>
+                        </tbody>
+                    </table>
+                    <p>この表は<strong>自分自身の実時間余裕</strong>を語るだけで、<strong>他のランタイムよりどれだけ速いかは何も語っていない</strong>。二種類の主張が同じ文書の中に同居しているわけだ。一方は条件が付いて検証でき、一方は条件がなく検証できない。</p>
+                    <p>これを著者の誠実さの問題として読むと学ぶものがない。<strong>一行説明の欄はもともと一行</strong>で、そこに測定条件をすべて入れることはできない。本当の問題は<strong>読む側</strong>で生じる。その一行が引用され、引用が再引用される間に<strong>条件は一度も付いてこない。</strong>だから習慣が一つ要る。<strong>速度主張を見るときは倍率より条件欄を先に見る。</strong>条件欄が空なら、その数値はまだ何も語っていない。</p>
+
+                    <h2>3. 速くなる理由を四つに分ける</h2>
+                    <p>ここから原理だ。<strong>低レベル再実装が生む利得は一つの塊ではない。</strong>少なくとも四つに分かれ、それぞれ寄与の大きさと<strong>言語を変えずに得られるかどうか</strong>が異なる。</p>
+                    <h3>ア. ランタイムのオーバーヘッド除去</h3>
+                    <p>汎用推論ランタイムは<strong>グラフを解釈</strong>し、ノードごとに<strong>カーネルを選び</strong>、テンソル記述子を確認し、実行プロバイダ境界を越える。この作業は<strong>実際の演算とは無関係に毎回</strong>かかる。そして核心はここだ。<strong>この固定費はモデルの大きさに比例しない。</strong></p>
+                    <p>そこに<strong>比率の問題</strong>が生まれる。この事例ではフレームあたりの予算が6.667 msで、実際の演算は0.458 ms程度だ。演算がこれほど小さいと<strong>フレームごとに繰り返す固定費の比重が相対的に大きくなる。</strong>逆に一回の呼び出しに数百ミリ秒を使う大きなモデルでは、同じ固定費が<strong>丸め誤差</strong>になる。だから<strong>同じ再実装が小さいモデルでは大きく勝ち、大きいモデルではほとんど勝てない。</strong>この非対称を知らないと、間違った場所に労力を注ぐことになる。</p>
+                    <h3>イ. メモリ確保の制御</h3>
+                    <p>このリポジトリは<strong>初期化後に確保がなく</strong>、すべての状態が<strong>432,384バイトの構造体一つ</strong>に入っていると述べる。この設計が減らすのは<strong>平均ではなく裾</strong>だ。</p>
+                    <p>オーディオではこの区別が決定的である。<strong>平均がいくら良くても一フレームが締め切りを越えれば音が途切れる。</strong>人は平均遅延を聞かず<strong>途切れを聞く。</strong>だから上の表で見るべき数値はp50ではなく<strong>p99</strong>だ。0.069に対して0.084なら裾が<strong>ぴったり張り付いている。</strong>実行中に確保があるとここが開く。アロケータ、ガベージコレクション、実行時コンパイルの暖機のように<strong>たまに長くかかる作業</strong>はすべてこの場所に現れる。</p>
+                    <h3>ウ. SIMDと整数演算</h3>
+                    <p>三つ目の軸は<strong>命令</strong>だ。このリポジトリは8ビット整数の行列積カーネルを<strong>命令セットごとに六通り</strong>手で書いたと述べる。ところが<strong>ここでの利得の出どころは言語ではなくハードウェア</strong>である。</p>
+                    <p>ONNX Runtimeの公式文書がこの点を明確に記している。整数推論の<strong>性能向上はモデルとハードウェアに依存し</strong>、<strong>古いハードウェアには8ビット推論に必要な命令がないか少ない</strong>というのだ。そして<strong>VNNIを備えたx86-64</strong>や<strong>ドット積命令を備えたArmプロセッサ</strong>などが一般により良い性能を出しうると記す。</p>
+                    <p>この文を裏返すと実務指針が出る。<strong>対象ハードウェアが決まっていなければ、この軸の利得は見積もりに入れられない。</strong>そしてこの軸は<strong>言語を変えなくても</strong>相当部分得られる。汎用ランタイムの量子化経路がすでに同じ命令を使うからだ。</p>
+                    <h3>エ. 使わない汎用性の切り捨て</h3>
+                    <p>もっとも過小評価される軸であり、実のところ<strong>もっとも大きく寄与する</strong>軸でもある。汎用ランタイムは<strong>知らないものに備える</strong>。任意の演算子、動的な形状、複数の精度、任意のバッチサイズ。この備えは無料ではない。</p>
+                    <p>このリポジトリはその備えをすべて捨てた。<strong>モデル一種、標本化周波数一つ、フレーム長一つ</strong>に固定した。その代償として<strong>スカラ代替経路すらない。</strong>基準命令セットを満たさない端末では初期化段階で失敗する。<strong>速度は手放した柔軟性の代わりに買ったもの</strong>であり、この取引は戻しにくい。</p>
+                    <h3>では言語自体はどれだけ寄与するのか</h3>
+                    <p>正直に言えば<strong>切り分けて測りにくく、たいてい過大評価される。</strong>同じアルゴリズム、同じ精度、同じ命令を使うなら<strong>他のコンパイル言語もおおむね似た機械語を出す。</strong>Cが与えたのは魔法ではなく<strong>上の四つをやりやすい場所</strong>だ。確保を直接制御し、メモリ配置を直接決め、組み込み関数で命令を直接呼ぶことが自然な環境という意味である。</p>
+                    <p>言語の乗り換えそのものをいつ決めるかは軸が違う問題なので、<a href="rextio_python_to_rust_2026.html">PythonをRustへ移すという決定</a>で別に扱った。本記事は<strong>同じモデルを別のランタイムで再実装し、それが同じ答えを出すと証明する問題</strong>に集中する。</p>
+                    <table>
+                        <thead><tr><th>利得の出どころ</th><th>原理</th><th>このリポジトリでの対応</th><th>言語を変えずに得られるか</th></tr></thead>
+                        <tbody>
+                            <tr><td>ランタイム費用</td><td>グラフ解釈・ディスパッチ・境界通過が呼び出しごとに繰り返す</td><td>推論フレームワーク自体を除去</td><td>部分的 - セッション設定や演算子融合で減らせる</td></tr>
+                            <tr><td>メモリ確保</td><td>実行中の確保は平均ではなく裾を作る</td><td>初期化後は確保なし、状態は一塊</td><td>部分的 - バッファ再利用やアリーナ確保</td></tr>
+                            <tr><td>SIMD・整数演算</td><td>整数の積和命令がスループットを上げる</td><td>命令セット別カーネル6段を手書き</td><td>おおむね可能 - ランタイムの量子化経路が既に使う</td></tr>
+                            <tr><td>汎用性の縮小</td><td>使わない経路も分岐と検証の費用を残す</td><td>モデル・標本化周波数・フレーム長を固定</td><td>難しい - 汎用ランタイムの存在理由と衝突する</td></tr>
+                            <tr><td>言語そのもの</td><td>同じ命令を出せば結果も似る</td><td>寄与を分離測定した資料がない</td><td>該当なし</td></tr>
+                        </tbody>
+                    </table>
+                    <p>表の最後の列が<strong>この表の核心</strong>だ。五行のうち<strong>再実装をしてはじめて得られるものは実質一行</strong>である。残りは<strong>いま使っているランタイムの中でも相当部分得られる。</strong>だから再実装は<strong>最初の手段ではなく最後の手段</strong>であるべきだ。</p>
+
+                    <h2>4. 信号処理の側を先に合わせる</h2>
+                    <p>速度の話を続ける前に<strong>対象が何なのか</strong>を正確にしておく必要がある。この層を雑に飛ばすと、後の測定と検証がすべて揺らぐ。</p>
+                    <h3>STFT - フレームとホップ</h3>
+                    <p>多くの音声強調モデルは波形をそのまま食べない。<strong>短時間フーリエ変換</strong>を通す。手順は三つだ。波形を一定長の<strong>フレーム</strong>に切り、各フレームに<strong>窓関数</strong>を掛け、離散フーリエ変換を適用する。フレームは互いに重ねて切り、重ならない間隔を<strong>ホップ長</strong>と呼ぶ。</p>
+                    <ul>
+                        <li><strong>フレーム長</strong>が周波数分解能を決める。長いほど周波数はよく分かれ、時間はぼやける。</li>
+                        <li><strong>ホップ長</strong>がフレームレートを決める。短いほど毎秒のフレーム数が増え<strong>計算量もその分増える。</strong></li>
+                        <li><strong>窓関数</strong>はフレーム境界で生じる不連続を和らげる。つなぎ直したときに元の振幅が復元されるよう、分析と合成の窓とホップの組み合わせを合わせる必要がある。</li>
+                        <li>この再実装が述べる値は<strong>1024点の実数FFT</strong>と、フレームあたり<strong>320サンプル</strong>の入出力、そして<strong>6.667 ms周期</strong>だ。48 kHzでは320サンプルがちょうど6.667 msである。</li>
+                        <li>元論文は16 kHzモデルの変換サイズを<strong>512</strong>と記し、ホップサイズはモデル変種ごとに変えている。</li>
+                    </ul>
+                    <h3>マスク方式と波形直接生成の違い</h3>
+                    <p>ここが<strong>再実装の難度を分ける地点</strong>なので特に重要だ。</p>
+                    <p>元論文によればこのモデルは<strong>2チャネルのマスクを予測</strong>し、それを入力スペクトログラムに掛けて強調スペクトログラムを作る。つまり<strong>マスク方式</strong>である。モデルは<strong>何をどれだけ残すか</strong>を決め、音そのものは入力から来る。</p>
+                    <ul>
+                        <li><strong>マスク方式の性質</strong> - 出力が入力の<strong>決定的な関数</strong>だ。同じ入力なら同じ出力が出なければならない。だから<strong>再実装の照合が容易である。</strong>両方の実装に同じファイルを入れて数値を比べればよい。</li>
+                        <li><strong>波形直接生成の性質</strong> - 標本抽出が介在する生成型なら、同じ入力でも出力が揺れうる。そうなると<strong>数値照合という手法自体が成立せず</strong>、知覚指標と統計的比較へ移る必要がある。検証費用が一段跳ね上がる。</li>
+                        <li><strong>実務上の含意</strong> - 再実装を検討するときは<strong>モデルが決定的かどうかから確認せよ。</strong>決定的でなければ、同じかどうかを確認するという計画を最初から立て直す必要がある。</li>
+                    </ul>
+                    <h3>実時間性の指標は二つある</h3>
+                    <p>もっとも頻繁に混ざる二つの数値を分離する。</p>
+                    <pre><code class="language-text">RTF = 処理にかかった時間 / 入力音声の長さ
+
+  1フレーム = 320サンプル @ 48 kHz = 6.667 ms
+  1フレームの処理に0.458 msかかったなら
+      RTF = 0.458 / 6.667 = 0.069
+
+  RTF &lt; 1     余裕がある
+  RTF &gt;= 1    締め切りを逃す - 音が途切れる
+
+  注意: RTFはスループットであり、アルゴリズム遅延は構造だ。
+    RTFをゼロに近づけても
+    STFTの整列で付く704サンプル(14.67 ms)はそのまま残る。</code></pre>
+                    <p><strong>実時間係数</strong>は処理時間を入力音声の長さで割った値であり、元論文もこの比率で定義する。これは<strong>スループット</strong>指標だ。一方<strong>アルゴリズム遅延</strong>は<strong>構造が生む遅延</strong>である。この再実装はSTFTの整列で<strong>704サンプル、すなわち14.67 msが固定で付く</strong>と述べる。</p>
+                    <p>両者の関係は一文にまとまる。<strong>より速いチップを買えばRTFは下がるが、アルゴリズム遅延は一マイクロ秒も下がらない。</strong>遅延を減らすには<strong>構造を変える</strong>必要がある。元論文が、時間軸のカーネルサイズが1より大きい因果的畳み込みは遅延を生むと記し、<strong>最小遅延のために時間軸カーネルサイズが1の畳み込みだけを使う</strong>と明かしたのがまさにその構造的選択だ。先読みしないよう<strong>設計段階で固定した</strong>のである。</p>
+
+                    <h2>5. 測定の罠 - ベンチマークは競走し、オーディオコールバックは競走しない</h2>
+                    <p>この節はこの事例が与えた<strong>もっとも価値ある教訓</strong>を扱う。そして興味深いことに、その教訓は<strong>リポジトリが自分の文書に直接書き込んだもの</strong>だ。</p>
+                    <p>READMEの一文は短い。<strong>「A benchmark races; an audio callback does not」</strong>。ベンチマークは競走するがオーディオコールバックは競走しない、という意味である。この一行に<strong>性能測定でもっともよくある誤り</strong>が入っている。</p>
+                    <ul>
+                        <li><strong>ベンチマークのループ</strong>はコアが受け付ける<strong>最大速度</strong>でフレームを押し込む。コアは休む間がなく、クロックは最高状態に留まる。</li>
+                        <li><strong>実際のオーディオコールバック</strong>は<strong>6.667 msに1フレームずつ</strong>しか渡さない。コアは合間に遊ぶ。すると<strong>周波数ガバナが反応して</strong>クロックを下げる。</li>
+                        <li>リポジトリはその差を実測して記した。M2の性能コアで<strong>ペースに合わせて回すと同じ作業のフレームあたり費用が4.2倍に増えRTFが0.286</strong>になり、代わりに<strong>エネルギーは49%少なく済む。</strong></li>
+                    </ul>
+                    <p><strong>同じコード、同じ端末、同じ作業量なのにRTFが0.069と0.286に分かれる。</strong>どちらも嘘ではない。<strong>条件が違うだけだ。</strong>条件のない速度主張が無意味だということを、これより見事に示す例は探しにくい。そしてこの事実は<strong>2節の3.3倍へ戻る。</strong>条件が書かれていない倍率は、これくらいの幅で揺れうる数値だ。</p>
+                    <table>
+                        <thead><tr><th>測定条件</th><th>なぜ重要か</th><th>抜けたときに生じる歪み</th></tr></thead>
+                        <tbody>
+                            <tr><td>暖機</td><td>初期フレームはキャッシュ充填・分岐予測・ページフォルトで遅い</td><td>最初のフレームを含めて実際より悪く報告する</td></tr>
+                            <tr><td>投入方式</td><td>競走式とペース式でガバナがクロックを別々に取る</td><td>同じコードが4倍を超える差で報告される</td></tr>
+                            <tr><td>スレッド数</td><td>ランタイムの既定値はたいてい物理コア数だ</td><td>1スレッド実装と全コア基準線を並べて比べてしまう</td></tr>
+                            <tr><td>バッチサイズ</td><td>ストリーミング推論のバッチは1である</td><td>バッチのスループットで実時間余裕を主張してしまう</td></tr>
+                            <tr><td>パーセンタイル</td><td>オーディオは平均ではなく上位パーセンタイルが途切れを決める</td><td>周期的に跳ねるフレームを平均が飲み込む</td></tr>
+                            <tr><td>入力長と反復</td><td>短いクリップは定常状態に入れない</td><td>測定ノイズが結果をひっくり返す</td></tr>
+                            <tr><td>ハードウェアと命令セット</td><td>整数演算の利得は命令の対応に依存する</td><td>別の端末でまったく再現しない</td></tr>
+                            <tr><td>基準線の設定</td><td>比較対象の設定が結果を左右する</td><td>調整していない基準線に勝ったことを成果として報告する</td></tr>
+                        </tbody>
+                    </table>
+                    <p><strong>スレッドの行を特に強調</strong>したい。ONNX Runtimeの公式文書は、演算子の<strong>内部</strong>を並列化するスレッドとグラフの<strong>ノード間</strong>を並列化するスレッドを区別し、既定値では前者の総スレッド数が<strong>物理CPUコア数</strong>になると記す。またスレッドが仕事を待って回る<strong>スピン待機</strong>は推論を速くする一方でCPUサイクルと資源、電力をより多く使うと述べ、これを切ったり時間制限を設ける設定を提示する。</p>
+                    <p>実務的な結論は明快だ。<strong>1スレッドで動く再実装と既定設定のままの汎用ランタイムを並べて倍率を語れば、その倍率はランタイムの品質ではなくスレッド設定の差を測っているかもしれない。</strong>基準線を<strong>公正に調整する作業</strong>は再実装を作る作業と同じくらい重要で、たいていはるかに安い。</p>
+
+                    <h2>6. 再実装の本当の危険は速度ではなく微妙な数値のずれだ</h2>
+                    <p>ここで軸を変える。これまでは<strong>速くなる話</strong>で、ここからは<strong>間違う話</strong>だ。実務で再実装が失敗する形は<strong>「動かない」ではない。</strong>動かなければすぐ分かる。本当の事故は<strong>「動くのに少し違う」</strong>で起きる。</p>
+                    <p>オーディオではこの<strong>少し</strong>が特に悪い。人の耳は平均誤差を聞かず<strong>アーティファクト</strong>を聞く。あるフレームで跳ねた値は平均指標をほとんど動かさないが<strong>はっきりしたクリック音</strong>として残る。したがって検証は<strong>平均一つで終えられず</strong>、層を分ける必要がある。</p>
+                    <h3>第1層 - 基準線をファイルで固定する</h3>
+                    <p>まずやるべきは最適化ではなく<strong>基準線の確保</strong>だ。元のランタイムの出力を<strong>ファイルに落とし</strong>、その横に<strong>ランタイムのバージョン・設定・前処理の方式</strong>を一緒に書いておく。これがないと以後の比較はすべて無意味だ。後で差が出ても<strong>どちらが変わったのか分からないから</strong>である。</p>
+                    <pre><code class="language-bash"># 1) 基準線をファイルで固定する (バージョンや設定も一緒に記録すること)
+ref_infer  --model base.onnx --in clip.wav --out ref.f32
+
+# 2) 再実装に同じ入力を通す
+fe_cli     --in clip.wav --out new.f32
+
+# 3) あらかじめ決めた許容誤差で判定する
+compare    ref.f32 new.f32 --atol 1e-4 --rtol 1e-3
+#   max_abs_err      = 3.1e-05     合格
+#   frames_over_tol  = 0 / 5569    合格
+#   first_bad_frame  = none        合格</code></pre>
+                    <h3>第2層 - 許容誤差を先に決める</h3>
+                    <p><strong>順序がすべてだ。</strong>許容誤差を<strong>結果を見た後に</strong>決めると、人は必ず<strong>通る値に</strong>決める。だから数値を見る前に書いておく必要がある。そして決めるとき二つを区別する。</p>
+                    <ul>
+                        <li><strong>ビット単位の一致を目標にできる場合</strong> - 同じ精度で同じ演算順序を守る移植。このときは<strong>完全一致を要求してよい。</strong>ずれれば即バグだ。</li>
+                        <li><strong>目標にできない場合</strong> - 量子化を入れたり演算順序を変えた再実装。浮動小数点の加算は結合法則が成り立たないので<strong>順序を変えただけで最後の桁が変わる。</strong>このときは完全一致ではなく<strong>指標で判定</strong>する必要がある。</li>
+                        <li><strong>混同すると起きること</strong> - 達成不可能な基準を立てるとチームはやがて<strong>基準を無視しはじめる。</strong>無視される関門はない関門より悪い。</li>
+                    </ul>
+                    <h3>第3層 - 指標で判定する</h3>
+                    <p>このリポジトリが公開した対照表が<strong>よい手本</strong>だ。同じ重みの32ビット浮動小数点ONNXグラフを基準線に置き、<strong>824発話のテストセット</strong>で四つの指標を並べている。</p>
+                    <table>
+                        <thead><tr><th>指標</th><th>雑音入力</th><th>fp32 ONNX</th><th>int8再実装</th></tr></thead>
+                        <tbody>
+                            <tr><td>PESQ</td><td>1.967</td><td>3.060</td><td>3.054</td></tr>
+                            <tr><td>STOI</td><td>0.9211</td><td>0.9512</td><td>0.9509</td></tr>
+                            <tr><td>SNR (dB)</td><td>8.39</td><td>19.43</td><td>19.35</td></tr>
+                            <tr><td>LSD</td><td>14.72</td><td>12.56</td><td>12.33</td></tr>
+                        </tbody>
+                    </table>
+                    <p>この表がうまいのは<strong>「雑音入力」の列を残したこと</strong>だ。その列がなければ3.060と3.054の差が<strong>大きいのか小さいのか判断する根拠がない。</strong>列があれば即座に見える。モデルは1.967を3.060へ引き上げ、8ビットに落として失ったのは<strong>0.006</strong>である。<strong>分母のない損失値は読めない。</strong>再実装の報告を書くとき必ず持っていくべき形式だ。</p>
+                    <p>加えて、ONNX Runtimeの公式文書は<strong>量子化が無損失変換ではなくモデルの精度に悪影響を与えうる</strong>と明記し、元のモデルと量子化モデルのテンソルを比べて問題箇所を探すよう勧める。さらに<strong>回帰型ニューラルネットワークとトランスフォーマ系には動的量子化を、畳み込み系には静的量子化を勧める</strong>と記す。<strong>モデル系統によって推奨が分かれる</strong>という事実自体が、量子化を既定値として押し進めてはいけない理由である。</p>
+                    <h3>第4層 - 決定性の関門を別に置く</h3>
+                    <p>指標の検証だけでは<strong>足りない。</strong>指標は<strong>平均</strong>なので、特定のカーネルでのみまれに出る誤差を<strong>飲み込んでしまう。</strong>だから層をもう一つ置く。</p>
+                    <p>このリポジトリは<strong>カーネルの段が違ってもクリップごとに同じハッシュが出なければならない</strong>という関門を掛けた。文書の表現どおり<strong>段をまたいだビット同一性は志向ではなく関門</strong>である。NEONで回そうとI8MMで回そうと出力バイトが同じでなければ通らない。</p>
+                    <pre><code class="language-bash"># カーネルの段を変えても出力が同じでなければならない
+for tier in neon dotprod i8mm; do
+    fe_cli --tier "$tier" --in clip.wav --out "out_$tier.f32"
+    sha256sum "out_$tier.f32"
+done
+
+# 三行のハッシュがすべて同じなら合格。
+# 一つでも違えばその段のカーネルが静かに違う値を出している。
+# 注意: 関門を信じる前に、丸めを一つわざと変えて入れ
+#   本当に赤くなるかを先に確認すること。</code></pre>
+                    <p>最後の二行が重要だ。<strong>検査の仕組みは、わざと壊してみて捕まることを確認するまで信頼できない。</strong>カーネル一箇所の丸めを変えて入れ、関門が実際に赤くなるか見る。赤くならなければ<strong>それまでの青信号には何の意味もなかった</strong>ということだ。</p>
+                    <p>そして再実装対象の<strong>構造も一緒に見る必要がある。</strong>このプロジェクトが扱う層には<strong>畳み込み、GRU、多頭注意</strong>が混ざっている。回帰層は<strong>状態を持ち越すので</strong>あるフレームの小さな誤差が<strong>次のフレームへ移る。</strong>だから回帰層のあるモデルでは<strong>一フレームだけ比べて終わらせてはいけない。</strong>誤差が<strong>時間とともに大きくなるのか小さくなるのか</strong>を長いクリップで確認する必要がある。上の例で5,569フレーム全体の超過フレーム数を数える理由がこれだ。</p>
+                    <p>以下はこうした検証を付けやすい形の<strong>インタフェースの形</strong>である。実装ではなく<strong>境界をどこに引くか</strong>を示す概念例だ。</p>
+                    <pre><code class="language-c">/* 概念例 - 初期化後に確保のないフレームループ */
+#include &lt;stdint.h&gt;
+
+typedef struct fe_state fe_state;      /* すべての状態を一塊に */
+
+int  fe_init(fe_state **s);            /* 確保はここでだけ起きる */
+void fe_process(fe_state *s,
+                const int16_t *in,     /* 320サンプル入り */
+                int16_t *out);         /* 320サンプル出る */
+
+/* オーディオコールバック - 6.667 msごとに一度呼ばれる */
+void on_frame(fe_state *s, const int16_t *in, int16_t *out) {
+    fe_process(s, in, out);   /* mallocなし、ロックなし、例外なし */
+}</code></pre>
+                    <p>この形の利点は<strong>検証しやすいこと</strong>だ。状態が一塊なので<strong>ダンプして比べやすく</strong>、コールバックが純粋関数に近いので<strong>同じ入力に同じ出力を要求しやすい。</strong>逆に状態があちこちに散らばった実装は速くても<strong>同じだと証明しにくい。</strong>再実装では<strong>証明可能性そのものが設計目標</strong>であるべきだ。</p>
+
+                    <h2>7. 確認できる他の事例 - 順位ではなく系譜</h2>
+                    <p>この手法は<strong>今回はじめて出た着想ではない。</strong>公式リポジトリと公式文書で確認できるものだけを挙げる。<strong>順位は付けない。</strong>三つは異なる層の物である。</p>
+                    <ul>
+                        <li><strong>RNNoise</strong> - <code>github.com/xiph/rnnoise</code>。回帰型ニューラルネットワークに基づく雑音抑制ライブラリで、<strong>実装はC</strong>、学習とモデル変換にPythonを使う。ライセンスはBSD-3-Clauseで、48 kHz 16ビットモノラルPCMを扱い、<strong>DSPと深層学習を混ぜた手法</strong>を掲げる。文書は性能のために<strong>AVX2に対応したアーキテクチャを使うか、x86の実行時CPUディスパッチを有効にせよ</strong>と勧める。ここでも利得の根拠として挙がるのは言語ではなく<strong>命令セット</strong>だ。</li>
+                        <li><strong>ggml</strong> - <code>github.com/ggml-org/ggml</code>。機械学習用のテンソルライブラリでライセンスはMIT。READMEが自ら掲げる項目に<strong>第三者依存関係なし</strong>、<strong>実行中のメモリ確保ゼロ</strong>、そして<strong>整数量子化への対応</strong>が並んでいる。先に3節で分けた四つの軸のうち<strong>三つがライブラリ次元の設計目標として明文化</strong>されているわけだ。音声認識や言語モデルをローカルで回す系統のプロジェクトがこの上に立っている。</li>
+                        <li><strong>ONNX Runtime</strong> - 公式文書。こちらは<strong>反対側の選択肢</strong>だ。再実装せずに<strong>残った性能を絞り出す経路</strong>を文書で提供する。量子化の文書は<strong>どの量子化がどのモデル系統に向くか</strong>を分け、性能向上が<strong>モデルとハードウェアに依存する</strong>と記す。スレッドの文書は演算子内部とノード間の並列を区別し<strong>スピン待機の制御</strong>設定を提示する。</li>
+                    </ul>
+                    <p>三つを並べると<strong>共通する一文</strong>が残る。<strong>利得は言語の名前ではなく「何をしないか」と「どの命令を使うか」から来る。</strong>ggmlが<strong>なし</strong>と<strong>ゼロ</strong>を自らの長所として掲げたことも、RNNoiseの文書が命令セットを先に挙げることも、ONNX Runtimeがハードウェア依存を明示することも、すべて同じ話である。</p>
+
+                    <h2>8. いつその代償を払う価値があるのか</h2>
+                    <p>ここからが判断だ。再実装は<strong>無料ではない。</strong>作る費用より<strong>維持する費用</strong>が大きく、その費用は<strong>モデルが変わるたびに</strong>請求される。</p>
+                    <h3>価値がある兆候</h3>
+                    <ul>
+                        <li><strong>エッジやオンデバイスに入れる必要がある</strong> - フレームワーク自体を載せられない環境がある。静的ライブラリ<strong>162 KiB</strong>と一般的な推論フレームワークの大きさの差は<strong>「速い」の問題ではなく「入るか入らないか」の問題</strong>だ。この場合は代替がないことが多い。</li>
+                        <li><strong>硬い実時間の締め切りがある</strong> - 6.667 msのような固定予算があり<strong>上位パーセンタイルが製品品質を決める</strong>場合。実行中の確保、ガベージコレクション、実行時コンパイルの暖機が裾を作る構造は<strong>原理的に不利</strong>である。</li>
+                        <li><strong>配布サイズと起動時間が要件だ</strong> - プロセスが頻繁に立ち上がって落ちるか、ダウンロードサイズが転換率に直接効く製品。</li>
+                        <li><strong>依存関係そのものが詰まりだ</strong> - 持ち込み審査やサプライチェーン監査を通す必要のある環境で<strong>依存ゼロ</strong>は<strong>監査費用を大きく減らす。</strong>性能と無関係な理由で再実装が正当化される珍しい場合だ。</li>
+                        <li><strong>モデルが凍っている</strong> - 後でまた扱うが、これが<strong>事実上もっとも重要な前提条件</strong>である。</li>
+                    </ul>
+                    <h3>やめるべき兆候</h3>
+                    <ul>
+                        <li><strong>モデルがまだ変わっている最中だ</strong> - 再実装は<strong>重みとグラフに手で釘を打つ作業</strong>だ。来週に層が一つ付けばカーネルを触り直すことになり、その間<strong>研究側が再実装を待つことになる。</strong>最適化が実験の速度を食いはじめた瞬間、損得はたいてい逆転する。</li>
+                        <li><strong>精度検証の仕組みがない</strong> - 基準線の出力もテストセットも指標もなければ、再実装が正しいか<strong>証明する方法自体がない。</strong>その状態での速度向上は測定ではなく<strong>希望</strong>だ。</li>
+                        <li><strong>保守要員が一人だ</strong> - 手書きのベクトルカーネルは読める人が少ない。その人が去れば残るのは<strong>誰も直せない速いコード</strong>である。これは資産ではなく負債だ。</li>
+                        <li><strong>ボトルネックがどこか分かっていない</strong> - プロファイリングなしに始めた再実装はたいてい<strong>熱くない場所</strong>を最適化する。時間はファイル入出力や標本化周波数変換、コピーで使われているかもしれない。</li>
+                        <li><strong>対象ハードウェアが決まっていない</strong> - 整数演算の利得は命令の対応に依存する。スカラ代替経路を作らなければ<strong>そもそも動かない端末</strong>が出るし、作れば<strong>その経路も検証対象</strong>になる。</li>
+                        <li><strong>目標が「もっと速く」だけだ</strong> - どれだけ速ければ十分かを数値で言えないなら<strong>終わる地点がない。</strong>締め切りと目標パーセンタイルを先に書く必要がある。</li>
+                    </ul>
+                    <h3>再実装より先にやること</h3>
+                    <p>順序は<strong>安くて戻しやすいものから</strong>だ。</p>
+                    <ol>
+                        <li><strong>プロファイリング</strong> - 時間が実際にどこで使われているか確認する。演算か、ディスパッチか、コピーか、入出力か。この答えがなければ残りの段階は推測だ。</li>
+                        <li><strong>ランタイム設定</strong> - スレッド数を明示的に固定し、スピン待機を制御し、グラフ最適化の水準を確認する。<strong>設定一行が再実装数週間に匹敵する場合が実際にある。</strong></li>
+                        <li><strong>量子化</strong> - 再学習なしで済む範囲から見る。文書が勧める方式を<strong>モデル系統に合わせて</strong>選ぶ。そして必ず<strong>損失を改善幅と並べて</strong>記す。</li>
+                        <li><strong>汎用性の縮小</strong> - 入力形状を固定し、バッチを1に固定し、前後処理の不要なコピーと型変換をなくす。<strong>ランタイムを変えなくても相当部分得られる軸</strong>だ。</li>
+                        <li><strong>その次に再実装</strong> - 上をすべてやっても締め切りに間に合わず、モデルが凍っていて、検証の仕組みが整っているとき。<strong>三条件が同時に成り立つときだけ</strong>である。</li>
+                    </ol>
+
+                    <h2>9. 判断表 - 状況から結論へ</h2>
+                    <p>最後に使える形へ圧縮する。<strong>真ん中の列より右の列が重要だ。</strong>大半の状況で正解は再実装ではなく<strong>その前の段階</strong>だからである。</p>
+                    <table>
+                        <thead><tr><th>状況</th><th>再実装する価値</th><th>先にやること</th></tr></thead>
+                        <tbody>
+                            <tr><td>MCU・組み込み、フレームワークが載らない</td><td>高い - 代替がない場合が多い</td><td>対象命令セットを確定し整数経路の対応可否を先に確認する</td></tr>
+                            <tr><td>モバイルアプリ、配布サイズと電池が問題</td><td>中から高</td><td>モデル縮小と量子化が先、その次にランタイム特化</td></tr>
+                            <tr><td>デスクトップの実時間オーディオ、p99が跳ねる</td><td>中</td><td>確保・スレッド・スピン待機から。裾の原因を先に特定する</td></tr>
+                            <tr><td>サーバのバッチ推論、スループットが目標</td><td>低い</td><td>バッチ・並列・アクセラレータ。呼び出し当たり固定費の比重が既に小さい</td></tr>
+                            <tr><td>モデルがまだ研究中だ</td><td>非常に低い</td><td>実験の速度を守る。再実装は実験を遅くする</td></tr>
+                            <tr><td>基準線の出力とテストセットがない</td><td>なし - 前提条件が未達</td><td>基準線・許容誤差・指標から作る</td></tr>
+                            <tr><td>維持する人が一人だ</td><td>低い</td><td>汎用ランタイムに残り維持費用を下げる</td></tr>
+                            <tr><td>持ち込み審査やサプライチェーン監査が詰まりだ</td><td>中から高</td><td>依存関係の一覧から減らす。再実装は最後の手段</td></tr>
+                            <tr><td>モデルが生成型で出力が決定的でない</td><td>低い</td><td>検証方法から設計し直す。数値照合が成立しない</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2>結論: 低レベルに下ろすとは約束を減らすことだ</h2>
+                    <p>この事例が<strong>実際に証明したこと</strong>から整理する。小さなストリーミング音声モデルは<strong>推論フレームワークなしで</strong>CPUコアの一部だけを使って動きうること、8ビットに落としても<strong>指標の損失が改善幅に比べて小さくありうること</strong>、そしてその事実を<strong>指標とハッシュという二層で証明可能な形</strong>に残せること。ここまでは文書と表で確認できる。</p>
+                    <p><strong>証明していないこと</strong>も明確にしておく。<strong>3.3倍がどんな条件で出た数値なのかは公開文書にない。</strong>そしてこの手法が<strong>大きなモデルや頻繁に変わるモデルでも同じ価値を出すか</strong>は、この事例が答えられる範囲の外だ。リポジトリが作られて数日しか経っていない点も併せて考慮すべきことである。</p>
+                    <p>実務者が持ち帰るものは三つだ。</p>
+                    <ol>
+                        <li><strong>速度主張は条件欄から読む。</strong>条件がなければその数値は情報ではない。同じコードが同じ端末でRTF 0.069と0.286を同時に出しうることを、このリポジトリが自分の文書に書き残している。</li>
+                        <li><strong>再実装を正当化するのは速度ではなく制約だ。</strong>入れる必要があるのに入らないとき、締め切りがあるのに裾が跳ねるとき、依存関係そのものが通過を阻むとき。<strong>「もっと速ければいい」は制約ではない。</strong></li>
+                        <li><strong>始める前に終わったかを判定する方法を先に作る。</strong>基準線の出力、あらかじめ決めた許容誤差、改善幅と並べて記した指標、そしてわざと壊して検証した回帰の関門。この四つがなければそのプロジェクトは<strong>終わらない。</strong></li>
+                    </ol>
+                    <p>最後に一行。<strong>低レベルに下ろす作業の本質は言語を変えることではなく約束を減らすことだ。</strong>任意のモデルを受けるという約束、任意の形状を受けるという約束、どの端末でも動くという約束を一つずつ引き取っていく作業である。<strong>引き取った約束の分だけ速くなり、引き取った約束の分だけ壊れやすくなる。</strong>その交換がいま目の前の製品に合うのかを問うことが、どの言語で書き直すかを選ぶことより<strong>はるかに先に来るべき問い</strong>である。</p>
+
+                    <h2>参考資料</h2>
+                    <ul>
+                        <li>faster-enhancer.c リポジトリ - 依存関係のないC/SIMD整数ランタイムという規定、再実装の範囲、6段の命令セット別カーネル、RTF表と測定条件、ペース駆動時のフレーム当たり費用4.2倍とエネルギー49%減、品質対照表、段をまたいだハッシュ同一性の関門、固定モデル一種とスカラ代替経路の不在、MITライセンス (2026-07-29確認): <a href="https://github.com/kdrkdrkdr/faster-enhancer.c" target="_blank" rel="noopener">github.com/kdrkdrkdr/faster-enhancer.c</a></li>
+                        <li>FastEnhancer 公式リポジトリ - 元モデル、ONNX Runtimeへの書き出しとRTF測定、MITライセンス (2026-07-29確認): <a href="https://github.com/aask1357/fastenhancer" target="_blank" rel="noopener">github.com/aask1357/fastenhancer</a></li>
+                        <li>FastEnhancer 論文 - エンコーダ・デコーダとRNNFormerブロック、マスク予測方式、RTFの定義と単一スレッド測定条件、時間軸カーネルサイズ1を使う理由、変種別パラメータ数 (2026-07-29確認): <a href="https://arxiv.org/abs/2509.21867" target="_blank" rel="noopener">arxiv.org/abs/2509.21867</a></li>
+                        <li>RNNoise リポジトリ - C実装とPythonによる学習、BSD-3-Clause、48 kHz 16ビットモノラルPCM、DSPと深層学習の混成手法、AVX2および実行時CPUディスパッチの推奨 (2026-07-29確認): <a href="https://github.com/xiph/rnnoise" target="_blank" rel="noopener">github.com/xiph/rnnoise</a></li>
+                        <li>ggml リポジトリ - 第三者依存関係なし、実行中のメモリ確保ゼロ、整数量子化への対応を設計目標として明示。MITライセンス (2026-07-29確認): <a href="https://github.com/ggml-org/ggml" target="_blank" rel="noopener">github.com/ggml-org/ggml</a></li>
+                        <li>ONNX Runtime 文書 - 量子化。整数の表現式、動的量子化と静的量子化の推奨対象、無損失変換ではないという明記、性能向上がモデルとハードウェアに依存するという記述、VNNIおよびドット積命令への言及 (2026-07-29確認): <a href="https://onnxruntime.ai/docs/performance/model-optimizations/quantization.html" target="_blank" rel="noopener">onnxruntime.ai/docs/performance/model-optimizations/quantization.html</a></li>
+                        <li>ONNX Runtime 文書 - スレッド管理。演算子内部の並列とノード間の並列の区別、既定のスレッド数が物理コア数であるという記述、スピン待機の制御設定 (2026-07-29確認): <a href="https://onnxruntime.ai/docs/performance/tune-performance/threading.html" target="_blank" rel="noopener">onnxruntime.ai/docs/performance/tune-performance/threading.html</a></li>
+                        <li>関連記事: <a href="rextio_python_to_rust_2026.html">PythonをRustへ移すという決定</a>、<a href="esp32_tiny_llm_on_mcu_2026.html">8ドルのMCUでLLMを動かす - オンデバイス推論の実際の限界</a>、<a href="mimalloc_performance_allocator_2026.html">mimalloc 完全分析 - アロケータが決める性能差</a>、<a href="netflix_llm_serving_platform_2026.html">LLMを自前で動かすという決断</a></li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>この記事をシェア</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">リンクをコピー</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">一覧に戻る</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">一緒に使うと便利な無料ツール</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/llm_price_calculator.html">LLM API 料金計算ツール</a></li>
+      <li><a href="../static/token_counter.html">トークン計算機</a></li>
+      <li><a href="../static/pdf_toolkit.html">PDFツール</a></li>
+      <li><a href="../static/qr_code_generator.html">QRコード生成ツール</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">すべてのツールを見る &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">関連記事</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="korean_regex_syllable_trap.html">ハングル正規表現の罠 - 「아닙니다」の中に「아니」は無い 2026</a></li>
+      <li><a href="esp32_tiny_llm_on_mcu_2026.html">8ドルのMCUで2,890万パラメータのLLMを動かす - ESP32-S3オンデバイス推論の実際の限界 2026</a></li>
+      <li><a href="rextio_python_to_rust_2026.html">PythonをRustへ移すという決定 - 自動変換ツールが引く境界線 2026</a></li>
+      <li><a href="data_tooling_landscape_2026.html">2026年のデータツール地形 - 何が変わり、選定基準はどう変わったか</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('リンクをコピーしました。Threadsアプリに貼り付けて共有してください。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('リンクをコピーしました!'); });
+    });
+    </script>
+</body>
+</html>

@@ -1,0 +1,937 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ja">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>まともな --dry-run の作り方 - まねごとではなく検証を</title>
+    <meta name="description" content="出力するだけの dry-run は検証ではない。実行と判断経路が食い違う偽の dry-run 五類型を実際に再現し、plan を三回走らせてハッシュ一致を確認する分離設計と終了コード規約、CI への組み込みまでまとめた。">
+    <meta name="keywords" content="dry-run, ドライラン, シェルスクリプト, bash, plan apply 分離, 終了コード, git clean -n, rsync -n, 副作用, CI 自動化, 計画ハッシュ, 事前検証, デプロイスクリプト, 自動化の安全装置">
+
+    <link rel="canonical" href="https://braindetox.kr/ja/posts/shell_dry_run_design.html">
+
+    <meta property="og:title" content="まともな --dry-run の作り方 - まねごとではなく検証を">
+    <meta property="og:description" content="偽の dry-run 五類型を実行出力で再現し、plan を三回走らせてハッシュ一致を確認する分離設計と、CI で使える終了コード規約までまとめた。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/ja/posts/shell_dry_run_design.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ja_JP">
+    <meta property="article:published_time" content="2026-07-29">
+    <meta property="article:section" content="開発・インフラ">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="まともな --dry-run の作り方 - まねごとではなく検証を">
+    <meta name="twitter:description" content="偽の dry-run 五類型を実行出力で再現し、plan と apply を分ける設計と終了コード規約をまとめた。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "まともな --dry-run の作り方 - まねごとではなく検証を",
+      "alternativeHeadline": "Designing a Dry Run That Actually Verifies, Not Pretends",
+      "datePublished": "2026-07-29",
+      "dateModified": "2026-07-29",
+      "inLanguage": "ja-JP",
+      "articleSection": "開発・インフラ",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "dry-run, シェルスクリプト, bash, plan apply 分離, 終了コード, git clean -n, rsync -n, 副作用, CI 自動化, 計画ハッシュ",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/ja/posts/shell_dry_run_design.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "dry-run が would delete と言ったのに実行が失敗するのはなぜですか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "二つの経路が別々の問いに答えているからです。よくある形、つまり if で分岐して dry なら echo、そうでなければ rm を呼ぶ構造では、echo 側はファイルが存在するかを一度も尋ねません。一方 rm は対象を実際に参照します。存在しないファイルを一つ混ぜて一時ディレクトリで走らせると差がすぐ見えます。dry は would delete をそのまま出力し、実行側は cannot remove ghost.log: No such file or directory を返しました。つまり dry-run が予測したのは実行結果ではなく引数の一覧です。判断を一度だけ計算し、両モードがその結果を共有する形に直さない限り、この隔たりは消えません。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "dry-run なのにファイルが作られたり消えたりすることはありますか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "よくあります。実測で三つ確認しました。第一に、スクリプト冒頭の mktemp -d や mkdir -p logs はモードに関係なく実行されるので、一時ディレクトリとログディレクトリがそのまま生まれます。第二に、exec 3&gt;&gt; logs/run.log のようなファイル記述子の準備も同じで、ログファイルが作られ書き込みまで残ります。第三が最も危険で、関数に付いたリダイレクトは分岐の外で評価されるため、dry-run だけ走らせても対象ファイルが 0 バイトに切り詰められました。実際、内容の入っていたファイルが dry-run 一回で空になりました。ラッパー関数にリダイレクトを付けた場合は would run という案内文そのものが状態ファイルに書き込まれるのも確認しました。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "plan と apply を分けると具体的に何が良くなりますか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "判断が一か所だけになります。plan は現在の状態を読むだけで、動作と対象と理由を行単位で出力します。apply はその行を読んで実行するだけです。apply の中に条件分岐がないので、二つのモードが食い違う余地が構造的に消えます。検証も楽になります。一時ディレクトリで plan を三回実行した結果はバイト単位で同一、sha256 も三回とも同じで、実行後のディレクトリには新しいファイルが一つも増えませんでした。apply の後にもう一度 plan を走らせると空の計画と終了コード 0 が返ります。計画が空であること自体が目標状態に到達した証拠になります。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "dry-run はどんな終了コードを返すべきですか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "常に 0 を返すなら CI では無意味です。実用的な規約は 0 が変更なし、2 が適用待ちの変更あり、1 が計画そのものを作れなかった誤りです。ただし配線に落とし穴が二つあります。set -e の下で計画コマンドをそのまま呼ぶと、終了コード 2 が失敗とみなされて後続の処理が丸ごと飛ばされます。また if で包むと変更ありの 2 と誤りの 1 が同じ枝に落ちて区別が消えます。rc=0 のあとにコマンドを書き || rc=$? で受け取り、case で三分岐する形が安全です。パイプに繋ぐと終了状態が最後の段のものになるため PIPESTATUS を見る必要があります。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "rsync -n や git clean -n など既存ツールの dry-run は信用できますか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "同じフラグで走らせる限りおおむね信用できますし、各ツールが境界を文書に明記しています。rsync の文書は dry-run が実行とおおむね同じ出力を出す試走であると説明したうえで、実データを送らないので進捗表示は効かず bytes sent や literal data などの統計は小さく出ると述べ、同時に itemize-changes の出力は dry run と続く実行で厳密に同じであるべきで、違えばそれはバグだと明言しています。git clean も同様です。ただし実測で確認したとおり、-n で見てから -fd で実行すると結果は変わります。食い違いが生じるのはツールではなく、人がフラグを変える瞬間です。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .danger { background:#fdecea; border-left:4px solid #d9534f; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/shell_dry_run_design.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/shell_dry_run_design.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/shell_dry_run_design.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/shell_dry_run_design.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/shell_dry_run_design.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="まともな --dry-run の作り方 - まねごとではなく検証を">
+                <meta itemprop="datePublished" content="2026-07-29">
+                <meta itemprop="dateModified" content="2026-07-29">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="dry-run, シェルスクリプト, plan apply 分離, 終了コード, git clean -n, rsync -n, 計画ハッシュ">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/ja/posts/shell_dry_run_design.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">まともな --dry-run の作り方 - まねごとではなく検証を</h1>
+                    <h2 class="post-subtitle">偽の dry-run 五類型を実行出力で再現し、plan のハッシュ三回一致で証明する</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-07-29">2026年7月29日</span>
+                        <span class="post-category" itemprop="articleSection">開発・インフラ</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <h2>はじめに: dry-run が約束したことを実行はできなかった</h2>
+                    <p>整理スクリプトに <code>--dry-run</code> を付けた。走らせると <code>would delete</code> が十二行出て、一覧も想定どおりだった。安心して本番で実行した。ところが途中でエラーになり、消えたファイルと残ったファイルが混在する状態になった。<strong>dry-run ははっきり「こうする」と言ったのに、実行はそのとおりにできなかった。</strong></p>
+                    <p>この状況が特に悪いのは、答えが間違っていたこと自体ではない。<strong>dry-run を走らせた人がその間に安心してしまった</strong>ことにある。何も検証していなければ慎重に実行しただろうに、確認したと信じたからそのまま押し切ったのだ。<strong>検証していない状態より、誤って検証した状態のほうが危険だ。</strong>これが偽の dry-run の本質的な害である。</p>
+                    <p>その下には広く行き渡った誤解がある。<em>「dry-run とは実行するコマンドを出力するだけのもの」</em>という考えだ。違う。出力は成果物にすぎない。dry-run が値打ちを持つには、<strong>実際に実行したときと同じ判断経路をたどらなければならない。</strong>同じ条件を評価し、同じ検査を通り、同じ順序で対象を選んだうえで、最後の一歩である「書き込み」だけをしない。この最後の一歩をどこに置くかで、dry-run は検証にもまねごとにもなる。</p>
+                    <p>この記事は定義から始めない。<strong>偽の dry-run 五類型を一時ディレクトリで実際に再現した出力</strong>から始め、それをどう直すかまで進む。順序はこうだ。まず五類型を一つずつ壊し、次に <code>plan</code> と <code>apply</code> を分ける形を作って<strong>三回実行のハッシュが一致することを証明</strong>する。続いて終了コード規約と CI 配線を整理し、最後に <code>git clean -n</code> や <code>rsync -n</code> といった既存ツールの dry-run をどこまで信用できるか線を引く。</p>
+                    <p>範囲を先に狭めておく。<strong>「二度走らせても同じ結果か」はこの記事の主題ではない。</strong>そちらは<a href="shell_readonly_idempotent_script.html">二度走らせても安全なスクリプト</a>で別に扱った。この記事の問いは一つだけだ。<strong>「走らせる前に結果を知ることができるか。」</strong>二つの性質は互いを助けるが同じものではない。完全に冪等なスクリプトでも、嘘をつく dry-run をいくらでも持てる。</p>
+
+                    <h2>1. 実行環境と検証方法</h2>
+                    <p>この記事の主張はすべて<strong>実際に走らせた出力</strong>である。再現環境は次のとおり。</p>
+                    <ul>
+                        <li><strong>OS</strong>: Windows 10 Pro 10.0.19045 上の MSYS2 系 Unix 環境(Git Bash)</li>
+                        <li><strong>シェル</strong>: GNU bash 5.2.37(1)-release (x86_64-pc-msys)</li>
+                        <li><strong>ユーティリティ</strong>: GNU coreutils 8.32, GNU tar 1.35, GNU Awk 5.0.0, git 2.48.1</li>
+                        <li><strong>作業場所</strong>: 一時ディレクトリ一つ。実験ごとに新しい下位フォルダを作って隔離</li>
+                    </ul>
+                    <p>Linux ディストリビューションではなく MSYS2 を使ったのは手元にあったからで、ここで見える挙動はほぼ<strong>シェル文法と POSIX ユーティリティの仕様から来るもの</strong>なので環境を移しても同じだ。ただし次の二つは環境依存なので扱わなかった。</p>
+                    <ul>
+                        <li>ファイル権限と所有者に起因する失敗 — この環境は POSIX の権限ビットを完全には模倣しないため再現が信頼できない</li>
+                        <li><code>rsync</code> の実際の挙動 — この環境に導入されておらず実行できなかった。11 節では<strong>公式文書に書かれた境界だけを引用</strong>し、代わりに同じ性質の分岐を <code>git</code> で再現した</li>
+                    </ul>
+                    <div class="danger">
+                        <strong>⚠ 警告 — この記事の例は一時ディレクトリ専用です。</strong><br>
+                        本文には <code>rm</code>、<code>sed -i</code>、<code>git clean -f</code> のような<strong>取り消せないコマンド</strong>が出てきます。すべて新しく作った一時ディレクトリの中だけで実行しており、それ以外を対象にするようには書かれていません。ご自身で確かめる際は<strong>空の一時ディレクトリを新規に作り、その中だけで</strong>走らせてください。実際のサーバー経路やホームディレクトリでは実行しないでください。特に <code>git clean</code> 系は<strong>追跡されていないファイルを復元不能な形で削除します。</strong>
+                    </div>
+
+                    <h2>2. 類型 1 出力するだけで判断しない</h2>
+                    <p>もっともよくある形だ。実行地点ごとに <code>if</code> で分け、dry なら文を出し、そうでなければ本当に呼ぶ。</p>
+                    <pre><code class="language-bash">clean() {
+  for f in "$@"; do
+    if [ -n "${DRY:-}" ]; then
+      echo "would delete $f"
+    else
+      rm "$f"
+    fi
+  done
+}</code></pre>
+                    <p>対象ディレクトリに <code>a.log</code> と <code>c.log</code> は作り、<code>ghost.log</code> は<strong>あえて作らないまま</strong>三つとも引数に渡した。</p>
+                    <pre><code>### 対象ディレクトリの状態
+a.log
+c.log
+
+### DRY=1 (偽の dry-run)
+would delete a.log
+would delete ghost.log
+would delete c.log
+exit=0
+
+### 実際の実行
+rm: cannot remove 'ghost.log': No such file or directory
+exit=0
+
+### 実行後に残ったもの
+(なし)</code></pre>
+                    <p>dry-run は<strong>存在すらしないファイルを消すと言った。</strong>理由は単純で、<code>echo</code> 側の経路は<strong>ファイルがあるかを一度も尋ねない</strong>のに対し、<code>rm</code> は対象を実際に参照する。二つの経路が答えている問いがそもそも違う。</p>
+                    <ul>
+                        <li>dry-run が答えた問い: <strong>「ループにどんな引数が入ってきたか」</strong></li>
+                        <li>実行が答えた問い: <strong>「その引数が指す対象は今存在し、削除できるか」</strong></li>
+                    </ul>
+                    <p>まとめると、この dry-run が見せたのは<strong>実行結果の予測ではなく引数一覧の復唱</strong>である。一覧が正しいことと実行が成功することはまったく別の命題なのに、出力形式が <code>would ...</code> なので後者として読まれてしまう。</p>
+                    <p>出力にもう一つ隠れている。<strong>実際の実行も終了コード 0 を返した。</strong><code>ghost.log</code> でエラーが出たのにである。ループ最後の <code>rm c.log</code> が成功し、関数の終了状態は最後に実行されたコマンドのものだからだ。この問題は 6 節で改めて扱う。</p>
+                    <p>直す方向は「検査を dry 側にも複写する」ことではない。<strong>判断を一度だけ計算し、両モードがその結果を共有するようにすること</strong>だ。複写すれば条件分岐が二組になり、次の人が片方だけ直す。</p>
+
+                    <h2>3. 類型 2 条件が実行経路にしかない</h2>
+                    <p>類型 1 を経験した人はたいてい検査を足す。ところが検査が<strong>実行分岐の内側</strong>に入ると状況はむしろ悪くなる。dry-run がより本物らしく見えながら、依然として外れるからだ。</p>
+                    <pre><code class="language-bash">for f in src/*.dat; do
+  base=${f#src/}
+  if [ -n "${DRY:-}" ]; then
+    echo "would archive $base"
+    continue                 # ← ここで残りの検査を全部飛ばす
+  fi
+  # ↓ 以下二つの検査は実行経路にしかない
+  if ! mkdir "$LOCK" 2&gt;/dev/null; then
+    echo "ERROR: another run holds $LOCK" &gt;&amp;2; exit 3
+  fi
+  size=$(wc -c &lt; "$f")
+  if [ $((used + size)) -gt "$QUOTA" ]; then
+    echo "ERROR: quota exceeded at $base (used=$used +$size &gt; $QUOTA)" &gt;&amp;2
+    rmdir "$LOCK"; exit 4
+  fi
+  cp "$f" "dst/$base"
+  ...
+done</code></pre>
+                    <p>200 バイトのファイル五つを、総量上限 500 バイトの対象に入れてみた。</p>
+                    <pre><code>### DRY=1 — 五件すべて可能と報告
+would archive f1.dat
+would archive f2.dat
+would archive f3.dat
+would archive f4.dat
+would archive f5.dat
+exit=0
+
+### 実際の実行 — 同じ入力、同じ順序
+archived f1.dat (used=200)
+archived f2.dat (used=400)
+ERROR: quota exceeded at f3.dat (used=400 +200 &gt; 500)
+exit=4
+
+### dst の実際の結果
+dst/f1.dat
+dst/f2.dat</code></pre>
+                    <p>dry-run は五件を約束し、実際は二件で止まった。しかも<strong>部分適用の状態</strong>が残った。ロックも同じだ。別の実行がロックを握っている状態でもう一度走らせた。</p>
+                    <pre><code>### ロックがすでに握られているとき (別の実行中)
+-- DRY=1 --
+would archive f1.dat
+would archive f2.dat
+would archive f3.dat
+would archive f4.dat
+would archive f5.dat
+exit=0
+-- 実際 --
+ERROR: another run holds .archive.lock
+exit=3</code></pre>
+                    <p>dry-run は<strong>今このスクリプトがそもそも始められないという事実すら伝えられなかった。</strong>ロック検査が実行経路の中にあるからだ。実務でこうした条件は思ったより多い。</p>
+                    <ul>
+                        <li>ディスク空き容量・inode・クォータ — 書き込む直前に確認する作りにしがちだ</li>
+                        <li>同時実行ロック — 「実際に何かするときだけ握ればよい」という判断で実行分岐に入る</li>
+                        <li>対象サービスのヘルスチェック — dry-run にはわざわざ繋がない</li>
+                        <li>認証・トークンの有効性 — dry-run がリモートに接続しなければ期限切れを掴めない</li>
+                        <li>累積状態 — 上の例のように、前の項目を処理して初めて次の項目の判定が定まる場合</li>
+                    </ul>
+                    <p>教訓は明快だ。<strong>実行可能性を左右する検査は、実行分岐ではなくその手前にあるべきだ。</strong>ロックとクォータの検査をループの外の事前点検に引き上げれば、両モードが同じ関門を通る。8 節の <code>plan</code> 構造はこれを強制する形である。</p>
+
+                    <h2>4. 類型 3 dry-run が副作用を残す</h2>
+                    <p>「何も変えないモード」なのにファイルを作ったり消したりするなら、名前が嘘をついていることになる。ところがこれは不注意ではなく<strong>シェルの評価順序から自然に生まれる事故</strong>だ。次のスクリプトを dry-run だけで走らせた。</p>
+                    <pre><code class="language-bash">WORK=$(mktemp -d "./tmp.XXXXXX")     # ① モードと無関係に作られる
+mkdir -p logs                         # ② 同じ
+exec 3&gt;&gt; logs/run.log                 # ③ ファイルがなければここで生まれる
+echo "start $$" &gt;&amp;3
+
+collect() {                           # ④ リダイレクトは分岐の外で評価される
+  if [ -z "${DRY:-}" ]; then
+    printf 'row-%s\n' 1 2 3
+  else
+    echo "would write 3 rows" &gt;&amp;2
+  fi
+} &gt; report.csv
+
+collect</code></pre>
+                    <pre><code>### 実行前の状態
+./report.csv
+./report.sh
+--- report.csv の内容 ---
+old-report-do-not-lose-me
+
+### DRY=1 だけで実行
+would write 3 rows
+exit=0
+
+### 実行後の状態 (dry-run だったのに)
+./logs
+./logs/run.log
+./report.csv
+./report.sh
+./tmp.XlPBYU
+--- report.csv の内容 ---
+(0 バイト — 内容が消えた)
+--- logs/run.log ---
+start 1945
+done</code></pre>
+                    <p>dry-run 一回で<strong>一時ディレクトリができ、ログディレクトリとログファイルができ、何より既存データの入っていた <code>report.csv</code> が 0 バイトになった。</strong>④ が要点だ。関数に付いた <code>&gt; report.csv</code> は<strong>関数が実行される瞬間にシェルが先に開くもの</strong>なので、中でどの分岐を通るかに関係なくファイルが切り詰められる。「出すものがなければ触らないだろう」という直感がちょうど外れる地点だ。</p>
+                    <p>同じ罠はラッパー関数でも出る。実行を包む <code>run</code> 関数を作り、呼び出し側にリダイレクトを付けるとこうなる。</p>
+                    <pre><code class="language-bash">run(){ if [ -n "${DRY:-}" ]; then echo "+ would run: $*"; else "$@"; fi; }
+run printf 'migrated=%s\n' 3 &gt; state.txt</code></pre>
+                    <pre><code>--- 実行前の state.txt ---
+migrated=99
+--- DRY=1 実行後の state.txt ---
++ would run: printf migrated=%s\n 3</code></pre>
+                    <p><strong>案内文が状態ファイルの中に入った。</strong>次の実行がこのファイルを読んだ瞬間に何が起きるかは想像にお任せする。dry-run が残してはならないものを一覧にするとこうなる。</p>
+                    <ul>
+                        <li>対象ファイルの<strong>切り詰め・生成・削除</strong> — リダイレクトの位置を分岐の中へ移す</li>
+                        <li><strong>一時ディレクトリ</strong> — 必要なら apply 段階でだけ作り <code>trap</code> で片付ける</li>
+                        <li><strong>ログファイル</strong> — dry-run の出力は標準出力・標準エラーへ送り、ファイルに書かない</li>
+                        <li><strong>ロックファイル</strong> — 読み取り専用の計画には不要だ。「ロックを握れるか」は検査するだけにする</li>
+                        <li><strong>リモート状態の変更</strong> — トークン更新・セッション生成・キュー消費のように、参照に見えて状態を変える呼び出し</li>
+                        <li><strong>キャッシュ・索引</strong> — 次の実行の判断を変えるので副作用である</li>
+                    </ul>
+                    <div class="callout">
+                        <strong>確かめ方。</strong>dry-run の直前と直後に作業ツリーのファイル一覧と各ファイルのサイズ・ハッシュを出して比べるだけでよい。一行でも違えば、その dry-run は<strong>名前負けしている。</strong>この比較はそのまま CI に入れられる。
+                    </div>
+
+                    <h2>5. 類型 4 後段が前段の結果に依存する</h2>
+                    <p>前の三類型はコードを直せば消える。今回は違う。<strong>段が鎖で繋がっていると、dry-run は原理的に後段を予測できない。</strong>三段の移行処理を作ってみた。1 段目は書庫を展開し、2 段目は展開された設定ファイルを置換し、3 段目は 2 段目の件数に応じて状態を記録する。</p>
+                    <pre><code class="language-bash">run() { if [ -n "${DRY:-}" ]; then echo "+ would run: $*"; else "$@"; fi; }
+
+echo "[1/3] リリース展開"
+run mkdir -p release
+run tar -xf release.tar -C release
+
+echo "[2/3] 設定置換"
+n=0
+for c in release/*.conf; do
+  [ -e "$c" ] || continue
+  n=$((n+1))
+  run sed -i 's/^mode=old$/mode=new/' "$c"
+done
+echo "    対象 ${n}件"
+
+echo "[3/3] 後処理"
+if [ "$n" -gt 0 ]; then ... else echo "    変更対象がないので飛ばす"; fi</code></pre>
+                    <pre><code>### DRY=1 (何をするか尋ねた結果)
+[1/3] リリース展開
++ would run: mkdir -p release
++ would run: tar -xf release.tar -C release
+[2/3] 設定置換
+    対象 0件
+[3/3] 後処理
+    変更対象がないので飛ばす
+exit=0
+
+### 実際の実行
+[1/3] リリース展開
+[2/3] 設定置換
+    対象 3件
+[3/3] 後処理
+    state 記録
+exit=0
+
+### 実際に変わったファイル
+release/app.conf:mode=new
+release/db.conf:mode=new
+release/web.conf:mode=new
+--- migrate.state ---
+migrated=3</code></pre>
+                    <p>dry-run は<strong>「2 段目の対象 0 件、3 段目は飛ばす」</strong>と答え、実際の実行は<strong>3 件を変更し状態ファイルまで書いた。</strong>ラッパー関数は完璧に動いた。問題はラッパーではなく<strong>構造</strong>だ。1 段目を実行しなかったので 2 段目が見る入力が存在せず、2 段目の結果が 0 だったので 3 段目の分岐が丸ごと反転した。</p>
+                    <p>ここで最も悪いのは<strong>沈黙</strong>だ。dry-run は「わからない」と言わず、<strong>「やることがない」</strong>と断言した。利用者が受ける印象は正反対である。この類型を扱う方法は三つしかなく、いずれも代償がある。</p>
+                    <table>
+                        <thead><tr><th>方法</th><th>内容</th><th>代償</th></tr></thead>
+                        <tbody>
+                            <tr><td><strong>範囲の縮小</strong></td><td>dry-run が予測する範囲を最初の段までと明示し、それ以降は <code>(予測不可)</code> と表示する</td><td>情報量は減るが<strong>嘘はなくなる</strong></td></tr>
+                            <tr><td><strong>状態のモデル化</strong></td><td>計画段階で書庫の一覧を先に読み「展開後に存在するファイル」を計算する</td><td>モデルと実際がずれうるので<strong>モデル自体の検証</strong>が要る</td></tr>
+                            <tr><td><strong>隔離実行</strong></td><td>使い捨ての作業空間で実際に 1 段目を行い、その上で 2・3 段目を計画する</td><td>最も正確だが<strong>費用が大きく副作用の境界を引き直す</strong>必要がある</td></tr>
+                        </tbody>
+                    </table>
+                    <p>実務では大半が一つ目を選ぶのが正しい。<strong>わからないことをわからないと言う dry-run のほうが、知ったかぶりをする dry-run よりはるかに役に立つ。</strong>展開の例なら <code>tar -tf</code> で一覧だけ読み、二つ目を安く真似ることもできる。</p>
+
+                    <h2>6. 類型 5 いつも 0 を返す</h2>
+                    <p>ここまでの実行すべてで終了コードも一緒に出してきた。改めて見ると妙な点がある。<strong>2 節の実際の実行はエラーを出しながら <code>exit=0</code> であり、dry-run は例外なく全部 <code>exit=0</code> だった。</strong></p>
+                    <p>dry-run が常に 0 を返すなら、<strong>人が目で読んだときだけ情報が伝わる。</strong>人が読むことを前提にする道具は自動化に繋げない。CI で「設定のずれがあればビルドを止める」をやるには、<strong>ずれの有無が終了コードで出てこなければならない。</strong></p>
+                    <p>ここに間違えやすい点がある。<code>0</code> と <code>1</code> だけを使うと<strong>「変更あり」と「計画の失敗」が同じ値になる。</strong>この二つは CI で正反対に扱うべき事象だ。前者は人が承認すれば済む話で、後者はパイプラインが壊れている。だから三つの値が要る。具体的な規約と配線は 10 節で扱う。</p>
+
+                    <h2>7. 五類型の一覧 どこを見れば判るか</h2>
+                    <p>ここまで再現したものを一つの表に畳んだ。<strong>他人のスクリプトを五分で判定する</strong>ときに使う表である。</p>
+                    <table>
+                        <thead><tr><th>類型</th><th>症状</th><th>コード上の兆候</th><th>再現された結果</th></tr></thead>
+                        <tbody>
+                            <tr><td><strong>1. 判断のない出力</strong></td><td>存在しない対象にも実行すると言う</td><td>実行地点ごとに <code>if DRY</code> が繰り返される</td><td>ないファイルに <code>would delete</code>、実行はエラー</td></tr>
+                            <tr><td><strong>2. 実行経路専用の条件</strong></td><td>ロックや容量の問題を事前に知らせない</td><td>dry 分岐直後の <code>continue</code>・<code>return</code></td><td>dry は 5 件成功と予測、実際は 2 件で <code>exit=4</code></td></tr>
+                            <tr><td><strong>3. 副作用の残存</strong></td><td>dry-run なのにファイルが変わる</td><td>分岐外のリダイレクト、<code>mktemp</code>、<code>exec N&gt;</code></td><td>既存ファイルが 0 バイトに切り詰め</td></tr>
+                            <tr><td><strong>4. 連鎖依存</strong></td><td>後段を 0 件と誤報する</td><td>前段の成果物を <code>for</code>・<code>find</code> で読み直す</td><td>dry は 0 件で飛ばし、実際は 3 件変更し状態記録</td></tr>
+                            <tr><td><strong>5. 無意味な終了コード</strong></td><td>CI で使えない</td><td>常に <code>exit 0</code>、値の区別がない</td><td>エラーを出しても <code>exit=0</code></td></tr>
+                        </tbody>
+                    </table>
+                    <p>五類型には共通点が一つある。<strong>どれもエラーを出さない。</strong>1 から 5 のどこでも、スクリプトが「この dry-run は正確ではありません」と言ってくれることはない。だからコードレビューで捕まらず、事故のあとになって発見される。</p>
+
+                    <h2>8. 正しい形 plan と apply を分ける</h2>
+                    <p>五類型を一度に消す構造がある。<strong>「何をするか」を先に計算して一覧にし、実行モードはその一覧を消費するだけにすること</strong>だ。インフラ系の道具が <code>plan</code> と <code>apply</code> と呼ぶあの構造である。</p>
+                    <p>要点は二行だ。</p>
+                    <ul>
+                        <li><strong>plan は状態を読むだけ。</strong>書き込み・生成・削除・ロック取得が一切ない。出力は整列され、時刻や乱数が混ざらない</li>
+                        <li><strong>apply は判断しない。</strong>計画の行を読んでその動作だけを行う。条件分岐がないので二つのモードが食い違う余地が消える</li>
+                    </ul>
+                    <pre><code class="language-bash"># ---------- plan: 読むだけ。何も作らない ----------
+make_plan() {
+  [ -d "$REQ_DIR" ] || printf 'MKDIR\t%s\tarchive ディレクトリなし\n' "$REQ_DIR"
+  for f in "$ROOT"/*; do
+    [ -f "$f" ] || continue
+    case "$f" in
+      *.tmp)  printf 'DELETE\t%s\t一時ファイル\n' "$f" ;;
+      *.log)  if [ -s "$f" ]; then printf 'ARCHIVE\t%s\t内容あり\n' "$f"
+              else                 printf 'DELETE\t%s\t0バイト\n' "$f"; fi ;;
+      *.conf) if grep -qxF 'mode=old' "$f"; then
+                printf 'PATCH\t%s\tmode=old\n' "$f"; fi ;;
+    esac
+  done
+}
+
+# ---------- apply: 計画だけを消費する。自ら判断しない ----------
+do_apply() {
+  local plan="$1" action path reason
+  while IFS=$'\t' read -r action path reason; do
+    [ -n "${action:-}" ] || continue
+    case "$action" in
+      MKDIR)   mkdir -p -- "$path"  &amp;&amp; echo "ok MKDIR   $path" ;;
+      DELETE)  rm -f -- "$path"     &amp;&amp; echo "ok DELETE  $path" ;;
+      ARCHIVE) mkdir -p -- "$REQ_DIR"; mv -- "$path" "$REQ_DIR/" &amp;&amp; echo "ok ARCHIVE $path" ;;
+      PATCH)   sed -i 's/^mode=old$/mode=new/' -- "$path" &amp;&amp; echo "ok PATCH   $path" ;;
+      *)       echo "unknown action: $action" &gt;&amp;2; return 1 ;;
+    esac
+  done &lt; "$plan"
+}
+
+case "${1:-}" in
+  plan)  make_plan | LC_ALL=C sort
+         n=$(make_plan | grep -c . || true)
+         [ "$n" -eq 0 ] &amp;&amp; exit 0 || exit 2 ;;
+  apply) do_apply "${2:?計画ファイルが必要です}" ;;
+esac</code></pre>
+
+                    <h3>三回実行してハッシュ一致を証明する</h3>
+                    <p>主張だけでは意味がない。<strong>同じ状態で計画を三回立て、バイト単位で比較</strong>した。</p>
+                    <pre><code>### plan 三回 — 出力とハッシュ
+run#1 exit=2 sha256=072c4bfb98ee74f7be43c92b2f7824a9c5aa926211cc9df111b84d1645b7cc0f
+run#2 exit=2 sha256=072c4bfb98ee74f7be43c92b2f7824a9c5aa926211cc9df111b84d1645b7cc0f
+run#3 exit=2 sha256=072c4bfb98ee74f7be43c92b2f7824a9c5aa926211cc9df111b84d1645b7cc0f
+--- plan の内容 (run#1) ---
+ARCHIVE data/access.log 内容あり
+DELETE  data/build.tmp  一時ファイル
+DELETE  data/cache.tmp  一時ファイル
+DELETE  data/empty.log  0バイト
+MKDIR   data/archive    archive ディレクトリなし
+PATCH   data/app.conf   mode=old
+--- 三回の比較 ---
+IDENTICAL: 三回ともバイト単位で同一
+
+### plan は副作用を残したか
+access.log app.conf build.tmp cache.tmp db.conf empty.log</code></pre>
+                    <p>三回とも <code>072c4bfb98ee...</code> で一致し、実行後のディレクトリには<strong>ファイルが一つも増えていない。</strong>4 節で見た副作用がここでは構造的に不可能だ。plan に書き込み命令がそもそもないからである。</p>
+                    <p>では計画を消費させてみよう。</p>
+                    <pre><code>### apply — 計画だけを消費
+ok ARCHIVE data/access.log
+ok DELETE  data/build.tmp
+ok DELETE  data/cache.tmp
+ok DELETE  data/empty.log
+ok MKDIR   data/archive
+ok PATCH   data/app.conf
+exit=0
+
+### apply 後に再び plan
+exit=0 (0=変更なし)
+--- data の最終状態 ---
+data/app.conf data/archive data/archive/access.log data/db.conf</code></pre>
+                    <p><strong>apply 後にもう一度計画を立てると空の計画と終了コード 0 が出た。</strong>これがこの構造の最後の利点だ。<strong>「計画が空である」ことそのものが目標状態に到達した証拠</strong>になる。別途の検証スクリプトが要らない。</p>
+                    <div class="callout">
+                        <strong>plan を決定的に保つには。</strong>出力に <code>date</code>・<code>$RANDOM</code>・プロセス ID・走査順序を入れないでください。<code>for f in dir/*</code> の順序はロケールで変わりうるので <code>LC_ALL=C sort</code> で固定します。理由の列を入れれば人が読めるようになり、ハッシュ比較もそのまま保てます。
+                    </div>
+
+                    <h2>9. 計画が古くなったとき ハッシュで施錠する</h2>
+                    <p>plan と apply を分けると新しい隙間ができる。<strong>計画を立てた時点と適用する時点の間に状態が変わりうる。</strong>承認の手順が挟まればこの間隔は数時間になることもある。その間に誰かがファイルを足せば、承認された計画と実際に起きることが食い違う。</p>
+                    <p>手当ては前節ですでに作ってある。<strong>計画のハッシュを一緒に保存し、apply が実行直前に現在の状態から計画を再計算してハッシュを照合</strong>すればよい。違えば拒む。</p>
+                    <pre><code class="language-bash">apply)
+  want=$(sed -n '1p' "$p.sha" 2&gt;/dev/null || echo '')
+  have=$(make_plan | LC_ALL=C sort | sha256sum | cut -d' ' -f1)
+  if [ -n "$want" ] &amp;&amp; [ "$want" != "$have" ]; then
+    echo "ERROR: 計画以降に状態が変わりました (plan=$want / now=$have)" &gt;&amp;2
+    exit 1
+  fi
+  do_apply "$p" ;;</code></pre>
+                    <pre><code>### 1) 計画の作成
+plan exit=2
+988ca65d91ce2783486a7216bdfb8dca47db67b8e1af3c0a664080c127aeab83
+DELETE  data/cache.tmp  一時ファイル
+MKDIR   data/archive    archive ディレクトリなし
+PATCH   data/app.conf   mode=old
+
+### 2) 計画と実行の間に別の人がファイルを追加
+app.conf cache.tmp late.tmp
+
+### 3) 古い計画で apply
+ERROR: 計画以降に状態が変わりました (plan=988ca65d... / now=84f56a62...)
+exit=1
+
+### 4) 計画を立て直せば通る
+plan exit=2
+ok DELETE  data/cache.tmp
+ok DELETE  data/late.tmp
+ok MKDIR   data/archive
+ok PATCH   data/app.conf
+apply exit=0</code></pre>
+                    <p>3 の段階で<strong>apply が実行を拒んだ。</strong>承認された計画に <code>late.tmp</code> がなかったからだ。4 で計画を立て直すと <code>late.tmp</code> が含まれて通った。この一枚で得られるものは大きい。</p>
+                    <ul>
+                        <li><strong>承認の意味が生きる</strong> — 人が承認した一覧と実際に実行される一覧が同じであることを機械が保証する</li>
+                        <li><strong>競合を早く掴む</strong> — 二つのパイプラインが同時に走れば後のほうが拒まれる</li>
+                        <li><strong>再現可能な事後分析</strong> — 計画ファイルとハッシュが残るので「何をなぜしたか」が記録される</li>
+                    </ul>
+                    <p>注意点もある。ハッシュ照合は<strong>計画をもう一度計算する</strong>ので対象が大きいと費用がかかる。そして<strong>無関係な変化まで拒む</strong>。上の例では <code>late.tmp</code> が実際に計画へ影響したが、計画と無関係なファイルが一つ増えても計画の内容が同じならハッシュは同じで通る。<strong>ハッシュは計画を施錠するのであってディレクトリを施錠するのではない。</strong>この区別がこの方式の実用性を作る。</p>
+
+                    <h2>10. 終了コード規約と CI 配線</h2>
+                    <p>6 節で先送りした問題に戻る。広く使われる規約は三つの値だ。</p>
+                    <table>
+                        <thead><tr><th>コード</th><th>意味</th><th>CI の動作</th><th>人がすること</th></tr></thead>
+                        <tbody>
+                            <tr><td><code>0</code></td><td>変更なし — 目標状態と一致</td><td>通過</td><td>なし</td></tr>
+                            <tr><td><code>2</code></td><td>適用待ちの変更あり</td><td>失敗扱い、または承認待ち</td><td>計画を読み承認・修正</td></tr>
+                            <tr><td><code>1</code></td><td>計画を作れなかった(誤り)</td><td>即失敗 + 通知</td><td>パイプラインの修理</td></tr>
+                        </tbody>
+                    </table>
+                    <p><code>2</code> を「変更あり」に割り当てるのは慣例だ。診断系の道具が長らく<strong>正常・差分あり・実行失敗</strong>を 0・1・2 に分けてきた流れと同じ発想で、ここでは誤りによくある <code>1</code> を残すために 2 を使った。何を使うにせよ<strong>三つの状態を区別する</strong>という点が大事である。</p>
+
+                    <h3>配線で実際に引っかかる三つ</h3>
+                    <p>規約を決めてもシェルの配線で崩れる。三つ再現した。</p>
+                    <pre><code>### A) set -e の下でそのまま呼ぶと
+exit=2
+   (「ここまで来ました」が出力されない — 後続処理が丸ごと実行されない)
+
+### B) if で包むと 2 と 1 を区別できない
+変更あり(または誤り)     ← 正常な「変更あり」(2)
+変更あり(または誤り)     ← 誤ったサブコマンドで出た誤り(1)
+exit=0
+
+### D) パイプに繋ぐと終了コードが tee のものになる
+$?=0  PIPESTATUS=2 0</code></pre>
+                    <p><strong>A</strong> は最もよく見る事故だ。<code>set -e</code> は 0 でない値をすべて失敗と見るので、「変更あり」を意味する 2 がスクリプトを殺す。<strong>B</strong> はもっと静かだ。<code>if</code> は 0 かどうかしか見ないので<strong>2 と 1 が同じ枝に落ちる。</strong>上の出力の二行はそれぞれ正常なずれと本物の誤りなのにメッセージが同じである。<strong>D</strong> は <code>| tee</code> で計画をファイルにも残すときに引っかかる。パイプラインの終了状態は最後のコマンドのものなので <code>tee</code> の 0 が残る。</p>
+                    <p>三つの罠をすべて避ける形はこうだ。</p>
+                    <pre><code class="language-bash">#!/usr/bin/env bash
+set -uo pipefail
+rc=0
+./tidy.sh plan &gt; plan.txt || rc=$?          # ← 死なせずにコードを受け取る
+case "$rc" in
+  0) echo "OK: 目標状態と一致 (変更 0 件)"; exit 0 ;;
+  2) echo "DRIFT: 適用待ち $(grep -c . plan.txt) 件"; sed 's/^/    /' plan.txt; exit 1 ;;
+  *) echo "FAIL: 計画の作成に失敗 (rc=$rc)" &gt;&amp;2; exit 2 ;;
+esac</code></pre>
+                    <pre><code>### C) 規約どおり三分岐にすると
+DRIFT: 適用待ち 3 件
+    DELETE  data/cache.tmp  一時ファイル
+    MKDIR   data/archive    archive ディレクトリなし
+    PATCH   data/app.conf   mode=old
+CI 終了=1
+
+### E) 適用後に同じ CI をもう一度回すと
+apply exit=0
+OK: 目標状態と一致 (変更 0 件)
+CI 終了=0</code></pre>
+                    <p>ずれがあれば計画を<strong>ログにそのまま展開して</strong>ビルドを止め、適用後は同じジョブが通った。CI に組み込むとき実務で押さえることを整理する。</p>
+                    <ul>
+                        <li><strong>フラグを変えないこと</strong> — 計画を作った命令行と適用する命令行は、対象・絞り込み・除外規則が完全に同じでなければならない</li>
+                        <li><strong>計画を成果物として保存</strong> — ビルド成果物に残せば承認・監査・事後分析がこのファイル一つで済む</li>
+                        <li><strong>プルリクエストでは <code>plan</code> だけ、マージ後に <code>apply</code></strong> — 承認段階を終了コード 2 に紐づける</li>
+                        <li><strong>定期実行でずれを監視</strong> — 一日一回 <code>plan</code> だけ回し 2 が出たら通知する。誰も配備していないのに 2 が出るなら手で変えた人がいるということだ</li>
+                        <li><strong>定期ジョブでは 2 を失敗に上げないこと</strong> — 通知は送りつつ、常時赤い表示にすると誰も見なくなる</li>
+                        <li><strong><code>pipefail</code> と <code>PIPESTATUS</code></strong> — パイプに繋ぐときどちらのコードを見るか明示的に決める</li>
+                    </ul>
+
+                    <h2>11. 既存ツールの dry-run はどこまで信用できるか</h2>
+                    <p>自作の話をしたので、既にある道具はどうかを見なければならない。結論から言えば<strong>広く使われる道具の dry-run はおおむね信頼でき、何より自分で境界を文書に書いている。</strong>問題は道具ではなく<strong>人が二つの実行の間にフラグを変える瞬間</strong>に生じる。</p>
+
+                    <h3>再現 同じ道具、違うフラグ</h3>
+                    <p>一時リポジトリを作り、追跡されていないファイルとディレクトリ、無視規則に掛かったディレクトリ、そして入れ子になった別のリポジトリを入れて確認した。</p>
+                    <pre><code>### git clean -n (既定)
+Would remove .gitignore
+
+### git clean -nd (ディレクトリを含む)
+Would remove .gitignore
+Would remove work/
+
+### git clean -ndx (無視ファイルまで)
+Would remove .gitignore
+Would remove ignored/
+Would remove work/
+
+### 実際の実行: git clean -fd
+Removing .gitignore
+Removing work/
+
+### 残ったもの
+./ignored  ./ignored/c.txt  ./nested  ./nested/.git  ./nested/n.txt</code></pre>
+                    <p>三つの dry-run の答えがすべて違う。そしてそれぞれは<strong>同じフラグで実行したときの結果と正確に一致する。</strong>公式文書がそのまま説明している。<code>-n</code> は<em>「実際には何も削除せず、何が行われるかだけを示す」</em>であり、<code>-d</code> は<em>「通常、削除しすぎるのを避けるため追跡されていないディレクトリへは再帰しない。-d を指定するとそうしたディレクトリにも再帰する」</em>である。</p>
+                    <p>つまり事故はこう起きる。<strong><code>git clean -n</code> で確認して <code>git clean -fd</code> で実行すること。</strong>上の出力で <code>-n</code> は <code>.gitignore</code> の一行だけ見せたのに、<code>-fd</code> はファイル二つの入った <code>work/</code> の木を丸ごと消した。dry-run が嘘をついたのではなく<strong>別の問いに答えた</strong>のだ。もう一つ、<code>-nd</code> が見せた <code>Would remove work/</code> は<strong>一行</strong>である。その中にファイルが何個あるかは教えてくれない。消える個数を知りたいなら dry-run の出力を数えるだけでは足りない。</p>
+                    <p>入れ子のリポジトリも興味深い。<code>-ndx</code> は <code>nested/</code> を<strong>一覧にまったく入れず</strong>、<code>-ndxff</code> を与えるとそこで現れた。文書には<em>「Git は .git 下位ディレクトリを持つ追跡されていない入れ子のリポジトリを、二つ目の -f が与えられない限り変更することを拒む」</em>と書かれている。<strong>dry-run が実際の挙動をそのまま映していた</strong>のであって、抜け落ちではない。</p>
+
+                    <h3>道具が自ら明かした境界</h3>
+                    <p>この環境には <code>rsync</code> がなく実行できなかった。代わりに公式文書が引いた境界を引用する。この段落は実行検証ではなく<strong>文書の引用であることを明記しておく。</strong></p>
+                    <blockquote>rsync の文書は <code>--dry-run</code> を<strong>「実行とおおむね同じ出力」</strong>を出す試走だと説明する。そのうえで dry run は実データを送らないので <code>--progress</code> は効かず、<code>bytes sent</code>・<code>bytes received</code>・<code>literal data</code>・<code>matched data</code> の統計は<strong>実際より小さく出て</strong>、<code>speedup</code> の値は転送が不要だった実行と同じになると述べる。一方で <code>--itemize-changes</code> の出力は<strong>dry run と続く実行で厳密に同じであるべきで、そうでなければそれはバグ</strong>だと明言している。</blockquote>
+                    <p>この記述は、よくできた dry-run がどうあるべきかをそのまま示している。<strong>「何を変えるか」は厳密に同じで、「どれだけ時間がかかり何バイト流れるか」は違う</strong>と項目ごとに線を引いたのだ。自作するときにも同じ姿勢が要る。予測する軸と予測できない軸を<strong>ヘルプに書いておくこと</strong>がそのまま信頼になる。</p>
+                    <p>既存の道具を使うときの実務規則は短い。</p>
+                    <ul>
+                        <li><strong>同じ命令行を使う</strong> — 確認は <code>-n</code> だけを足した形で。実行時に別のフラグを足さない</li>
+                        <li><strong>ファイル一覧を成果物として残す</strong> — dry-run の出力をファイルに保存し、実行後の結果と突き合わせる</li>
+                        <li><strong>個数ではなく項目を見る</strong> — ディレクトリ一行がファイル数百個ということがある</li>
+                        <li><strong>文書の「例外」節を読む</strong> — よくできた道具は自分が予測できないことを書いている</li>
+                        <li><strong>リモートが絡めばもう一段疑う</strong> — 権限・経路・時刻の解釈が両側で違いうる</li>
+                    </ul>
+
+                    <h2>12. dry-run が最後まで予測できないもの</h2>
+                    <p>どれだけうまく設計しても残る領域がある。<strong>この一覧をヘルプに書いておくことが「正直な dry-run」の最後の条件</strong>だ。</p>
+                    <table>
+                        <thead><tr><th>予測できないもの</th><th>なぜ</th><th>緩和</th></tr></thead>
+                        <tbody>
+                            <tr><td><strong>時間の経過</strong></td><td>計画時点と適用時点が違う。保存期間・期限・cron の境界がその間に越える</td><td>判定基準の時刻を計画に埋め込み apply へ渡す</td></tr>
+                            <tr><td><strong>同時変更</strong></td><td>他のプロセスや人が同じ対象を触る</td><td>9 節の計画ハッシュ照合と、適用中のロック</td></tr>
+                            <tr><td><strong>資源の枯渇</strong></td><td>ディスク・inode・メモリは使う瞬間に足りなくなる</td><td>計画段階で総量を計算し余裕と比べる(概算と明示)</td></tr>
+                            <tr><td><strong>権限と方針</strong></td><td>実行ユーザー・セキュリティモジュール・マウント設定が書き込み時に介入する</td><td>代表経路一つに試し書きをするか、予測不可と表示する</td></tr>
+                            <tr><td><strong>リモートの状態</strong></td><td>API 応答・サーバー側検証・流量制限は呼んでみないと判らない</td><td>提供されていればサーバーの検証専用モードを使う</td></tr>
+                            <tr><td><strong>連鎖する成果物</strong></td><td>5 節 — 前段の結果が後段の入力である</td><td>範囲を最初の段に固定するか、一覧だけ先に読む</td></tr>
+                            <tr><td><strong>部分失敗のあと</strong></td><td>途中で止まれば計画の残りは別の状態の上で実行される</td><td>失敗したら即中断し計画を立て直す</td></tr>
+                        </tbody>
+                    </table>
+                    <p>表の最後の行が特に大事だ。<strong>計画は「計画を立てたその状態」の上でのみ有効である。</strong>半分ほど適用して失敗したなら、残り半分をそのまま押し通してはいけない。計画を捨てて立て直すのが正しく、8 節の構造ならそれは命令一つだ。</p>
+
+                    <h2>結論: dry-run はモードではなく関数だ</h2>
+                    <p>この記事で再現した五類型には共通点があった。<strong>どれも静かに間違える。</strong>ないファイルを消すと言い、5 件だと言っておいて 2 件で止まり、何も変えないと言いながら既存ファイルを空にし、やることがないと断言してから 3 件を変え、そのうえで終了コードは常に 0 だ。<strong>どれ一つとして「私の予測は不正確です」と言ってはくれない。</strong></p>
+                    <p>だから判定基準は一つに絞られる。<strong>「dry-run は実行と同じ判断を経たか。」</strong>同じ条件を評価し同じ順序で対象を選んだなら、その出力は予測だ。引数一覧を復唱しただけならまねごとである。そしてこの問いに確実に「はい」と答える方法は、これまでのところ一つしかない。<strong>判断を一か所だけに置くこと</strong> — つまり <code>plan</code> が一人で判断し <code>apply</code> は消費だけするようにすることだ。</p>
+                    <p>この構造が良い理由は三つ。第一に<strong>二つのモードが食い違うコードが存在しない。</strong>類型 1・2 は構造的に発生しえない。第二に<strong>検証がただで付いてくる。</strong>三回実行のハッシュ比較で決定性を、適用後の空の計画で収束を確かめられる。第三に<strong>承認と監査がファイル一つで済む。</strong>計画ファイルとそのハッシュがそのまま記録だ。</p>
+                    <p>最後に今日できること一つ。<strong>手元のスクリプトの dry-run を空の一時ディレクトリで走らせ、実行前後のファイル一覧とハッシュを比べること。</strong>一行でも違えば、その dry-run はすでに何かを変えている。そして終了コードを出してみてほしい。常に 0 なら、その dry-run は人が画面を読んでくれるときだけ働く装置だ。<strong>読まれない安全装置は安全装置ではない。</strong></p>
+
+                    <h2>参考資料</h2>
+                    <ul>
+                        <li>The Open Group Base Specifications Issue 8, Shell Command Language(リダイレクトの評価時点と終了状態の規定): <a href="https://pubs.opengroup.org/onlinepubs/9799919799/utilities/V3_chap02.html" target="_blank" rel="noopener">pubs.opengroup.org</a></li>
+                        <li>The Open Group Base Specifications Issue 8, <code>rm</code> ユーティリティ(存在しないオペランドの扱い): <a href="https://pubs.opengroup.org/onlinepubs/9799919799/utilities/rm.html" target="_blank" rel="noopener">pubs.opengroup.org</a></li>
+                        <li>The Open Group Base Specifications Issue 8, <code>sort</code>(ロケールと整列順序): <a href="https://pubs.opengroup.org/onlinepubs/9799919799/utilities/sort.html" target="_blank" rel="noopener">pubs.opengroup.org</a></li>
+                        <li>Bash Reference Manual(<code>set -e</code>・<code>pipefail</code>・<code>PIPESTATUS</code> の正確な挙動): <a href="https://www.gnu.org/software/bash/manual/bash.html" target="_blank" rel="noopener">gnu.org/software/bash</a></li>
+                        <li>Git 公式文書, <code>git clean</code>(<code>-n</code>・<code>-d</code>・<code>-x</code> と入れ子リポジトリに対する二つ目の <code>-f</code>): <a href="https://git-scm.com/docs/git-clean" target="_blank" rel="noopener">git-scm.com/docs/git-clean</a></li>
+                        <li><code>rsync(1)</code> man page(<code>--dry-run</code> の出力境界と <code>--itemize-changes</code> の保証): <a href="https://man7.org/linux/man-pages/man1/rsync.1.html" target="_blank" rel="noopener">man7.org</a></li>
+                        <li>GNU Coreutils Manual, <code>mktemp</code>・<code>sha256sum</code>(一時ディレクトリ生成とハッシュ比較): <a href="https://www.gnu.org/software/coreutils/manual/html_node/index.html" target="_blank" rel="noopener">gnu.org/software/coreutils</a></li>
+                        <li>GNU Grep Manual(<code>-c</code>・<code>-q</code> と終了コード 0/1/2): <a href="https://www.gnu.org/software/grep/manual/grep.html" target="_blank" rel="noopener">gnu.org/software/grep</a></li>
+                        <li>Ansible 公式文書, Check Mode(<code>--check</code> が予測できない条件の説明): <a href="https://docs.ansible.com/ansible/latest/playbook_guide/playbooks_checkmode.html" target="_blank" rel="noopener">docs.ansible.com</a></li>
+                        <li>関連記事: <a href="shell_readonly_idempotent_script.html">二度走らせても安全なスクリプト - 冪等性の設計</a>, <a href="linux_server_guide_07_shell_advanced.html">Linux サーバー管理 7 - シェルスクリプト応用</a>, <a href="linux_server_guide_06_shell_basics.html">Linux サーバー管理 6 - シェルスクリプト基礎</a></li>
+                    </ul>
+                </div>
+
+                <!-- md-artifact-start -->
+                    <div class="md-artifact" style="margin:2rem 0;border:1px solid #d7dce3;border-radius:10px;overflow:hidden;background:#fbfcfd;">
+                        <div style="display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;justify-content:space-between;padding:.7rem 1rem;background:#eef2f7;border-bottom:1px solid #d7dce3;">
+                            <span style="font-weight:700;font-size:.97rem;">📋 そのまま持ち出せるチェックリスト</span>
+                            <span style="display:flex;gap:.5rem;align-items:center;">
+                                <code style="font-size:.82rem;color:#5a6675;background:transparent;padding:0;">shell_dry_run_design.md</code>
+                                <button type="button" class="md-artifact-copy" style="cursor:pointer;border:1px solid #b9c2cf;background:#fff;color:#2c3e50;font-weight:600;line-height:1.3;border-radius:6px;padding:.32rem .7rem;font-size:.85rem;">全体をコピー</button>
+                            </span>
+                        </div>
+                        <pre style="margin:0;max-height:420px;overflow:auto;padding:1rem;background:#fbfcfd;font-size:.86rem;line-height:1.62;"><code class="nohighlight" style="background:transparent;padding:0;white-space:pre;"># dry-run 設計指針 — 作る前に目を通す一覧
+
+&gt; 出典: braindetox.kr — まともな --dry-run の作り方
+&gt; 根拠: POSIX Issue 8 (Shell Command Language), Bash Reference Manual, git-clean(1), rsync(1)
+&gt; このファイルをそのまま AI に貼り「うちのスクリプトをこの基準で直して」と書けば使えます。
+
+## 1. plan / apply 分離の骨格 — そのまま貼る形
+
+```bash
+#!/usr/bin/env bash
+# usage: tool.sh plan|apply [計画ファイル]
+#   終了コード  0=変更なし · 2=変更あり · 1=誤り
+set -uo pipefail
+TAB=$(printf '\t')          # ANSI-C 引用の代わりに変数で(移植性)
+
+make_plan() {               # ★読むだけ。生成・削除・ロック取得は禁止
+  [ -d "$REQ_DIR" ] || printf 'MKDIR%s%s%sなし\n' "$TAB" "$REQ_DIR" "$TAB"
+  for f in "$ROOT"/*; do
+    [ -f "$f" ] || continue
+    case "$f" in
+      *.tmp) printf 'DELETE%s%s%s一時ファイル\n' "$TAB" "$f" "$TAB" ;;
+    esac
+  done
+}
+
+do_apply() {                # ★判断しない。case にない動作は誤り
+  local plan="$1" action path reason
+  while IFS="$TAB" read -r action path reason; do
+    [ -n "${action:-}" ] || continue
+    case "$action" in
+      MKDIR)  mkdir -p -- "$path" ;;
+      DELETE) rm -f -- "$path" ;;
+      *) echo "unknown action: $action" &gt;&amp;2; return 1 ;;
+    esac
+  done &lt; "$plan"
+}
+
+case "${1:-}" in
+  plan)
+    make_plan | LC_ALL=C sort
+    n=$(make_plan | grep -c . || true)
+    [ "$n" -eq 0 ] &amp;&amp; exit 0 || exit 2 ;;
+  apply)
+    p="${2:?計画ファイルが必要です}"
+    want=$(cat "$p.sha" 2&gt;/dev/null || echo '')
+    have=$(make_plan | LC_ALL=C sort | sha256sum | cut -d' ' -f1)
+    [ -z "$want" ] || [ "$want" = "$have" ] || {
+      echo "計画が古いです (plan=$want now=$have)" &gt;&amp;2; exit 1; }
+    do_apply "$p" ;;
+  *) echo "usage: tool.sh plan|apply [planfile]" &gt;&amp;2; exit 1 ;;
+esac
+```
+
+- [ ] plan の中に書き込み命令が **一行もない**
+- [ ] apply の中に状態を見る **条件分岐がない**
+- [ ] 計画の各行に **理由の列** がある(人が承認できる必要がある)
+- [ ] 出力順を `LC_ALL=C sort` で固定した
+
+## 2. 終了コード規約
+
+| コード | 意味 | CI の動作 |
+|---|---|---|
+| `0` | 変更なし — 目標状態と一致 | 通過 |
+| `2` | 適用待ちの変更あり | 失敗扱い、または承認待ち |
+| `1` | 計画を作れなかった | 即失敗 + 通知 |
+
+- [ ] `set -e` の下で `rc=0; cmd || rc=$?` として受け取っているか
+- [ ] `if cmd; then` で **2 と 1 を潰して** いないか
+- [ ] パイプに繋ぐとき `PIPESTATUS` を見ているか
+- [ ] ヘルプにコードの意味を書いたか
+- [ ] 定期ジョブでは 2 を失敗に上げず通知だけにしているか
+
+## 3. plan 段階で禁止する副作用
+
+- [ ] 対象ファイルの生成・削除・切り詰め(`&gt;` リダイレクトを含む)
+- [ ] `mktemp` · `mkdir -p` による作業ディレクトリ
+- [ ] ログファイルを開くこと(`exec 3&gt; ...` は **開いた瞬間** にファイルを作る)
+- [ ] ロックファイル・ロックディレクトリの取得(「握れるか」は検査だけ)
+- [ ] リモート状態の変更(トークン更新・セッション生成・キュー消費)
+- [ ] キャッシュ・索引の更新(次の実行の判断を変えるなら副作用)
+
+★ **リダイレクトは分岐の外で評価される。** `f(){ ...; } &gt; out` は dry でも `out` を切り詰める。
+★ ラッパーに `run cmd &gt; state` と書くと案内文が **状態ファイルの中へ** 入る。
+
+## 4. 検証手順 — 三回のハッシュと副作用ゼロ
+
+```bash
+snap(){ find "$1" -type f | LC_ALL=C sort | xargs -r sha256sum | sha256sum; }
+
+before=$(snap target)
+for i in 1 2 3; do ./tool.sh plan &gt; "p.$i"; echo "run$i $(sha256sum &lt; "p.$i")"; done
+cmp -s p.1 p.2 &amp;&amp; cmp -s p.2 p.3 &amp;&amp; echo DETERMINISTIC || echo "★出力が揺れている"
+after=$(snap target)
+[ "$before" = "$after" ] &amp;&amp; echo "NO SIDE EFFECT" || echo "★plan が状態を変えた"
+```
+
+- [ ] 三回のハッシュが一致する
+- [ ] before と after のスナップショットが一致する
+- [ ] apply 後にもう一度 plan すると **空の計画 + 終了コード 0**
+- [ ] 古い計画で apply すると **拒否される**
+
+## 5. dry-run が嘘をつく条件 — 一つでも当たればヘルプに書く
+
+- [ ] 実行分岐の **中にしかない** 検査(ロック・容量・権限・ヘルスチェック)
+- [ ] 前段の成果物を後段が読む **連鎖構造**
+- [ ] 計画と適用の間に **時間が流れる** 運用(承認・バッチ)
+- [ ] リモート API の応答やサーバー側検証で分岐する
+- [ ] 実行ユーザー・セキュリティ方針・マウント設定が異なる環境
+- [ ] **部分失敗のあとの再開**(残りの計画は別の状態の上で動く)
+- [ ] 時刻・乱数・走査順序が結果に混ざる
+
+## 6. 既存ツールを使うとき
+
+- [ ] 確認と実行の命令行が `-n` 一つだけ違うか
+- [ ] dry-run の出力を **ファイルに保存** して結果と突き合わせたか
+- [ ] ディレクトリ一行をファイル一個と数えていないか(一行が数百個のことがある)
+- [ ] 文書の **例外の節** を読んだか(統計や進捗は保証対象外のことがある)
+- [ ] リモートが絡むとき権限・経路・時刻の解釈をもう一度疑ったか
+
+## 7. ヘルプに入れる文面のひな型
+
+```
+--dry-run   変更を適用せず計画だけを出力します。
+            予測できるもの : &lt;ここに書く&gt;
+            予測できないもの : &lt;ここに書く&gt;
+            終了コード : 0=変更なし / 2=変更あり / 1=誤り
+            このモードはいかなるファイルも作らず消しません。
+```
+
+★ 破壊的な命令を試すときは **必ず新規に作った空の一時ディレクトリの中だけで** 実行してください。
+</code></pre>
+                        <p style="margin:0;padding:.6rem 1rem;font-size:.82rem;color:#5a6675;border-top:1px solid #e3e8ee;">コピーしてメモアプリやAIツールにそのまま貼り付けてください。</p>
+                    </div>
+                    <script>
+                    (function(){
+                      if (window.__mdArtifactBound) return;
+                      window.__mdArtifactBound = true;
+                      document.addEventListener('click', function(ev){
+                        var btn = ev.target.closest && ev.target.closest('.md-artifact-copy');
+                        if (!btn) return;
+                        var box = btn.closest('.md-artifact');
+                        var code = box && box.querySelector('pre code');
+                        if (!code) return;
+                        var text = code.textContent;
+                        var label = btn.textContent;
+                        var ok = function(){
+                          btn.textContent = "コピーしました";
+                          setTimeout(function(){ btn.textContent = label; }, 1600);
+                          if (typeof gtag === 'function') {
+                            gtag('event', 'md_copy', { slug: "shell_dry_run_design", lang: "ja", chars: text.length });
+                          }
+                        };
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                          navigator.clipboard.writeText(text).then(ok).catch(function(){ fallback(); });
+                        } else { fallback(); }
+                        function fallback(){
+                          var ta = document.createElement('textarea');
+                          ta.value = text; ta.setAttribute('readonly','');
+                          ta.style.position='fixed'; ta.style.left='-9999px';
+                          document.body.appendChild(ta); ta.select();
+                          try { document.execCommand('copy'); ok(); } catch(e) {}
+                          document.body.removeChild(ta);
+                        }
+                      });
+                    })();
+                    </script>
+                    <!-- md-artifact-end -->
+
+                <div class="share-section">
+                    <h3>この記事をシェア</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">スレッズ</button>
+                        <button id="link-copy" class="share-btn link-btn">リンクをコピー</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">一覧に戻る</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">一緒に使うと便利な無料ツール</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/json_formatter.html">JSON フォーマッター</a></li>
+      <li><a href="../static/regex_tester.html">正規表現テスター</a></li>
+      <li><a href="../static/jwt_decoder.html">JWTデコーダー・生成器 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 エンコーダー/デコーダー</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">すべてのツールを見る &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">関連記事</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="shell_readonly_idempotent_script.html">二度実行しても壊れないスクリプト - 冪等性の設計と実際に壊れる六つのパターン</a></li>
+      <li><a href="shell_quoting_rules_guide.html">シェルのクォート規則 - どの引用符が何を止めるのか</a></li>
+      <li><a href="shell_exit_code_pipefail.html">シェルの終了コードと set -e - 何を捕まえ何を見逃すか</a></li>
+      <li><a href="gpt56_sol_powershell_incident_2026.html">Codex gpt-5.6-sol PowerShell $HOME変数衝突事故 - AIエージェントのシェル実行リスク 2026</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('リンクがコピーされました。Threadsアプリに貼り付けてシェアしてください！');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('リンクがコピーされました！'); });
+    });
+    </script>
+</body>
+</html>
