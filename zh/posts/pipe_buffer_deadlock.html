@@ -1,0 +1,1012 @@
+<!DOCTYPE html>
+<!--
+ * 技术博客文章模板
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>子进程停住的真正原因 - 管道缓冲区装满引发的死锁 2026</title>
+    <meta name="description" content="小输入能通过，只有真实数据才会停住。原因不是代码而是管道缓冲区的容量。在 Windows 上用 Python 3.13 与 Node 22 按字节测出死锁边界 4096 与 4097，并把四种解法、选择表与卡住诊断流程按实际运行输出整理出来。">
+    <meta name="keywords" content="管道缓冲区, 死锁, subprocess, child_process, communicate, PIPE, 流量控制, SIGPIPE, stdout stderr, 块缓冲, PYTHONUNBUFFERED, stdbuf, maxBuffer, highWaterMark, 子进程, 卡住诊断, 流式处理, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/pipe_buffer_deadlock.html">
+
+    <meta property="og:title" content="子进程停住的真正原因 - 管道缓冲区装满引发的死锁">
+    <meta property="og:description" content="管道是有限的缓冲区。装满后写入方就等待。这不是缺陷而是流量控制，只有在读取方已经在等待时才会变成死锁。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/pipe_buffer_deadlock.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-07-30">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="子进程停住的真正原因 - 管道缓冲区死锁">
+    <meta name="twitter:description" content="4096 字节能过，4097 字节就停。一份按字节测量边界的记录。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "子进程停住的真正原因 - 管道缓冲区装满引发的死锁",
+      "alternativeHeadline": "Why Your Child Process Hangs - Deadlock From a Full Pipe Buffer",
+      "datePublished": "2026-07-30",
+      "dateModified": "2026-07-30",
+      "inLanguage": "zh-CN",
+      "articleSection": "开发/基础设施",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "管道缓冲区, 死锁, subprocess, child_process, communicate, 流量控制, SIGPIPE, 块缓冲, maxBuffer, highWaterMark, 卡住诊断",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/pipe_buffer_deadlock.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "小输入下好好的脚本，为什么只在真实数据上停住",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "因为管道的缓冲区容量就是边界。如果输出比这个容量小，子进程会把它全部写完并立刻退出，所以即使父进程先等待也不会出事。输出一旦超过容量，子进程就停下来等缓冲区空出位置，父进程则停下来等子进程结束。在这个环境里实测，边界分得非常干净。子进程写 4096 字节时，等待调用在 0.10 秒返回；写 4097 字节时就进入了永久等待。经过 13 次二分探测确认，能通过的最大值是 4096 字节，会卡住的最小值是 4097 字节。单元测试用的样本几乎总是比这个值小。所以代码看上去没有问题，而故障只在生产环境第一次遇到真实数据的那天出现。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "管道满了导致写入方停住，这算缺陷吗",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "不算。那是流量控制，是正常行为。管道不是无限的通道而是固定大小的缓冲区，在装满的状态下尝试写入就等到有空位为止，这是规范规定的。POSIX 规范也写明，如果没有设置非阻塞标志，写请求可能让线程阻塞。实际验证下来，这种等待并不是问题。我让外壳管道的下游两秒内什么都不读，整条管道仍然在 2455 毫秒正常结束，退出码为 0。上游短暂等待之后，下游开始读取，它就接着走完了。死锁不是等待本身，而是发生在唯一能读取的那一方已经在等别的东西的时候。也就是说，只有变成双方互相等待的结构时才是问题。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "stdout 和 stderr 都用管道打开了，为什么还会停住",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "因为管道有两条而读取的代码只有一份。这是实际工作中最常踩的坑。父进程只读标准输出，并等待那条流结束。可是子进程往标准错误写了大量内容，那条管道满了，于是子进程停住。子进程停住了，标准输出也就不会关闭，父进程的读取也就永远结束不了。运行验证后发现，子进程往标准错误写 20 万字节时，父进程的读取调用过了四秒仍未返回，而子进程还活着。Node 上也一样。只给标准输出挂数据监听器、把标准错误放着不管，结束事件三秒内都没有到来。解决办法只有一个，就是同时消费两条流。用一个单独的线程，或者用会自动同时读取两条流的高层函数都可以。验证结果是，用线程一起读取标准错误时，同样的工作在 0.10 秒完成。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "管道缓冲区到底是多少字节",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "随环境而异，即使在同一台机器上也随层次而异。这一点很重要，所以我在一台机器上分别测量了三条路径。原生 Windows 匿名管道正好是 4096 字节。一个字节一个字节地写并计数，在第 4096 次上写入被卡住。同一台机器的 MSYS2 外壳管道是 65536 字节，用 128 字节和 16 字节两种粒度各测一次，结果相同。在 Node 里，不消费流而等待结束时的停滞边界是 131072 字节。这个值的产生，是因为 Node 在操作系统管道之上还叠了自己的流缓冲区。那条流的默认水位标记读出来是 16384 字节，但实测的停滞边界远大于它，无法用两个数值的简单相加来解释。结论不是背下某个数字，而是在自己的环境里测。把别的文档里看到的数值直接拿来假定，是最危险的做法。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "怎么判断一个卡住的进程是不是这个问题",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "分四步，不需要任何特殊工具。第一，在进程列表里看父进程和子进程是不是都活着。两个都在，就说明不是死了而是在等待。第二，采样两次累计 CPU 时间并比较。数值不变说明是阻塞而不是死循环。在实测的案例里，两次采样都是 0.109375。第三，采样两次进度并比较。让程序记录已写字节数就会发现数值冻结在某一点。在观察到的案例里，两秒时点和四秒时点都是 65536 字节。第四，这一步是决定性的，只改变输入或输出的大小，再跑一遍同样的代码。如果同一份代码在某个尺寸以下不再卡住，那么原因就是缓冲区而不是你的逻辑。在实测的案例里，65536 字节的样本以退出码 0 正常结束，而 400000 字节的样本在阻塞状态下被强制结束，留下了 124。除了尺寸什么都没改，这一点就是证据。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/pipe_buffer_deadlock.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/pipe_buffer_deadlock.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/pipe_buffer_deadlock.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/pipe_buffer_deadlock.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/pipe_buffer_deadlock.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="子进程停住的真正原因 - 管道缓冲区装满引发的死锁">
+                <meta itemprop="datePublished" content="2026-07-30">
+                <meta itemprop="dateModified" content="2026-07-30">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="管道缓冲区, 死锁, subprocess, child_process, 流量控制, 块缓冲, 卡住诊断">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/pipe_buffer_deadlock.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">子进程停住的真正原因 - 管道缓冲区装满引发的死锁</h1>
+                    <h2 class="post-subtitle">小输入能通过，只有真实数据才停住 - 一份按字节测量边界的记录</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-07-30">2026-07-30</span>
+                        <span class="post-category" itemprop="articleSection">开发/基础设施</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <h2>引言：没有任何消息就停在那里</h2>
+                    <p>把夜间批处理跑上，早上一看，脚本停在了某个地方。没有错误消息，没有异常堆栈。进程仍然在列表里，CPU 使用率是百分之零。日志最后一行的时间戳停在几个小时前。再跑一遍，<strong>还是在同一个地方停住</strong>。可是昨天用短样本跑的时候，五秒就结束了。</p>
+                    <p>在这种情形下，大部分时间都被花在错误的地方。重读逻辑、加更多日志、开始怀疑锁或者网络。但代码本身没有任何问题。<strong>原因不是代码，而是管道缓冲区的大小</strong>，而那是一个源码里任何地方都没有写出来的数字。所以无论怎么读代码都看不见。</p>
+                    <p>这篇文章是我亲自测量那个数字、并按字节确认它所造成的边界的记录。先把结论压成三句话。</p>
+                    <ul>
+                        <li><strong>管道是有限的缓冲区。</strong>它不是无限的通道，而是固定大小的盒子，在这个环境里是 4096 字节</li>
+                        <li><strong>装满之后写入方就等待。这不是缺陷，而是流量控制。</strong>下游慢，管道照样能正常完成。等待本身是正常的</li>
+                        <li><strong>死锁发生在应该读取的那一方已经在等别的东西的时候。</strong>也就是说，问题的形状永远是「双方互相等待」</li>
+                    </ul>
+                    <p>而这个结构真正可怕的理由在最后一点。<strong>如果输出比缓冲区小，什么都不会发生。</strong>单元测试用的样本几乎总是比缓冲区小。所以这个缺陷<strong>会通过所有测试，只在生产环境第一次遇到真实数据的那天出现。</strong></p>
+                    <div class="callout">
+                        <p><strong>运行环境。</strong>下面所有输出都是在 <strong>Windows 10 Pro (10.0.19045)</strong> 上实际运行得到的结果。外壳是 <strong>GNU bash 5.2.37 (MSYS2 / MINGW64)</strong>，运行时是 <strong>Python 3.13.3 (win32)</strong> 与 <strong>Node.js v22.16.0 (win32)</strong>。所有脚本都先保存成文件再运行，而且<strong>因为这是复现死锁的实验，每一次运行都加了十秒以内的超时。</strong>凡是撞上超时的，都记为「死锁确认」。</p>
+                        <p><strong>★缓冲区容量随环境而异。</strong>下列数字是<strong>这个环境的实测值</strong>，换成别的操作系统、外壳、运行时就会得到别的值。事实上，就在同一台机器上，不同路径也给出了三个不同的值。所以本文不要求你背数字，而是给你<strong>测量的方法</strong>。示例路径都写成 <code>/tmp/demo</code> 这样的占位符。</p>
+                        <p><strong>本文不涉及的内容。</strong>管道的<strong>退出码</strong>约定、状态数组、以及如何察觉管道失败，已经在<a href="shell_exit_code_pipefail.html">退出码与管道</a>里讲过了。这里只专注于<strong>缓冲区装满引发的死锁</strong>这一点。文件名里混入空格导致管道损坏的问题在<a href="find_xargs_whitespace_trap.html">find 与 xargs 的空格陷阱</a>，引号规则在<a href="shell_quoting_rules_guide.html">外壳引号规则</a>。</p>
+                    </div>
+
+                    <h2>1. 管道是有限的缓冲区 - 在这个环境是 4096 字节</h2>
+                    <p>首先得亲自测出容量。我建了一条管道，<strong>完全不碰读取端</strong>，只持续写入。写入在某处不再返回，那个点就是容量。为了不陷入无限等待，写入放在单独的线程里，五秒后检查状态。</p>
+                    <pre><code>python 3.13.3 / win32
+--- 1-1. raw os.pipe() capacity: write until it blocks ---
+  writer thread is STILL BLOCKED after 5.0s  &lt;- pipe is full
+  bytes accepted before blocking : 4096
+
+--- 1-2. same measurement, 1 byte at a time (exact) ---
+  blocked after exactly 4096 bytes
+
+--- 1-3. drain the pipe, does the writer resume? ---
+  read 4608 bytes from the read end
+  writer counter is now 8704 (was 8704)
+
+--- 1-4. subprocess stdin pipe: child never reads ---
+  parent is BLOCKED writing to a child that never reads
+  bytes accepted : 4096
+  child killed, test over</code></pre>
+                    <p>这里要读出三件事。第一，<strong>正好是 4096 字节</strong>。按 512 字节为单位量是 4096，按 1 字节为单位量还是 4096。不是约数而是一个整齐的值。第二，写入线程<strong>没有死，而是在等待。</strong>是等待而不是错误，这一点是核心。第三，从读取端取走 4608 字节之后，写入<strong>就直接继续了。</strong>计数器涨到了 8704。</p>
+                    <p>最后这个观察确立了本文的前提。<strong>管道满了导致写入方等待，这不是故障。</strong>有空位就会自动继续。POSIX 规范说的是同一件事。在没有非阻塞标志的情况下，它写着「写请求可能让线程阻塞，但正常完成时会返回请求的字节数」。也就是说这是<strong>被设计出来的行为</strong>。</p>
+                    <p>1-4 是只换了方向的同一个实验。启动一个子进程并用管道打开它的标准输入，让子进程什么都不读。父进程能写进去的量同样是<strong>4096 字节</strong>。无论往哪个方向写，管道都是同一个盒子。</p>
+                    <h3>1.1 同一台机器上值分成了三个</h3>
+                    <p>不过这里要小心。4096 这个值是<strong>只在这条路径上</strong>得到的。在同一台机器上测别的路径，结果全都不一样。</p>
+                    <table>
+                        <thead>
+                            <tr><th>层</th><th>本环境实测</th><th>测量方法</th><th>性质</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>原生 Windows 匿名管道</td><td><strong>4096 B</strong></td><td>往没人读的管道里一次写一个字节</td><td>操作系统内核缓冲区</td></tr>
+                            <tr><td>MSYS2 外壳管道</td><td><strong>65536 B</strong></td><td>往下游在睡觉的管道里写</td><td>外壳运行时创建的管道</td></tr>
+                            <tr><td>Node 流的水位标记</td><td><strong>16384 B</strong></td><td>查询流的属性</td><td>用户空间缓冲区</td></tr>
+                            <tr><td>Node 未消费 stdout 的停滞边界</td><td><strong>131073 B</strong></td><td>不消费只等结束，再做二分</td><td>上面两层的合成结果</td></tr>
+                            <tr><td>Python stdio 输出缓冲区</td><td><strong>8192 B</strong></td><td>查询运行时常量</td><td>与管道无关的另一层</td></tr>
+                        </tbody>
+                    </table>
+                    <p>表的最后两行尤其重要。Node 的停滞边界 131073 字节<strong>既不是操作系统的管道容量，也不是流的水位标记。</strong>也不是两个值的简单相加。它是若干层叠加出来的结果值，而我没能准确核实其内部的账。所以<strong>这个数字只作为测量值给出，不把它一般化成公式。</strong></p>
+                    <ul>
+                        <li>你所在环境的值<strong>可能与这里写的任何数字都不同。</strong>Linux 与 Windows、外壳的种类、运行时的版本全都是变量</li>
+                        <li>所以真正有用的不是数字而是<strong>测量的步骤</strong>。1-1 的实验十行就能复现</li>
+                        <li>更重要的是<strong>开发环境与生产环境的值可能不同</strong>。开发能过、只有生产会停的第二个理由就在这里</li>
+                        <li>容器内外、本地与持续集成、经过外壳的运行与直接运行，都是<strong>不同的路径</strong>。一条路过了，并不保证另一条</li>
+                    </ul>
+
+                    <h2>2. 复现死锁 - 在 4096 与 4097 之间</h2>
+                    <p>现在来造出真实的事故形状。最常见的错误代码是这个顺序。<strong>启动子进程，先等待，然后再读输出。</strong>在读之前先等，这就是陷阱的全部。</p>
+                    <pre><code>python 3.13.3 / win32
+
+--- 2-1. parent calls wait() first: small vs large output ---
+  child writes     1024 B -&gt; wait(3s) : finished (0.10s)
+  child writes     4096 B -&gt; wait(3s) : finished (0.10s)
+  child writes     4097 B -&gt; wait(3s) : DEADLOCK (2.01s)
+  child writes     8192 B -&gt; wait(3s) : DEADLOCK (2.02s)
+  child writes    65536 B -&gt; wait(3s) : DEADLOCK (2.01s)
+  child writes  1048576 B -&gt; wait(3s) : DEADLOCK (2.01s)
+
+--- 2-2. bisect the exact boundary ---
+  largest output that does NOT deadlock : 4096 bytes
+  smallest output that DOES deadlock    : 4097 bytes
+  probes                                : 13</code></pre>
+                    <p>这张表是本文的心脏。<strong>4096 字节在 0.10 秒结束，4097 字节进入永久等待。</strong>代码一个字符都没有变，只是子进程写的字节数多了一个字节。</p>
+                    <p>DEADLOCK 标记的意思是「撞上了超时」。等待调用设了两秒上限，超过上限就判定为死锁。不设上限跑，这个实验本身就结束不了。<strong>处理死锁的实验必须加超时</strong>，这是第一条实务教训。</p>
+                    <p>用二分探测扎了 13 次把边界定了下来。能过的最大值是 4096，会停的最小值是 4097。<strong>这个值与第 1 节测出的管道容量完全相同。</strong>不是巧合，而是它就是原因的证据。</p>
+                    <h3>2.1 为什么会停 - 用两句话说</h3>
+                    <p>结构很简单。子进程在等<strong>管道空出位置</strong>。父进程在等<strong>子进程结束</strong>。能腾出位置的只有父进程，而父进程在等待。能让子进程结束的只有写入完成，而它被堵住了。<strong>彼此都在等对方下一步动作的那个圆闭合了。</strong></p>
+                    <ul>
+                        <li>输出在 4096 字节以下时，子进程<strong>把它全写完就直接退出。</strong>管道里即使还有数据，子进程也已经不在了，所以等待立刻返回</li>
+                        <li>输出是 4097 字节时，最后一个字节写不进去，<strong>子进程就无法退出。</strong>等待永远不会返回</li>
+                        <li>这个差别<strong>不会以任何日志留下来。</strong>没有异常，没有错误码。两个进程安静地互相等待</li>
+                        <li>所以症状是「停住」。不是「失败」而是<strong>什么都没发生</strong>，这正是它难以诊断的地方</li>
+                    </ul>
+                    <p>Python 官方文档明确写出了这个风险。在等待调用的说明里写着：当标准输出或标准错误使用管道，且子进程产生的输出多到足以让它阻塞、等待操作系统管道缓冲区接受更多数据时，这个调用就会死锁。文档里写的东西，被实测原样复现了出来。</p>
+
+                    <h2>3. 为什么测试能通过</h2>
+                    <p>第 2 节的边界决定了这个缺陷的性质。<strong>4096 字节根本不算什么。</strong>换成文本大约两千个字，换成日志是四五十行。单元测试里放的样本很少比这更大。</p>
+                    <table>
+                        <thead>
+                            <tr><th>情形</th><th>输出大小</th><th>在这个环境</th><th>结果</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>单元测试的短样本</td><td>几百 B</td><td>全部装得进缓冲区</td><td><strong>通过</strong></td></tr>
+                            <tr><td>手工确认过的示例文件</td><td>1 到 2 KB</td><td>全部装得进缓冲区</td><td><strong>通过</strong></td></tr>
+                            <tr><td>刚好在边界上</td><td>4096 B</td><td>正好装满的状态</td><td><strong>通过</strong>（0.10 秒）</td></tr>
+                            <tr><td>比边界多一个字节</td><td>4097 B</td><td>最后一次写入被堵住</td><td><strong>永久等待</strong></td></tr>
+                            <tr><td>一条生产数据</td><td>几十 KB</td><td>老早就被堵住了</td><td><strong>永久等待</strong></td></tr>
+                            <tr><td>报错很多的那一天</td><td>好几 MB</td><td>堵在标准错误上</td><td><strong>永久等待</strong></td></tr>
+                        </tbody>
+                    </table>
+                    <p>表的最后一行在实务中尤其恶劣。<strong>平时跑得好好的批处理，偏偏在报错很多的那天停住。</strong>其实是警告日志变多、标准错误的输出越过了缓冲区，但从外面看像是「出了故障，连批处理也停了」。调查在因果颠倒的状态下开始。</p>
+                    <ul>
+                        <li>这个缺陷<strong>很容易复现。</strong>把样本加大就百分之百复现。问题是没有人去做这个尝试</li>
+                        <li>反过来说，<strong>用小样本绝对复现不出来。</strong>所以「在我这儿明明是好的」才会成立</li>
+                        <li>因此在测试样本里<strong>放一个比缓冲区容量更大的</strong>，是最便宜的防御。按第 1 节的方法测出容量，再造一个比它大的样本就行</li>
+                        <li>更好的做法是把代码改成<strong>与大小无关都安全的结构</strong>。第 4 节起讲的就是这个</li>
+                    </ul>
+
+                    <h2>4. 解法一 先读，然后再等</h2>
+                    <p>最简单的解法是把顺序倒过来。先把输出全部读完、把管道腾空，然后再等待。</p>
+                    <pre><code>--- 2-3. FIX A: read the output first, then wait ---
+  read 1048576 bytes, then wait() returned 0 in 0.09s
+
+--- 2-4. FIX A': communicate() does the same thing for you ---
+  communicate() -&gt; 1048576 bytes, rc=0, 0.10s</code></pre>
+                    <p>在第 2 节里造成永久等待的<strong>同样的 1048576 字节</strong>，这次 0.09 秒就结束了。改变的只有两行的顺序。读的过程中管道一直在腾空，所以子进程不会被堵住；子进程结束后流关闭，读取也就结束了。</p>
+                    <p>2-4 用的是替你做这件事的标准函数。Python 文档建议使用合并调用而不是自己写入和读取，以避免其他操作系统管道缓冲区被填满而阻塞子进程所导致的死锁。不过文档也一并写出了代价：读到的数据会缓冲在内存里，所以数据量很大或无限时不要使用这个方法。实际验证一下，这个代价看得见。</p>
+                    <pre><code>--- 9-4. streaming a huge output line by line: constant memory ---
+  streamed 200000 lines in 0.31s, largest object held = 12 chars
+
+--- 9-5. the same data via communicate(): held entirely in memory ---
+  communicate() -&gt; one object of 2600000 bytes (2.5 MB) in 0.53s</code></pre>
+                    <p>同样的 20 万行用两种方式接收。逐行流式处理时，<strong>任何时刻手上只有一个 12 个字符的对象</strong>。用合并调用则会把<strong>一个 2.5 兆字节的对象</strong>装进内存。20 万行还算小的。对于输出没有上限的子进程，这种方式迟早会在内存上爆掉。</p>
+                    <ul>
+                        <li>如果<strong>输出上限明确而且很小</strong>，合并调用最安全也最短。把上限写进代码注释就更好了</li>
+                        <li>如果<strong>没有上限</strong>，就必须用流式或文件来接。合并调用能挡住死锁，却留下了内存问题</li>
+                        <li>流式在<strong>内存上限只有一行</strong>这一点上结构性地更优。20 万行在 0.31 秒内处理完</li>
+                        <li>不过流式<strong>会受到子进程输出缓冲的影响。</strong>第 9 节会讲</li>
+                    </ul>
+
+                    <h2>5. 最常踩的坑 - 两条管道，一个读者</h2>
+                    <p>到这里管道都只有一条。实际代码通常会把标准输出和标准错误<strong>两条都</strong>用管道打开。既然想抓住错误消息，这是自然的选择。可是读取的代码通常只有一份。<strong>于是就变成管道有两条而读者只有一个。</strong></p>
+                    <pre><code>--- 2-5. the classic trap: stdout AND stderr piped, only stdout read ---
+  stdout.read() has NOT returned after 4.0s -&gt; DEADLOCK
+  child alive : True   (it is blocked writing stderr)</code></pre>
+                    <p>子进程往标准错误写 200000 字节，往标准输出只写 10 字节。父进程只读标准输出。<strong>标准输出明明只有 10 字节，读取却结束不了。</strong>等了四秒也没返回，而子进程还活着。</p>
+                    <p>这种情况特别恶劣的原因在于<strong>我正在读的那条流本身毫无问题。</strong>标准输出是 10 字节，只有缓冲区的四百分之一。无论怎么盯着代码看，都拼不出「输出太大被堵住」的画面。堵住的地方是<strong>我自己打开却从不看的另一条管道</strong>。</p>
+                    <p>Node 上也一样复现了。而且 Node 多了一层，所以边界值大得多。</p>
+                    <pre><code>node v22.16.0 / win32 / 10.0.19045
+
+--- 4-1. spawn, never touch child.stdout, wait for close ---
+  child writes     1024 B: close fired, code=0 (93 ms)
+  child writes     4096 B: close fired, code=0 (92 ms)
+  child writes    65536 B: close fired, code=0 (95 ms)
+  child writes  1048576 B: TIMEOUT after 2500 ms -&gt; DEADLOCK
+
+--- 4-2. exact boundary for the paused-stream case (bisect) ---
+  largest output that does NOT hang : 131072 B
+  smallest output that DOES hang    : 131073 B
+  probes: 18
+
+--- 4-5. stdout AND stderr piped, only stdout consumed ---
+  only stdout consumed: TIMEOUT after 3000 ms -&gt; DEADLOCK</code></pre>
+                    <p>值得注意的是<strong>65536 字节通过了</strong>。这个大小在 Python 里早就被堵住了。Node 会把从操作系统管道读到的数据先攒进自己的流缓冲区，所以能撑得更久。也就是说<strong>在 Node 上这个缺陷出现得更晚，只有更大的数据才会暴露。</strong>这不是好消息，因为它意味着在开发阶段被发现的概率更低。</p>
+                    <p>Node 官方文档准确地描述了这个情形。它写着：默认情况下，父 Node 进程与所生成的子进程之间会建立标准输入、输出、错误的管道；这些管道的容量是有限的，而且随平台而异；如果子进程在输出未被捕获的情况下写入超过该限制，子进程就会阻塞，等待管道缓冲区接受更多数据。<strong>「随平台而异的容量」这句话，正好解释了第 1 节的那张表。</strong></p>
+
+                    <h2>6. 解法二 同时读、解法三 用文件接、解法四 合并成一条</h2>
+                    <p>两条管道的问题有三个解决方向。三个都运行验证过了。</p>
+                    <pre><code>--- 2-6. FIX B: read stderr concurrently in a thread ---
+  stdout 10 B, stderr 200000 B, rc=0, 0.10s -&gt; no deadlock
+
+--- 2-7. FIX B': communicate() reads both streams at once ---
+  communicate() -&gt; stdout 10 B, stderr 200000 B, rc=0, 0.20s
+
+--- 2-8. FIX C: give the child a real file instead of a pipe ---
+  wait() first with files: rc=0 in 0.10s
+  out.tmp 10 B, err.tmp 200000 B
+
+--- 2-9. FIX D: merge stderr into stdout (one pipe, one reader) ---
+  merged read 200010 B, rc=0, 0.09s
+  first 4 bytes b'EEEE'  last 4 bytes b'OOOO'
+  count O=10  E=200000</code></pre>
+                    <p><strong>解法二，同时读。</strong>另起一个线程读标准错误，主线程读标准输出。原本超过四秒都结束不了的，0.10 秒就完成了。异步运行时则用并发等待做同样的事。原则只有一条：<strong>用管道打开了几条流，就得有几个读取者。</strong></p>
+                    <p><strong>解法三，用文件接。</strong>2-8 很有意思。把输出接到临时文件里之后，<strong>先等待也是安全的。</strong>正是第 2 节里造出永久等待的那个顺序，这次却在 0.10 秒完成了。理由很清楚：<strong>普通文件没有「满了」这种状态。</strong>管道是固定大小的盒子，文件却能长到磁盘允许的程度。写入方没有等待的理由，死锁的前提本身就消失了。</p>
+                    <p><strong>解法四，合并成一条。</strong>把标准错误合并进标准输出，管道就只剩一条，一个读者就够了。200010 字节在 0.09 秒全部收到。可是输出的头四个字节是 <code>EEEE</code>，而<strong>末尾四个字节是 <code>OOOO</code></strong>。子进程明明先写的标准输出，结果里标准错误却排在前面。<strong>顺序被颠倒了。</strong></p>
+                    <h3>6.1 合并的代价 - 顺序会被打乱</h3>
+                    <p>我用一个短例子再确认了这个现象，让子进程交替往两条流各写三次。</p>
+                    <pre><code>--- 2-10. the price of merging: ordering gets scrambled ---
+  merged (default buffering):
+    ERR-0
+    ERR-1
+    ERR-2
+    OUT-0
+    OUT-1
+    OUT-2
+  merged (PYTHONUNBUFFERED=1):
+    OUT-0
+    ERR-0
+    OUT-1
+    ERR-1
+    OUT-2
+    ERR-2
+  same bytes? False</code></pre>
+                    <p>子进程实际写出的顺序是 OUT-0、ERR-0、OUT-1、ERR-1、OUT-2、ERR-2。用默认设置合并时，<strong>标准错误的三行先出来，标准输出的三行排在后面。</strong>读起来完全是另一个故事。</p>
+                    <p>原因不在管道，而在<strong>程序自身的输出缓冲区</strong>。标准错误通常不缓冲、立刻送出；标准输出一旦接上管道就切换成块缓冲，<strong>在退出的时刻一次性</strong>送出。于是时间顺序被重排了。打开无缓冲开关后，真实顺序被原样恢复。</p>
+                    <ul>
+                        <li><strong>顺序重要的日志不能合并。</strong>在必须按时间顺序阅读进度与错误的场合，这是致命的</li>
+                        <li>合并方便的场合是<strong>不看顺序的时候</strong>。失败时把整份输出当成一块存下来，这种用途完全没问题</li>
+                        <li>既要保住顺序又想只用一条管道，就<strong>必须让子进程无缓冲运行。</strong>上面输出的第二块就是这样</li>
+                        <li>合并之后再想「只挑出标准错误」是不可能的。<strong>合并的那一刻来源信息就消失了</strong></li>
+                    </ul>
+                    <p>Node 一侧的解法也做了对称的验证。</p>
+                    <pre><code>--- 4-3. FIX: consume the stream (data listener) ---
+  4 MB with a data listener: close code=0, read 4194304 B (100 ms)
+
+--- 4-4. FIX: resume() alone is enough (discard the data) ---
+  4 MB with resume() only: close code=0 (101 ms)
+
+--- 4-6. FIX: consume both streams ---
+  both consumed: close code=0, stdout 10 B, stderr 400000 B (91 ms)
+
+--- 4-9. FIX: stream straight to a file, no memory, no pipe limit ---
+  4 MB to a file descriptor: close code=0, file 4194304 B (91 ms)
+
+--- 4-7. spawnSync reads both for you: no deadlock, but memory ---
+  spawnSync 4 MB : status=0, stdout 4194304 B, 116 ms
+  maxBuffer 1024 : status=null, error=ENOBUFS
+
+--- 4-8. execFile has a default maxBuffer ---
+  execFile 4 MB default maxBuffer -&gt; error code=ERR_CHILD_PROCESS_STDIO_MAXBUFFER</code></pre>
+                    <p>4-4 很有趣。<strong>光是把数据扔掉，死锁也能解开。</strong>即使不打算用其中的内容，只要让流动起来，子进程就不会被堵住。当然，如果本来就没打算看输出，<strong>不创建管道</strong>才是正解。Node 文档也明说了：如果不会消费输出，就使用忽略选项。</p>
+                    <p>4-7 与 4-8 展示了有上限的方式的性格。执行文件的便捷函数的默认上限在文档上是一兆字节，超过之后<strong>不是卡住而是给出错误。</strong>子进程被结束，输出被截断。这比死锁好得多。<strong>吵闹地失败永远好过安静地停住。</strong></p>
+
+                    <h2>7. 外壳管道 - 流量控制不是缺陷</h2>
+                    <p>同样的原理在外壳里也起作用，但在那里通常<strong>不构成问题。</strong>知道原因，就得到了区分死锁与流量控制的标准。</p>
+                    <pre><code>bash 5.2.37(1)-release on Msys / MINGW64_NT-10.0-19045
+
+--- 3-1. capacity of a SHELL pipe: writer pushes, reader sleeps ---
+  bytes the writer got in before it blocked : 65536 (128 B granularity)
+
+--- 3-2. same probe, 16 B granularity ---
+  bytes accepted : 65536
+
+--- 3-3. flow control is NOT a bug: slow reader only slows the writer ---
+  pipeline exit=0  elapsed=2455 ms  (reader slept 2s, still COMPLETED)
+
+--- 3-4. reader closes early: writer gets SIGPIPE (the opposite problem) ---
+row
+row
+  PIPESTATUS = 141 0</code></pre>
+                    <p>3-1 就是第 1 节表格的第二行。外壳的管道容量是<strong>65536 字节</strong>，比同一台机器上的原生管道大十六倍。用两种不同的测量粒度量，值也相同。</p>
+                    <p>3-3 是本节的要点。我让下游两秒内什么都不读。上游填满 65536 字节后开始等待。<strong>可是整条管道在 2455 毫秒以退出码 0 正常完成了。</strong>睡了两秒醒来的下游开始读取，上游就接着走到了最后。</p>
+                    <p>这就是<strong>流量控制</strong>。管道会自动把快的生产者和慢的消费者的速度匹配起来。生产者等待不是浪费，而是<strong>为了不无限占用内存的设计</strong>。没有这个装置，生产者会在慢消费者面前把内存吃光。</p>
+                    <table>
+                        <thead>
+                            <tr><th>区分</th><th>流量控制（正常）</th><th>死锁（事故）</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>写入方的状态</td><td>等待中</td><td>等待中（相同）</td></tr>
+                            <tr><td>读取方的状态</td><td><strong>迟早会读</strong></td><td><strong>正在等别的东西</strong></td></tr>
+                            <tr><td>时间过去之后</td><td>进展会恢复</td><td>永远保持原样</td></tr>
+                            <tr><td>本环境实测</td><td>2455 ms 后退出码 0</td><td>直到超时都没有变化</td></tr>
+                            <tr><td>区分的方法</td><td colspan="2"><strong>采样两次进度并比较。</strong>在动就是流量控制，冻住就是死锁</td></tr>
+                        </tbody>
+                    </table>
+                    <p>表的前两行是核心。<strong>只看写入方，两者根本分不出来。</strong>两边都是「正在往管道写，处于等待中」。差别在读取方。所以诊断必须<strong>把两边一起看</strong>。</p>
+                    <p>3-4 是反方向的事故。读取方先结束时，写入方得到的不是等待而是<strong>终止信号。</strong>状态数组第一格显示 141 就是那个痕迹。这个值的含义与管道退出码的约定在<a href="shell_exit_code_pipefail.html">退出码与管道</a>里讲过，这里只点一下方向。<strong>死锁是因为读取方不读，这一种是因为读取方先走了。</strong></p>
+                    <p>还有一个观察值得补充。在同样的情形下把原生 Windows 程序放在上游，出现的不是信号而是<strong>写入错误</strong>。退出码是 1，错误消息是表示无效参数的那一种。<strong>也就是说，连「读取方消失了」这件事的传达方式都随环境而不同。</strong>想靠退出码定位原因，就得先在自己的环境里确认。</p>
+
+                    <h2>8. 缓冲区不止一层</h2>
+                    <p>到这里只谈了管道缓冲区，但实际上还有一层：<strong>程序自身的输出缓冲区</strong>。这两者完全是两回事，混在一起想就会把诊断带偏。</p>
+                    <pre><code>--- 5-1. what Python says about its own stdout buffering ---
+  plain          : isatty=False line_buffering=False
+  into a pipe    : isatty=False line_buffering=False
+  with -u        : isatty=False line_buffering=False write_through=True
+  buffer size    : io.DEFAULT_BUFFER_SIZE = 8192
+
+--- 5-6. two independent layers: how many bytes arrive per read ---
+  default buffering  : chunk sizes [8268, 212]
+                       2 chunks, 8480 bytes total
+  PYTHONUNBUFFERED=1 : first 10 chunk sizes [212, 4240, 4028]
+                       3 chunks, 8480 bytes total
+  one line is 210 bytes; the default run hands them over in 8192 B blocks</code></pre>
+                    <p>子进程写 40 行、每行 210 字节，总共 8480 字节。默认设置下父进程收到的块<strong>只有两个，8268 字节和 212 字节</strong>。写了 40 次，分两次到达。是 8192 这个<strong>程序输出缓冲区的大小</strong>决定了那个单位。</p>
+                    <p>这里需要把两层的差别理清楚。</p>
+                    <table>
+                        <thead>
+                            <tr><th>层</th><th>本环境的值</th><th>装满之后</th><th>改变的方法</th><th>症状</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><strong>程序输出缓冲区</strong></td><td>8192 B（Python stdio）</td><td>送往操作系统</td><td>无缓冲开关、环境变量</td><td>输出<strong>成块且延迟</strong>到达</td></tr>
+                            <tr><td><strong>管道缓冲区</strong></td><td>4096 B（这条路径）</td><td><strong>写入方等待</strong></td><td>通常改不了</td><td>进程<strong>停住</strong></td></tr>
+                            <tr><td>Node 的流缓冲区</td><td>16384 B（水位标记）</td><td>暂时停止读取</td><td>流的选项</td><td>停滞边界<strong>变大</strong></td></tr>
+                            <tr><td>普通文件</td><td>事实上无限</td><td>不会装满</td><td>不适用</td><td><strong>不存在死锁</strong></td></tr>
+                        </tbody>
+                    </table>
+                    <p>这张表在诊断上之所以重要，是因为<strong>两层的症状不同</strong>。输出缓冲区制造<strong>延迟</strong>，管道缓冲区制造<strong>停止</strong>。「日志出得晚」和「进程卡住了」是不同的问题，解法也不同。</p>
+                    <p>在写入一侧，Node 做了另一种选择。这个也测了。</p>
+                    <pre><code>node v22.16.0
+--- 8-1. Node adds its OWN buffer on top of the OS pipe ---
+  child.stdout.readableHighWaterMark : 16384
+  child.stderr.readableHighWaterMark : 16384
+  child.stdin.writableHighWaterMark  : 16384
+
+--- 8-3. write() return value tells you the buffer is full ---
+  bytes handed to write()            : 1048576
+  write() first returned false at    : 16384 B
+  socket.writableLength (queued)     : 1048576
+  -&gt; Node queues in memory instead of blocking; the queue is unbounded</code></pre>
+                    <p>我往子进程的标准输入塞了 1048576 字节。写入函数<strong>从 16384 字节这个点开始返回假值</strong>，告知「缓冲区满了」。可是<strong>它并没有阻塞。</strong>交出去的 1048576 字节全部堆进了内存队列。</p>
+                    <ul>
+                        <li>Node 把写入侧的死锁<strong>换成了内存增长。</strong>它不停住，代价是队列无限地长大</li>
+                        <li>忽略返回值就会得到<strong>内存耗尽而不是死锁</strong>。只是症状变了，问题还在</li>
+                        <li>反过来<strong>读取侧仍然会死锁。</strong>第 5 节的 131073 字节就是</li>
+                        <li>也就是说运行时不同，<strong>同一个原因会以不同的症状</strong>出现。「我们用的是 Node 所以没事」这个判断只对了一半</li>
+                    </ul>
+
+                    <h2>9. 进度显示出不来的原因</h2>
+                    <p>第 8 节的输出缓冲区造成的代表性症状就是这个：进度日志不实时出现。我在三种条件下测了同一个程序的到达时刻，那是一个每隔 0.3 秒输出六行的程序。</p>
+                    <pre><code>--- 5-2. six lines through a pipe, DEFAULT buffering (arrival times) ---
+    +2019 ms  progress 0/6
+    +2074 ms  progress 1/6
+    +2125 ms  progress 2/6
+    +2177 ms  progress 3/6
+    +2237 ms  progress 4/6
+    +2294 ms  progress 5/6
+
+--- 5-3. the same program with PYTHONUNBUFFERED=1 ---
+    + 200 ms  progress 0/6
+    + 504 ms  progress 1/6
+    + 812 ms  progress 2/6
+    +1108 ms  progress 3/6
+    +1413 ms  progress 4/6
+    +1702 ms  progress 5/6
+
+--- 5-5. does stdbuf help a Python child? ---
+    +2223 ms  progress 0/6
+    +2276 ms  progress 1/6
+    +2328 ms  progress 2/6
+    +2384 ms  progress 3/6
+    +2439 ms  progress 4/6
+    +2492 ms  progress 5/6</code></pre>
+                    <p>默认设置下<strong>六行全部在 2019 毫秒之后一次性</strong>到达，也就是程序结束之后。对于期待每 0.3 秒出一行的人来说，看起来就像<strong>两秒钟完全没有进展</strong>。打开无缓冲开关后，到达时刻是 200、504、812、1108、1413、1702 毫秒，正是<strong>期待中的间隔</strong>。</p>
+                    <p>5-5 是个陷阱。我在前面加了外部的缓冲调节工具，结果<strong>一点效果都没有。</strong>从 2223 毫秒开始成块出现，和默认设置一样。那个工具调的是 C 标准库的缓冲，而这个运行时另外用自己的缓冲区。<strong>加了工具却没效果时，可能是那个工具够不到那一层。</strong></p>
+                    <ul>
+                        <li>进度显示出不来的原因大多<strong>不是程序慢，而是数据积在缓冲区里</strong>。5-2 和 5-3 的程序完全相同</li>
+                        <li>要改的是<strong>生产者一侧</strong>。读取方无能为力。已经没进管道的数据没有办法读出来</li>
+                        <li>要用与运行时匹配的开关。环境变量和运行选项在这个环境里给出了<strong>几乎相同的结果</strong>（200 毫秒对 210 毫秒）</li>
+                        <li>这种延迟<strong>与死锁无关。</strong>把两个问题混为一谈就会去修错地方</li>
+                    </ul>
+                    <div class="callout">
+                        <p><strong>★没能复现的部分。</strong>这个症状的标准解释是「接到终端时按行缓冲，接到管道时切换成块缓冲」。可是<strong>在这个环境里，与真实终端的对比没能复现出来。</strong>由于是非交互式运行，任何一条路径上的终端判定都不为真；即便挂上伪终端工具，也只得到一条说标准输入不是终端的拒绝消息。因此上面的输出<strong>全部是管道的情形</strong>，而接到终端时的行为<strong>没有测量</strong>。能确认的只到这一步：在接着管道的状态下打开缓冲开关，到达间隔就会恢复。</p>
+                    </div>
+
+                    <h2>10. 双方互相等待的结构 - 双向死锁</h2>
+                    <p>到这里只看了输出方向。当你还必须给子进程灌<strong>大量输入</strong>时，死锁会以最纯粹的形式出现：父进程写完全部输入，然后再读输出。可是这里出现了意料之外的结果。</p>
+                    <pre><code>--- 6-1. child A (reads all, then writes) - like sort ---
+  payload     4096 B -&gt; ok         (wrote 4096 B, echoed 4096 B, 0.09s)
+  payload    65536 B -&gt; ok         (wrote 65536 B, echoed 65536 B, 0.09s)
+  payload  1048576 B -&gt; ok         (wrote 1048576 B, echoed 1048576 B, 0.10s)
+  payload  4194304 B -&gt; ok         (wrote 4194304 B, echoed 4194304 B, 0.14s)
+
+--- 6-2. child B (streaming filter) - like cat / grep / sed ---
+  payload     1024 B -&gt; ok         (wrote 1024 B before stopping, 0.10s)
+  payload     4096 B -&gt; ok         (wrote 4096 B before stopping, 0.10s)
+  payload     8192 B -&gt; ok         (wrote 8192 B before stopping, 0.09s)
+  payload    16384 B -&gt; DEADLOCK   (wrote 10240 B before stopping, 3.01s)
+  payload    65536 B -&gt; DEADLOCK   (wrote 10240 B before stopping, 3.01s)
+  payload  1048576 B -&gt; DEADLOCK   (wrote 10240 B before stopping, 3.01s)
+
+--- 6-3. verify the bracket, then bisect the streaming case ---
+  bracket check: 1 B hangs=False   65536 B hangs=True
+  largest payload that survives : 9216 B
+  smallest payload that hangs   : 9217 B
+  probes : 16</code></pre>
+                    <p><strong>结果完全取决于子进程是哪一种。</strong>这是整个实验里最实用的发现。</p>
+                    <ul>
+                        <li><strong>先把输入全部读完再输出的子进程</strong>（排序工具那一类）即使灌进四兆字节也没有死锁。子进程一直在读，所以父进程的写入不会被堵住；写完之后父进程已经转到读取上了</li>
+                        <li><strong>边读边写的流式过滤器</strong>（字符串查找或替换工具那一类）从 9217 字节开始死锁。子进程在输出管道上被堵住时就停止读取，于是父进程的写入也被堵住</li>
+                        <li>也就是说<strong>同一份父进程代码，会因为对方不同而通过或停住。</strong>把管道中间的某个工具换一下就开始卡住的事故，就是从这儿来的</li>
+                        <li>这意味着只看父进程代码是判断不了的。<strong>你必须知道子进程是不是流式的</strong></li>
+                    </ul>
+                    <p>把边界值 9216 字节拆开，结构就看得见了。<strong>4096 加 4096 加 1024 等于 9216。</strong>子进程的输出管道装满 4096 字节，父进程的输入管道装满 4096 字节，最后一个 1024 字节的块正在传递中，圆就闭合了。<strong>两条管道容量之和原样表现为边界。</strong>这就是「双方互相等待的结构」的算术证据。</p>
+                    <pre><code>--- 6-4. FIX: feed and drain at the same time ---
+  communicate() 4 MB in -&gt; 4194304 B out, rc=0, 0.12s
+
+--- 6-5. FIX: writer thread + reader in the main thread ---
+  writer thread + main-thread reader -&gt; 4194304 B, rc=0, 0.12s</code></pre>
+                    <p>解法只有一个：<strong>把灌入和抽出同时进行。</strong>无论是交给合并调用，还是把写入挪到单独的线程，四兆字节都在 0.12 秒内完成。把顺序分开的一刻就是死锁，让它们重叠的一刻就解开了。</p>
+
+                    <h2>11. 卡住的进程的诊断流程</h2>
+                    <p>现在是实际的场面。眼前有个卡住的进程，你得判断它是不是这个问题。分五步，不需要特殊工具。我特意造了一个死锁状态，然后走了一遍流程。</p>
+                    <pre><code>--- 7-1. start a pipeline that is stuck on purpose, then look at it ---
+  step 1: are both ends still alive?
+          372     369     365      22220  ?         197609 13:40:40 /usr/bin/sleep
+          373     370     370       7504  ?         197609 13:40:40 .../python      
+
+  step 2: is the writer making progress? (sample the counter twice)
+    bytes written at t=2s : 65536
+    bytes written at t=4s : 65536
+    -&gt; FROZEN at the same byte count
+
+  step 3: is it burning CPU (a loop) or waiting (blocked)?
+    CPU seconds sample 1 : 0.109375
+    CPU seconds sample 2 : 0.109375
+    -&gt; equal CPU time + alive process = BLOCKED, not looping
+
+  step 4: the decisive test - shrink the payload
+     65536 B payload -&gt; writer exit=0  (0 = finished on its own)
+    400000 B payload -&gt; writer exit=124  (124 = still blocked when timeout killed it)
+    got 65536 B in before blocking
+    same code, only the size changed -&gt; the cause is the pipe buffer</code></pre>
+                    <p>按顺序读这四步，判定就会收窄。</p>
+                    <ul>
+                        <li><strong>第一步，确认存活。</strong>进程列表里<strong>两个都在。</strong>不是死掉才停的，而是活着在等。光这一点就抹掉了「崩溃」的假设</li>
+                        <li><strong>第二步，确认进度。</strong>已写字节数在两秒时点和四秒时点<strong>都是 65536</strong>。冻住了。第 7 节表里区分流量控制与死锁的标准就是这个</li>
+                        <li><strong>第三步，确认 CPU。</strong>累计 CPU 时间<strong>从 0.109375 到 0.109375 原封不动</strong>。要是死循环，这个值会涨。它没涨，所以是等待而不是计算</li>
+                        <li><strong>第四步，决定性试验。</strong>只改大小，把同一份代码跑了两次。65536 字节以<strong>退出码 0</strong> 正常结束，400000 字节在阻塞状态下被强制结束，留下<strong>124</strong>。灌进去的量正好是 65536 字节，也就是外壳的管道容量</li>
+                        <li><strong>第五步，检查代码。</strong>看等待调用是不是排在读取之前，看有没有用管道打开却不消费的流。前四步都成立的话，原因一定在这里</li>
+                    </ul>
+                    <p>值得强调第四步为什么是决定性的。<strong>除了大小什么都没改。</strong>代码一样，环境一样，输入内容也一样。可结果分岔了。没有比这更明确的证据。而且这个试验<strong>完全不需要任何特殊工具。</strong></p>
+                    <table>
+                        <thead>
+                            <tr><th>观察</th><th>判定</th><th>下一步行动</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>两边都活着 + CPU 时间停住</td><td>在某处阻塞</td><td>用第二、四步确认是不是管道</td></tr>
+                            <tr><td>活着 + CPU 时间在涨</td><td>死循环</td><td><strong>不是管道问题。</strong>去看逻辑</td></tr>
+                            <tr><td>两次采样的进度相同</td><td>停止</td><td>死锁的可能性大</td></tr>
+                            <tr><td>进度慢但在动</td><td>流量控制</td><td><strong>正常。</strong>去改善慢的一侧</td></tr>
+                            <tr><td>把尺寸变小就通过</td><td><strong>确诊为管道缓冲区死锁</strong></td><td>套用第 4、6、10 节的解法</td></tr>
+                            <tr><td>无论尺寸都会卡住</td><td>不是管道问题</td><td>去看锁、网络、等待输入</td></tr>
+                            <tr><td>子进程结束了父进程却没结束</td><td>有流未消费或未关闭</td><td>数一数用管道打开了几条流</td></tr>
+                        </tbody>
+                    </table>
+                    <p>关于工具补充一句。在这个环境里能用的只有<strong>查询进程列表和查询 CPU 时间</strong>。没有查看打开文件的工具，也没有调试器；系统调用跟踪工具虽然有，却<strong>无法附加到已经在运行的原生进程上。</strong>所以上面的流程是刻意只用<strong>到处都能做的事情</strong>拼出来的。进度采样和缩小尺寸的试验，在一件工具都没有的环境里也能做。</p>
+
+                    <h2>12. 超时、流式处理、父进程死掉的时候</h2>
+                    <p>实务里还会一起踩到的另外三件事也验证了。第一件是超时的陷阱。</p>
+                    <pre><code>--- 9-1. wait(timeout=) does NOT kill the child; run(timeout=) does ---
+  Popen.wait(1.5) raised TimeoutExpired
+  child alive right after the exception : True
+  after an explicit kill(), alive        : False
+
+--- 9-2. run(timeout=) on a big output: does it survive? ---
+  run(capture_output=True, timeout=5) -&gt; rc=0, 2097152 B, 1.23s
+
+--- 9-3. the trap: check_output on a child that also writes stderr ---
+  check_output, stderr NOT a pipe (DEVNULL) -&gt; 10 B, 0.38s
+  check_output(stderr=PIPE)  -&gt; 10 B, 1.15s</code></pre>
+                    <p>9-1 很重要。给等待调用加了上限并收到了异常，可是<strong>子进程仍然活着。</strong>超时的意思是「我不等了」，不是「我把对方结束掉」。显式终止之后它才消失。</p>
+                    <ul>
+                        <li>只设超时而不终止，<strong>孤儿进程就会堆积。</strong>在批处理反复运行的环境里，这会悄悄吃掉资源</li>
+                        <li>在捕获异常的地方<strong>必须调用终止</strong>。而且终止之后还要回收</li>
+                        <li>正如 9-2 与 9-3 所示，<strong>高层函数会替你处理这些。</strong>两兆字节的输出在上限之内正常结束，把标准错误用管道打开也没有死锁</li>
+                        <li>所以只要没有非要自己拼装的理由，<strong>用高层函数更安全。</strong>大部分死锁都出自自己拼装的代码</li>
+                    </ul>
+                    <p>第二件是父进程先死的时候。我分成两种情况验证了子进程会怎样。</p>
+                    <pre><code>--- 10-1. orphan that keeps WRITING to the dead parent's pipe ---
+  1.5s after the parent exited, still running : False
+  -&gt; its next write failed, so it terminated on its own
+
+--- 10-2. orphan that is NOT writing (just sleeping) ---
+  1.5s after the parent exited, still running : True
+  -&gt; nothing ever tells it the parent is gone; it just keeps sleeping
+  had to be killed explicitly</code></pre>
+                    <p>结果分岔了。<strong>持续写入的子进程自己死掉了</strong>，因为它的下一次写入失败了。而<strong>不写入只是在等的子进程活了下来</strong>，因为没有任何契机告诉它父进程已经不在了。显式终止之后它才消失。</p>
+                    <ul>
+                        <li>「父进程死了子进程也会被清理」这个期待<strong>只对了一半。</strong>它只对持续写入的子进程成立</li>
+                        <li>管道<strong>只在写的时候</strong>才告知对方不在。对于正在读取或睡眠的进程，不会有任何信号传到</li>
+                        <li>所以启动子进程的代码需要<strong>在父进程退出路径上清理子进程的处理</strong>。它不仅要在正常退出上，也要在异常路径上</li>
+                        <li>这一点<strong>会随操作系统和进程组设置</strong>而有不同表现。上面的结果是这个环境的实测值</li>
+                    </ul>
+
+                    <h2>13. 判断表 - 该选哪一种</h2>
+                    <p>把前面的实测压缩成实务决策。由三件事决定：<strong>输出的大小、是否使用标准错误、顺序是否重要</strong>。</p>
+                    <table>
+                        <thead>
+                            <tr><th>情形</th><th>选择的方式</th><th>本环境实测</th><th>注意点</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>输出小且上限明确</td><td>调用一次高层函数</td><td>1048576 B / 0.10 秒</td><td>全量载入内存。把上限写进代码</td></tr>
+                            <tr><td>输出大或没有上限</td><td>重定向到文件</td><td>4194304 B / 91 ms</td><td>临时文件的清理与磁盘余量由你负责</td></tr>
+                            <tr><td>实时处理输出</td><td>逐行流式消费</td><td>20 万行 / 0.31 秒，最大对象 12 字符</td><td>因子进程缓冲而变慢。让它无缓冲运行</td></tr>
+                            <tr><td>还要看标准错误</td><td>同时消费两条流</td><td>200000 B / 0.10 秒</td><td><strong>只读一边一定死锁</strong></td></tr>
+                            <tr><td>只要错误内容，顺序无关</td><td>把标准错误合进输出</td><td>200010 B / 0.09 秒</td><td><strong>顺序会乱。</strong>来源的区分也消失</td></tr>
+                            <tr><td>既要顺序又只用一条管道</td><td>合并但让子进程无缓冲</td><td>确认真实顺序被恢复</td><td>你必须能控制子进程</td></tr>
+                            <tr><td>还要灌入大量输入</td><td>写与读同时进行</td><td>4194304 B / 0.12 秒</td><td><strong>写完全部再读就是双向死锁</strong></td></tr>
+                            <tr><td>完全不使用输出</td><td>指向空设备</td><td>立即结束</td><td>用管道打开却放着不管是最糟的</td></tr>
+                        </tbody>
+                    </table>
+                    <p>各个运行时里哪些调用安全、哪些危险，也整理了出来。全部是在这个环境里确认过的结果。</p>
+                    <table>
+                        <thead>
+                            <tr><th>运行时</th><th>安全（已确认）</th><th>危险（死锁已确认）</th><th>边界值</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Python</td><td>合并调用、高层执行函数、重定向到文件、逐行流式</td><td>先等待后读取、两条管道只读一条</td><td><strong>4097 B</strong></td></tr>
+                            <tr><td>Node 异步</td><td>挂上数据监听器、让它流动、指定文件描述符、忽略选项</td><td>不消费却等结束、放着标准错误不管</td><td><strong>131073 B</strong></td></tr>
+                            <tr><td>Node 同步与便捷函数</td><td>有上限的执行函数（超过就报错）</td><td>上限设得太低而失败</td><td>默认上限 1 MB</td></tr>
+                            <tr><td>外壳</td><td>普通管道、用文件切分阶段</td><td>几乎不成问题（下游总是在读）</td><td>在 65536 B 等待后恢复</td></tr>
+                        </tbody>
+                    </table>
+                    <p>最后一行值得注意。<strong>这个问题在外壳管道里几乎不出现，是因为下游的工具总是在读。</strong>标准工具都被做成会持续消费输入的样子。问题出在我们自己写父进程时<strong>写出了「读之前先等」的代码</strong>。</p>
+
+                    <h2>14. 检查清单与不要做的事</h2>
+                    <p>整理成在代码评审里可以直接使用的形式。</p>
+                    <ul>
+                        <li>数一数用管道打开的<strong>每条流是否都有消费它的代码</strong>。流的数量与读者的数量必须相同</li>
+                        <li>看等待调用是否排在<strong>读取之后</strong>。排在前面，光这一条就是缺陷</li>
+                        <li>看每一个等待调用是否有<strong>超时</strong>。没有的话，出故障时连调查都做不了</li>
+                        <li>看超时之后是否<strong>显式终止</strong>子进程。只捕获异常并不会让子进程死掉</li>
+                        <li>看输出上限不明的子进程是否用<strong>文件或流式</strong>来接</li>
+                        <li>看测试样本里有没有<strong>比缓冲区容量更大</strong>的。没有的话，这条路径从未被验证过</li>
+                        <li>看灌入大量输入的代码里<strong>写与读是否同时</strong>在跑</li>
+                        <li>看顺序重要的日志<strong>是否被合并了</strong>。合并会破坏时间顺序</li>
+                        <li>看需要显示进度的子进程是否以<strong>无缓冲</strong>运行</li>
+                        <li>看在不使用输出的地方<strong>是否还在创建管道</strong></li>
+                        <li>看父进程退出路径上有没有<strong>清理子进程</strong>。睡着的子进程不会自己死</li>
+                        <li>看生产环境的缓冲区容量是否<strong>亲自测过</strong>。它可能与开发环境不同</li>
+                    </ul>
+                    <p>反过来是不该做的事。</p>
+                    <ul>
+                        <li>❌ <strong>用管道打开却不消费的流</strong> — 实务中压倒性常见的原因，而且多半是标准错误</li>
+                        <li>❌ <strong>先等待、后读取</strong> — 这是只能通过到 4096 字节的代码</li>
+                        <li>❌ 因为等待失败就<strong>假定子进程也死了</strong> — 实测结果是它还活着</li>
+                        <li>❌ <strong>只用小样本判定通过</strong> — 边界只会在真实数据上被跨过</li>
+                        <li>❌ 用<strong>别的环境的数值假定</strong>缓冲区容量 — 同一台机器上分成了 4096、65536、131072</li>
+                        <li>❌ 把进度日志的延迟<strong>误诊为程序慢</strong> — 它只是积在缓冲区里，原因不同</li>
+                        <li>❌ 把两条流<strong>合并之后还信任顺序</strong> — 实测中顺序被彻底颠倒</li>
+                        <li>❌ <strong>没有超时的等待</strong> — 它会让复现实验本身变得不可能。本文的实验也全都是加了上限才跑的</li>
+                        <li>❌ 只看父进程代码就<strong>判断安全</strong> — 就像第 10 节那样，子进程的种类会改变结果</li>
+                    </ul>
+
+                    <h2>参考资料</h2>
+                    <ul>
+                        <li>The Open Group Base Specifications Issue 7, 2018 edition (IEEE Std 1003.1-2017) - <code>write</code>（管道装满且没有非阻塞标志时的阻塞行为、原子性规则、没有读取方时的信号）：<a href="https://pubs.opengroup.org/onlinepubs/9699919799/functions/write.html" target="_blank" rel="noopener">pubs.opengroup.org</a></li>
+                        <li>The Open Group Base Specifications Issue 7, 2018 edition - <code>pipe</code>（管道的创建与两个文件描述符的初始标志状态）：<a href="https://pubs.opengroup.org/onlinepubs/9699919799/functions/pipe.html" target="_blank" rel="noopener">pubs.opengroup.org</a></li>
+                        <li>Python 文档 - <code>subprocess</code>（等待调用的死锁警告、推荐使用合并调用、数据会缓冲在内存里的提醒）：<a href="https://docs.python.org/3/library/subprocess.html" target="_blank" rel="noopener">docs.python.org</a></li>
+                        <li>Node.js 文档 - <code>child_process</code>（管道容量有限且随平台而异的说明、输出上限的默认值与超过时的行为、文件描述符与忽略选项）：<a href="https://nodejs.org/api/child_process.html" target="_blank" rel="noopener">nodejs.org</a></li>
+                        <li>相关文章：<a href="shell_exit_code_pipefail.html">退出码与管道 - 如何察觉管道的失败</a>, <a href="find_xargs_whitespace_trap.html">find 与 xargs 的空格陷阱</a>, <a href="shell_quoting_rules_guide.html">外壳引号规则</a>, <a href="cp949_utf8_mojibake_guide.html">定位乱码发生的位置</a></li>
+                    </ul>
+                </div>
+
+                <!-- md-artifact-start -->
+                    <div class="md-artifact" style="margin:2rem 0;border:1px solid #d7dce3;border-radius:10px;overflow:hidden;background:#fbfcfd;">
+                        <div style="display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;justify-content:space-between;padding:.7rem 1rem;background:#eef2f7;border-bottom:1px solid #d7dce3;">
+                            <span style="font-weight:700;font-size:.97rem;">📋 可直接带走的检查清单</span>
+                            <span style="display:flex;gap:.5rem;align-items:center;">
+                                <code style="font-size:.82rem;color:#5a6675;background:transparent;padding:0;">pipe_buffer_deadlock.md</code>
+                                <button type="button" class="md-artifact-copy" style="cursor:pointer;border:1px solid #b9c2cf;background:#fff;color:#2c3e50;font-weight:600;line-height:1.3;border-radius:6px;padding:.32rem .7rem;font-size:.85rem;">复制全部</button>
+                            </span>
+                        </div>
+                        <pre style="margin:0;max-height:420px;overflow:auto;padding:1rem;background:#fbfcfd;font-size:.86rem;line-height:1.62;"><code class="nohighlight" style="background:transparent;padding:0;white-space:pre;"># 管道缓冲区死锁 — 子进程执行检查清单
+
+&gt; 来源: braindetox.kr — 子进程停住的真正原因
+&gt; 依据: 在 Windows 10 / bash 5.2.37 (MSYS2) / Python 3.13.3 / Node.js 22.16.0 上实际运行验证
+&gt; 把本文件直接贴给 AI，写上「按这个标准检查我们的代码」即可使用。
+&gt; ⚠ 缓冲区容量随操作系统、外壳与运行时而异。下列数字是上述环境的实测值，你需要在自己的环境重新测量。
+
+## 0. 一句话原理
+
+管道是**有限的缓冲区**。装满后写入方就等待 — 这不是缺陷，而是**流量控制**。
+问题出在应该读取的人已经在等待的时候。那时就变成**双方互相等待**的结构。
+
+## 1. 各层实测容量（参考值）
+
+| 层 | 实测 | 含义 |
+|---|---|---|
+| 原生 Windows 匿名管道 | 4096 B | Python 的 os.pipe 与 subprocess 的 PIPE |
+| MSYS2 外壳管道 | 65536 B | bash 里 cmd1 管道 cmd2 的形式 |
+| Node 流的 highWaterMark | 16384 B | 叠在操作系统管道之上的用户空间缓冲区 |
+| Node 未消费 stdout 的停滞边界 | 131073 B | 实测值，并非上面两者的简单相加 |
+| Python stdio 缓冲区 | 8192 B | io.DEFAULT_BUFFER_SIZE，与管道是不同的层 |
+
+## 2. 实测的死锁边界
+
+| 模式 | 通过 | 死锁 | 边界解读 |
+|---|---|---|---|
+| Python: 先等待，子进程往 stdout 输出 | 到 4096 B | 4097 B 以上 | 就是管道容量本身 |
+| Node: 无 data 监听器却等 close | 到 131072 B | 131073 B 以上 | 流缓冲区加 libuv 的预读 |
+| 父进程写完全部输入再读（流式过滤器子进程） | 到 9216 B | 9217 B 以上 | 4096 加 4096 加 1024 |
+| 父进程写完全部输入再读（一次读完的子进程） | 4 MB 也通过 | — | 子进程持续读取，所以不会堵住 |
+
+## 3. 执行方式选择表
+
+| 情形 | 选择的方式 | 注意点 |
+|---|---|---|
+| 输出小且上限明确 | 调用一次高层 API（run / check_output / spawnSync） | 全量载入内存。把上限写进代码 |
+| 输出大或没有上限 | 重定向到文件描述符 | 临时文件的清理与磁盘余量由你负责 |
+| 需要实时处理输出 | 逐行流式消费 | 子进程的 stdio 缓冲区会造成延迟 → 让子进程无缓冲运行 |
+| 也需要看 stderr | 同时消费两条流（线程、异步或高层 API） | 只读一边一定会死锁 |
+| 只要 stderr 的内容且顺序无关 | 把 stderr 合并进 stdout | 两者缓冲方式不同，顺序会被打乱 |
+| 还要向子进程灌入大量输入 | 写与读同时进行（另起线程或用统一 API） | 写完全部再读就是双向死锁 |
+| 完全不使用输出 | 指向空设备 | 用 PIPE 打开却放着不管是最糟的 |
+
+## 4. 安全的调用模式
+
+### Python
+
+```python
+import subprocess
+
+# (1) 输出小: 一次全部取回。两条流会被自动同时读取
+r = subprocess.run(cmd, capture_output=True, timeout=60)
+
+# (2) 输出大: 用文件承接，这时先等待也是安全的
+with open("/tmp/demo/out.log", "wb") as fo, open("/tmp/demo/err.log", "wb") as fe:
+    p = subprocess.Popen(cmd, stdout=fo, stderr=fe)
+    rc = p.wait(timeout=600)
+
+# (3) 实时处理: 逐行消费，内存里只保留一行
+p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                     text=True, bufsize=1)
+for line in p.stdout:
+    handle(line)
+p.wait(timeout=600)
+
+# (4) 大输入加大输出: 把灌入与排出交给同一个调用
+out, err = p2.communicate(payload, timeout=600)
+```
+
+**禁止的写法**
+
+```python
+p = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+p.wait()                 # 输出一旦超过缓冲区就永久等待
+out = p.stdout.read()    # 永远到不了这一行
+
+p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+out = p.stdout.read()    # stderr 满了子进程就停住，这个 read 也不会结束
+```
+
+### Node.js
+
+```javascript
+const { spawn, execFile } = require("child_process");
+
+// (1) 输出小: 默认上限是 1 MB，超过会以错误通知你
+execFile(cmd, args, { maxBuffer: 4 * 1024 * 1024, timeout: 60000 }, cb);
+
+// (2) 输出大: 直接流进文件描述符
+const fd = fs.openSync("/tmp/demo/out.log", "w");
+const child = spawn(cmd, args, { stdio: ["ignore", fd, "inherit"] });
+
+// (3) 把两条流都消费掉
+const c = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+c.stdout.on("data", onOut);
+c.stderr.on("data", onErr);      // 没有这一行，stderr 塞满就会停住
+c.on("close", onDone);
+
+// (4) 不打算看输出，就不要创建管道
+spawn(cmd, args, { stdio: "ignore" });
+```
+
+**禁止的写法**
+
+```javascript
+const c = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+c.on("close", done);   // stdout 和 stderr 都没人消费 → close 永远不来
+```
+
+### 外壳
+
+```bash
+# 流量控制是正常的。慢的后段只会拖慢前段，不会让它停住
+producer | consumer
+
+# 大的中间产物用文件切开
+producer &gt; /tmp/demo/stage1.tsv
+consumer &lt; /tmp/demo/stage1.tsv
+
+# 读的一方先结束时前段会收到通知。检查退出码
+producer | head -n 100
+echo "${PIPESTATUS[0]} ${PIPESTATUS[1]}"
+
+# 进度日志成块出现时，让生产者无缓冲运行
+PYTHONUNBUFFERED=1 producer.py | tee /tmp/demo/run.log
+```
+
+## 5. 卡住时的诊断流程（五步）
+
+1. **确认它还活着。** 进程列表里父与子都在，说明不是死了而是在等待。
+2. **采样两次 CPU 时间。** 数值不变说明是**阻塞**而不是死循环。实测例: 0.109375 到 0.109375。
+3. **采样两次进度。** 已写字节数、输出文件大小、最后一行日志，看有没有动。
+4. **决定性试验 — 把输入变小。** 同一份代码在某个尺寸以下不再卡住，原因就是**缓冲区**而不是你的逻辑。
+   - 实测例: 65536 B 正常退出(0)，400000 B 在阻塞状态下被强制结束(124)，实际灌入 65536 B。
+5. **检查代码里的顺序。** 等待调用是否排在读取之前。有没有开了管道却不消费的流。
+
+| 观察 | 判定 |
+|---|---|
+| 活着而 CPU 时间不动 | 在管道上阻塞（或其他 I O 等待） |
+| 活着而 CPU 时间在涨 | 死循环。不是管道问题 |
+| 把尺寸变小就通过 | **确诊为管道缓冲区死锁** |
+| 无论尺寸都会卡住 | 不是管道问题。怀疑锁、网络或等待输入 |
+| 子进程结束了父进程却没结束 | 父进程没有关闭或没有消费某条流 |
+
+## 6. 评审用语（可直接粘贴）
+
+- 这个调用对子进程输出的上限是多少字节？如果没有上限，请改成文件或流式处理。
+- stderr 用管道打开了，但看不到消费它的代码。只读一边就是死锁。
+- 等待调用排在读取之前。请调换顺序，或换成统一 API。
+- 你把大输入全部写完之后才读输出。如果对方是流式过滤器，这就是双向死锁。
+- 没有超时。等待必须设上限，超时后请显式结束子进程。
+- 测试输入太小，这条路径从未被验证过。请补一个大于缓冲区容量的样本。
+- 进度日志成块出现。接上管道就会切换成块缓冲。请让生产者无缓冲运行。
+
+## 7. 检查清单
+
+- [ ] 每条用管道打开的流都有**消费它的代码**
+- [ ] 等待调用排在**读取之后**（或使用统一 API）
+- [ ] 所有等待调用都有**超时**
+- [ ] 超时之后**显式结束**子进程（等待失败并不代表它死了）
+- [ ] 输出上限不明的子进程改用**文件或流式**承接
+- [ ] 测试样本**大于缓冲区容量**
+- [ ] 灌入大输入时**写与读同时进行**
+- [ ] 顺序重要的日志**不做合并**（合并会打乱）
+- [ ] 需要显示进度的子进程以**无缓冲**运行
+- [ ] 不使用输出时**不创建管道**
+- [ ] 父进程死亡时有**清理子进程的路径**
+- [ ] **亲自测量过**生产环境的缓冲区容量（可能与开发环境不同）
+
+## 8. 不要做的事
+
+- ❌ 用管道打开却**不消费的流** — 最常见的原因
+- ❌ **先等待、后读取** — 只在输出很小时才通得过
+- ❌ 因为等待失败就**认定子进程已死** — 实测中它还活着
+- ❌ 只用小样本判定通过 — 边界只会在真实数据上被跨过
+- ❌ 用**别的环境的数值假定**缓冲区容量 — 同一台机器上分成了 4096、65536、131072
+- ❌ 把进度日志的延迟**误判为程序慢** — 它只是积在缓冲区里
+- ❌ 把顺序重要的两条流**合并之后还信任顺序**
+- ❌ 没有超时的等待 — 连复现实验都做不了
+</code></pre>
+                        <p style="margin:0;padding:.6rem 1rem;font-size:.82rem;color:#5a6675;border-top:1px solid #e3e8ee;">复制后可直接粘贴到笔记应用或 AI 工具中。</p>
+                    </div>
+                    <script>
+                    (function(){
+                      if (window.__mdArtifactBound) return;
+                      window.__mdArtifactBound = true;
+                      document.addEventListener('click', function(ev){
+                        var btn = ev.target.closest && ev.target.closest('.md-artifact-copy');
+                        if (!btn) return;
+                        var box = btn.closest('.md-artifact');
+                        var code = box && box.querySelector('pre code');
+                        if (!code) return;
+                        var text = code.textContent;
+                        var label = btn.textContent;
+                        var ok = function(){
+                          btn.textContent = "已复制";
+                          setTimeout(function(){ btn.textContent = label; }, 1600);
+                          if (typeof gtag === 'function') {
+                            gtag('event', 'md_copy', { slug: "pipe_buffer_deadlock", lang: "zh", chars: text.length });
+                          }
+                        };
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                          navigator.clipboard.writeText(text).then(ok).catch(function(){ fallback(); });
+                        } else { fallback(); }
+                        function fallback(){
+                          var ta = document.createElement('textarea');
+                          ta.value = text; ta.setAttribute('readonly','');
+                          ta.style.position='fixed'; ta.style.left='-9999px';
+                          document.body.appendChild(ta); ta.select();
+                          try { document.execCommand('copy'); ok(); } catch(e) {}
+                          document.body.removeChild(ta);
+                        }
+                      });
+                    })();
+                    </script>
+                    <!-- md-artifact-end -->
+
+                <div class="share-section">
+                    <h3>分享这篇文章</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../../blog.html" class="back-link">返回列表</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/json_formatter.html">JSON 格式化工具</a></li>
+      <li><a href="../static/regex_tester.html">正则表达式测试器</a></li>
+      <li><a href="../static/jwt_decoder.html">JWT解码生成器 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 编码器/解码器</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+<!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="sql_left_join_where_becomes_inner.html">给 LEFT JOIN 加上 WHERE 就变成了 INNER JOIN - ON 与 WHERE 的边界 2026</a></li>
+      <li><a href="sql_not_in_null_empty_result.html">NOT IN 列表里混进一个 NULL，结果就整个变空 - 不报错却返回0行的 SQL 三值逻辑 2026</a></li>
+      <li><a href="json_number_precision_loss.html">装进 JSON 的 64 位 ID 末尾会变 - 数字精度消失的位置 2026</a></li>
+      <li><a href="monotonic_vs_wall_clock.html">用墙上时钟测量经过时间会得到负数 - 该用单调时钟的地方 2026</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制。粘贴到 Threads 应用即可分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制。'); });
+    });
+    </script>
+</body>
+</html>

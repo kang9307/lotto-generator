@@ -1,0 +1,1031 @@
+<!DOCTYPE html>
+<!--
+ * Tech blog post template
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ja">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>サーバー10台のp99を平均した - その数字は何でもない 2026</title>
+    <meta name="description" content="ダッシュボードのp99は91ミリ秒、本当のp99は450ミリ秒だった。サーバーごとのパーセンタイルを平均するとなぜ最大4.9倍ずれるのか、後から再計算するには何を収集しておくべきかを固定シードの実行出力で整理した。">
+    <meta name="keywords" content="p99, パーセンタイル, 分位点, 集計の誤り, 平均の罠, ヒストグラム, レイテンシ, 応答時間, ダッシュボード, オブザーバビリティ, 監視, ロングテール, テールレイテンシ, 分位点の定義, 収集設計, SLO, 指標設計, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/ja/posts/percentile_aggregation_error.html">
+
+    <meta property="og:title" content="サーバー10台のp99を平均した - その数字は何でもない">
+    <meta property="og:description" content="パーセンタイルは値ではなく分布の性質であり、性質は平均できない。合計・件数・最大は合成でき、p99は合成できない。その境目を実行で分けた。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/ja/posts/percentile_aggregation_error.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ja_JP">
+    <meta property="article:published_time" content="2026-07-30">
+    <meta property="article:section" content="開発・インフラ">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="サーバー10台のp99を平均した - その数字は何でもない">
+    <meta name="twitter:description" content="指標ごとの合成可能性の判断表と、誤って畳まれたパーセンタイルを見分ける手順。固定シード20260730で再現できる。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "サーバー10台のp99を平均した - その数字は何でもない",
+  "alternativeHeadline": "We Averaged the p99 of Ten Servers - That Number Is Nothing",
+  "datePublished": "2026-07-30",
+  "dateModified": "2026-07-30",
+  "inLanguage": "ja-JP",
+  "articleSection": "開発・インフラ",
+  "author": {
+    "@type": "Person",
+    "name": "BrainDetox"
+  },
+  "keywords": "p99, パーセンタイル, 集計の誤り, ヒストグラム, レイテンシ, ダッシュボード, オブザーバビリティ, 分位点の定義, 収集設計, SLO",
+  "publisher": {
+    "@type": "Organization",
+    "name": "BrainDetox",
+    "logo": {
+      "@type": "ImageObject",
+      "url": "https://braindetox.kr/site_logo.png"
+    }
+  },
+  "image": {
+    "@type": "ImageObject",
+    "url": "https://braindetox.kr/site_logo.png"
+  },
+  "mainEntityOfPage": "https://braindetox.kr/ja/posts/percentile_aggregation_error.html"
+}
+    </script>
+
+    <script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "サーバーごとのp99を平均してはいけない理由は何か?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "パーセンタイルは値ではなく分布の性質であり、性質は平均できないからだ。実際に実行して確かめた。サーバー10台に各1万件、合計10万件を作り、1台だけ状態を悪くしたとき、サーバー別p99を平均した値は138.51ミリ秒、リクエスト全体を合わせて求めた本当のp99は209.67ミリ秒だった。33.94パーセント削り取ったことになる。原因は裾を誰が作るかを数えれば見える。真のp99より上の1001件がすべてその悪いサーバー1台から出た。そのサーバーはトラフィックの10パーセントを処理しているのに裾の100パーセントを占める。ところが単純平均はそのサーバーに10分の1の重みしか与えない。全体のp99を正確に求めるには各サーバーが全体の上位1パーセントの中で占める割合を知る必要があるが、その割合はトラフィックの割合と無関係で、サーバーごとにp99という数字を一つだけ残した瞬間、その割合を計算する材料も一緒に消える。"
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "リクエスト数で加重平均すれば解決するか?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "しない。実行で反例を作った。1台が要求の80パーセントを受けそのサーバーが遅い場合、リクエスト数の加重平均は404.16ミリ秒で真の値449.63ミリ秒から10.11パーセントの差にとどまり、かなり近かった。ところが条件を反転させ、忙しいサーバーが速く暇なサーバーが遅いようにすると、同じ加重平均が137.07ミリ秒となり真の値217.55ミリ秒から36.99パーセント下に落ちた。つまり先の事例でよく合ったのは原理ではなく状況だった。より根本的な問題もある。重みを定数倍しても加重平均は変わらないので、リクエスト数から導いたどんな重みもリクエスト数の重み付けと同じ答えを出す。正解の重みは各グループが全体の上位1パーセントの中にどれだけ入っているかだが、確かめてみるとトラフィックの85パーセントを占める二つのグループの裾への寄与度は0パーセントだった。トラフィックの割合と裾の割合は無関係である。"
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "最大値はなぜ合成でき、p99はできないのか?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "最大値には部分から全体を作る畳み込み規則があり、p99にはないからだ。10グループで確認したとき、部分の最大値の平均は605.33ミリ秒で真の最大値1107.77ミリ秒から45.36パーセントずれたが、部分の最大値の最大値は真の値と完全に一致した。最小値も同様だった。理由は情報の構造にある。全体の最大値になりうる候補は部分の最大値だけで、残りの値はそもそも候補ではない。だから部分の最大値だけ残しても必要な情報をすべて持っている。p99はそうではない。全体のp99になる値は各部分の中のどの位置にもありうる。実際に確認した事例で、真のp99である209.67ミリ秒は悪いサーバーのp99である1020.21ミリ秒でもなく、他のサーバーのp99である約40ミリ秒でもなかった。つまりp100はパーセンタイル系列の極値ではなく別種の統計量であり、名前が似ていることが誤解を生む。"
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "パーセンタイルを正確に合成するには何を収集すべきか?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "元データをすべて持っているか、それに準ずる併合可能な要約を持っている必要がある。実務的にはバケットのヒストグラムだ。根拠は件数が合成できるという性質である。値を区間に分けて区間ごとの件数を保存すれば、その件数はサーバー同士で足せるので、足したあとにパーセンタイルを求めればよい。実行してみると差は大きい。トラフィックが80パーセント偏った群れでサーバー別p99を平均した値は79.68パーセント外れていたが、同じデータを7個のバケットという非常に粗いヒストグラムで併合したときは12.11パーセント、112個のバケットでは0.25パーセント、399個のバケットでは0.03パーセントだった。差を作ったのは計算式ではなく順序で、ヒストグラム方式はパーセンタイルを求める前に件数を先に足した。実務の規則に直せば、合成の演算を要約より前に置けということだ。ただしヒストグラムは近似であり、誤差が真の順位を含むバケットの幅を超えないというところまでが実行で確認された範囲である。"
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "今見ているダッシュボードのp99が誤って合成されたものかどう分かるか?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "グループ基準を変えてみればよい。正しく計算されたパーセンタイルはまとめる単位を変えても値が変わらず、誤って畳まれたものは変わる。同じ10万件を10グループ、5グループ、2グループ、1グループにまとめて「グループ別p99の平均」を求めたところ、128.39、159.47、190.62、198.82と1.55倍動いた。同じデータでまとめ方だけを変えた結果だ。一方、合計と件数と最大値は四つの場合すべてで完全に同じだった。この対比が診断のすべてである。時間範囲を広げてみるのも同じ検査で、広げるほどp99が下がるなら窓ごとの値を平均している。最も強力な検査は閾値超過件数を数えることだ。p99がXなら定義上、全体のリクエストの1パーセントがXを超えているはずなので、ログで数えた件数がはるかに多ければp99が過小評価されている。サーバー別のパーセンタイルしか残っておらず直せないなら、平均ではなく最大値で畳むこと。無作為な構成400個で、真のp99がグループ別p99の最大値を超えた場合は0件だった。"
+      }
+    }
+  ]
+}
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/percentile_aggregation_error.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/percentile_aggregation_error.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/percentile_aggregation_error.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/percentile_aggregation_error.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/percentile_aggregation_error.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="サーバー10台のp99を平均した - その数字は何でもない">
+                <meta itemprop="datePublished" content="2026-07-30">
+                <meta itemprop="dateModified" content="2026-07-30">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="p99, パーセンタイル, 集計の誤り, ヒストグラム, レイテンシ, ダッシュボード, オブザーバビリティ, 分位点の定義, 収集設計, SLO">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/ja/posts/percentile_aggregation_error.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">サーバー10台のp99を平均した - その数字は何でもない</h1>
+                    <h2 class="post-subtitle">パーセンタイルは合成できない。固定シードで再現できる計算で確かめた集計の誤りと収集設計</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-07-30">2026-07-30</span>
+                        <span class="post-category" itemprop="articleSection">開発・インフラ</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+                    <h2>序論: ダッシュボードは正常なのに利用者は遅いと言う</h2>
+                    <p>応答時間ダッシュボードにp99のグラフがある。この一か月ずっと90ミリ秒あたりで平らだ。それなのに問い合わせが増えた。画面がよく固まる、決済ボタンを押すと延々と回る。アクセスログを自分で掘ると400ミリ秒を超えるリクエストがいくらでも出てくる。ダッシュボードはなぜそれを見せなかったのか。</p>
+                    <p>よくある答えは「p99も結局1パーセントは捨てる指標だから」だ。間違いではないが、この状況の原因ではない。原因はもっと単純でもっと悪い。<strong>画面に出ていたその90ミリ秒は、そもそもp99ではなかった。</strong>サーバー10台がそれぞれ計算して送ってきたp99の値10個を平均したものだった。そしてパーセンタイルは、平均で合成できる種類の数字ではない。</p>
+                    <p>この記事はその差を数字で見る。同じリクエスト10万件を二通りに要約した。サーバーごとのp99を求めて平均した値は<strong>91.04ミリ秒</strong>、リクエスト全体を一つの器に入れて求めたp99は<strong>449.63ミリ秒</strong>だった。<strong>4.94倍だ。</strong>どちらの数字も「p99」という名前を持ち、どちらもバグから出た値ではない。両方とも指示された通りの計算を正確に行った。</p>
+                    <p>厄介なのは、この誤りが静かだという点だ。画面の値はもっともらしく、単位も合っており、トラフィックが増えれば一緒に上がり、デプロイ後に悪化すれば一緒に悪化する。方向はおおむね合っているので疑う契機がない。そして<strong>誤って合成されたパーセンタイルは例外を投げない。</strong>文字コードが違えば文字が壊れて目に見えるが、集計が違う数字はただの数字に見える。</p>
+                    <p>実務ではこの問題は、たいてい次の四つの症状として先に現れる。</p>
+                    <ul>
+                        <li>ダッシュボードのp99は平らなのに、問い合わせとログ上の<strong>遅いリクエスト件数</strong>はともに増える</li>
+                        <li>同じ期間をサーバー別に割ると一台だけ明らかに悪いのに、全体グラフではその山が<strong>消えている</strong></li>
+                        <li>ダッシュボードでグループ基準を変えると(ホスト別 &rarr; リージョン別 &rarr; 全体)<strong>「同じp99」が別の値になる</strong></li>
+                        <li>1分単位のp99グラフには鋭い山があるのに、同じ画面の<strong>「今時間のp99」という一つの数字は穏やかだ</strong></li>
+                    </ul>
+                    <p>後ろの二つが決定的な手掛かりで、12節と9節で計算によって理由を示す。結論を先に書くとこうなる。<strong>パーセンタイルは値ではなく分布の性質であり、性質は平均できない。</strong>だから実務上の問いは「p99を見るかp95を見るか」ではなく、<strong>何を収集しておいたか</strong>だ。収集設計が指標の精度を決める。</p>
+                    <div class="callout">
+                        <p><strong>実行環境。</strong>以下のすべての出力は<strong>Windows 10 Pro (10.0.19045)</strong>上で<strong>Python 3.13.3</strong>を使って実際に実行した結果だ。標準ライブラリのみを使い、外部の数値計算パッケージは使っていない。スクリプトはシェル引数やヒアドキュメントではなく<strong>ファイルに保存して実行</strong>した。</p>
+                        <p><strong>固定シード。</strong>乱数はすべて固定だ。基準シードは<strong>20260730</strong>で、k番目の節は<code>random.Random(20260730 + k)</code>を使う。正規乱数は<code>random()</code>の上に<strong>Box-Muller変換</strong>を重ねて作った。同じPythonで同じ順に走らせれば、この記事のすべての数字がそのまま出る。<strong>再現できない例は根拠ではない。</strong>下の成果物ボックスに短縮版の再現コードを入れてあり、それは1節の三つの数字をそのまま作り直す。</p>
+                        <p><strong>データはすべて架空だ。</strong>実在するサービスの指標は使っていない。レイテンシは対数正規分布で生成した。応答時間が右に長い裾を持つという観察に合うからで、この記事の論旨は特定の分布に依存しない。パーセンタイルの既定規則は<strong>最近接順位(nearest-rank)</strong>だ。並べ替えてから<code>ceil(0.99 x n)</code>番目の値であり、常に実際に観測されたリクエスト一件を指す。別の定義を使う節ではその都度明示する。</p>
+                    </div>
+
+                    <h2>1. 反例ひとつ - サーバー10台のp99を平均すると</h2>
+                    <p>条件はできるだけ平凡に取った。サーバー10台、各1万件、合計10万件。9台は健全で1台だけ状態が悪い。特別な事故ではない。ディスクが一台だけ古いとか、隣のコンテナがCPUを食っているとか、カーネルが一台だけ違うとか - 群れでは常にあることだ。</p>
+                    <pre><code>python           : 3.13.3
+platform         : Windows-10-10.0.19045-SP0
+base seed        : 20260730   (section k uses random.Random(base seed + k))
+generator        : Mersenne Twister, normals via Box-Muller
+percentile rule  : nearest-rank unless a section says otherwise
+unit             : milliseconds
+
+==============================================================================
+1. average of per-server p99 vs the real pooled p99
+==============================================================================
+server     requests      p50      p95      p99      max
+------------------------------------------------------------------------------
+web-01       10000    17.99    31.90    40.82    82.82
+web-02       10000    18.02    32.56    40.47    71.75
+web-03       10000    18.11    32.05    40.38    68.75
+web-04       10000    17.91    31.50    39.90    75.24
+web-05       10000    17.98    31.63    40.63    76.76
+web-06       10000    18.00    31.97    41.07    70.41
+web-07       10000    17.87    32.14    40.88    77.30
+web-08       10000    17.88    32.00    40.55    76.58
+web-09       10000    18.00    31.82    40.19    65.51
+web-10       10000    30.00   379.58  1020.21 15169.20
+------------------------------------------------------------------------------
+requests total                       : 100000
+(a) MEAN of the 10 per-server p99    :   138.51 ms   [what many dashboards show]
+(b) TRUE p99 of all pooled requests  :   209.67 ms   [what users actually meet]
+(b) minus (a)                        :    71.16 ms
+(a) understates the truth by          :    33.94 %  of the truth
+ratio (b)/(a)                        :   1.5138 x
+
+for reference, other ways to fold the same 10 numbers:
+  MAX of per-server p99              :  1020.21 ms   deviation  +386.57 %
+  MIN of per-server p99              :    39.90 ms   deviation   -80.97 %
+  MEDIAN of per-server p99           :    40.59 ms   deviation   -80.64 %</code></pre>
+                    <p>表で<code>web-10</code>だけが違う。まず注目すべきは<strong>p50が30.00ミリ秒で、他のサーバーの二倍にも満たない</strong>点だ。中央値だけ見れば「少し遅いな」程度である。ところがp99は1020.21ミリ秒で他の25倍だ。<strong>裾でだけ壊れたサーバーは中央値の指標では捕まらない。</strong></p>
+                    <p>そして次の二行がこの記事の心臓だ。サーバー別p99を平均した値は<strong>138.51ミリ秒</strong>、リクエスト全体を合わせて求めた本当のp99は<strong>209.67ミリ秒</strong>だ。差は71.16ミリ秒、真の値の<strong>33.94パーセント</strong>を削り取っている。1.51倍だ。</p>
+                    <p>同じ10個の数字を別のやり方で畳んだときのほうがさらに興味深い。</p>
+                    <ul>
+                        <li><strong>最大値で畳むと</strong>1020.21ミリ秒 - 真の値より386.57パーセント高い。大きく過大評価だが<strong>一度も真の値の下に落ちない。</strong>12節でこれが偶然でないことを示す</li>
+                        <li><strong>中央値で畳むと</strong>40.59ミリ秒 - 80.64パーセント低い。悪いサーバー一台が<strong>完全に消える。</strong>外れ値に強いという性質が、ここでは正確に逆向きに働く</li>
+                        <li><strong>最小値で畳むと</strong>39.90ミリ秒 - 下限だ。役には立たないが方向は正直である</li>
+                        <li><strong>平均で畳むと</strong>138.51ミリ秒 - 上限でも下限でもなく、<strong>どのリクエストも指していない数字</strong>だ。10万件の中に138.51ミリ秒のリクエストがあるかもしれないが、この値が出た理由とは何の関係もない</li>
+                        <li>10個の数字を<strong>どう畳んでも209.67は出ない。</strong>その情報は各サーバーが要約した時点ですでに捨てられている</li>
+                    </ul>
+                    <p>何が捨てられたのかは、裾を誰が作ったのかを見れば分かる。真のp99より上にあるリクエストの出どころを数えた。</p>
+                    <pre><code>who actually populates the pooled tail (requests at or above 209.67 ms):
+  web-01         0 requests    0.00 % of the tail   (10.0 % of traffic)
+  web-02         0 requests    0.00 % of the tail   (10.0 % of traffic)
+  web-03         0 requests    0.00 % of the tail   (10.0 % of traffic)
+  web-04         0 requests    0.00 % of the tail   (10.0 % of traffic)
+  web-05         0 requests    0.00 % of the tail   (10.0 % of traffic)
+  web-06         0 requests    0.00 % of the tail   (10.0 % of traffic)
+  web-07         0 requests    0.00 % of the tail   (10.0 % of traffic)
+  web-08         0 requests    0.00 % of the tail   (10.0 % of traffic)
+  web-09         0 requests    0.00 % of the tail   (10.0 % of traffic)
+  web-10      1001 requests  100.00 % of the tail   (10.0 % of traffic)</code></pre>
+                    <p>1001件すべてが<code>web-10</code>から出た。他の9台の寄与は<strong>0件</strong>だ。<code>web-10</code>はトラフィックの10パーセントを処理しているのに<strong>裾の100パーセントを占める。</strong>ところが平均はこのサーバーに10分の1の重みを与える。だから90パーセント削るのだ。</p>
+                    <p>ここでパーセンタイル集計の核心が見える。全体のp99を正確に計算するには、各サーバーが<strong>全体の上位1パーセントの中で占める割合</strong>を知る必要がある。その割合はトラフィックの割合とは何の関係もない(10パーセント対100パーセント)。そしてサーバーごとにp99という数字を一つだけ残した瞬間、その割合を計算する材料も一緒に消える。<strong>捨てられたのは精度ではなく構造だ。</strong></p>
+                    <p>では、なぜこの誤りは長く生き延びるのか。条件を一つだけ変えると答えが出る。サーバー10台をすべて同じ分布にし、トラフィックも均等に配った。</p>
+                    <pre><code>per-server p99 values : 128.99, 126.51, 125.63, 129.69, 118.68, 129.06, 132.86, 123.23, 129.23, 131.61
+MEAN of them          :   127.55 ms
+TRUE pooled p99       :   127.59 ms
+deviation             :    -0.03 %</code></pre>
+                    <p>平均したp99は127.55ミリ秒、本当のp99は127.59ミリ秒だ。<strong>誤差0.03パーセント。</strong>事実上合っている。</p>
+                    <p>これがこの誤りの見つからない理由だ。<strong>平常時には合っている。</strong>群れが均質でロードバランサーが均等に分配している間、二つの数字はくっついている。そして一台が落ち込んだ瞬間、つまり<strong>指標が最も必要な瞬間にずれる。</strong></p>
+                    <ul>
+                        <li>正常なときに合い、異常なときに外れる指標は、<strong>異常の検知には使えない。</strong>それが指標の唯一の用途であるにもかかわらず</li>
+                        <li>検証も難しい。平常時に二つの値を比べると一致するので「確認したが問題ない」という結論になる。検証を正常状態でだけ行えば、この欠陥は通過する</li>
+                        <li>誤差の大きさは<strong>均質性が崩れた度合いに比例</strong>する。そして均質性が崩れること自体が、我々が探している事象だ。信号が大きくなるときに計器が一緒に壊れる構造である</li>
+                    </ul>
+
+                    <h2>2. トラフィックが偏ると誤差の符号まで変わる</h2>
+                    <p>実際の群れはトラフィックを均等に受け取らない。カナリアデプロイ、シャッフルシャーディング、セッション固定、ゾーンごとの容量差、特定顧客専用ノード - 偏る理由はいくらでもある。一台が要求の80パーセントを受ける場合で計算し直した。</p>
+                    <pre><code>--- case A: the BUSY server is the slow one ---
+server     requests   share      p99
+------------------------------------------------------------------------------
+app-01       80000   80.0 %   493.62
+app-02        2222    2.2 %    47.13
+app-03        2222    2.2 %    46.89
+app-04        2222    2.2 %    47.10
+app-05        2222    2.2 %    44.81
+app-06        2222    2.2 %    46.83
+app-07        2222    2.2 %    45.52
+app-08        2222    2.2 %    44.62
+app-09        2222    2.2 %    47.34
+app-10        2222    2.2 %    46.52
+------------------------------------------------------------------------------
+MEAN of per-server p99            :    91.04 ms
+request-count WEIGHTED mean of p99:   404.16 ms
+TRUE pooled p99                   :   449.63 ms
+mean  deviation from truth        :   -79.75 %   (ratio 0.2025 x)
+weighted deviation from truth     :   -10.11 %   (ratio 0.8989 x)</code></pre>
+                    <p>平均したp99が<strong>91.04ミリ秒</strong>、本当のp99が<strong>449.63ミリ秒</strong>だ。<strong>4.94倍</strong>、79.75パーセントの過小評価。1節の33.94パーセントが79.75パーセントに拡大した。理由は単純で、実際に裾を作るサーバーがトラフィックの80パーセントを処理しているのに、平均は依然として10分の1の重みしか与えないからだ。</p>
+                    <p>ではリクエスト数で重み付けすればよいのか。同じ表に入れてみた。加重平均は404.16ミリ秒で10.11パーセントの過小評価だ。はるかに良い。しかしこれが原理なのか偶然なのかを確かめる必要がある。条件を正確に反転させた。数字はそのままにして、<strong>どのサーバーが忙しいか</strong>だけを入れ替えた。</p>
+                    <pre><code>--- case B: the BUSY server is the fast one ---
+server     requests   share      p99
+------------------------------------------------------------------------------
+app-01       80000   80.0 %    45.22
+app-02        2222    2.2 %   433.31
+app-03        2222    2.2 %   543.06
+app-04        2222    2.2 %   513.11
+app-05        2222    2.2 %   560.31
+app-06        2222    2.2 %   486.16
+app-07        2222    2.2 %   423.37
+app-08        2222    2.2 %   620.89
+app-09        2222    2.2 %   489.19
+app-10        2222    2.2 %   471.45
+------------------------------------------------------------------------------
+MEAN of per-server p99            :   458.61 ms
+request-count WEIGHTED mean of p99:   137.07 ms
+TRUE pooled p99                   :   217.55 ms
+mean  deviation from truth        :  +110.80 %   (ratio 2.1080 x)
+weighted deviation from truth     :   -36.99 %   (ratio 0.6301 x)
+
+the sign of the error flips between the two cases:
+  case A  mean is -79.75 % off  (dashboard says 91.04 ms, reality 449.63 ms)
+  case B  mean is +110.80 % off  (dashboard says 458.61 ms, reality 217.55 ms)</code></pre>
+                    <p>忙しいサーバーが速く、暇なサーバー9台が遅い場合だ。平均したp99は458.61ミリ秒、本当は217.55ミリ秒。今度は<strong>110.80パーセントの過大評価</strong>である。<strong>符号がひっくり返った。</strong>そしてリクエスト数の加重平均は137.07ミリ秒で36.99パーセントの過小評価 - 先の事例で良かった手法が、ここでは単純平均より特に良くはない。</p>
+                    <ul>
+                        <li>誤差の<strong>符号が状況によって変わる。</strong>だから「だいたい何倍かけて補正すればよい」という手が成立しない。方向の分からない誤差は補正できない</li>
+                        <li>事例Aはダッシュボードが91ミリ秒を見せているのに実際は450ミリ秒という状況だ。<strong>障害が見えない。</strong>序論の症状がまさにこれである</li>
+                        <li>事例Bはダッシュボードが459ミリ秒を見せているのに実際は218ミリ秒という状況だ。<strong>ない障害を追う。</strong>原因が見つからないので調査は永遠に終わらない</li>
+                        <li>二つの事例のサーバー別p99の一覧は<strong>構成要素が互いに同じ</strong>だ。違うのはどの値が大きなトラフィックに紐づいているかだけで、その対応関係はp99の一覧には入っていない</li>
+                        <li>リクエスト数の重み付けが事例Aでよく合ったのは、一台が圧倒的で<strong>そのサーバーのp99がほぼ全体のp99だった</strong>からだ。原理ではなく状況である。5節でこの点をさらに掘る</li>
+                    </ul>
+
+                    <h2>3. 最大値は合成できる - p100とp99の決定的な違い</h2>
+                    <p>ここで反問が一つありうる。最大値はパーセンタイル100パーセントではないのか。それも合成できないのか。計算すると答えが割れる。そしてこの分岐が、この記事で最も重要な概念上の地点だ。</p>
+                    <pre><code>per-group max : 402.68, 409.36, 451.85, 627.13, 577.14, 699.29, 517.51, 531.50, 1107.77, 729.08
+
+MEAN of per-group max :   605.3333 ms
+MAX  of per-group max :  1107.7706 ms
+TRUE max of pooled    :  1107.7706 ms
+mean equals truth     : False   (off by -45.36 %)
+max-of-max equals truth: True
+min-of-min equals truth: True</code></pre>
+                    <p>平均した最大値は605.33ミリ秒、本当の最大値は1107.77ミリ秒だ。45.36パーセントの過小評価 - <strong>平均はここでも外れる。</strong>ところが最大値同士で最大値を取ると<strong>完全に一致する。</strong>小数点以下4桁まで同じ値で、浮動小数点比較でも<code>True</code>だ。最小値も同様である。</p>
+                    <p>違いは名前ではなく演算の性質にある。最大値には部分から全体を作る<strong>畳み込み規則</strong>がある。二つの集合を合わせたものの最大値は、各集合の最大値の最大値と常に等しい。p99にはそのような規則がない。二つの集合を合わせたもののp99を、各集合のp99だけから計算する関数は<strong>存在しない。</strong>近似が悪いという話ではなく、その関数がないという話だ。</p>
+                    <ul>
+                        <li>最大値が畳めるのは<strong>各部分の最大値が、その部分について必要な情報をすべて持っている</strong>からだ。全体の最大値になりうる候補は部分の最大値だけで、残りの値はそもそも候補ではない</li>
+                        <li>p99はそうではない。全体のp99になる値は各部分の<strong>どの位置にもありうる。</strong>1節で真のp99である209.67は、<code>web-10</code>のp99(1020.21)でもなく他のサーバーのp99(約40)でもなかった。<code>web-10</code>のどこか中間の地点だった</li>
+                        <li>だから「p100はできるがp99はできない」が成立する。<strong>p100はパーセンタイル系列の極値ではなく別種の統計量</strong>であり、名前が似ていることが誤解を生む</li>
+                        <li>実務上の含意がある。<strong>最大値ベースの指標はどの単位で集計しても安全だ。</strong>最も遅いリクエスト、最も長いキュー長、最大同時接続 - これらは計算経路を疑う必要がない。代わりにリクエスト一件に完全に左右されるのでノイズが大きい。安全であることと有用であることは別だ</li>
+                    </ul>
+
+                    <h2>4. 合成できる指標と合成できない指標</h2>
+                    <p>ここからは指標ごとに一つずつ確認する。6グループを、大きさが互いに違うように(3000から7500まで)取った。大きさが同じだと単純平均と加重平均が偶然一致して区別がつかなくなるからだ。そして浮動小数点の丸めで「正確に等しい」という判定が曖昧にならないよう、値を<strong>マイクロ秒の整数</strong>に変換して計算した。</p>
+                    <pre><code>6 groups, sizes: 3000, 3900, 4800, 5700, 6600, 7500   total 31500 requests
+all values are integer microseconds, so sums are exact integers.
+
+metric      fold used on the parts        recomputed      from raw data    exact
+------------------------------------------------------------------------------
+count       sum of counts                          31500            31500    True
+sum         sum of sums                       1498826643       1498826643    True
+max         max of maxes                         2181107          2181107    True
+min         min of mins                              337              337    True
+mean        plain mean of means               42220.2378       47581.7982    False
+mean        count-weighted mean of means      47581.7982       47581.7982    True
+p99         plain mean of p99s               267686.0000      373760.0000    False
+p99         count-weighted mean of p99s      318257.0000      373760.0000    False
+p50         plain mean of medians             24974.0000       25084.0000    False
+------------------------------------------------------------------------------
+
+the plain mean of means is off by -11.2681 % here; the weighted one is exact.
+no weighting rescues p99: see section 5.</code></pre>
+                    <p>表の最後の列がこの節の要点だ。件数、合計、最大、最小は部分の結果だけで<strong>完全に復元</strong>される。<code>True</code>は近似ではなく整数の同一性だ。平均は条件付きである。単純平均は11.2681パーセント外れ、件数で重み付けすると<strong>正確に一致</strong>する。p99とp50はどの方式でも復元されない。</p>
+                    <p>整理すると次のようになる。</p>
+                    <table>
+                        <thead>
+                            <tr><th>指標</th><th>部分から畳む方法</th><th>正確か</th><th>合成するには何が必要か</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>件数</td><td>部分件数の和</td><td><strong>正確</strong></td><td>件数。それ自体で完全だ</td></tr>
+                            <tr><td>合計</td><td>部分合計の和</td><td><strong>正確</strong></td><td>合計。加算は結合法則を満たす</td></tr>
+                            <tr><td>最大</td><td>部分最大の最大</td><td><strong>正確</strong></td><td>最大値ひとつ</td></tr>
+                            <tr><td>最小</td><td>部分最小の最小</td><td><strong>正確</strong></td><td>最小値ひとつ</td></tr>
+                            <tr><td>平均</td><td>部分平均の単純平均</td><td><strong>誤り</strong></td><td>-- グループの大きさが違うと外れる</td></tr>
+                            <tr><td>平均</td><td>部分平均を件数で重み付け</td><td><strong>正確</strong></td><td><strong>合計と件数。</strong>平均だけ残してはいけない</td></tr>
+                            <tr><td>分散・標準偏差</td><td>件数・合計・二乗和から再計算</td><td><strong>条件付きで正確</strong></td><td>三つとも保存すれば復元される</td></tr>
+                            <tr><td>中央値(p50)</td><td>畳み込み規則なし</td><td><strong>不可</strong></td><td>元データまたはヒストグラム</td></tr>
+                            <tr><td>p95・p99</td><td>畳み込み規則なし</td><td><strong>不可</strong></td><td>元データまたはヒストグラム</td></tr>
+                        </tbody>
+                    </table>
+                    <p>分散と標準偏差の行がこの表で最も教訓的だ。標準偏差の値だけ保存しておくと合成できないが、件数・合計・二乗和の三つを保存しておくと正確に復元される。<strong>同じ指標が、何を保存したかによって合成できるものにもできないものにもなる。</strong>この性質が10節のヒストグラムの根拠である。</p>
+                    <ul>
+                        <li>「合成できる」は指標の属性ではなく<strong>保存した要約の属性</strong>だ。これがこの記事の実務的結論にまっすぐつながる</li>
+                        <li>件数を一緒に保存していない平均は合成できない。ダッシュボードが平均だけ残して件数を捨てると<strong>平均さえ合成できない。</strong>しかも表の通りこの場合は11パーセント台の誤差なので目につきにくい</li>
+                        <li>パーセンタイルはどんな補助的な数字を一緒に保存しても復元されない。例外は<strong>分布そのものを近似する要約</strong>(バケットのヒストグラムなど)だけであり、それは数字一つではなく構造だ</li>
+                        <li>逆に読むと収集設計の規則になる。<strong>後で別の単位で計算し直す必要のある指標は、畳める形で保存する。</strong>畳めない形で保存すれば、その後のすべての再集計が誤る</li>
+                        <li>表で「不可」の二行が、よりによってダッシュボードで最もよく使われる二つの指標だ。それがこの問題の大きさである</li>
+                    </ul>
+
+                    <h2>5. 重み付けでも復元されない理由</h2>
+                    <p>2節ではリクエスト数の重み付けが一つの事例でよく合った。だから「重みをうまく選べば済む問題」に見えるかもしれない。複数の重み付け方式を一つのデータにすべて適用し、どれが原理的に通用するかを確かめた。</p>
+                    <pre><code>group  requests   weight      p99
+------------------------------------------------------------------------------
+a         60000   0.6000    65.06
+b         25000   0.2500    87.34
+c         10000   0.1000   920.90
+d          5000   0.0500  2504.83
+------------------------------------------------------------------------------
+TRUE pooled p99                 :   413.37 ms
+  plain mean of p99              :   894.53 ms   deviation  +116.40 %
+  count-weighted mean of p99     :   278.20 ms   deviation   -32.70 %
+  square-root-count weighted     :   521.03 ms   deviation   +26.04 %
+  tail-count weighted (0.01*n)   :   278.20 ms   deviation   -32.70 %
+  max of p99                     :  2504.83 ms   deviation  +505.95 %
+  min of p99                     :    65.06 ms   deviation   -84.26 %</code></pre>
+                    <p>本当のp99は413.37ミリ秒だ。単純平均は116.40パーセント過大、リクエスト数の重み付けは32.70パーセント過小、平方根の重み付けは26.04パーセント過大である。どれも合わず、どれも一貫して一方向に外れてはいない。</p>
+                    <p>「リクエスト数の0.01倍」で重み付けした行が、リクエスト数の重み付けと<strong>完全に同じ値</strong>になったことに注意したい。重みを定数倍しても加重平均は変わらない。つまり<strong>リクエスト数から導いたどんな重みも、リクエスト数の重み付けと同じ答えを出す。</strong>新しい情報が入ってこないからだ。これが「重みのチューニング」が行き詰まる地点である。</p>
+                    <p>では、どの重みが正解なのか。各グループが<strong>全体の上位1パーセントの中に</strong>どれだけ入っているかが正解だ。その値を直接取り出した。</p>
+                    <pre><code>group  share of traffic   share of the pooled top 1 percent
+------------------------------------------------------------------------------
+a               60.00 %                         0.00 %
+b               25.00 %                         0.00 %
+c               10.00 %                        42.86 %
+d                5.00 %                        57.14 %
+------------------------------------------------------------------------------</code></pre>
+                    <p>トラフィックの<strong>85パーセント</strong>を占めるグループaとbが、裾には<strong>0パーセント</strong>しか寄与していない。裾を作るのはトラフィック15パーセントのcとdだ。つまり正解の重みは(0, 0, 0.4286, 0.5714)に近いのに、リクエスト数の重みは(0.6, 0.25, 0.1, 0.05)である。二つのベクトルは事実上逆の方向を指している。</p>
+                    <ul>
+                        <li>正確な重みは<strong>グループごとの裾への寄与度</strong>であり、その値は元データを見て初めて出る。サーバー別のp99だけ残した時点でその情報はない</li>
+                        <li>つまり重みを選ぶ問題ではない。<strong>加重平均という形ではそもそも表現できない値</strong>を表現しようとしているのだ。表現力が足りないのであって、係数が違うのではない</li>
+                        <li>トラフィックの割合と裾の割合が無関係だというのが実務上の核心だ。<strong>「多く受けるサーバーが重要だ」という直観は裾では成立しない。</strong>静かなノードが裾をすべて作るケースはよくある</li>
+                        <li>加重平均が偶然よく合う場合もある(2節の事例Aの10.11パーセント)。しかしそのときも<strong>合っていたことを確認する方法は元データを見ることだけ</strong>だ。確認できない近似は近似ではなく推測である</li>
+                    </ul>
+
+                    <h2>6. 平均が隠すもの - 一節だけ</h2>
+                    <p>パーセンタイルを使う理由そのものは短く確認するにとどめる。この記事の主題ではないからだ。平均応答時間がほぼ同じ二つの分布を作った。</p>
+                    <pre><code>shape                     mean      p50      p90      p99     p999      max
+------------------------------------------------------------------------------
+A near-normal             40.00    40.01    47.68    53.92    58.41    66.46
+B long tail               39.85    24.36    46.17   473.97  1670.75  6766.82
+------------------------------------------------------------------------------
+means differ by 0.38 %, but p99 differs by 8.79 x and p999 by 28.60 x.</code></pre>
+                    <p>平均は40.00と39.85で<strong>0.38パーセント</strong>の差だ。p99は53.92と473.97で<strong>8.79倍</strong>の差、p99.9は<strong>28.60倍</strong>の差である。二つのサービスの「平均応答時間」レポートは事実上同じ文書になり、ユーザー体験はまったく違う。</p>
+                    <ul>
+                        <li>平均が有用なのは分布がAのように対称的なときだ。実際の応答時間はおおむねBに近い。だから裾の指標を使う</li>
+                        <li>Bの中央値(24.36)は平均(39.85)より<strong>低い。</strong>ロングテール分布では平均が大多数の利用者より悪い値なので、「平均より速い利用者」が多数派になる。平均は誰も代表しない</li>
+                        <li>この節はここまでだ。平均と裾の関係はそれ自体が別の主題であり、<strong>この記事の論旨は裾の指標を使うと決めたあとでそれをどう合成するか</strong>である。6節と7節はそれぞれ一節だけに留める</li>
+                    </ul>
+
+                    <h2>7. パーセンタイルの定義は一つではない - 一節だけ</h2>
+                    <p>ツール間の数字を比べる前に確認すべきことがある。「p95」という一つの名前の下に複数の計算規則がある。n=20の小さな標本一つに複数の規則を適用した。</p>
+                    <pre><code>n = 20 sorted sample: [12, 14, 15, 15, 18, 21, 24, 29, 33, 41, 55, 60, 78, 92, 140, 260, 410, 900, 1200, 3000]
+
+definition                                  p95        p99
+------------------------------------------------------------------------------
+nearest-rank ceil(p/100*n)                  1200.00    3000.00
+lower rank floor(p/100*n)                   1200.00    1200.00
+linear interp, inclusive (R-7)              1290.00    2658.00
+linear interp, exclusive, clamped           2910.00    3000.00
+statistics.quantiles inclusive              1290.00    2658.00
+statistics.quantiles exclusive              2910.00    4422.00
+------------------------------------------------------------------------------
+spread of p95 across definitions : 1200.00 to 2910.00 ms  (2.42 x)
+my linear-inclusive matches statistics inclusive at p95 : True
+my linear-exclusive matches statistics exclusive at p95 : True
+
+note the exclusive p99 cell: 4422.00 ms, while the largest observation is 3000.00 ms.
+that method is documented as being for a population that can hold more
+extreme values than the sample, so it is allowed to point past the data.
+my clamped variant caps at the maximum instead, which is why the two
+agree at p95 and part ways at p99. same name, two answers.
+
+same comparison on n = 200000 from one distribution:
+  nearest-rank             p99 =   127.8243 ms
+  lower rank               p99 =   127.8243 ms
+  linear inclusive         p99 =   127.8245 ms
+  linear exclusive         p99 =   127.8466 ms
+  spread : 0.0223 ms  (0.0175 % of the value)</code></pre>
+                    <p>同じ20個の数字からp95が1200から2910まで出る。<strong>2.42倍</strong>だ。そして最後の行を見てほしい。排他的(exclusive)方式のp99は<strong>4422ミリ秒</strong>だが、この標本の最大値は3000ミリ秒である。<strong>観測されたどの値より大きい値</strong>を返したのだ。</p>
+                    <p>これはバグではない。Python標準ライブラリの文書は、この方式が「標本で見つかったものより極端な値を持ちうる母集団」を対象とすると明記しており、下側の切断点を<code>i / (m + 1)</code>で計算すると書いている。仕様通りに動いたのだ。一方、私が自分で実装したほうは最大値で頭打ちにしたので、p95では二つの値が一致しp99で分かれた。<strong>同じ名前、二つの答え</strong>である。</p>
+                    <table>
+                        <thead>
+                            <tr><th>定義</th><th>n=20でのp95</th><th>n=20でのp99</th><th>性格</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>最近接順位(この記事の既定)</td><td>1200.00</td><td>3000.00</td><td>常に観測された値ひとつを指す</td></tr>
+                            <tr><td>下位順位(切り捨て)</td><td>1200.00</td><td>1200.00</td><td>同じ値を再利用し保守的に低く出る</td></tr>
+                            <tr><td>線形補間、包含型</td><td>1290.00</td><td>2658.00</td><td>最小値を0パーセント、最大値を100パーセントと見る</td></tr>
+                            <tr><td>線形補間、排他型(頭打ち)</td><td>2910.00</td><td>3000.00</td><td>補間するが観測範囲を超えないよう抑えた</td></tr>
+                            <tr><td>線形補間、排他型(標準実装)</td><td>2910.00</td><td><strong>4422.00</strong></td><td><strong>最大値3000より大きい値を返す</strong></td></tr>
+                        </tbody>
+                    </table>
+                    <p>標本が大きくなればこの差は消える。20万個の標本で四方式のp99の幅は<strong>0.0223ミリ秒</strong>、値の0.0175パーセントだ。だからこの問題と集計の問題は大きさが違う。</p>
+                    <ul>
+                        <li>ツール間の数字を比べるときは<strong>定義を揃えてから比べること。</strong>ツールごとに既定の定義が違いうるので、それぞれの文書を確認するのが先だ。ここで特定製品の内部実装を断定はしない</li>
+                        <li>定義の差は<strong>標本が小さいときにだけ</strong>問題になる。1分の窓にリクエストが数十件しかない低トラフィックのエンドポイントが危険区間で、8節がその話だ</li>
+                        <li><strong>定義の差は、この記事が扱う4~5倍の誤差の原因ではない。</strong>二つの問題を混ぜると本当の原因を見失う。数字が大きくずれたら、定義を掘る前に<strong>集計経路</strong>を先に確認すること</li>
+                        <li>この節もここまでだ。定義ごとの性格を掘り下げるのは別の主題である</li>
+                    </ul>
+
+                    <h2>8. 標本が小さいとp99は最大値の別名だ</h2>
+                    <p>集計とは別に、一つの窓のリクエスト数自体が少ないとp99が不安定になる。同じ母集団から標本数だけを変えて繰り返し計算した。対数正規分布なので真のp99を解析的に計算でき、推定値がどこを狙っているかを比較できる。</p>
+                    <pre><code>population: lognormal, median 20.0 ms, sigma 0.80
+analytic population p99 = median * exp(sigma * 2.3263478740408408) = 128.6133 ms
+
+     n   trials      p5   median      p95     min      max   p95/p5   which rank is used
+------------------------------------------------------------------------------
+   100     2000   75.89   109.77   166.90   53.84   300.51    2.199   rank 99 of 100 (1 above it)
+  1000     2000  109.97   126.51   148.66   94.90   176.01    1.352   rank 990 of 1000 (10 above it)
+ 10000      500  122.15   128.53   134.93  116.72   142.29    1.105   rank 9900 of 10000 (100 above it)
+100000      100  126.87   128.62   130.55  125.97   131.80    1.029   rank 99000 of 100000 (1000 above it)
+------------------------------------------------------------------------------
+
+a single n=100 window, its top 5 values : 63.23, 63.43, 67.21, 75.07, 80.44
+nearest-rank p99 of it                 : 75.07 ms   (the 99th of 100, i.e. 2nd largest)
+drop that one request and p99 becomes  : 80.44 ms</code></pre>
+                    <p>母集団の真のp99は128.6133ミリ秒だ。標本100個から推定したp99は、下位5パーセント地点が75.89、上位5パーセント地点が166.90 - <strong>2.199倍の範囲</strong>で揺れる。2000回のうち最小は53.84、最大は300.51まで出た。標本10万個ではその範囲が1.029倍まで縮まる。</p>
+                    <p>なぜそれほど揺れるのかは一番右の列にある。標本100個のp99は99番目の値であり、<strong>その上にあるリクエストはたった一件</strong>だ。実際の窓を一つ開いて確認した。上位5個が63.23、63.43、67.21、75.07、80.44で、p99は75.07である。そのリクエスト一件を除くとp99は80.44に変わる。</p>
+                    <ul>
+                        <li>標本100個のp99は事実上<strong>「二番目に遅いリクエスト」</strong>だ。パーセンタイルという名前が統計的な安定性を保証してくれるわけではない</li>
+                        <li>だから低トラフィックのエンドポイントのp99アラートはリクエスト一件で揺れる。窓を広げるか<strong>より低い分位点(p90、p95)を使う</strong>のが正直だ。リクエストが100件なのにp99を見るのは、最大値を見ながらp99と呼んでいるのに近い</li>
+                        <li>窓を広げることと<strong>窓ごとのp99を合成することは別の作業</strong>だ。後者は9節の通り成立しない。窓を広げるには、広い窓にまたがって元データから計算し直す必要がある</li>
+                        <li>標本数を併記しないパーセンタイルのグラフは読めない。<strong>分母を一緒に描くこと。</strong>リクエスト数が急減した区間のp99の揺れは、性能変化ではなく標本不足かもしれない</li>
+                    </ul>
+
+                    <h2>9. 時間軸も同じ - 1分p99を60個集めても1時間p99にはならない</h2>
+                    <p>ここまでのグループ軸はホストだった。時間に変えても結果は同じだ。1分ごとに1200件で60分、合計72000件。真ん中の5分に性能低下の区間を入れた。実際の障害の形に近づけたものだ。</p>
+                    <pre><code>60 minutes x 1200 requests = 72000 requests
+per-minute p99, minutes 25 to 32 : 68.1, 77.8, 1130.7, 1868.3, 1208.6, 1041.3, 1525.5, 69.8
+
+fold applied to the 60 per-minute p99 values      value      deviation
+------------------------------------------------------------------------------
+mean                                                 175.68       -36.98 %
+median                                                68.07       -75.58 %
+max                                                 1868.28      +570.19 %
+min                                                   61.20       -78.05 %
+p95 of the 60 values                                1130.71      +305.61 %
+TRUE hourly p99 from raw requests                    278.77            -
+------------------------------------------------------------------------------</code></pre>
+                    <p>本当の1時間p99は<strong>278.77ミリ秒</strong>だ。1分p99を60個平均すると175.68ミリ秒で36.98パーセント過小、最大値を取ると1868.28ミリ秒で570.19パーセント過大、中央値を取ると68.07ミリ秒で75.58パーセント過小である。<strong>どの畳み方も合わず、誤差の幅は一桁を超える。</strong></p>
+                    <p>これが序論に書いた最後の症状の正体だ。1分単位のグラフの山と「今時間のp99」という一つの数字は<strong>互いに別の量</strong>であり、どちらも他方から計算されない。二つの数字が違うからといって、どちらかがバグなのでもない。</p>
+                    <ul>
+                        <li>時間軸だからといってパーセンタイルが加算可能になるわけではない。5分p99を12個集めて1時間にするのも、1時間p99を24個集めて1日にするのも同じ誤りだ</li>
+                        <li>ダッシュボードで<strong>時間範囲を変えるとき</strong>、数字がどう計算されるかを確認すること。画面の横ピクセル数に合わせて区間を自動的に切り直すツールは、この地点で静かに再集計しうる。拡大・縮小で値が変わるならそれが合図だ</li>
+                        <li>アラートの閾値を1分の窓で決め、週次レポートを1時間の窓で書くと、<strong>二つの数字は互いを検証してくれない。</strong>アラートは鳴ったのにレポートは穏やか、という状態が正常動作でありうる</li>
+                        <li>中央値で畳むと68.07ミリ秒だ。低下区間の5分が残り55分に埋もれて<strong>完全に消える。</strong>裾の事象はホスト軸でも時間軸でも同じように希釈される</li>
+                    </ul>
+
+                    <h2>10. ヒストグラム - 合成できる近似</h2>
+                    <p>では元データ10万件を永遠に持ち続けなければならないのか。代替があり、その根拠はすでに4節にある。<strong>件数は合成できる。</strong>値を区間(バケット)に分け、区間ごとの件数を保存すれば、その件数はサーバー同士で足せる。2節の事例Aと同じ群れに適用した。</p>
+                    <pre><code>same fleet as section 2 case A. TRUE pooled p99 = 438.6759 ms
+
+bucket scheme              buckets   est p99   deviation   bucket holding the answer
+------------------------------------------------------------------------------
+coarse                           7  491.7815     +12.11 %   [100.00, 500.00] width 400.00
+pow2                            15  478.8454      +9.16 %   [256.00, 512.00] width 256.00
+growth10                       112  439.7592      +0.25 %   [405.27, 445.79] width 40.53
+linear10                       399  438.8169      +0.03 %   [430.00, 440.00] width 10.00
+------------------------------------------------------------------------------
+
+for comparison, the mean of the same fleet's per-server p99 was -79.68 % off.
+
+what merging actually did: bucket counts were ADDED across the 10 servers
+before any percentile was computed. that is the whole difference.</code></pre>
+                    <p>バケット境界を変えながら計算した。7個のバケットの粗い構成で12.11パーセント過大、2のべき乗15個で9.16パーセント、10パーセントずつ増える112個で<strong>0.25パーセント</strong>、10ミリ秒間隔の399個で<strong>0.03パーセント</strong>だ。同じデータでサーバー別p99を平均した値は79.68パーセント外れていた。<strong>最も粗いヒストグラムでさえ、サーバー別p99の平均より6倍以上正確である。</strong></p>
+                    <p>差を作ったのは計算式ではなく<strong>順序</strong>だ。ヒストグラム方式はパーセンタイルを求める前に件数を先に足した。サーバー別p99方式は各サーバーでパーセンタイルを先に求めてしまった。その順序がすべてである。これがこの記事の実務的結論でもある。<strong>合成の演算を要約より前に置け。</strong></p>
+                    <p>ただしこれは近似だ。誤差の性質を確認しておく必要がある。</p>
+                    <pre><code>interpolation inside the last bucket assumes the values are spread evenly
+in it. checking that assumption on the bucket that held the answer:
+  bucket [256.00, 512.00] holds 2185 requests
+  if evenly spread, half of them would sit below 384.00 ms
+  actually below the midpoint : 1589 of 2185 = 72.72 %
+  so the values crowd the LOW edge here, and even interpolation
+  reads high for this bucket. with a different shape or different
+  boundaries the sign can go the other way, so treat this as a
+  measurement of THIS histogram, not a general rule.
+
+bounded claim you can rely on: the estimate stays inside the bucket that
+contains the true rank, so the error cannot exceed that bucket's width.
+checked here for every scheme above:
+  coarse       true 438.68 and est 491.78 both inside [100.00, 500.00] : True   abs error 53.1056 ms, bucket width 400.0000 ms
+  pow2         true 438.68 and est 478.85 both inside [256.00, 512.00] : True   abs error 40.1695 ms, bucket width 256.0000 ms
+  growth10     true 438.68 and est 439.76 both inside [405.27, 445.79] : True   abs error 1.0833 ms, bucket width 40.5265 ms
+  linear10     true 438.68 and est 438.82 both inside [430.00, 440.00] : True   abs error 0.1410 ms, bucket width 10.0000 ms</code></pre>
+                    <p>答えが入っていたバケット(256~512ミリ秒)には2185件があった。均一に散らばっていれば半分が中間値384ミリ秒より下にあるはずだが、実際には<strong>72.72パーセント</strong>が下にあった。つまりこのバケットで値は低いほうに寄っており、だから均一を仮定した補間が高めに読んだのだ。</p>
+                    <div class="callout">
+                        <p><strong>ここで断定はしない。</strong>上の72.72パーセントと誤差の符号は<strong>この分布とこのバケット境界で観測されたもの</strong>だ。分布の形が違ったり境界が違ったりすれば符号は逆に振れうる。「ヒストグラムの補間は常に高めに読む」といった一般規則を、この一回の実行から引き出さないでほしい。誤差の方向を知りたければ、自分のデータと自分のバケット境界で同じ検査をする必要がある。</p>
+                        <p>同じ理由で、<strong>特定の監視製品がヒストグラムから分位点をどう推定するかも断定しない。</strong>補間方式やバケットの定義は実装ごとに違いうる。使っているツールの文書で確認すること。この節が示すのは手法の性質であって、どの製品が何をするかではない。</p>
+                    </div>
+                    <p>代わりに、実行で確認された形の明確な境界条件はある。推定値は<strong>真の順位を含むバケットの中に留まる。</strong>真の値も同じバケットの中にある。したがって誤差の絶対値はそのバケットの幅を超えない。四つの構成すべてで確認された。粗い構成で誤差53.1056ミリ秒に対しバケット幅400ミリ秒、最も細かい構成で誤差0.1410ミリ秒に対しバケット幅10ミリ秒だ。</p>
+                    <ul>
+                        <li>誤差を減らす方法は<strong>関心区間のバケットを細かくすること</strong>だ。補間方式を変えるより効果が確実で予測しやすい</li>
+                        <li>どの区間が細かくあるべきかは事前に決める必要がある。ここではp99が400ミリ秒台だったのでその区間が重要だった。<strong>バケット境界は想定レイテンシ範囲を覆うように設計する。</strong>あとから境界を変えると過去のデータと比較できない</li>
+                        <li>最後のバケット(上限超過)に値が入ると、その時点でパーセンタイルを計算できなくなる。<strong>上限は余裕をもって取ること。</strong>タイムアウト値より上まで置くのが安全だ</li>
+                        <li>ヒストグラムの保存コストはバケット数かける系列数だ。<strong>精度とコストが直接交換される。</strong>ログ・トレースの保存コストそのものを扱った話は<a href="clickhouse_observability_2026.html">ClickHouseのオブザーバビリティ</a>にある</li>
+                        <li>ヒストグラム以外にも分位点近似用の要約データ構造が何系統かあり、誤差保証の形が互いに違う。<strong>重要な共通点は一つだ。どれも部分同士を併合する演算を持っており、パーセンタイルという数字一つは持っていない</strong></li>
+                    </ul>
+
+                    <h2>11. 利用者が出会うのはリクエストではなく画面だ</h2>
+                    <p>リクエストのp99を正確に計算したとしても、もう一段階残っている。利用者はリクエストを一つ送るのではない。画面一つがリクエストを何本も呼ぶ。この層を抜かすと「p99は良くなったのになぜ不満はそのままなのか」が説明できない。</p>
+                    <pre><code>if a screen fires k independent requests and each has a 1 percent chance
+of landing above the request-level p99, the chance the screen contains at
+least one of them is 1 - 0.99^k:
+
+     k   P(at least one slow)   expected slow requests per screen
+------------------------------------------------------------------------------
+     1               1.0000 %                          0.010
+     2               1.9900 %                          0.020
+     3               2.9701 %                          0.030
+     5               4.9010 %                          0.050
+     8               7.7255 %                          0.080
+    10               9.5618 %                          0.100
+    20              18.2093 %                          0.200
+    30              26.0300 %                          0.300
+    50              39.4994 %                          0.500
+   100              63.3968 %                          1.000
+------------------------------------------------------------------------------
+at k = 69 the screen exceeds a coin flip: P = 50.0163 %</code></pre>
+                    <p>画面がリクエストをk本呼び、各リクエストが1パーセントの確率でp99より上に落ちるなら、画面に遅いリクエストが一つでも入る確率は1から0.99のk乗を引いた値だ。k=10で9.5618パーセント、k=20で18.2093パーセント、k=100で63.3968パーセントである。<strong>k=69でコイン投げを超える。</strong></p>
+                    <p>計算だけでなく測定でも確認した。2節の事例Aのリクエスト母集団から画面を4万個ずつ抽出し、画面のレイテンシをリクエストの最大値(完全並列)と合計(完全直列)の二通りで計算した。</p>
+                    <pre><code>request-level p50 = 24.33 ms   request-level p99 = 435.58 ms
+
+     k   screens   frac with a slow request   screen p50(max)  screen p99(max)  screen p50(sum)  screen p99(sum)
+------------------------------------------------------------------------------------------------------------------------
+     1     40000                     1.020 %             24.20            442.26             24.20            442.26
+     3     40000                     3.045 %             64.99            709.26            109.49            820.36
+     5     40000                     4.938 %             97.71            828.38            205.77           1058.17
+    10     40000                     9.433 %            159.16           1093.44            455.44           1658.83
+    20     40000                    18.088 %            232.84           1404.46            968.31           2552.58
+    40     40000                    32.992 %            336.73           1781.27           2008.24           4087.61
+------------------------------------------------------------------------------------------------------------------------</code></pre>
+                    <p>リクエストのp99は435.58ミリ秒だ。リクエストを20本呼ぶ画面の直列p99は<strong>2552.58ミリ秒</strong>、並列p99は<strong>1404.46ミリ秒</strong>である。リクエストの指標はそのままなのに画面の指標は数倍になる。「遅いリクエストを含む画面」の割合も、計算値18.2093パーセントと測定値18.088パーセントでよく合った。</p>
+                    <ul>
+                        <li>だからリクエストのp99を改善しながら画面あたりのリクエスト数を増やすと、<strong>二つの変化が相殺されてダッシュボードには何も起きない。</strong>その間に利用者の体感は悪化しうる</li>
+                        <li>画面あたりのリクエスト数はたいていどこにも記録されない。フロントエンドの変更やウィジェット追加で<strong>静かに増える。</strong>バックエンドの指標だけを見ているチームはこの変化を見られない</li>
+                        <li>並列化は合計を最大値に変える。表でk=20のとき2552.58から1404.46に減った。それでもリクエストp99の3倍を超える。<strong>並列化は問題を減らすが無くしはしない</strong></li>
+                        <li>可能なら、リクエスト単位ではなく<strong>画面・取引単位でレイテンシを測る</strong>こと。リクエストのパーセンタイルはその次だ。画面単位の測定は元データが画面一つにつき一行なので、4節の問題も一緒に小さくなる</li>
+                    </ul>
+
+                    <h2>12. 診断 - 今見ている数字が誤って合成されたかを見分ける</h2>
+                    <p>ここまで来ると残る問いは一つだ。今見ているp99が誤って合成されたものかどうか、どうすれば分かるのか。ダッシュボードは計算式を見せないし、クエリを読める状況とも限らない。しかし見分ける方法がある。<strong>正しく計算されたパーセンタイルは、グループ基準を変えても値が変わらない。</strong>誤って畳まれたものは変わる。</p>
+                    <pre><code>grouping            groups   mean of group p99   max of group p99   sum   count   max
+------------------------------------------------------------------------------------------------
+10 groups                10              128.39             916.06    2.67  100000 50869.28
+5 groups                  5              159.47             634.13    2.67  100000 50869.28
+2 groups                  2              190.62             340.29    2.67  100000 50869.28
+1 groups                  1              198.82             198.82    2.67  100000 50869.28
+------------------------------------------------------------------------------------------------
+TRUE pooled p99 = 198.82 ms
+
+the mean column moved from 128.39 to 198.82 as the grouping changed, a 1.55 x
+swing on identical data. sum, count and max did not move at all. that
+difference is the whole diagnosis.</code></pre>
+                    <p>同じ10万件を10グループ、5グループ、2グループ、1グループにまとめ、それぞれ「グループ別p99の平均」を求めた。128.39から159.47、190.62、198.82へと動いた。<strong>1.55倍揺れる。</strong>データは一つも変わっておらず、まとめ方だけが変わった。</p>
+                    <p>一方、合計・件数・最大値は四つの場合すべてで完全に同じだ。2.67、100000、50869.28で固定である。<strong>この対比が診断のすべてだ。</strong>グループ基準を変えたときに動く数字は誤って畳まれたもので、動かない数字はきちんと計算されたものである。</p>
+                    <p>最大値の列も動いたが(916.06から634.13、340.29、198.82)方向が<strong>一方向だけ</strong>で、一度も真の値の下に落ちなかった。これが偶然かを確認した。</p>
+                    <pre><code>the max column moved too, but only downward, and it never went below the
+truth. that is not a coincidence. checking the bounds over 400 random
+fleet configurations, all with a fixed seed:
+
+  trials                                   : 400
+  times pooled p99 exceeded max of group p99: 0
+  times pooled p99 fell below min of group p99: 0
+  worst overshoot above the max bound       : +0.000000 %
+  worst undershoot below the min bound      : +0.000000 %
+
+counting argument behind it: each group has at most 1 percent of its own
+requests above its own p99, so at most 1 percent of the pooled requests
+sit above the largest of those values. that makes max of group p99 an
+upper bound for the pooled p99, and min a lower bound. it is not the
+answer, but it is a bound, which a mean is not.
+
+so if per-group percentiles are all you have, fold with max, not mean.
+the bound tightens as groups get coarser; it is loosest when cardinality
+is highest, which is exactly when dashboards slice most finely.</code></pre>
+                    <p>無作為な群れの構成400個で、真のp99がグループ別p99の最大値を超えた場合が<strong>0件</strong>、最小値の下に落ちた場合も<strong>0件</strong>だった。理由は数え上げの論証から出る。各グループは自分のp99の上に自分のリクエストの1パーセント以下しか持たない。したがって、それらの値のうち最大のものの上には全体のリクエストの1パーセント以下しかない。よってそれは全体のp99の<strong>上限</strong>だ。最小値は同じ理屈で下限になる。</p>
+                    <p>実務的には、これがサーバー別のパーセンタイルしか残っていないときの最善だ。<strong>平均ではなく最大値で畳め。</strong>正解ではないが上限であり、上限は「最悪でもこれより悪くはない」という判断に使える。平均は上限でも下限でもないので、どんな判断にも使えない。そしてこの上限はグループが粗くなるほど締まる。つまり<strong>カーディナリティが高いときに最も緩く、ダッシュボードはよりによってそのときに最も細かく刻む。</strong></p>
+                    <table>
+                        <thead>
+                            <tr><th>検査</th><th>何をするか</th><th>誤って合成された合図</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>グループ基準を変える</td><td>ホスト別 &rarr; リージョン別 &rarr; 全体でまとめる単位を変えて同じ指標を見る</td><td><strong>数字が動く。</strong>粗くまとめるほど大きくなるなら平均で畳まれている</td></tr>
+                            <tr><td>時間範囲を変える</td><td>1時間 &rarr; 6時間 &rarr; 1日と窓を広げる</td><td>広げるほどp99が<strong>下がる。</strong>窓ごとの値を平均している</td></tr>
+                            <tr><td>閾値超過件数を数える</td><td>ログでダッシュボードのp99値を超えるリクエスト数を直接数える</td><td>全体の1パーセントより<strong>はるかに多い。</strong>p99が過小評価</td></tr>
+                            <tr><td>上限検査</td><td>サーバー別p99の最大値と全体のp99を比べる</td><td>全体のp99が<strong>その最大値より大きい。</strong>計算自体が誤り</td></tr>
+                            <tr><td>単一ノード対照</td><td>最悪のノード一つのp99と全体のp99を見る</td><td>全体が<strong>はるかに低い。</strong>希釈されている</td></tr>
+                        </tbody>
+                    </table>
+                    <ul>
+                        <li>最も速い検査は<strong>グループ基準を変えてみること</strong>だ。クリック二回で、クエリを読む必要もない。動けば誤って畳まれている</li>
+                        <li>時間範囲の検査は9節の誤りを捕まえる。<strong>拡大・縮小でp99が変わるなら再集計を疑うこと</strong></li>
+                        <li>閾値超過件数の検査が最も強力だ。p99がXミリ秒なら、全体のリクエストのちょうど1パーセントがXを超えているはずである。<strong>これは定義なので反論できない。</strong>実際の件数が3パーセントなら、本当のp99ははるかに上にある</li>
+                        <li>計算が合っていると確認したあとでも8節と11節は残る。<strong>正しく計算されたp99も標本が小さければ揺れるし、画面単位の体感とは別の量だ</strong></li>
+                    </ul>
+
+                    <h2>13. 判断表 - 何を収集すれば後から計算し直せるのか</h2>
+                    <p>整理する。これは指標を選ぶ問題ではなく<strong>何を残すかの問題</strong>だ。残さなかったものは、あとからどんなに良いツールを付けても戻ってこない。</p>
+                    <table>
+                        <thead>
+                            <tr><th>見たいもの</th><th>合成できるか</th><th>何を収集すべきか</th><th>これだけ残すと終わる</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>総リクエスト数</td><td><strong>可能</strong></td><td>カウンター</td><td>-</td></tr>
+                            <tr><td>秒あたりスループット</td><td><strong>可能</strong></td><td>カウンター + 時刻</td><td>-</td></tr>
+                            <tr><td>エラー率</td><td><strong>可能</strong></td><td>エラーカウンターと全体カウンターを<strong>別々に</strong></td><td><strong>比率の値だけ</strong>残すと合成できない</td></tr>
+                            <tr><td>平均応答時間</td><td><strong>条件付き</strong></td><td>合計と件数</td><td><strong>平均の値だけ</strong>残すと合成できない</td></tr>
+                            <tr><td>標準偏差</td><td><strong>条件付き</strong></td><td>件数・合計・二乗和</td><td><strong>標準偏差だけ</strong>残すと合成できない</td></tr>
+                            <tr><td>最大・最小レイテンシ</td><td><strong>可能</strong></td><td>最大値・最小値</td><td>-</td></tr>
+                            <tr><td>中央値・p90・p95・p99</td><td><strong>不可</strong></td><td>元データまたは<strong>バケットのヒストグラム</strong></td><td><strong>パーセンタイルの値</strong>を残すと終わりだ</td></tr>
+                            <tr><td>画面・取引単位のレイテンシ</td><td><strong>不可</strong></td><td>画面単位の元データまたはヒストグラム</td><td>リクエスト単位だけでは復元不可</td></tr>
+                            <tr><td>遅いリクエストの件数</td><td><strong>可能</strong></td><td>閾値ごとのカウンター(事実上ヒストグラム)</td><td>-</td></tr>
+                            <tr><td>どのノードが裾を作るか</td><td><strong>不可</strong></td><td>ノードのラベルが付いたヒストグラム</td><td>ノード別パーセンタイルだけでは不可</td></tr>
+                        </tbody>
+                    </table>
+                    <p>最後の列がこの表の核心だ。<strong>何を収集するかより、何を捨てるかが取り返しのつかない決定である。</strong>そして「遅いリクエストの件数」の行を見てほしい。閾値ごとのカウンターは結局ヒストグラムであり、これは合成できる。<strong>「p99はいくつか」を「何件が500ミリ秒を超えたか」に言い換えると、指標が合成できる種類に変わる。</strong>問いを変えるのが最も安上がりな解決策であることもある。</p>
+                    <p>この記事の実行結果を一つの表にまとめた。すべて固定シード20260730から出た数字だ。</p>
+                    <table>
+                        <thead>
+                            <tr><th>状況</th><th>誤って合成した値</th><th>本当の値</th><th>誤差</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>10台中1台が低下、トラフィック均等(p99の平均)</td><td>138.51 ms</td><td>209.67 ms</td><td>-33.94 %</td></tr>
+                            <tr><td>10台すべて同一、トラフィック均等(p99の平均)</td><td>127.55 ms</td><td>127.59 ms</td><td><strong>-0.03 %</strong></td></tr>
+                            <tr><td>忙しいサーバーが遅い、80パーセント偏り(p99の平均)</td><td>91.04 ms</td><td>449.63 ms</td><td><strong>-79.75 %</strong></td></tr>
+                            <tr><td>忙しいサーバーが速い、80パーセント偏り(p99の平均)</td><td>458.61 ms</td><td>217.55 ms</td><td><strong>+110.80 %</strong></td></tr>
+                            <tr><td>1分p99を60個平均して1時間p99に</td><td>175.68 ms</td><td>278.77 ms</td><td>-36.98 %</td></tr>
+                            <tr><td>1分p99を60個の最大値を1時間p99に</td><td>1868.28 ms</td><td>278.77 ms</td><td>+570.19 %</td></tr>
+                            <tr><td>併合ヒストグラム、粗いバケット7個</td><td>491.78 ms</td><td>438.68 ms</td><td>+12.11 %</td></tr>
+                            <tr><td>併合ヒストグラム、細かいバケット399個</td><td>438.82 ms</td><td>438.68 ms</td><td><strong>+0.03 %</strong></td></tr>
+                            <tr><td>最大値の代わりに平均で畳む(10グループの最大値)</td><td>605.33 ms</td><td>1107.77 ms</td><td>-45.36 %</td></tr>
+                            <tr><td>同じデータ、グループ基準だけ10個から1個に</td><td>128.39 ms</td><td>198.82 ms</td><td>-35.42 %</td></tr>
+                        </tbody>
+                    </table>
+                    <p>二行目がこの表で最も危険な行だ。<strong>-0.03パーセント。</strong>この状態で検証すれば「我々のダッシュボードは正確だ」という結論が出るが、その結論は群れが均質である間だけ有効である。</p>
+
+                    <h2>14. チェックリストとやってはいけないこと</h2>
+                    <p>収集設計とダッシュボード点検にそのまま使えるよう整理した。</p>
+                    <ul>
+                        <li>[ ] ダッシュボードのパーセンタイルのパネルが<strong>どの段階でパーセンタイルを計算するか</strong>確認した</li>
+                        <li>[ ] グループ基準を変えてみて<strong>数字が動かないこと</strong>を確認した</li>
+                        <li>[ ] 時間範囲を広げてみてp99が下がらないことを確認した</li>
+                        <li>[ ] ログで<strong>閾値超過件数</strong>を数えてp99と突き合わせた</li>
+                        <li>[ ] パーセンタイルのグラフに<strong>リクエスト数(分母)を併記</strong>した</li>
+                        <li>[ ] 低トラフィックのエンドポイントは窓を広げるか<strong>より低い分位点</strong>を使う</li>
+                        <li>[ ] レイテンシはパーセンタイルではなく<strong>ヒストグラムで収集</strong>する</li>
+                        <li>[ ] ヒストグラムのバケットが<strong>想定レイテンシ範囲とタイムアウトの上まで</strong>覆う</li>
+                        <li>[ ] 平均を保存するとき<strong>合計と件数を一緒に</strong>保存する</li>
+                        <li>[ ] エラー率を保存するとき<strong>分子と分母を別々に</strong>保存する</li>
+                        <li>[ ] サーバー別パーセンタイルしか残っていない場所では<strong>平均ではなく最大値</strong>で畳む</li>
+                        <li>[ ] <strong>画面・取引単位のレイテンシ</strong>をリクエスト単位とは別に測る</li>
+                        <li>[ ] ツール間の数字を比べるとき<strong>パーセンタイルの定義を揃えた</strong></li>
+                    </ul>
+                    <p>逆にやってはいけないことだ。</p>
+                    <ul>
+                        <li>サーバー別・窓別のパーセンタイルを<strong>平均すること</strong> - この記事全体がその話だ</li>
+                        <li>パーセンタイルに<strong>リクエスト数の重みを付けて「直した」と言うこと</strong> - 5節で符号がひっくり返った</li>
+                        <li>正常状態でだけ指標を検証すること - 1b節で誤差は0.03パーセントだった</li>
+                        <li>パーセンタイルの値そのものを時系列で保存し<strong>元データやヒストグラムを捨てること</strong> - 取り返しがつかない</li>
+                        <li>リクエスト100件の窓のp99をアラートの閾値に使うこと - リクエスト一件で揺れる</li>
+                        <li>数字が大きくずれたとき<strong>パーセンタイルの定義から掘ること</strong> - 定義の差はおおむね0.02パーセント規模だ</li>
+                        <li>ヒストグラムの誤差の符号を<strong>一度観測して一般化すること</strong> - 分布と境界に依存する</li>
+                        <li>リクエストのp99だけ改善して画面あたりのリクエスト数を確認しないこと - 11節で相殺される</li>
+                    </ul>
+
+                    <h2>参考資料</h2>
+                    <ul>
+                        <li><a href="https://docs.python.org/3/library/statistics.html" target="_blank" rel="noopener">Python 3 標準ライブラリ - statistics</a> : <code>quantiles()</code>の包含型・排他型の定義と線形補間の規則。7節で引用した「標本で見つかったものより極端な値を持ちうる母集団」という文言と、<code>i / (m + 1)</code>という切断点の計算の出典</li>
+                        <li><a href="https://prometheus.io/docs/practices/histograms/" target="_blank" rel="noopener">Prometheus 公式文書 - Histograms and summaries</a> : あらかじめ計算された分位点をインスタンス間で平均することが統計的に無意味だという明示的な警告と、ヒストグラムのバケット件数は合算してから分位点を求められるという説明。この記事の10節の順序の論旨と同じ地点</li>
+                        <li>同じサイト: <a href="clickhouse_observability_2026.html">ClickHouseがオブザーバビリティ戦争で先行する理由</a> - 元データを長く持つために保存コストをどう扱うか</li>
+                        <li>同じサイト: <a href="cp949_utf8_mojibake_guide.html">ハングルが壊れる地点を特定する方法</a> - 「戻せる破損と戻せない破損」という同じ構造の問題を文字コードの領域で扱った記事</li>
+                    </ul>
+                </div>
+                <!-- md-artifact-start -->
+                    <div class="md-artifact" style="margin:2rem 0;border:1px solid #d7dce3;border-radius:10px;overflow:hidden;background:#fbfcfd;">
+                        <div style="display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;justify-content:space-between;padding:.7rem 1rem;background:#eef2f7;border-bottom:1px solid #d7dce3;">
+                            <span style="font-weight:700;font-size:.97rem;">📋 そのまま持ち出せるチェックリスト</span>
+                            <span style="display:flex;gap:.5rem;align-items:center;">
+                                <code style="font-size:.82rem;color:#5a6675;background:transparent;padding:0;">percentile_aggregation_error.md</code>
+                                <button type="button" class="md-artifact-copy" style="cursor:pointer;border:1px solid #b9c2cf;background:#fff;color:#2c3e50;font-weight:600;line-height:1.3;border-radius:6px;padding:.32rem .7rem;font-size:.85rem;">全体をコピー</button>
+                            </span>
+                        </div>
+                        <pre style="margin:0;max-height:420px;overflow:auto;padding:1rem;background:#fbfcfd;font-size:.86rem;line-height:1.62;"><code class="nohighlight" style="background:transparent;padding:0;white-space:pre;"># パーセンタイル集計の点検 - 合成可能性の判断表と再現コード
+
+&gt; 出典: braindetox.kr - サーバー10台のp99を平均した
+&gt; 根拠: Windows 10 / Python 3.13.3 標準ライブラリ、固定シード20260730で実行検証
+&gt; このファイルをそのままAIに貼って「この基準で我々のダッシュボードと収集設計を点検して」と書けば使えます。
+&gt; データはすべて架空です。実在するサービスの指標ではありません。
+
+## 0. 一行要約
+
+パーセンタイルは値ではなく**分布の性質**だ。性質は平均できない。
+合成するには**元データか併合可能な要約(ヒストグラム)**が必要だ。
+**合成の演算を要約より前に置け。**
+
+## 1. 合成可能性の判断表
+
+| 指標 | 部分から畳む方法 | 正確か | 合成するには何が必要か |
+|---|---|---|---|
+| 件数 | 部分件数の和 | 正確 | 件数 |
+| 合計 | 部分合計の和 | 正確 | 合計 |
+| 最大 | 部分最大の最大 | 正確 | 最大値 |
+| 最小 | 部分最小の最小 | 正確 | 最小値 |
+| 平均 | 部分平均の単純平均 | **誤り** | - |
+| 平均 | 部分平均を件数で重み付け | 正確 | **合計と件数** |
+| 分散・標準偏差 | 件数・合計・二乗和から再計算 | 条件付きで正確 | 三つとも |
+| 中央値 p50 | 畳み込み規則なし | **不可** | 元データまたはヒストグラム |
+| p90・p95・p99 | 畳み込み規則なし | **不可** | 元データまたはヒストグラム |
+| エラー率 | 比率同士の平均 | **誤り** | **分子と分母を別々に** |
+
+「合成できる」は指標の属性ではなく**保存した要約の属性**だ。
+
+## 2. 絶対にしてはいけない集計
+
+- サーバー別p99を平均 (観測誤差 -33.94 % ~ -79.75 %)
+- サーバー別p99をリクエスト数で加重平均 (符号が反転: -36.99 % / -10.11 %)
+- 1分p99を60個平均して1時間p99に (-36.98 %)
+- 1分p99を60個の最大値を1時間p99に (+570.19 %)
+- 比率(エラー率・成功率)同士の平均
+- 部分の最大値を平均 (-45.36 %)
+
+## 3. 観測された誤差 (固定シード20260730)
+
+| 状況 | 誤って合成した値 | 本当の値 | 誤差 |
+|---|---|---|---|
+| 10台中1台が低下、トラフィック均等 | 138.51 ms | 209.67 ms | -33.94 % |
+| 10台すべて同一、トラフィック均等 | 127.55 ms | 127.59 ms | **-0.03 %** |
+| 忙しいサーバーが遅い、80 % 偏り | 91.04 ms | 449.63 ms | **-79.75 %** |
+| 忙しいサーバーが速い、80 % 偏り | 458.61 ms | 217.55 ms | **+110.80 %** |
+| 1分p99を60個平均 | 175.68 ms | 278.77 ms | -36.98 % |
+| 1分p99を60個の最大値 | 1868.28 ms | 278.77 ms | +570.19 % |
+| 併合ヒストグラム バケット7個 | 491.78 ms | 438.68 ms | +12.11 % |
+| 併合ヒストグラム バケット399個 | 438.82 ms | 438.68 ms | **+0.03 %** |
+| グループ基準だけ10個から1個に | 128.39 ms | 198.82 ms | -35.42 % |
+
+**二行目が罠だ。**群れが均質なら誤差は0.03 %なので検証を通過する。
+正常なときに合い異常なときに外れる指標は、異常の検知には使えない。
+
+## 4. 再現コード (Python 3.13、標準ライブラリのみ)
+
+```python
+import math, random
+
+def p99(xs):
+    s = sorted(xs)
+    return s[math.ceil(0.99 * len(s)) - 1]      # nearest-rank
+
+def nrm(rng, _s=[None]):                        # Box-Muller
+    if _s[0] is not None:
+        v = _s[0]; _s[0] = None; return v
+    u1 = rng.random() or 1e-12
+    u2 = rng.random()
+    r = math.sqrt(-2.0 * math.log(u1))
+    _s[0] = r * math.sin(2 * math.pi * u2)
+    return r * math.cos(2 * math.pi * u2)
+
+rng = random.Random(20260730 + 1)               # 1節のシード
+
+def ln(med, sig, n):
+    return [math.exp(math.log(med) + sig * nrm(rng)) for _ in range(n)]
+
+groups = [ln(18.0, 0.35, 10000) for _ in range(9)] + [ln(30.0, 1.50, 10000)]
+per  = [p99(g) for g in groups]
+pool = [v for g in groups for v in g]
+
+print('mean of per-server p99 :', round(sum(per) / len(per), 2))   # 138.51
+print('true pooled p99        :', round(p99(pool), 2))             # 209.67
+print('max of per-server p99  :', round(max(per), 2))              # 1020.21 (上限)
+```
+
+三つの数字がそのまま出れば再現成功だ。
+
+## 5. ダッシュボード点検手順
+
+| 検査 | 何をするか | 誤って合成された合図 |
+|---|---|---|
+| グループ基準を変える | ホスト別 → リージョン別 → 全体 | **数字が動く** |
+| 時間範囲を変える | 1時間 → 6時間 → 1日 | 広げるほどp99が**下がる** |
+| 閾値超過件数 | ログでp99値を超えるリクエスト数を数える | 全体の1 %より**はるかに多い** |
+| 上限検査 | サーバー別p99の最大値と全体のp99を比較 | 全体が**その最大値より大きい** |
+| 単一ノード対照 | 最悪ノードのp99と全体のp99を比較 | 全体が**はるかに低い** |
+
+**閾値超過件数の検査が最も強力だ。**p99がXなら定義上、全体の1 %がXを超える。
+
+## 6. 収集設計の規則
+
+- レイテンシは**パーセンタイルではなくヒストグラム**で収集する
+- ヒストグラムのバケットは**想定レイテンシ範囲とタイムアウトの上まで**覆う
+- 関心区間(現在のp99付近)のバケットを**細かく**しておく — 補間方式を変えるより確実だ
+- 平均を保存するとき**合計と件数を一緒に**保存する
+- エラー率を保存するとき**分子と分母を別々に**保存する
+- 標準偏差を保存するとき**件数・合計・二乗和**を保存する
+- パーセンタイルの値そのものを時系列で保存し、元データ・ヒストグラムを捨てない
+- パーセンタイルのグラフに**リクエスト数(分母)を併記**する
+- 低トラフィックのエンドポイントは窓を広げるか**より低い分位点**を使う
+- **画面・取引単位のレイテンシ**をリクエスト単位とは別に測る
+- ツール間の数字を比べるとき**パーセンタイルの定義を揃える**(ツールごとに違いうる)
+
+## 7. 直せないときの次善策
+
+サーバー別のパーセンタイルしか残っていないなら**平均ではなく最大値で畳め。**
+
+- 無作為な群れの構成400個で、真のp99がグループ別p99の**最大値を超えた場合は0件**
+- 最小値の下に落ちた場合も**0件**
+- 根拠: 各グループは自分のp99の上に自分のリクエストの1 %以下しか持たない → それらの最大値の上には全体の1 %以下しかない → 上限
+- 上限は「最悪でもこれより悪くない」に使える。平均は上限でも下限でもない
+- 上限はグループが粗くなるほど締まる。**カーディナリティが高いときに最も緩い**
+
+## 8. パーセンタイルを正しく求めたあとも残る二つの問題
+
+- **標本不足**: リクエスト100件の窓のp99は事実上2番目に遅いリクエストだ。2000回の反復で推定値が53.84 ~ 300.51 msまで揺れた (真値128.61 ms)
+- **画面単位の体感**: 画面がリクエストをk本呼ぶと、遅いリクエストが一つでも入る確率は1 - 0.99^kだ。k=20で18.21 %、k=69で50 %を超える。リクエスト20本の画面の直列p99は2552.58 msだった (リクエストのp99は435.58 ms)
+
+## 9. やってはいけないこと
+
+- パーセンタイルを平均すること
+- 重みを付けて「直した」と言うこと
+- 正常状態でだけ指標を検証すること
+- 元データ・ヒストグラムを捨ててパーセンタイルの値だけ残すこと
+- リクエスト100件の窓のp99をアラートの閾値に使うこと
+- 大きな誤差に出会って定義から掘ること (定義の差はおおむね0.02 %規模)
+- ヒストグラムの誤差の符号を一度見て一般化すること (分布と境界に依存する)
+- リクエストのp99だけ改善して画面あたりのリクエスト数を確認しないこと
+</code></pre>
+                        <p style="margin:0;padding:.6rem 1rem;font-size:.82rem;color:#5a6675;border-top:1px solid #e3e8ee;">コピーしてメモアプリやAIツールにそのまま貼り付けてください。</p>
+                    </div>
+                    <script>
+                    (function(){
+                      if (window.__mdArtifactBound) return;
+                      window.__mdArtifactBound = true;
+                      document.addEventListener('click', function(ev){
+                        var btn = ev.target.closest && ev.target.closest('.md-artifact-copy');
+                        if (!btn) return;
+                        var box = btn.closest('.md-artifact');
+                        var code = box && box.querySelector('pre code');
+                        if (!code) return;
+                        var text = code.textContent;
+                        var label = btn.textContent;
+                        var ok = function(){
+                          btn.textContent = "コピーしました";
+                          setTimeout(function(){ btn.textContent = label; }, 1600);
+                          if (typeof gtag === 'function') {
+                            gtag('event', 'md_copy', { slug: "percentile_aggregation_error", lang: "ja", chars: text.length });
+                          }
+                        };
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                          navigator.clipboard.writeText(text).then(ok).catch(function(){ fallback(); });
+                        } else { fallback(); }
+                        function fallback(){
+                          var ta = document.createElement('textarea');
+                          ta.value = text; ta.setAttribute('readonly','');
+                          ta.style.position='fixed'; ta.style.left='-9999px';
+                          document.body.appendChild(ta); ta.select();
+                          try { document.execCommand('copy'); ok(); } catch(e) {}
+                          document.body.removeChild(ta);
+                        }
+                      });
+                    })();
+                    </script>
+                    <!-- md-artifact-end -->
+
+                <div class="share-section">
+                    <h3>この記事をシェア</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">リンクをコピー</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../../blog.html" class="back-link">一覧に戻る</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">一緒に使うと便利な無料ツール</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/json_formatter.html">JSON フォーマッター</a></li>
+      <li><a href="../static/regex_tester.html">正規表現テスター</a></li>
+      <li><a href="../static/jwt_decoder.html">JWTデコーダー・生成器 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 エンコーダー/デコーダー</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">すべてのツールを見る &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+<!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">関連記事</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="sql_left_join_where_becomes_inner.html">LEFT JOIN に WHERE を付けると INNER JOIN になる - ON と WHERE の境界 2026</a></li>
+      <li><a href="sql_not_in_null_empty_result.html">NOT IN のリストに NULL が一つ混ざると結果が丸ごと空になる - エラーなしで0行になる SQL 三値論理 2026</a></li>
+      <li><a href="json_number_precision_loss.html">JSON に載せた 64 ビット ID の末尾が変わる - 数値精度が消える地点 2026</a></li>
+      <li><a href="monotonic_vs_wall_clock.html">経過時間を壁時計で測るとマイナスになる - 単調時計を使うべき場所 2026</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('リンクがコピーされました。Threadsアプリに貼り付けてシェアしてください！');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('リンクがコピーされました！'); });
+    });
+    </script>
+</body>
+</html>

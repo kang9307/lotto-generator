@@ -1,0 +1,1031 @@
+<!DOCTYPE html>
+<!--
+ * Tech blog post template
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="en">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>We Averaged the p99 of Ten Servers - That Number Is Nothing 2026</title>
+    <meta name="description" content="The dashboard said 91 ms. The real p99 was 450 ms. Fixed-seed runs show why averaging per-server percentiles is off by up to 4.9x and what to collect.">
+    <meta name="keywords" content="p99, percentile, quantile aggregation, averaging percentiles, histogram, latency, response time, dashboard, observability, monitoring, long tail, tail latency, quantile definition, telemetry design, SLO, metrics design, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/en/posts/percentile_aggregation_error.html">
+
+    <meta property="og:title" content="We Averaged the p99 of Ten Servers - That Number Is Nothing">
+    <meta property="og:description" content="A percentile is a property of a distribution, and properties do not average. Sums, counts and maxima merge; p99 does not. Every claim here is a run you can reproduce.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/en/posts/percentile_aggregation_error.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="en_US">
+    <meta property="article:published_time" content="2026-07-30">
+    <meta property="article:section" content="Dev &amp; Infra">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="We Averaged the p99 of Ten Servers - That Number Is Nothing">
+    <meta name="twitter:description" content="A mergeability table per metric, plus a procedure for detecting a wrongly folded percentile. Reproducible from fixed seed 20260730.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "We Averaged the p99 of Ten Servers - That Number Is Nothing",
+  "alternativeHeadline": "Why Percentiles Do Not Merge - The Aggregation Error Behind a Calm Dashboard",
+  "datePublished": "2026-07-30",
+  "dateModified": "2026-07-30",
+  "inLanguage": "en-US",
+  "articleSection": "Dev & Infra",
+  "author": {
+    "@type": "Person",
+    "name": "BrainDetox"
+  },
+  "keywords": "p99, percentile, quantile aggregation, histogram, latency, dashboard, observability, quantile definition, telemetry design, SLO",
+  "publisher": {
+    "@type": "Organization",
+    "name": "BrainDetox",
+    "logo": {
+      "@type": "ImageObject",
+      "url": "https://braindetox.kr/site_logo.png"
+    }
+  },
+  "image": {
+    "@type": "ImageObject",
+    "url": "https://braindetox.kr/site_logo.png"
+  },
+  "mainEntityOfPage": "https://braindetox.kr/en/posts/percentile_aggregation_error.html"
+}
+    </script>
+
+    <script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "Why is it wrong to average the p99 of each server?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Because a percentile is not a value but a property of a distribution, and properties do not average. This was run directly. With ten servers of 10,000 requests each, 100,000 in total, and only one server left in bad shape, the mean of the per-server p99 values was 138.51 ms while the true p99 of all pooled requests was 209.67 ms. That is 33.94 percent shaved off. Counting who builds the tail exposes the cause: all 1001 requests above the true p99 came from that one bad server. It handles 10 percent of the traffic and owns 100 percent of the tail, yet the plain mean gives it a weight of one tenth. Computing the pooled p99 correctly requires knowing each server's share of the pooled top one percent, that share bears no relation to its share of traffic, and the moment only one p99 number per server survives, the material for computing that share is gone with it."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does weighting by request count fix it?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. A counterexample was constructed by running it. When one server takes 80 percent of requests and that server is the slow one, the count-weighted mean was 404.16 ms against a true 449.63 ms, off by 10.11 percent, which is quite close. Invert the conditions so the busy server is fast and the idle ones are slow, and the same weighted mean gives 137.07 ms against a true 217.55 ms, 36.99 percent low. So the good result in the first case was a situation, not a principle. There is a deeper problem too: scaling all weights by a constant does not change a weighted mean, so any weight derived from request counts returns the same answer as count weighting. The correct weights are each group's share of the pooled top one percent, and when that was extracted, two groups holding 85 percent of the traffic contributed zero percent of the tail. Traffic share and tail share are unrelated."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Why do maxima merge when p99 does not?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "The maximum has a fold rule that builds the whole from the parts and p99 has none. Checked across ten groups, the mean of the per-group maxima was 605.33 ms against a true maximum of 1107.77 ms, off by 45.36 percent, while the maximum of the per-group maxima matched the true value exactly. Minima behaved the same way. The reason lies in the structure of the information. The only candidates for the overall maximum are the part maxima, and the remaining values were never candidates, so keeping just the part maxima keeps everything needed. p99 is different. The value that becomes the pooled p99 can sit anywhere inside a part. In the case actually examined, the true p99 of 209.67 ms was neither the bad server's p99 of 1020.21 ms nor the roughly 40 ms of the others. So p100 is not the extreme member of the percentile family but a different kind of statistic, and the similar name breeds the confusion."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "What must I collect in order to merge percentiles correctly?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Either the raw data or an equivalent mergeable summary. In practice that means a bucketed histogram. The basis is that counts merge: split values into buckets, store the count per bucket, add those counts across servers, and only then compute the percentile. Running it shows a large difference. On a fleet with 80 percent traffic skew, averaging per-server p99 was 79.68 percent wrong, while merging the same data as a very coarse seven-bucket histogram was 12.11 percent off, 112 buckets 0.25 percent, and 399 buckets 0.03 percent. What made the difference is not the formula but the order: the histogram path added counts before computing any percentile. Stated as an operational rule, put the merge before the summary. Histograms are still an approximation, and what the run establishes is that the error does not exceed the width of the bucket containing the true rank."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How do I know whether the p99 on my dashboard was merged wrongly?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Change the grouping. A correctly computed percentile does not change value when you change the unit you group by, and a wrongly folded one does. Grouping the same 100,000 requests into 10, 5, 2 and 1 groups and taking the mean of the per-group p99 gave 128.39, 159.47, 190.62 and 198.82, a 1.55x swing. Same data, only the grouping changed. Sum, count and max, by contrast, were identical in all four cases. That contrast is the entire diagnosis. Widening the time range is the same test, and if the p99 falls as you widen, per-window values were averaged. The strongest check is counting threshold crossings: if the p99 is X, then by definition 1 percent of requests exceed X, so if the count in the log is far larger, the p99 is understated. If only per-server percentiles survive and you cannot fix it, fold with max rather than mean. Across 400 random configurations, the true p99 exceeded the maximum of the per-group p99 values zero times."
+      }
+    }
+  ]
+}
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/percentile_aggregation_error.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/percentile_aggregation_error.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/percentile_aggregation_error.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/percentile_aggregation_error.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/percentile_aggregation_error.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="We Averaged the p99 of Ten Servers - That Number Is Nothing">
+                <meta itemprop="datePublished" content="2026-07-30">
+                <meta itemprop="dateModified" content="2026-07-30">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="p99, percentile, quantile aggregation, histogram, latency, dashboard, observability, quantile definition, telemetry design, SLO">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/en/posts/percentile_aggregation_error.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">We Averaged the p99 of Ten Servers - That Number Is Nothing</h1>
+                    <h2 class="post-subtitle">Percentiles do not merge. An aggregation error and a collection design, checked with fixed-seed runs you can reproduce</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-07-30">2026-07-30</span>
+                        <span class="post-category" itemprop="articleSection">Dev &amp; Infra</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+                    <h2>The dashboard looks fine and users say it is slow</h2>
+                    <p>There is a p99 line on the response-time dashboard. It has been flat around 90 ms for a month. Support tickets are up anyway. The screen freezes a lot. The pay button spins for ages. Grep the access log yourself and there are plenty of requests over 400 ms. Why did the dashboard not show them?</p>
+                    <p>The usual answer is that p99 throws away one percent by definition. True, but not the cause here. The cause is simpler and worse. <strong>That 90 ms on the screen was never a p99 at all.</strong> It was the mean of ten p99 values, one from each of ten servers. And a percentile is not the kind of number you can merge by averaging.</p>
+                    <p>This article puts numbers on the difference. The same 100,000 requests were summarised two ways. Taking each server's p99 and averaging them gave <strong>91.04 ms</strong>. Pooling every request into one bucket and computing the p99 gave <strong>449.63 ms</strong>. <strong>That is 4.94x.</strong> Both numbers carry the label p99, and neither came out of a bug. Both did exactly the arithmetic they were told to do.</p>
+                    <p>The awkward part is how quiet this error is. The displayed value is plausible, the unit is right, it rises when traffic rises, and it gets worse after a bad deploy. The direction is mostly correct, so nothing prompts suspicion. And <strong>a wrongly merged percentile never raises an exception.</strong> A broken encoding shows up as garbled text you can see; a broken aggregation just looks like a number.</p>
+                    <p>In practice the problem announces itself through four symptoms first.</p>
+                    <ul>
+                        <li>The dashboard p99 stays flat while support tickets and the <strong>count of slow requests in the log</strong> both climb</li>
+                        <li>Split the same window by server and one host is visibly bad, yet in the fleet-wide chart that spike has <strong>disappeared</strong></li>
+                        <li>Change the group-by in the dashboard (per host &rarr; per region &rarr; everything) and <strong>the same p99 becomes a different value</strong></li>
+                        <li>The per-minute p99 chart has sharp spikes, while <strong>the single number labelled p99 for this hour is calm</strong></li>
+                    </ul>
+                    <p>The last two are the decisive clues, and sections 12 and 9 show why with calculations. The conclusion up front: <strong>a percentile is not a value but a property of a distribution, and properties do not average.</strong> So the real question is not whether to watch p99 or p95. It is <strong>what you collected</strong>. Collection design decides metric accuracy.</p>
+                    <div class="callout">
+                        <p><strong>Environment.</strong> Every output below was actually run on <strong>Windows 10 Pro (10.0.19045)</strong> with <strong>Python 3.13.3</strong>. Standard library only, no external numerics package. Scripts were <strong>saved to files and executed</strong>, not passed through shell arguments or heredocs.</p>
+                        <p><strong>Fixed seeds.</strong> All randomness is pinned. The base seed is <strong>20260730</strong>, and section k uses <code>random.Random(20260730 + k)</code>. Normal deviates come from a <strong>Box-Muller</strong> transform on top of <code>random()</code>. Run it in the same order on the same Python and every number in this article comes back. <strong>An example you cannot reproduce is not evidence.</strong> The artifact box below carries a condensed reproduction script, and it regenerates the three numbers from section 1 exactly.</p>
+                        <p><strong>All data is synthetic.</strong> No real service metric was used. Latencies were generated from a lognormal distribution, which matches the observation that response times have a long right tail, and none of the argument here depends on that particular choice. The default percentile rule is <strong>nearest-rank</strong>: sort, then take the <code>ceil(0.99 x n)</code>-th value, so the answer is always one request that actually happened. Where a section uses something else, it says so.</p>
+                    </div>
+
+                    <h2>1. One counterexample - averaging the p99 of ten servers</h2>
+                    <p>The setup is deliberately ordinary. Ten servers, 10,000 requests each, 100,000 total. Nine are healthy and one is not. This is not an incident scenario. One older disk, one noisy neighbour eating CPU, one host still on the previous kernel - this is the normal state of a fleet.</p>
+                    <pre><code>python           : 3.13.3
+platform         : Windows-10-10.0.19045-SP0
+base seed        : 20260730   (section k uses random.Random(base seed + k))
+generator        : Mersenne Twister, normals via Box-Muller
+percentile rule  : nearest-rank unless a section says otherwise
+unit             : milliseconds
+
+==============================================================================
+1. average of per-server p99 vs the real pooled p99
+==============================================================================
+server     requests      p50      p95      p99      max
+------------------------------------------------------------------------------
+web-01       10000    17.99    31.90    40.82    82.82
+web-02       10000    18.02    32.56    40.47    71.75
+web-03       10000    18.11    32.05    40.38    68.75
+web-04       10000    17.91    31.50    39.90    75.24
+web-05       10000    17.98    31.63    40.63    76.76
+web-06       10000    18.00    31.97    41.07    70.41
+web-07       10000    17.87    32.14    40.88    77.30
+web-08       10000    17.88    32.00    40.55    76.58
+web-09       10000    18.00    31.82    40.19    65.51
+web-10       10000    30.00   379.58  1020.21 15169.20
+------------------------------------------------------------------------------
+requests total                       : 100000
+(a) MEAN of the 10 per-server p99    :   138.51 ms   [what many dashboards show]
+(b) TRUE p99 of all pooled requests  :   209.67 ms   [what users actually meet]
+(b) minus (a)                        :    71.16 ms
+(a) understates the truth by          :    33.94 %  of the truth
+ratio (b)/(a)                        :   1.5138 x
+
+for reference, other ways to fold the same 10 numbers:
+  MAX of per-server p99              :  1020.21 ms   deviation  +386.57 %
+  MIN of per-server p99              :    39.90 ms   deviation   -80.97 %
+  MEDIAN of per-server p99           :    40.59 ms   deviation   -80.64 %</code></pre>
+                    <p>Only <code>web-10</code> differs. Note first that <strong>its p50 is 30.00 ms, less than double the others</strong>. On medians alone it reads as slightly slow. Its p99, though, is 1020.21 ms, twenty-five times the rest. <strong>A host that broke only in the tail does not show up in median metrics.</strong></p>
+                    <p>And the next two lines are the heart of this article. Averaging the per-server p99 gives <strong>138.51 ms</strong>. Pooling every request and computing the p99 gives <strong>209.67 ms</strong>. A gap of 71.16 ms, shaving <strong>33.94 percent</strong> off the truth. A factor of 1.51.</p>
+                    <p>Folding the same ten numbers other ways is more interesting still.</p>
+                    <ul>
+                        <li><strong>Fold with max</strong> and you get 1020.21 ms, 386.57 percent above the truth. Badly overstated, but <strong>it never lands below the true value.</strong> Section 12 shows that is not luck</li>
+                        <li><strong>Fold with median</strong> and you get 40.59 ms, 80.64 percent low. The bad host is <strong>erased completely.</strong> Robustness against outliers, the property you normally want, works exactly backwards here</li>
+                        <li><strong>Fold with min</strong> and you get 39.90 ms, a lower bound. Useless, but at least honest about its direction</li>
+                        <li><strong>Fold with mean</strong> and you get 138.51 ms, which is neither an upper nor a lower bound and <strong>points at no request at all.</strong> Some request among the 100,000 may well have taken 138.51 ms, but that has nothing to do with why this number appeared</li>
+                        <li><strong>No fold of those ten numbers produces 209.67.</strong> That information was already discarded the moment each server summarised itself</li>
+                    </ul>
+                    <p>What got discarded becomes clear once you ask who built the tail. Here is where the requests above the true p99 came from.</p>
+                    <pre><code>who actually populates the pooled tail (requests at or above 209.67 ms):
+  web-01         0 requests    0.00 % of the tail   (10.0 % of traffic)
+  web-02         0 requests    0.00 % of the tail   (10.0 % of traffic)
+  web-03         0 requests    0.00 % of the tail   (10.0 % of traffic)
+  web-04         0 requests    0.00 % of the tail   (10.0 % of traffic)
+  web-05         0 requests    0.00 % of the tail   (10.0 % of traffic)
+  web-06         0 requests    0.00 % of the tail   (10.0 % of traffic)
+  web-07         0 requests    0.00 % of the tail   (10.0 % of traffic)
+  web-08         0 requests    0.00 % of the tail   (10.0 % of traffic)
+  web-09         0 requests    0.00 % of the tail   (10.0 % of traffic)
+  web-10      1001 requests  100.00 % of the tail   (10.0 % of traffic)</code></pre>
+                    <p>All 1001 of them came from <code>web-10</code>. The other nine contributed <strong>zero</strong>. <code>web-10</code> handles 10 percent of the traffic and owns <strong>100 percent of the tail.</strong> The mean gives it a weight of one tenth. Hence the 90 percent haircut.</p>
+                    <p>This exposes the core of percentile aggregation. To compute the pooled p99 correctly you need to know each server's <strong>share of the pooled top one percent</strong>. That share bears no relation to its share of traffic (10 percent versus 100 percent). And the moment you keep only one p99 number per server, the material for computing that share goes with it. <strong>What was thrown away is not precision but structure.</strong></p>
+                    <p>So why does this error survive so long? Change one condition and the answer appears. Make all ten servers identical and spread traffic evenly.</p>
+                    <pre><code>per-server p99 values : 128.99, 126.51, 125.63, 129.69, 118.68, 129.06, 132.86, 123.23, 129.23, 131.61
+MEAN of them          :   127.55 ms
+TRUE pooled p99       :   127.59 ms
+deviation             :    -0.03 %</code></pre>
+                    <p>The averaged p99 is 127.55 ms and the true p99 is 127.59 ms. <strong>An error of 0.03 percent.</strong> Effectively correct.</p>
+                    <p>That is why nobody catches it. <strong>It is right in normal times.</strong> While the fleet is homogeneous and the load balancer spreads evenly, the two numbers sit on top of each other. They part company the moment one host degrades - that is, <strong>at the exact moment the metric is needed.</strong></p>
+                    <ul>
+                        <li>A metric that is correct when things are fine and wrong when they are not <strong>cannot be used to detect that things are not fine</strong>, which is its only purpose</li>
+                        <li>It also resists verification. Compare the two values during normal operation and they match, so the review concludes there is no problem. Any validation done only in the healthy state passes this defect</li>
+                        <li>The size of the error scales with <strong>how badly homogeneity has broken</strong>. And broken homogeneity is precisely the event you were looking for. The instrument fails as the signal grows</li>
+                    </ul>
+
+                    <h2>2. Skew the traffic and even the sign of the error flips</h2>
+                    <p>Real fleets do not receive traffic evenly. Canary deploys, shuffle sharding, sticky sessions, uneven zone capacity, dedicated nodes for one large customer - there are many reasons for a lopsided distribution. Here is the same calculation with one server taking 80 percent of requests.</p>
+                    <pre><code>--- case A: the BUSY server is the slow one ---
+server     requests   share      p99
+------------------------------------------------------------------------------
+app-01       80000   80.0 %   493.62
+app-02        2222    2.2 %    47.13
+app-03        2222    2.2 %    46.89
+app-04        2222    2.2 %    47.10
+app-05        2222    2.2 %    44.81
+app-06        2222    2.2 %    46.83
+app-07        2222    2.2 %    45.52
+app-08        2222    2.2 %    44.62
+app-09        2222    2.2 %    47.34
+app-10        2222    2.2 %    46.52
+------------------------------------------------------------------------------
+MEAN of per-server p99            :    91.04 ms
+request-count WEIGHTED mean of p99:   404.16 ms
+TRUE pooled p99                   :   449.63 ms
+mean  deviation from truth        :   -79.75 %   (ratio 0.2025 x)
+weighted deviation from truth     :   -10.11 %   (ratio 0.8989 x)</code></pre>
+                    <p>The averaged p99 is <strong>91.04 ms</strong> and the true p99 is <strong>449.63 ms</strong>. <strong>A factor of 4.94</strong>, understated by 79.75 percent. Section 1's 33.94 percent has grown to 79.75. The reason is plain: the server that actually builds the tail handles 80 percent of traffic, and the mean still gives it one tenth of the weight.</p>
+                    <p>So weight by request count? That column is in the same table: the weighted mean is 404.16 ms, understated by 10.11 percent. Much better. But is that a principle or an accident? The conditions were inverted exactly - same numbers, <strong>only which server is busy</strong> changed.</p>
+                    <pre><code>--- case B: the BUSY server is the fast one ---
+server     requests   share      p99
+------------------------------------------------------------------------------
+app-01       80000   80.0 %    45.22
+app-02        2222    2.2 %   433.31
+app-03        2222    2.2 %   543.06
+app-04        2222    2.2 %   513.11
+app-05        2222    2.2 %   560.31
+app-06        2222    2.2 %   486.16
+app-07        2222    2.2 %   423.37
+app-08        2222    2.2 %   620.89
+app-09        2222    2.2 %   489.19
+app-10        2222    2.2 %   471.45
+------------------------------------------------------------------------------
+MEAN of per-server p99            :   458.61 ms
+request-count WEIGHTED mean of p99:   137.07 ms
+TRUE pooled p99                   :   217.55 ms
+mean  deviation from truth        :  +110.80 %   (ratio 2.1080 x)
+weighted deviation from truth     :   -36.99 %   (ratio 0.6301 x)
+
+the sign of the error flips between the two cases:
+  case A  mean is -79.75 % off  (dashboard says 91.04 ms, reality 449.63 ms)
+  case B  mean is +110.80 % off  (dashboard says 458.61 ms, reality 217.55 ms)</code></pre>
+                    <p>Now the busy server is fast and the nine idle ones are slow. The averaged p99 is 458.61 ms against a true 217.55 ms: <strong>overstated by 110.80 percent.</strong> <strong>The sign flipped.</strong> And the count-weighted mean is 137.07 ms, understated by 36.99 percent - the method that looked good a moment ago is no better than the plain mean here.</p>
+                    <ul>
+                        <li><strong>The sign of the error depends on the situation.</strong> So no approach of the form multiply by roughly this factor can work. You cannot correct an error whose direction you do not know</li>
+                        <li>Case A is a dashboard showing 91 ms when reality is 450 ms. <strong>You miss the incident.</strong> That is precisely the symptom in the introduction</li>
+                        <li>Case B is a dashboard showing 459 ms when reality is 218 ms. <strong>You chase an incident that does not exist.</strong> There is no cause to find, so the investigation never ends</li>
+                        <li>The two lists of per-server p99 values <strong>contain the same elements.</strong> All that differs is which value sits next to the large traffic, and that pairing is not present in the list of p99 values</li>
+                        <li>Count weighting worked in case A because one server was so dominant that <strong>its own p99 nearly was the pooled p99.</strong> That is a situation, not a principle. Section 5 pushes on this</li>
+                    </ul>
+
+                    <h2>3. Maxima do merge - the decisive difference between p100 and p99</h2>
+                    <p>An objection is available here. Is the maximum not the 100th percentile? Does that fail to merge as well? Running it splits the answer, and that split is the most important conceptual point in this article.</p>
+                    <pre><code>per-group max : 402.68, 409.36, 451.85, 627.13, 577.14, 699.29, 517.51, 531.50, 1107.77, 729.08
+
+MEAN of per-group max :   605.3333 ms
+MAX  of per-group max :  1107.7706 ms
+TRUE max of pooled    :  1107.7706 ms
+mean equals truth     : False   (off by -45.36 %)
+max-of-max equals truth: True
+min-of-min equals truth: True</code></pre>
+                    <p>The mean of the per-group maxima is 605.33 ms against a true maximum of 1107.77 ms, understated by 45.36 percent - <strong>the mean is wrong here too.</strong> But taking the maximum of the maxima gives <strong>an exact match</strong>: equal to four decimal places, and <code>True</code> under a floating-point comparison. Minima behave the same way.</p>
+                    <p>The difference is not in the name but in the algebra. The maximum has a <strong>fold rule</strong> that builds the whole from the parts: the maximum of a union always equals the maximum of the parts' maxima. p99 has no such rule. <strong>There exists no function</strong> that computes the p99 of a union from the p99 values of the parts. This is not a statement about a poor approximation; the function does not exist.</p>
+                    <ul>
+                        <li>Maxima fold because <strong>each part's maximum carries everything needed about that part.</strong> The only candidates for the overall maximum are the part maxima; the remaining values were never candidates</li>
+                        <li>p99 is different. The value that becomes the pooled p99 can sit <strong>anywhere inside a part.</strong> In section 1 the true p99 of 209.67 was neither <code>web-10</code>'s p99 of 1020.21 nor the roughly 40 ms of the others. It sat somewhere in <code>web-10</code>'s middle</li>
+                        <li>So it is true that p100 merges while p99 does not. <strong>p100 is not the extreme member of the percentile family but a different kind of statistic</strong>, and the similar name is what breeds the confusion</li>
+                        <li>There is a practical consequence. <strong>Maximum-based metrics are safe to aggregate at any granularity</strong> - slowest request, longest queue, peak concurrency. You never need to suspect the computation path. They are also entirely decided by one request, so they are noisy. Safe and useful are separate properties</li>
+                    </ul>
+
+                    <h2>4. Which metrics merge and which do not</h2>
+                    <p>Now check them one at a time. Six groups, deliberately given different sizes (3,000 up to 7,500). Equal sizes would make the plain mean and the weighted mean coincide by accident and hide the distinction. And to keep floating-point rounding from muddying any claim of exact equality, values were converted to <strong>integer microseconds</strong> first.</p>
+                    <pre><code>6 groups, sizes: 3000, 3900, 4800, 5700, 6600, 7500   total 31500 requests
+all values are integer microseconds, so sums are exact integers.
+
+metric      fold used on the parts        recomputed      from raw data    exact
+------------------------------------------------------------------------------
+count       sum of counts                          31500            31500    True
+sum         sum of sums                       1498826643       1498826643    True
+max         max of maxes                         2181107          2181107    True
+min         min of mins                              337              337    True
+mean        plain mean of means               42220.2378       47581.7982    False
+mean        count-weighted mean of means      47581.7982       47581.7982    True
+p99         plain mean of p99s               267686.0000      373760.0000    False
+p99         count-weighted mean of p99s      318257.0000      373760.0000    False
+p50         plain mean of medians             24974.0000       25084.0000    False
+------------------------------------------------------------------------------
+
+the plain mean of means is off by -11.2681 % here; the weighted one is exact.
+no weighting rescues p99: see section 5.</code></pre>
+                    <p>The last column is the point of this section. Count, sum, max and min are <strong>fully recoverable</strong> from the partial results, and <code>True</code> there means integer identity, not approximation. The mean is conditional: the plain mean is off by 11.2681 percent, while weighting by count is <strong>exact</strong>. p99 and p50 are recoverable by no method at all.</p>
+                    <p>Summarised:</p>
+                    <table>
+                        <thead>
+                            <tr><th>Metric</th><th>How the parts fold</th><th>Exact?</th><th>What you need in order to merge</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Count</td><td>Sum of the counts</td><td><strong>Exact</strong></td><td>The count. It is complete in itself</td></tr>
+                            <tr><td>Sum</td><td>Sum of the sums</td><td><strong>Exact</strong></td><td>The sum. Addition is associative</td></tr>
+                            <tr><td>Max</td><td>Max of the maxima</td><td><strong>Exact</strong></td><td>One maximum value</td></tr>
+                            <tr><td>Min</td><td>Min of the minima</td><td><strong>Exact</strong></td><td>One minimum value</td></tr>
+                            <tr><td>Mean</td><td>Plain mean of the means</td><td><strong>Wrong</strong></td><td>-- it breaks whenever group sizes differ</td></tr>
+                            <tr><td>Mean</td><td>Means weighted by count</td><td><strong>Exact</strong></td><td><strong>Sum and count.</strong> Keeping only the mean is not enough</td></tr>
+                            <tr><td>Variance, stddev</td><td>Recomputed from count, sum, sum of squares</td><td><strong>Conditionally exact</strong></td><td>Store all three and it comes back</td></tr>
+                            <tr><td>Median (p50)</td><td>No fold rule</td><td><strong>Impossible</strong></td><td>Raw data or a histogram</td></tr>
+                            <tr><td>p95, p99</td><td>No fold rule</td><td><strong>Impossible</strong></td><td>Raw data or a histogram</td></tr>
+                        </tbody>
+                    </table>
+                    <p>The variance row is the most instructive line in the table. Store only the standard deviation and you cannot merge; store count, sum and sum of squares and it recovers exactly. <strong>The same metric is mergeable or not depending on what you stored.</strong> That property is the whole basis of the histogram approach in section 10.</p>
+                    <ul>
+                        <li>Mergeability is not a property of the metric but <strong>a property of the summary you saved.</strong> This leads straight to the practical conclusion of this article</li>
+                        <li>A mean stored without its count cannot be merged. If a dashboard keeps means and drops counts, <strong>even the mean stops merging.</strong> And as the table shows, that error lands around 11 percent, which is small enough to go unnoticed</li>
+                        <li>No auxiliary number rescues a percentile. The exception is a summary that <strong>approximates the distribution itself</strong> (bucketed histograms and similar), and that is a structure rather than a single number</li>
+                        <li>Read backwards, this is the collection rule. <strong>Any metric you will need to recompute at a different granularity must be stored in a foldable form.</strong> Store it in a non-foldable form and every later re-aggregation is wrong</li>
+                        <li>The two rows marked impossible happen to be the two metrics dashboards use most. That is the size of this problem</li>
+                    </ul>
+
+                    <h2>5. Why weighting cannot rescue a percentile</h2>
+                    <p>Count weighting worked in one case in section 2, which makes it look like a matter of picking better weights. Several weighting schemes were applied to one dataset to see which of them works as a principle.</p>
+                    <pre><code>group  requests   weight      p99
+------------------------------------------------------------------------------
+a         60000   0.6000    65.06
+b         25000   0.2500    87.34
+c         10000   0.1000   920.90
+d          5000   0.0500  2504.83
+------------------------------------------------------------------------------
+TRUE pooled p99                 :   413.37 ms
+  plain mean of p99              :   894.53 ms   deviation  +116.40 %
+  count-weighted mean of p99     :   278.20 ms   deviation   -32.70 %
+  square-root-count weighted     :   521.03 ms   deviation   +26.04 %
+  tail-count weighted (0.01*n)   :   278.20 ms   deviation   -32.70 %
+  max of p99                     :  2504.83 ms   deviation  +505.95 %
+  min of p99                     :    65.06 ms   deviation   -84.26 %</code></pre>
+                    <p>The true p99 is 413.37 ms. The plain mean is 116.40 percent high, count weighting 32.70 percent low, square-root weighting 26.04 percent high. None is right, and none is consistently wrong in one direction.</p>
+                    <p>Notice that the row weighted by 0.01 times the request count produced <strong>exactly the same value</strong> as count weighting. Scaling every weight by a constant does not change a weighted mean. In other words, <strong>any weight derived from request counts gives the same answer as count weighting</strong>, because no new information entered. That is where weight tuning hits a wall.</p>
+                    <p>So which weights are correct? The correct weights are each group's share of <strong>the pooled top one percent</strong>. Those were extracted directly.</p>
+                    <pre><code>group  share of traffic   share of the pooled top 1 percent
+------------------------------------------------------------------------------
+a               60.00 %                         0.00 %
+b               25.00 %                         0.00 %
+c               10.00 %                        42.86 %
+d                5.00 %                        57.14 %
+------------------------------------------------------------------------------</code></pre>
+                    <p>Groups a and b, holding <strong>85 percent</strong> of the traffic, contribute <strong>zero percent</strong> of the tail. The tail is built by c and d, which hold 15 percent. So the correct weight vector is close to (0, 0, 0.4286, 0.5714) while the count weights are (0.6, 0.25, 0.1, 0.05). The two vectors point in effectively opposite directions.</p>
+                    <ul>
+                        <li>The correct weight is <strong>each group's tail contribution</strong>, and that only emerges from the raw data. Once only per-server p99 values remain, the information is gone</li>
+                        <li>So this is not a problem of choosing weights. It is an attempt to express <strong>a value that the weighted-mean form cannot represent at all.</strong> The form lacks expressive power; the coefficients are not merely mistuned</li>
+                        <li>The practical core is that traffic share and tail share are unrelated. <strong>The intuition that the busiest server matters most does not hold in the tail.</strong> A quiet node building the entire tail is a common pattern</li>
+                        <li>A weighted mean does sometimes land close by luck (10.11 percent in case A). Even then, <strong>the only way to know it landed close is to look at the raw data.</strong> An approximation you cannot check is not an approximation but a guess</li>
+                    </ul>
+
+                    <h2>6. What the mean hides - one section only</h2>
+                    <p>The reason for using percentiles at all gets one short check, because it is not this article's subject. Two distributions were built with nearly identical mean response times.</p>
+                    <pre><code>shape                     mean      p50      p90      p99     p999      max
+------------------------------------------------------------------------------
+A near-normal             40.00    40.01    47.68    53.92    58.41    66.46
+B long tail               39.85    24.36    46.17   473.97  1670.75  6766.82
+------------------------------------------------------------------------------
+means differ by 0.38 %, but p99 differs by 8.79 x and p999 by 28.60 x.</code></pre>
+                    <p>The means are 40.00 and 39.85, a difference of <strong>0.38 percent</strong>. The p99 values are 53.92 and 473.97, a factor of <strong>8.79</strong>, and the p99.9 values differ by <strong>28.60x</strong>. A report on mean response time would be effectively the same document for both services, while the user experience is nothing alike.</p>
+                    <ul>
+                        <li>The mean is useful when the distribution is symmetric like shape A. Real response times mostly look like B. That is why tail metrics exist</li>
+                        <li>B's median (24.36) is <strong>below</strong> its mean (39.85). In a long-tailed distribution the mean is worse than what most users see, so users faster than the mean are the majority. The mean represents nobody</li>
+                        <li>That is as far as this section goes. The relationship between means and tails is its own subject, and <strong>this article is about how to merge a tail metric once you have decided to use one.</strong> Sections 6 and 7 each get one section and no more</li>
+                    </ul>
+
+                    <h2>7. There is more than one definition of a percentile - one section only</h2>
+                    <p>Before comparing numbers across tools, something else needs checking. Several calculation rules live under the single name p95. Several were applied to one small sample of n=20.</p>
+                    <pre><code>n = 20 sorted sample: [12, 14, 15, 15, 18, 21, 24, 29, 33, 41, 55, 60, 78, 92, 140, 260, 410, 900, 1200, 3000]
+
+definition                                  p95        p99
+------------------------------------------------------------------------------
+nearest-rank ceil(p/100*n)                  1200.00    3000.00
+lower rank floor(p/100*n)                   1200.00    1200.00
+linear interp, inclusive (R-7)              1290.00    2658.00
+linear interp, exclusive, clamped           2910.00    3000.00
+statistics.quantiles inclusive              1290.00    2658.00
+statistics.quantiles exclusive              2910.00    4422.00
+------------------------------------------------------------------------------
+spread of p95 across definitions : 1200.00 to 2910.00 ms  (2.42 x)
+my linear-inclusive matches statistics inclusive at p95 : True
+my linear-exclusive matches statistics exclusive at p95 : True
+
+note the exclusive p99 cell: 4422.00 ms, while the largest observation is 3000.00 ms.
+that method is documented as being for a population that can hold more
+extreme values than the sample, so it is allowed to point past the data.
+my clamped variant caps at the maximum instead, which is why the two
+agree at p95 and part ways at p99. same name, two answers.
+
+same comparison on n = 200000 from one distribution:
+  nearest-rank             p99 =   127.8243 ms
+  lower rank               p99 =   127.8243 ms
+  linear inclusive         p99 =   127.8245 ms
+  linear exclusive         p99 =   127.8466 ms
+  spread : 0.0223 ms  (0.0175 % of the value)</code></pre>
+                    <p>From the same twenty numbers, p95 ranges from 1200 to 2910, <strong>a factor of 2.42</strong>. And look at the last row. The exclusive method's p99 is <strong>4422 ms</strong> while the largest observation in the sample is 3000 ms. <strong>It returned a value larger than anything observed.</strong></p>
+                    <p>This is not a bug. The Python standard library documentation states that this method is for a population that can hold more extreme values than those found in the sample, and that the fraction below the i-th of m points is computed as <code>i / (m + 1)</code>. It behaved to specification. My own implementation clamps at the maximum, which is why the two agree at p95 and diverge at p99. <strong>One name, two answers.</strong></p>
+                    <table>
+                        <thead>
+                            <tr><th>Definition</th><th>p95 at n=20</th><th>p99 at n=20</th><th>Character</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Nearest-rank (default here)</td><td>1200.00</td><td>3000.00</td><td>Always points at one observed value</td></tr>
+                            <tr><td>Lower rank (floor)</td><td>1200.00</td><td>1200.00</td><td>Reuses a value and reads conservatively low</td></tr>
+                            <tr><td>Linear interpolation, inclusive</td><td>1290.00</td><td>2658.00</td><td>Treats min as 0 percent and max as 100 percent</td></tr>
+                            <tr><td>Linear interpolation, exclusive (clamped)</td><td>2910.00</td><td>3000.00</td><td>Interpolates but is held inside the observed range</td></tr>
+                            <tr><td>Linear interpolation, exclusive (library)</td><td>2910.00</td><td><strong>4422.00</strong></td><td><strong>Returns more than the maximum of 3000</strong></td></tr>
+                        </tbody>
+                    </table>
+                    <p>The differences vanish as samples grow. Across 200,000 samples the four methods' p99 values span <strong>0.0223 ms</strong>, or 0.0175 percent of the value. So this problem and the aggregation problem are not the same size.</p>
+                    <ul>
+                        <li>When comparing numbers across tools, <strong>align the definitions first.</strong> Default definitions can differ, so read each tool's own documentation. Nothing here asserts what any particular product does internally</li>
+                        <li>Definition differences only matter <strong>on small samples.</strong> Low-traffic endpoints with a few dozen requests per minute are the risky zone, and section 8 is about that</li>
+                        <li><strong>Definition differences are not the cause of the 4x to 5x gaps in this article.</strong> Conflating the two problems loses the real cause. When numbers are badly apart, check the <strong>aggregation path</strong> before hunting definitions</li>
+                        <li>That is as far as this section goes too. Digging into the character of each definition is a separate subject</li>
+                    </ul>
+
+                    <h2>8. On small samples, p99 is another name for the maximum</h2>
+                    <p>Aggregation aside, a p99 is unstable when a window holds few requests to begin with. The same population was sampled repeatedly at different sample sizes. Because it is lognormal, the true p99 can be computed analytically, so the estimates can be compared against what they are aiming at.</p>
+                    <pre><code>population: lognormal, median 20.0 ms, sigma 0.80
+analytic population p99 = median * exp(sigma * 2.3263478740408408) = 128.6133 ms
+
+     n   trials      p5   median      p95     min      max   p95/p5   which rank is used
+------------------------------------------------------------------------------
+   100     2000   75.89   109.77   166.90   53.84   300.51    2.199   rank 99 of 100 (1 above it)
+  1000     2000  109.97   126.51   148.66   94.90   176.01    1.352   rank 990 of 1000 (10 above it)
+ 10000      500  122.15   128.53   134.93  116.72   142.29    1.105   rank 9900 of 10000 (100 above it)
+100000      100  126.87   128.62   130.55  125.97   131.80    1.029   rank 99000 of 100000 (1000 above it)
+------------------------------------------------------------------------------
+
+a single n=100 window, its top 5 values : 63.23, 63.43, 67.21, 75.07, 80.44
+nearest-rank p99 of it                 : 75.07 ms   (the 99th of 100, i.e. 2nd largest)
+drop that one request and p99 becomes  : 80.44 ms</code></pre>
+                    <p>The population's true p99 is 128.6133 ms. At n=100, the estimated p99 has its 5th percentile at 75.89 and its 95th at 166.90 - <strong>a 2.199x spread</strong>. Across 2,000 trials the minimum was 53.84 and the maximum 300.51. At n=100,000 that spread narrows to 1.029x.</p>
+                    <p>The rightmost column explains the wobble. The p99 of 100 samples is the 99th value, and <strong>exactly one request sits above it.</strong> One actual window was opened to check. Its top five were 63.23, 63.43, 67.21, 75.07 and 80.44, and the p99 is 75.07. Remove that one request and the p99 becomes 80.44.</p>
+                    <ul>
+                        <li>The p99 of 100 samples is effectively <strong>the second slowest request.</strong> The word percentile guarantees no statistical stability</li>
+                        <li>So a p99 alert on a low-traffic endpoint moves with a single request. Widening the window or <strong>using a lower quantile (p90, p95)</strong> is the honest option. Watching p99 over 100 requests is close to watching the maximum and calling it p99</li>
+                        <li>Widening a window and <strong>merging per-window p99 values are different operations.</strong> The latter does not work, as section 9 shows. Widening requires recomputing from raw data across the wider window</li>
+                        <li>A percentile chart without its sample count is unreadable. <strong>Plot the denominator alongside.</strong> A p99 that jumps around in a period of collapsed traffic may be sample starvation rather than a performance change</li>
+                    </ul>
+
+                    <h2>9. Time behaves the same - sixty one-minute p99 values do not make an hourly p99</h2>
+                    <p>The grouping axis so far was the host. Switching to time changes nothing. Sixty minutes of 1,200 requests each, 72,000 in total, with a degradation window inserted for five minutes in the middle - shaped like a real incident.</p>
+                    <pre><code>60 minutes x 1200 requests = 72000 requests
+per-minute p99, minutes 25 to 32 : 68.1, 77.8, 1130.7, 1868.3, 1208.6, 1041.3, 1525.5, 69.8
+
+fold applied to the 60 per-minute p99 values      value      deviation
+------------------------------------------------------------------------------
+mean                                                 175.68       -36.98 %
+median                                                68.07       -75.58 %
+max                                                 1868.28      +570.19 %
+min                                                   61.20       -78.05 %
+p95 of the 60 values                                1130.71      +305.61 %
+TRUE hourly p99 from raw requests                    278.77            -
+------------------------------------------------------------------------------</code></pre>
+                    <p>The true hourly p99 is <strong>278.77 ms</strong>. Averaging the sixty per-minute p99 values gives 175.68 ms, 36.98 percent low. Taking their maximum gives 1868.28 ms, 570.19 percent high. Taking their median gives 68.07 ms, 75.58 percent low. <strong>No fold is correct, and the error range spans more than an order of magnitude.</strong></p>
+                    <p>This is the last symptom from the introduction. The spikes in the per-minute chart and the single number labelled p99 for this hour are <strong>different quantities</strong>, and neither is computable from the other. Nor is either one a bug for disagreeing with the other.</p>
+                    <ul>
+                        <li>Nothing about the time axis makes a percentile additive. Combining twelve five-minute p99 values into an hour, or twenty-four hourly ones into a day, is the same error</li>
+                        <li>Check how numbers are computed when you <strong>change the time range</strong> on a dashboard. Tools that automatically re-bucket to match the pixel width of the chart can quietly re-aggregate right here. If zooming changes the value, that is your signal</li>
+                        <li>Set an alert threshold on a one-minute window and write the weekly report on an hourly window, and <strong>the two numbers cannot validate each other.</strong> An alert firing while the report stays calm can be correct behaviour</li>
+                        <li>The median fold gives 68.07 ms. Five degraded minutes <strong>vanish entirely</strong> into the other fifty-five. Tail events are diluted identically on the host axis and the time axis</li>
+                    </ul>
+
+                    <h2>10. Histograms - an approximation you can actually merge</h2>
+                    <p>Does this mean holding all 100,000 raw values forever? There is an alternative, and its basis is already in section 4. <strong>Counts merge.</strong> Split values into buckets, store the count per bucket, and those counts can be added across servers. Applied to the same fleet as case A in section 2.</p>
+                    <pre><code>same fleet as section 2 case A. TRUE pooled p99 = 438.6759 ms
+
+bucket scheme              buckets   est p99   deviation   bucket holding the answer
+------------------------------------------------------------------------------
+coarse                           7  491.7815     +12.11 %   [100.00, 500.00] width 400.00
+pow2                            15  478.8454      +9.16 %   [256.00, 512.00] width 256.00
+growth10                       112  439.7592      +0.25 %   [405.27, 445.79] width 40.53
+linear10                       399  438.8169      +0.03 %   [430.00, 440.00] width 10.00
+------------------------------------------------------------------------------
+
+for comparison, the mean of the same fleet's per-server p99 was -79.68 % off.
+
+what merging actually did: bucket counts were ADDED across the 10 servers
+before any percentile was computed. that is the whole difference.</code></pre>
+                    <p>Bucket boundaries were varied. The coarse seven-bucket layout is 12.11 percent high, fifteen powers of two 9.16 percent, 112 buckets growing by 10 percent <strong>0.25 percent</strong>, and 399 buckets at 10 ms intervals <strong>0.03 percent</strong>. On the same data, averaging the per-server p99 was 79.68 percent wrong. <strong>Even the coarsest histogram beats the averaged p99 by more than sixfold.</strong></p>
+                    <p>What made the difference is not the formula but <strong>the order</strong>. The histogram path added counts before computing any percentile. The per-server path computed a percentile first. That order is the whole story, and it is also this article's operational conclusion: <strong>put the merge before the summary.</strong></p>
+                    <p>It is still an approximation, though, and the nature of the error is worth pinning down.</p>
+                    <pre><code>interpolation inside the last bucket assumes the values are spread evenly
+in it. checking that assumption on the bucket that held the answer:
+  bucket [256.00, 512.00] holds 2185 requests
+  if evenly spread, half of them would sit below 384.00 ms
+  actually below the midpoint : 1589 of 2185 = 72.72 %
+  so the values crowd the LOW edge here, and even interpolation
+  reads high for this bucket. with a different shape or different
+  boundaries the sign can go the other way, so treat this as a
+  measurement of THIS histogram, not a general rule.
+
+bounded claim you can rely on: the estimate stays inside the bucket that
+contains the true rank, so the error cannot exceed that bucket's width.
+checked here for every scheme above:
+  coarse       true 438.68 and est 491.78 both inside [100.00, 500.00] : True   abs error 53.1056 ms, bucket width 400.0000 ms
+  pow2         true 438.68 and est 478.85 both inside [256.00, 512.00] : True   abs error 40.1695 ms, bucket width 256.0000 ms
+  growth10     true 438.68 and est 439.76 both inside [405.27, 445.79] : True   abs error 1.0833 ms, bucket width 40.5265 ms
+  linear10     true 438.68 and est 438.82 both inside [430.00, 440.00] : True   abs error 0.1410 ms, bucket width 10.0000 ms</code></pre>
+                    <p>The bucket holding the answer (256 to 512 ms) contained 2,185 requests. If they were spread evenly, half would sit below the midpoint of 384 ms; in fact <strong>72.72 percent</strong> did. So values crowd the low edge of this bucket, and interpolation under a uniform assumption read high.</p>
+                    <div class="callout">
+                        <p><strong>No general claim is made here.</strong> That 72.72 percent and the sign of the error are <strong>what was observed for this distribution and these bucket boundaries.</strong> A different shape or different boundaries can flip the sign. Do not extract a rule like histogram interpolation always reads high from this single run. If you want to know the direction of your error, run the same check on your own data with your own boundaries.</p>
+                        <p>For the same reason, <strong>nothing here asserts how any particular monitoring product estimates quantiles from histograms.</strong> Interpolation methods and bucket definitions can differ between implementations. Check the documentation of the tool you use. This section demonstrates a property of the method, not what any product does.</p>
+                    </div>
+                    <p>There is, however, a bound with a clear shape that the run does establish. The estimate <strong>stays inside the bucket that contains the true rank</strong>, and the true value is in that same bucket. So the absolute error cannot exceed that bucket's width. This held for all four layouts: 53.1056 ms of error against a 400 ms bucket in the coarse layout, and 0.1410 ms against a 10 ms bucket in the finest.</p>
+                    <ul>
+                        <li>The way to reduce the error is <strong>finer buckets in the range you care about.</strong> That is more reliable and more predictable than changing the interpolation method</li>
+                        <li>Which range needs to be fine must be decided in advance. Here the p99 lived in the 400 ms region, so that region mattered. <strong>Design bucket boundaries to cover the expected latency range.</strong> Changing boundaries afterwards makes historical comparison impossible</li>
+                        <li>If values land in the final overflow bucket, no percentile can be computed at that point. <strong>Set the upper bound generously</strong> - above your timeout value is the safe choice</li>
+                        <li>Histogram storage cost is bucket count times series count. <strong>Accuracy trades directly against cost.</strong> The storage cost of logs and traces themselves is covered in <a href="clickhouse_observability_2026.html">the ClickHouse observability piece</a></li>
+                        <li>Beyond histograms there are several families of sketch structures for approximating quantiles, with different shapes of error guarantee. <strong>The one thing they share matters most: each has an operation for merging parts, and a single percentile number has none</strong></li>
+                    </ul>
+
+                    <h2>11. A user meets a screen, not a request</h2>
+                    <p>Even a correctly computed request p99 leaves one layer to go. Users do not send one request. One screen fires many. Leave this layer out and you cannot explain why complaints stayed flat after the p99 improved.</p>
+                    <pre><code>if a screen fires k independent requests and each has a 1 percent chance
+of landing above the request-level p99, the chance the screen contains at
+least one of them is 1 - 0.99^k:
+
+     k   P(at least one slow)   expected slow requests per screen
+------------------------------------------------------------------------------
+     1               1.0000 %                          0.010
+     2               1.9900 %                          0.020
+     3               2.9701 %                          0.030
+     5               4.9010 %                          0.050
+     8               7.7255 %                          0.080
+    10               9.5618 %                          0.100
+    20              18.2093 %                          0.200
+    30              26.0300 %                          0.300
+    50              39.4994 %                          0.500
+   100              63.3968 %                          1.000
+------------------------------------------------------------------------------
+at k = 69 the screen exceeds a coin flip: P = 50.0163 %</code></pre>
+                    <p>If a screen fires k requests and each has a 1 percent chance of landing above the request-level p99, the chance the screen contains at least one is 1 minus 0.99 to the k. That is 9.5618 percent at k=10, 18.2093 percent at k=20 and 63.3968 percent at k=100. <strong>It passes a coin flip at k=69.</strong></p>
+                    <p>This was also measured rather than assumed. Screens were drawn 40,000 at a time from the request population of case A in section 2, and screen latency was computed two ways: the maximum of the requests (fully parallel) and their sum (fully serial).</p>
+                    <pre><code>request-level p50 = 24.33 ms   request-level p99 = 435.58 ms
+
+     k   screens   frac with a slow request   screen p50(max)  screen p99(max)  screen p50(sum)  screen p99(sum)
+------------------------------------------------------------------------------------------------------------------------
+     1     40000                     1.020 %             24.20            442.26             24.20            442.26
+     3     40000                     3.045 %             64.99            709.26            109.49            820.36
+     5     40000                     4.938 %             97.71            828.38            205.77           1058.17
+    10     40000                     9.433 %            159.16           1093.44            455.44           1658.83
+    20     40000                    18.088 %            232.84           1404.46            968.31           2552.58
+    40     40000                    32.992 %            336.73           1781.27           2008.24           4087.61
+------------------------------------------------------------------------------------------------------------------------</code></pre>
+                    <p>The request p99 is 435.58 ms. For a screen firing twenty requests, the serial p99 is <strong>2552.58 ms</strong> and the parallel p99 is <strong>1404.46 ms</strong>. The request metric did not move and the screen metric multiplied. The fraction of screens containing a slow request also matched well: 18.2093 percent predicted against 18.088 percent measured.</p>
+                    <ul>
+                        <li>So improving the request p99 while increasing requests per screen means <strong>the two changes cancel and the dashboard shows nothing happening.</strong> Meanwhile the user experience can get worse</li>
+                        <li>Requests per screen is usually recorded nowhere. It <strong>grows quietly</strong> through frontend changes and added widgets. A team watching only backend metrics cannot see the change</li>
+                        <li>Parallelising turns the sum into a maximum. In the table at k=20 it fell from 2552.58 to 1404.46. That is still more than three times the request p99. <strong>Parallelism reduces the problem without removing it</strong></li>
+                        <li>Where possible, <strong>measure latency per screen or per transaction</strong> rather than per request, and treat request percentiles as secondary. Screen-level measurement also has one raw row per screen, which shrinks the section 4 problem as well</li>
+                    </ul>
+
+                    <h2>12. Diagnosis - deciding whether the number in front of you was merged wrongly</h2>
+                    <p>One question remains. How do you know whether the p99 you are looking at was merged wrongly? Dashboards do not show their arithmetic, and you may not be in a position to read the query. There is a test, though. <strong>A correctly computed percentile does not change when you change the grouping.</strong> A wrongly folded one does.</p>
+                    <pre><code>grouping            groups   mean of group p99   max of group p99   sum   count   max
+------------------------------------------------------------------------------------------------
+10 groups                10              128.39             916.06    2.67  100000 50869.28
+5 groups                  5              159.47             634.13    2.67  100000 50869.28
+2 groups                  2              190.62             340.29    2.67  100000 50869.28
+1 groups                  1              198.82             198.82    2.67  100000 50869.28
+------------------------------------------------------------------------------------------------
+TRUE pooled p99 = 198.82 ms
+
+the mean column moved from 128.39 to 198.82 as the grouping changed, a 1.55 x
+swing on identical data. sum, count and max did not move at all. that
+difference is the whole diagnosis.</code></pre>
+                    <p>The same 100,000 requests were grouped into 10, 5, 2 and 1 groups, and the mean of the per-group p99 was taken each time. It moved from 128.39 to 159.47 to 190.62 to 198.82. <strong>A 1.55x swing.</strong> Not one data point changed; only the grouping did.</p>
+                    <p>Sum, count and max, meanwhile, are identical in all four cases - fixed at 2.67, 100000 and 50869.28. <strong>That contrast is the entire diagnosis.</strong> A number that moves when you change the grouping was folded wrongly; a number that does not was computed properly.</p>
+                    <p>The max column moved too (916.06 to 634.13 to 340.29 to 198.82), but <strong>in one direction only</strong>, and never below the true value. Whether that was luck got checked.</p>
+                    <pre><code>the max column moved too, but only downward, and it never went below the
+truth. that is not a coincidence. checking the bounds over 400 random
+fleet configurations, all with a fixed seed:
+
+  trials                                   : 400
+  times pooled p99 exceeded max of group p99: 0
+  times pooled p99 fell below min of group p99: 0
+  worst overshoot above the max bound       : +0.000000 %
+  worst undershoot below the min bound      : +0.000000 %
+
+counting argument behind it: each group has at most 1 percent of its own
+requests above its own p99, so at most 1 percent of the pooled requests
+sit above the largest of those values. that makes max of group p99 an
+upper bound for the pooled p99, and min a lower bound. it is not the
+answer, but it is a bound, which a mean is not.
+
+so if per-group percentiles are all you have, fold with max, not mean.
+the bound tightens as groups get coarser; it is loosest when cardinality
+is highest, which is exactly when dashboards slice most finely.</code></pre>
+                    <p>Across 400 random fleet configurations, the true p99 exceeded the maximum of the per-group p99 values <strong>zero</strong> times, and fell below their minimum <strong>zero</strong> times. A counting argument explains it. Each group holds at most 1 percent of its own requests above its own p99. Therefore at most 1 percent of the pooled requests sit above the largest of those values. So that largest value is an <strong>upper bound</strong> on the pooled p99, and the smallest is a lower bound by the same reasoning.</p>
+                    <p>Practically, this is the best available when only per-server percentiles survive. <strong>Fold with max, not mean.</strong> It is not the answer, but it is a bound, and a bound supports the judgement that things are no worse than this. A mean is neither an upper nor a lower bound and supports no judgement at all. The bound also tightens as groups get coarser, which means <strong>it is loosest at high cardinality, and dashboards slice most finely exactly then.</strong></p>
+                    <table>
+                        <thead>
+                            <tr><th>Check</th><th>What you do</th><th>The tell that it was merged wrongly</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Change the grouping</td><td>View the same metric per host, then per region, then fleet-wide</td><td><strong>The number moves.</strong> Rising as groups coarsen means a mean fold</td></tr>
+                            <tr><td>Change the time range</td><td>Widen the window from 1 hour to 6 hours to 1 day</td><td>p99 <strong>falls</strong> as you widen. Per-window values were averaged</td></tr>
+                            <tr><td>Count threshold crossings</td><td>Count log requests exceeding the dashboard's p99 value</td><td><strong>Far more</strong> than 1 percent of the total. The p99 is understated</td></tr>
+                            <tr><td>Bound check</td><td>Compare the max of per-server p99 with the fleet p99</td><td>The fleet p99 is <strong>above that maximum.</strong> The computation itself is broken</td></tr>
+                            <tr><td>Single-node contrast</td><td>Pick the worst node and compare its p99 with the fleet p99</td><td>The fleet number is <strong>far lower.</strong> It has been diluted</td></tr>
+                        </tbody>
+                    </table>
+                    <ul>
+                        <li>The fastest check is <strong>changing the grouping.</strong> Two clicks, no query reading required. If it moves, it was folded wrongly</li>
+                        <li>The time-range check catches the section 9 error. <strong>If zooming changes the p99, suspect re-aggregation</strong></li>
+                        <li>The threshold-count check is the strongest of all. If the p99 is X ms, then exactly 1 percent of requests must exceed X. <strong>That is a definition, so it cannot be argued with.</strong> If the real count is 3 percent, the true p99 sits far above</li>
+                        <li>Sections 8 and 11 still apply after you have confirmed the arithmetic. <strong>Even a correctly computed p99 wobbles on small samples, and it is a different quantity from what a user experiences per screen</strong></li>
+                    </ul>
+
+                    <h2>13. The judgement table - what to collect so it can be recomputed later</h2>
+                    <p>To summarise: this is not a problem of choosing metrics but <strong>a problem of what you keep.</strong> What you did not keep does not come back, no matter how good a tool you attach later.</p>
+                    <table>
+                        <thead>
+                            <tr><th>What you want to see</th><th>Mergeable?</th><th>What to collect</th><th>Keeping only this ends it</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Total requests</td><td><strong>Yes</strong></td><td>A counter</td><td>-</td></tr>
+                            <tr><td>Throughput per second</td><td><strong>Yes</strong></td><td>A counter plus a timestamp</td><td>-</td></tr>
+                            <tr><td>Error rate</td><td><strong>Yes</strong></td><td>Error counter and total counter <strong>separately</strong></td><td><strong>The ratio alone</strong> cannot be merged</td></tr>
+                            <tr><td>Mean response time</td><td><strong>Conditional</strong></td><td>Sum and count</td><td><strong>The mean alone</strong> cannot be merged</td></tr>
+                            <tr><td>Standard deviation</td><td><strong>Conditional</strong></td><td>Count, sum, sum of squares</td><td><strong>The stddev alone</strong> cannot be merged</td></tr>
+                            <tr><td>Max and min latency</td><td><strong>Yes</strong></td><td>The maximum and the minimum</td><td>-</td></tr>
+                            <tr><td>Median, p90, p95, p99</td><td><strong>No</strong></td><td>Raw data or a <strong>bucketed histogram</strong></td><td><strong>The percentile value</strong> ends it</td></tr>
+                            <tr><td>Screen or transaction latency</td><td><strong>No</strong></td><td>Screen-level raw data or histogram</td><td>Request level alone cannot recover it</td></tr>
+                            <tr><td>Count of slow requests</td><td><strong>Yes</strong></td><td>Counters per threshold (a histogram, in effect)</td><td>-</td></tr>
+                            <tr><td>Which node builds the tail</td><td><strong>No</strong></td><td>Histograms labelled by node</td><td>Per-node percentiles alone cannot recover it</td></tr>
+                        </tbody>
+                    </table>
+                    <p>The last column is the heart of the table. <strong>What you discard is the irreversible decision, more than what you collect.</strong> And look at the slow-request row. Counters per threshold are a histogram, and histograms merge. <strong>Rephrase what is the p99 as how many requests exceeded 500 ms and the metric becomes a mergeable kind.</strong> Sometimes changing the question is the cheapest fix available.</p>
+                    <p>Every result in this article, gathered into one table. All of it comes from fixed seed 20260730.</p>
+                    <table>
+                        <thead>
+                            <tr><th>Situation</th><th>Wrongly merged</th><th>True value</th><th>Error</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>1 of 10 degraded, even traffic (mean of p99)</td><td>138.51 ms</td><td>209.67 ms</td><td>-33.94 %</td></tr>
+                            <tr><td>All 10 identical, even traffic (mean of p99)</td><td>127.55 ms</td><td>127.59 ms</td><td><strong>-0.03 %</strong></td></tr>
+                            <tr><td>Busy server is slow, 80 percent skew (mean of p99)</td><td>91.04 ms</td><td>449.63 ms</td><td><strong>-79.75 %</strong></td></tr>
+                            <tr><td>Busy server is fast, 80 percent skew (mean of p99)</td><td>458.61 ms</td><td>217.55 ms</td><td><strong>+110.80 %</strong></td></tr>
+                            <tr><td>Mean of 60 one-minute p99 as the hourly p99</td><td>175.68 ms</td><td>278.77 ms</td><td>-36.98 %</td></tr>
+                            <tr><td>Max of 60 one-minute p99 as the hourly p99</td><td>1868.28 ms</td><td>278.77 ms</td><td>+570.19 %</td></tr>
+                            <tr><td>Merged histogram, 7 coarse buckets</td><td>491.78 ms</td><td>438.68 ms</td><td>+12.11 %</td></tr>
+                            <tr><td>Merged histogram, 399 fine buckets</td><td>438.82 ms</td><td>438.68 ms</td><td><strong>+0.03 %</strong></td></tr>
+                            <tr><td>Mean instead of max fold (maxima of 10 groups)</td><td>605.33 ms</td><td>1107.77 ms</td><td>-45.36 %</td></tr>
+                            <tr><td>Same data, grouping only, 10 groups to 1</td><td>128.39 ms</td><td>198.82 ms</td><td>-35.42 %</td></tr>
+                        </tbody>
+                    </table>
+                    <p>The second row is the most dangerous line in the table. <strong>Minus 0.03 percent.</strong> Validate in that state and you conclude the dashboard is accurate, and that conclusion holds only while the fleet stays homogeneous.</p>
+
+                    <h2>14. Checklist and what not to do</h2>
+                    <p>Arranged for direct use in collection design and dashboard review.</p>
+                    <ul>
+                        <li>[ ] Confirmed <strong>at which stage</strong> the dashboard's percentile panel computes the percentile</li>
+                        <li>[ ] Changed the grouping and confirmed <strong>the number does not move</strong></li>
+                        <li>[ ] Widened the time range and confirmed the p99 does not fall</li>
+                        <li>[ ] Counted <strong>threshold crossings</strong> in the log and cross-checked against the p99</li>
+                        <li>[ ] Plotted <strong>the request count (the denominator)</strong> alongside the percentile chart</li>
+                        <li>[ ] Low-traffic endpoints use a wider window or <strong>a lower quantile</strong></li>
+                        <li>[ ] Latency is collected <strong>as a histogram</strong>, not as percentiles</li>
+                        <li>[ ] Histogram buckets cover <strong>the expected latency range and above the timeout</strong></li>
+                        <li>[ ] Means are stored <strong>together with sum and count</strong></li>
+                        <li>[ ] Error rates are stored with <strong>numerator and denominator separately</strong></li>
+                        <li>[ ] Where only per-server percentiles survive, they are folded <strong>with max, not mean</strong></li>
+                        <li>[ ] <strong>Screen and transaction latency</strong> is measured separately from request latency</li>
+                        <li>[ ] <strong>Percentile definitions were aligned</strong> before comparing numbers across tools</li>
+                    </ul>
+                    <p>And the things not to do.</p>
+                    <ul>
+                        <li><strong>Averaging percentiles</strong> across servers or windows - this whole article is about that</li>
+                        <li><strong>Adding count weighting and declaring it fixed</strong> - the sign flipped in section 5</li>
+                        <li>Validating metrics only in the healthy state - the error was 0.03 percent in section 1b</li>
+                        <li>Storing percentile values as a time series and <strong>discarding the raw data or histogram</strong> - it is irreversible</li>
+                        <li>Using the p99 of a 100-request window as an alert threshold - one request moves it</li>
+                        <li><strong>Hunting percentile definitions first</strong> when numbers are badly apart - definition differences are around 0.02 percent</li>
+                        <li><strong>Generalising the sign of a histogram error from one observation</strong> - it depends on the distribution and the boundaries</li>
+                        <li>Improving the request p99 without checking requests per screen - they cancel, as in section 11</li>
+                    </ul>
+
+                    <h2>References</h2>
+                    <ul>
+                        <li><a href="https://docs.python.org/3/library/statistics.html" target="_blank" rel="noopener">Python 3 standard library - statistics</a> : the inclusive and exclusive definitions of <code>quantiles()</code> and its linear interpolation rule. Source of the wording about a population that can have more extreme values than the samples, and of the <code>i / (m + 1)</code> cut-point formula quoted in section 7</li>
+                        <li><a href="https://prometheus.io/docs/practices/histograms/" target="_blank" rel="noopener">Prometheus documentation - Histograms and summaries</a> : the explicit warning that averaging precomputed quantiles across instances yields statistically nonsensical values, and the explanation that histogram bucket counts can be summed before a quantile is computed. The same point as the ordering argument in section 10</li>
+                        <li>Same site: <a href="clickhouse_observability_2026.html">Why ClickHouse Is Winning the Observability War</a> - how to handle storage cost if you want to keep raw data for a long time</li>
+                        <li>Same site: <a href="cp949_utf8_mojibake_guide.html">Locating Where Hangul Breaks</a> - the same structural problem of recoverable versus unrecoverable damage, treated in the encoding domain</li>
+                    </ul>
+                </div>
+                <!-- md-artifact-start -->
+                    <div class="md-artifact" style="margin:2rem 0;border:1px solid #d7dce3;border-radius:10px;overflow:hidden;background:#fbfcfd;">
+                        <div style="display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;justify-content:space-between;padding:.7rem 1rem;background:#eef2f7;border-bottom:1px solid #d7dce3;">
+                            <span style="font-weight:700;font-size:.97rem;">📋 Checklist you can take with you</span>
+                            <span style="display:flex;gap:.5rem;align-items:center;">
+                                <code style="font-size:.82rem;color:#5a6675;background:transparent;padding:0;">percentile_aggregation_error.md</code>
+                                <button type="button" class="md-artifact-copy" style="cursor:pointer;border:1px solid #b9c2cf;background:#fff;color:#2c3e50;font-weight:600;line-height:1.3;border-radius:6px;padding:.32rem .7rem;font-size:.85rem;">Copy all</button>
+                            </span>
+                        </div>
+                        <pre style="margin:0;max-height:420px;overflow:auto;padding:1rem;background:#fbfcfd;font-size:.86rem;line-height:1.62;"><code class="nohighlight" style="background:transparent;padding:0;white-space:pre;"># Percentile aggregation review - mergeability table and reproduction code
+
+&gt; Source: braindetox.kr - We Averaged the p99 of Ten Servers
+&gt; Basis: Windows 10 / Python 3.13.3 standard library, verified with fixed seed 20260730
+&gt; Paste this file into an AI tool as is and say: review our dashboard and collection design against these rules.
+&gt; All data is synthetic. These are not real service metrics.
+
+## 0. One-line summary
+
+A percentile is not a value but a **property of a distribution**. Properties do not average.
+Merging requires **raw data or a mergeable summary (a histogram)**.
+**Put the merge before the summary.**
+
+## 1. Mergeability table
+
+| Metric | How the parts fold | Exact? | What you need in order to merge |
+|---|---|---|---|
+| Count | Sum of counts | Exact | The count |
+| Sum | Sum of sums | Exact | The sum |
+| Max | Max of maxima | Exact | The maximum |
+| Min | Min of minima | Exact | The minimum |
+| Mean | Plain mean of means | **Wrong** | - |
+| Mean | Means weighted by count | Exact | **Sum and count** |
+| Variance, stddev | Recomputed from count, sum, sum of squares | Conditionally exact | All three |
+| Median p50 | No fold rule | **Impossible** | Raw data or histogram |
+| p90, p95, p99 | No fold rule | **Impossible** | Raw data or histogram |
+| Error rate | Averaging ratios | **Wrong** | **Numerator and denominator separately** |
+
+Mergeability is not a property of the metric but **a property of the summary you saved**.
+
+## 2. Aggregations to never do
+
+- Averaging per-server p99 (observed error -33.94 % to -79.75 %)
+- Weighting per-server p99 by request count (sign flips: -36.99 % / -10.11 %)
+- Averaging 60 one-minute p99 into an hourly p99 (-36.98 %)
+- Taking the max of 60 one-minute p99 as an hourly p99 (+570.19 %)
+- Averaging ratios (error rate, success rate)
+- Averaging partial maxima (-45.36 %)
+
+## 3. Observed errors (fixed seed 20260730)
+
+| Situation | Wrongly merged | True value | Error |
+|---|---|---|---|
+| 1 of 10 degraded, even traffic | 138.51 ms | 209.67 ms | -33.94 % |
+| All 10 identical, even traffic | 127.55 ms | 127.59 ms | **-0.03 %** |
+| Busy server slow, 80 % skew | 91.04 ms | 449.63 ms | **-79.75 %** |
+| Busy server fast, 80 % skew | 458.61 ms | 217.55 ms | **+110.80 %** |
+| Mean of 60 one-minute p99 | 175.68 ms | 278.77 ms | -36.98 % |
+| Max of 60 one-minute p99 | 1868.28 ms | 278.77 ms | +570.19 % |
+| Merged histogram, 7 buckets | 491.78 ms | 438.68 ms | +12.11 % |
+| Merged histogram, 399 buckets | 438.82 ms | 438.68 ms | **+0.03 %** |
+| Grouping only, 10 groups to 1 | 128.39 ms | 198.82 ms | -35.42 % |
+
+**The second row is the trap.** With a homogeneous fleet the error is 0.03 %, so validation passes.
+A metric that is right when things are fine and wrong when they are not cannot detect that they are not.
+
+## 4. Reproduction code (Python 3.13, standard library only)
+
+```python
+import math, random
+
+def p99(xs):
+    s = sorted(xs)
+    return s[math.ceil(0.99 * len(s)) - 1]      # nearest-rank
+
+def nrm(rng, _s=[None]):                        # Box-Muller
+    if _s[0] is not None:
+        v = _s[0]; _s[0] = None; return v
+    u1 = rng.random() or 1e-12
+    u2 = rng.random()
+    r = math.sqrt(-2.0 * math.log(u1))
+    _s[0] = r * math.sin(2 * math.pi * u2)
+    return r * math.cos(2 * math.pi * u2)
+
+rng = random.Random(20260730 + 1)               # section 1 seed
+
+def ln(med, sig, n):
+    return [math.exp(math.log(med) + sig * nrm(rng)) for _ in range(n)]
+
+groups = [ln(18.0, 0.35, 10000) for _ in range(9)] + [ln(30.0, 1.50, 10000)]
+per  = [p99(g) for g in groups]
+pool = [v for g in groups for v in g]
+
+print('mean of per-server p99 :', round(sum(per) / len(per), 2))   # 138.51
+print('true pooled p99        :', round(p99(pool), 2))             # 209.67
+print('max of per-server p99  :', round(max(per), 2))              # 1020.21 (upper bound)
+```
+
+If the three numbers come back, the reproduction succeeded.
+
+## 5. Dashboard review procedure
+
+| Check | What you do | The tell that it was merged wrongly |
+|---|---|---|
+| Change the grouping | Per host → per region → fleet-wide | **The number moves** |
+| Change the time range | 1 hour → 6 hours → 1 day | p99 **falls** as you widen |
+| Count threshold crossings | Count log requests above the p99 value | **Far more** than 1 % of the total |
+| Bound check | Max of per-server p99 versus fleet p99 | Fleet value is **above that maximum** |
+| Single-node contrast | Worst node p99 versus fleet p99 | Fleet value is **far lower** |
+
+**The threshold-count check is the strongest.** If the p99 is X, then by definition 1 % of requests exceed X.
+
+## 6. Collection design rules
+
+- Collect latency **as a histogram, not as percentiles**
+- Histogram buckets cover **the expected latency range and above the timeout**
+- Keep buckets **fine in the range you care about** (near the current p99) — more reliable than changing interpolation
+- Store means **together with sum and count**
+- Store error rates with **numerator and denominator separately**
+- Store standard deviation as **count, sum and sum of squares**
+- Do not store percentile values as a time series while discarding raw data or histograms
+- Plot **the request count (the denominator)** alongside percentile charts
+- Low-traffic endpoints use a wider window or **a lower quantile**
+- Measure **screen and transaction latency** separately from request latency
+- **Align percentile definitions** before comparing numbers across tools (defaults can differ)
+
+## 7. Second best when you cannot fix it
+
+If only per-server percentiles survive, **fold with max, not mean.**
+
+- Across 400 random fleet configurations, the true p99 exceeded the max of the per-group p99 **zero times**
+- It fell below their minimum **zero times** as well
+- Why: each group holds at most 1 % of its own requests above its own p99 → at most 1 % of the pooled requests sit above the largest of those values → upper bound
+- A bound supports the judgement that things are no worse than this. A mean is neither an upper nor a lower bound
+- The bound tightens as groups coarsen. **It is loosest at high cardinality**
+
+## 8. Two problems that remain after computing the percentile correctly
+
+- **Sample starvation**: the p99 of a 100-request window is effectively the second slowest request. Across 2,000 trials the estimate ranged from 53.84 to 300.51 ms (true value 128.61 ms)
+- **Screen-level experience**: if a screen fires k requests, the chance of containing at least one slow request is 1 - 0.99^k. That is 18.21 % at k=20 and passes 50 % at k=69. The serial p99 of a 20-request screen was 2552.58 ms (request p99 was 435.58 ms)
+
+## 9. What not to do
+
+- Averaging percentiles
+- Adding weights and calling it fixed
+- Validating metrics only in the healthy state
+- Discarding raw data or histograms and keeping only percentile values
+- Using the p99 of a 100-request window as an alert threshold
+- Hunting definitions first when facing a large error (definition differences are around 0.02 %)
+- Generalising the sign of a histogram error from one observation (it depends on the distribution and the boundaries)
+- Improving the request p99 without checking requests per screen
+</code></pre>
+                        <p style="margin:0;padding:.6rem 1rem;font-size:.82rem;color:#5a6675;border-top:1px solid #e3e8ee;">Copy and paste it straight into your notes or an AI assistant.</p>
+                    </div>
+                    <script>
+                    (function(){
+                      if (window.__mdArtifactBound) return;
+                      window.__mdArtifactBound = true;
+                      document.addEventListener('click', function(ev){
+                        var btn = ev.target.closest && ev.target.closest('.md-artifact-copy');
+                        if (!btn) return;
+                        var box = btn.closest('.md-artifact');
+                        var code = box && box.querySelector('pre code');
+                        if (!code) return;
+                        var text = code.textContent;
+                        var label = btn.textContent;
+                        var ok = function(){
+                          btn.textContent = "Copied";
+                          setTimeout(function(){ btn.textContent = label; }, 1600);
+                          if (typeof gtag === 'function') {
+                            gtag('event', 'md_copy', { slug: "percentile_aggregation_error", lang: "en", chars: text.length });
+                          }
+                        };
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                          navigator.clipboard.writeText(text).then(ok).catch(function(){ fallback(); });
+                        } else { fallback(); }
+                        function fallback(){
+                          var ta = document.createElement('textarea');
+                          ta.value = text; ta.setAttribute('readonly','');
+                          ta.style.position='fixed'; ta.style.left='-9999px';
+                          document.body.appendChild(ta); ta.select();
+                          try { document.execCommand('copy'); ok(); } catch(e) {}
+                          document.body.removeChild(ta);
+                        }
+                      });
+                    })();
+                    </script>
+                    <!-- md-artifact-end -->
+
+                <div class="share-section">
+                    <h3>Share this article</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">Copy Link</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../../blog.html" class="back-link">Back to list</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Free tools you may find useful</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/json_formatter.html">JSON Formatter</a></li>
+      <li><a href="../static/regex_tester.html">Regex Tester</a></li>
+      <li><a href="../static/jwt_decoder.html">JWT Decoder Generator 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 Encoder/Decoder</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">See all tools &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+<!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Related Posts</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="sql_left_join_where_becomes_inner.html">A WHERE Clause Turns Your LEFT JOIN Into an INNER JOIN - Where ON Ends and WHERE Begins 2026</a></li>
+      <li><a href="sql_not_in_null_empty_result.html">One NULL in a NOT IN List Empties the Whole Result - SQL Three-Valued Logic 2026</a></li>
+      <li><a href="json_number_precision_loss.html">The Last Digits of a 64-bit ID Change in JSON - Where Number Precision Disappears 2026</a></li>
+      <li><a href="monotonic_vs_wall_clock.html">Measuring Elapsed Time on a Wall Clock Gives You Negative Durations - Where the Monotonic Clock Belongs 2026</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('Link copied. Paste it into the Threads app to share!');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('Link copied!'); });
+    });
+    </script>
+</body>
+</html>

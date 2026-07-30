@@ -1,0 +1,1012 @@
+<!DOCTYPE html>
+<!--
+ * Technical blog post template
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="en">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Why Your Child Process Hangs - Deadlock From a Full Pipe Buffer 2026</title>
+    <meta name="description" content="It passes on small inputs and hangs on real data. The cause is not the code but the pipe buffer size, measured byte by byte with Python and Node.">
+    <meta name="keywords" content="pipe buffer, deadlock, subprocess, child_process, communicate, PIPE, flow control, SIGPIPE, stdout stderr, block buffering, PYTHONUNBUFFERED, stdbuf, maxBuffer, highWaterMark, child process, hang diagnosis, streaming output, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/en/posts/pipe_buffer_deadlock.html">
+
+    <meta property="og:title" content="Why Your Child Process Hangs - Deadlock From a Full Pipe Buffer">
+    <meta property="og:description" content="A pipe is a finite buffer. When it fills, the writer waits. That is flow control, not a bug - it becomes a deadlock only when the reader is already waiting.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/en/posts/pipe_buffer_deadlock.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="en_US">
+    <meta property="article:published_time" content="2026-07-30">
+    <meta property="article:section" content="Development/Infrastructure">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Why Your Child Process Hangs - Pipe Buffer Deadlock">
+    <meta name="twitter:description" content="4096 bytes passes, 4097 bytes hangs. A record of measuring the boundary byte by byte.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "Why Your Child Process Hangs - Deadlock From a Full Pipe Buffer",
+      "alternativeHeadline": "The Boundary Is the Buffer, Measured Byte by Byte",
+      "datePublished": "2026-07-30",
+      "dateModified": "2026-07-30",
+      "inLanguage": "en-US",
+      "articleSection": "Development/Infrastructure",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "pipe buffer, deadlock, subprocess, child_process, communicate, flow control, SIGPIPE, block buffering, maxBuffer, highWaterMark, hang diagnosis",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/en/posts/pipe_buffer_deadlock.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "Why does a script that works on small inputs hang only on real data?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Because the capacity of the pipe is the boundary. If the output is smaller than that capacity the child writes all of it and exits immediately, so nothing goes wrong even when the parent waits before reading. The moment the output exceeds the capacity, the child stops and waits for room in the buffer while the parent stops and waits for the child to finish. Measured in this environment the split was exact. When the child wrote 4096 bytes the wait call returned in 0.10 seconds. When it wrote 4097 bytes the wait never returned. Thirteen bisection probes confirmed that the largest output which passes is 4096 bytes and the smallest which deadlocks is 4097 bytes. The samples a unit test uses are almost always smaller than that. That is why the code looks fine and the failure appears on the first day it meets production data."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Is it a bug that the writer stops when the pipe is full?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "No. That is flow control and it is the intended behaviour. A pipe is not an unlimited channel but a buffer of a fixed size, and the specification says that a write attempted on a full pipe waits until room appears. The POSIX text states that if the non-blocking flag is clear a write request may cause the thread to block, but on normal completion it returns the number of bytes requested. In practice this waiting is not the problem. I made the downstream end of a shell pipeline read nothing for two seconds, and the whole pipeline still completed in 2455 milliseconds with exit code zero. The upstream end waited briefly and resumed as soon as the reader started reading. A deadlock is not the waiting itself. It appears when the only party who could read is already waiting for something else, which is to say when both sides are waiting for each other."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "I opened both stdout and stderr as pipes, so why does it hang?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Because there are two pipes and only one piece of code reading. This is the trap that catches people most often. The parent reads only standard output and waits for the end of that stream. Meanwhile the child writes a large amount to standard error, that pipe fills, and the child stops. Because the child has stopped, standard output is never closed either, so the read in the parent never finishes. Running it confirmed this. With the child writing 200000 bytes to standard error, the read call in the parent had still not returned after four seconds and the child was still alive. Node behaved the same way. Attaching a data listener to standard output only and leaving standard error alone meant the close event never arrived within three seconds. The only fix is to consume both streams at once, using a separate thread or a high-level call that drains both for you. Measured with a thread reading standard error alongside, the same work finished in 0.10 seconds."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How many bytes is a pipe buffer?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "It differs per environment, and even within one machine it differs per layer. That point mattered enough that I measured three separate paths on a single machine. A native Windows anonymous pipe was exactly 4096 bytes. Counting one byte at a time, the write blocked on the 4096th. The MSYS2 shell pipe on the same machine was 65536 bytes, and measuring again at both 128-byte and 16-byte granularity gave the same value. In Node, the stall boundary when the stream is not consumed and the code waits for close was 131072 bytes. That value exists because Node stacks its own stream buffer on top of the operating system pipe. The default high water mark of that stream reported 16384 bytes, yet the measured stall boundary was far larger, so it is not explained by simply adding the two numbers. The conclusion is not to memorise a number but to measure your own. Assuming a value you read in someone else document is the most dangerous move."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How do I tell whether a hung process has this problem?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Four steps, no special tooling required. First, check the process list for both parent and child. If both appear, nothing died and they are waiting. Second, sample cumulative CPU time twice and compare. An unchanged value means a block rather than a spin loop. In the measured case both samples read 0.109375. Third, sample progress twice and compare. Recording bytes written shows the value frozen at one point. In the case observed, both the two-second and the four-second samples read 65536 bytes. Fourth, and this is the decisive one, change only the size of the input or output and run the same code again. If the same code stops hanging below a certain size, the cause is the buffer and not your logic. In the measured case a 65536-byte sample exited normally with code zero, while a 400000-byte sample was still blocked when it was killed and left code 124. The evidence is that nothing but the size was changed."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/pipe_buffer_deadlock.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/pipe_buffer_deadlock.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/pipe_buffer_deadlock.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/pipe_buffer_deadlock.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/pipe_buffer_deadlock.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="Why Your Child Process Hangs - Deadlock From a Full Pipe Buffer">
+                <meta itemprop="datePublished" content="2026-07-30">
+                <meta itemprop="dateModified" content="2026-07-30">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="pipe buffer, deadlock, subprocess, child_process, flow control, block buffering, hang diagnosis">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/en/posts/pipe_buffer_deadlock.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">Why Your Child Process Hangs - Deadlock From a Full Pipe Buffer</h1>
+                    <h2 class="post-subtitle">It passes on small inputs and hangs only on real data - a record of measuring the boundary byte by byte</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-07-30">2026-07-30</span>
+                        <span class="post-category" itemprop="articleSection">Development/Infrastructure</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <h2>Opening: it was stopped, with no message at all</h2>
+                    <p>You leave a nightly batch running and in the morning the script is stopped somewhere. No error message. No stack trace. The process is still in the list and CPU usage is zero percent. The last line of the log carries a timestamp from hours ago. Run it again and <strong>it stops in the same place.</strong> Yet yesterday, with a short sample, it finished in five seconds.</p>
+                    <p>In this situation most of the time is spent in the wrong place. You reread the logic, add more logging, and start suspecting locks or the network. But there is nothing wrong with the code. <strong>The cause is not the code, it is the size of the pipe buffer</strong> — a number written nowhere in your source. That is why reading the source never reveals it.</p>
+                    <p>This article is a record of measuring that number directly and confirming, byte by byte, the boundary it creates. The conclusion fits in three sentences.</p>
+                    <ul>
+                        <li><strong>A pipe is a finite buffer.</strong> Not an unlimited channel but a box of fixed size, and in this environment it was 4096 bytes</li>
+                        <li><strong>When it fills, the writer waits. That is not a bug, that is flow control.</strong> A slow downstream still lets the pipeline complete. Waiting itself is normal</li>
+                        <li><strong>A deadlock appears when the party who should read is already waiting for something else.</strong> The shape of the problem is always both sides waiting for each other</li>
+                    </ul>
+                    <p>And the truly dangerous part is the last one. <strong>If the output is smaller than the buffer, nothing at all happens.</strong> The samples a unit test uses are almost always smaller than the buffer. So this defect <strong>passes every test and shows up only on the first day it meets production data.</strong></p>
+                    <div class="callout">
+                        <p><strong>Environment.</strong> Every output below was produced by actually running the code on <strong>Windows 10 Pro (10.0.19045)</strong>. The shell is <strong>GNU bash 5.2.37 (MSYS2 / MINGW64)</strong>, and the runtimes are <strong>Python 3.13.3 (win32)</strong> and <strong>Node.js v22.16.0 (win32)</strong>. Every script was saved to a file before running, and because these experiments reproduce deadlocks, <strong>every run carried a timeout of ten seconds or less.</strong> Anything that hit the timeout is recorded as a confirmed deadlock.</p>
+                        <p><strong>★Buffer capacity differs per environment.</strong> The numbers below are <strong>measurements from this environment</strong>, and other operating systems, shells and runtimes will produce different values. In fact three different values appeared on this one machine depending on the path. So this article does not ask you to memorise numbers, it shows you <strong>how to measure</strong>. Example paths are written as placeholders such as <code>/tmp/demo</code>.</p>
+                        <p><strong>What this article does not cover.</strong> Pipeline <strong>exit codes</strong>, the status array, and how to notice a failing pipe were already covered in <a href="shell_exit_code_pipefail.html">exit codes and pipes</a>. Here I stay on the single point of <strong>deadlock caused by a full buffer</strong>. Filenames with spaces breaking a pipeline are in <a href="find_xargs_whitespace_trap.html">the whitespace trap in find and xargs</a>, and quoting rules are in <a href="shell_quoting_rules_guide.html">shell quoting rules</a>.</p>
+                    </div>
+
+                    <h2>1. A pipe is a finite buffer - 4096 bytes here</h2>
+                    <p>The capacity has to be measured first. I created a pipe and kept writing while <strong>never touching the read end</strong>. Wherever the write stops returning is the capacity. To avoid hanging forever the writing ran on a separate thread and the state was checked after five seconds.</p>
+                    <pre><code>python 3.13.3 / win32
+--- 1-1. raw os.pipe() capacity: write until it blocks ---
+  writer thread is STILL BLOCKED after 5.0s  &lt;- pipe is full
+  bytes accepted before blocking : 4096
+
+--- 1-2. same measurement, 1 byte at a time (exact) ---
+  blocked after exactly 4096 bytes
+
+--- 1-3. drain the pipe, does the writer resume? ---
+  read 4608 bytes from the read end
+  writer counter is now 8704 (was 8704)
+
+--- 1-4. subprocess stdin pipe: child never reads ---
+  parent is BLOCKED writing to a child that never reads
+  bytes accepted : 4096
+  child killed, test over</code></pre>
+                    <p>Three things to read here. First, it is <strong>exactly 4096 bytes</strong>. Measuring in 512-byte units gave 4096 and measuring one byte at a time gave 4096. Not a rough figure but an exact one. Second, the writing thread <strong>did not die, it waited.</strong> That it is a wait and not an error is the key. Third, once 4608 bytes were pulled out from the read end, writing <strong>simply resumed.</strong> The counter climbed to 8704.</p>
+                    <p>That last observation establishes the premise of this article. <strong>A writer waiting on a full pipe is not a fault.</strong> It continues by itself once room appears. The POSIX text says the same thing. Where the non-blocking flag is clear it records that a write request may cause the thread to block, but that on normal completion it returns the number of bytes requested. In other words it is <strong>designed behaviour</strong>.</p>
+                    <p>Item 1-4 is the same experiment with the direction reversed. A child process was started with its standard input piped, and the child read nothing. The amount the parent could write was <strong>the same 4096 bytes</strong>. A pipe is the same box whichever way you write into it.</p>
+                    <h3>1.1 Three different values on one machine</h3>
+                    <p>There is a caution here. That value of 4096 came out of <strong>this path only</strong>. Measuring other paths on the same machine gave entirely different numbers.</p>
+                    <table>
+                        <thead>
+                            <tr><th>Layer</th><th>Measured here</th><th>How it was measured</th><th>Nature</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Native Windows anonymous pipe</td><td><strong>4096 B</strong></td><td>write one byte at a time into an unread pipe</td><td>operating system kernel buffer</td></tr>
+                            <tr><td>MSYS2 shell pipe</td><td><strong>65536 B</strong></td><td>write into a pipeline whose reader sleeps</td><td>pipe created by the shell runtime</td></tr>
+                            <tr><td>Node stream high water mark</td><td><strong>16384 B</strong></td><td>read the stream property</td><td>userland buffer</td></tr>
+                            <tr><td>Node unconsumed stdout stall boundary</td><td><strong>131073 B</strong></td><td>wait for close without consuming, then bisect</td><td>composite of the two layers above</td></tr>
+                            <tr><td>Python stdio output buffer</td><td><strong>8192 B</strong></td><td>read the runtime constant</td><td>a separate layer unrelated to the pipe</td></tr>
+                        </tbody>
+                    </table>
+                    <p>The last two rows matter most. The Node stall boundary of 131073 bytes is <strong>neither the operating system pipe capacity nor the stream high water mark.</strong> It is not the plain sum of the two either. It is the result of several layers stacked together, and I could not verify the internal accounting exactly. So <strong>I present that number strictly as a measurement and do not generalise it into a formula.</strong></p>
+                    <ul>
+                        <li>The value in your environment <strong>may differ from every number written here.</strong> Linux versus Windows, the kind of shell, and the runtime version are all variables</li>
+                        <li>So what is useful in practice is not the number but <strong>the procedure for measuring it</strong>. The experiment in 1-1 reproduces in ten lines</li>
+                        <li>More important is that <strong>development and production may hold different values</strong>. That is the second reason something passes in development and hangs only in production</li>
+                        <li>Inside and outside a container, local versus CI, running through a shell versus running directly are all <strong>different paths</strong>. Passing on one guarantees nothing about another</li>
+                    </ul>
+
+                    <h2>2. Reproducing the deadlock - between 4096 and 4097</h2>
+                    <p>Now for the real accident shape. The most common wrong code follows this order. <strong>Start the child, wait first, then read the output.</strong> Having waited before reading is the entire trap.</p>
+                    <pre><code>python 3.13.3 / win32
+
+--- 2-1. parent calls wait() first: small vs large output ---
+  child writes     1024 B -&gt; wait(3s) : finished (0.10s)
+  child writes     4096 B -&gt; wait(3s) : finished (0.10s)
+  child writes     4097 B -&gt; wait(3s) : DEADLOCK (2.01s)
+  child writes     8192 B -&gt; wait(3s) : DEADLOCK (2.02s)
+  child writes    65536 B -&gt; wait(3s) : DEADLOCK (2.01s)
+  child writes  1048576 B -&gt; wait(3s) : DEADLOCK (2.01s)
+
+--- 2-2. bisect the exact boundary ---
+  largest output that does NOT deadlock : 4096 bytes
+  smallest output that DOES deadlock    : 4097 bytes
+  probes                                : 13</code></pre>
+                    <p>This table is the heart of the article. <strong>4096 bytes finishes in 0.10 seconds and 4097 bytes waits forever.</strong> The code does not differ by a single character. Only the number of bytes the child writes went up by one.</p>
+                    <p>The DEADLOCK marker means the run hit its timeout. The wait call carried a two-second ceiling and anything past it was judged a deadlock. Without a ceiling the experiment itself never ends. <strong>Experiments about deadlocks must always carry a timeout</strong> — that is the first practical lesson.</p>
+                    <p>Thirteen bisection probes pinned the boundary. The largest passing value is 4096, the smallest hanging value is 4097. <strong>That is exactly the pipe capacity measured in section 1.</strong> Not a coincidence, but evidence of the cause.</p>
+                    <h3>2.1 Why it stops, in two sentences</h3>
+                    <p>The structure is simple. The child waits <strong>for room in the pipe</strong>. The parent waits <strong>for the child to finish</strong>. The only party who could make room is the parent, and the parent is waiting. The only thing that could finish the child is completing the write, and that is blocked. <strong>The circle in which each waits for the other next move has closed.</strong></p>
+                    <ul>
+                        <li>At 4096 bytes or less the child <strong>writes everything and simply exits.</strong> Data may remain in the pipe but the child is already gone, so the wait returns at once</li>
+                        <li>At 4097 bytes the last byte cannot be written, so <strong>the child cannot exit.</strong> The wait never returns</li>
+                        <li>This difference <strong>is logged nowhere.</strong> No exception, no error code. Two processes quietly wait for one another</li>
+                        <li>So the symptom is a hang. Not a failure but <strong>nothing happening at all</strong>, and that is what makes it hard to diagnose</li>
+                    </ul>
+                    <p>The Python documentation states the risk explicitly. The description of the wait call reads that it will deadlock when using a pipe for standard output or standard error and the child generates enough output to block waiting for the operating system pipe buffer to accept more data. What the document describes is exactly what the measurement reproduced.</p>
+
+                    <h2>3. Why the tests pass</h2>
+                    <p>The boundary from section 2 determines the character of this defect. <strong>4096 bytes is nothing at all.</strong> As text that is roughly 4000 characters, as logs about 40 to 50 lines. Samples placed in unit tests are rarely larger.</p>
+                    <table>
+                        <thead>
+                            <tr><th>Situation</th><th>Output size</th><th>In this environment</th><th>Result</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>short sample in a unit test</td><td>a few hundred B</td><td>fits inside the buffer</td><td><strong>passes</strong></td></tr>
+                            <tr><td>example file checked by hand</td><td>1 to 2 KB</td><td>fits inside the buffer</td><td><strong>passes</strong></td></tr>
+                            <tr><td>right at the boundary</td><td>4096 B</td><td>exactly full</td><td><strong>passes</strong> (0.10 s)</td></tr>
+                            <tr><td>one byte over the boundary</td><td>4097 B</td><td>the last write blocks</td><td><strong>waits forever</strong></td></tr>
+                            <tr><td>a single production record</td><td>tens of KB</td><td>blocked long before the end</td><td><strong>waits forever</strong></td></tr>
+                            <tr><td>a day with many errors</td><td>several MB</td><td>blocked on standard error</td><td><strong>waits forever</strong></td></tr>
+                        </tbody>
+                    </table>
+                    <p>The last row is especially nasty in practice. <strong>A batch that normally runs fine stops on exactly the day when many errors occurred.</strong> Warning logs grew and standard error crossed the buffer, yet from the outside it reads as if a failure took the batch down with it. The investigation begins with cause and effect reversed.</p>
+                    <ul>
+                        <li>This defect is <strong>easy to reproduce.</strong> Enlarge the sample and it reproduces every time. The problem is that nobody tries</li>
+                        <li>Conversely it <strong>never reproduces with a small sample.</strong> Which is how the phrase it works on my machine becomes true</li>
+                        <li>So <strong>putting one sample larger than the buffer</strong> into the test set is the cheapest defence. Measure capacity by the method in section 1 and build a sample above it</li>
+                        <li>Better still is to restructure the code so that it is <strong>safe regardless of size</strong>. That is what section 4 onwards is about</li>
+                    </ul>
+
+                    <h2>4. Fix one - read first, wait afterwards</h2>
+                    <p>The simplest fix reverses the order. Read all the output to empty the pipe, then wait.</p>
+                    <pre><code>--- 2-3. FIX A: read the output first, then wait ---
+  read 1048576 bytes, then wait() returned 0 in 0.09s
+
+--- 2-4. FIX A': communicate() does the same thing for you ---
+  communicate() -&gt; 1048576 bytes, rc=0, 0.10s</code></pre>
+                    <p><strong>The same 1048576 bytes</strong> that hung forever in section 2 finished in 0.09 seconds. All that changed was the order of two lines. The pipe keeps emptying while you read, so the child never blocks, and once the child exits the stream closes and the read ends.</p>
+                    <p>Item 2-4 uses the standard function that does this for you. The Python documentation advises using the combined call rather than writing and reading the streams yourself, in order to avoid deadlocks due to any of the other operating system pipe buffers filling up and blocking the child. But the document also records the price: the data read is buffered in memory, so do not use this method if the data size is large or unlimited. Running it makes that price visible.</p>
+                    <pre><code>--- 9-4. streaming a huge output line by line: constant memory ---
+  streamed 200000 lines in 0.31s, largest object held = 12 chars
+
+--- 9-5. the same data via communicate(): held entirely in memory ---
+  communicate() -&gt; one object of 2600000 bytes (2.5 MB) in 0.53s</code></pre>
+                    <p>The same 200000 lines were taken two ways. Streaming line by line held <strong>a single 12-character object at any moment</strong>. The combined call puts <strong>one 2.5 megabyte object</strong> into memory. And 200000 lines is on the small side. For a child with no output ceiling this approach eventually blows up on memory.</p>
+                    <ul>
+                        <li>If the <strong>output ceiling is known and small</strong>, the combined call is the safest and shortest. Recording that ceiling in a comment is better still</li>
+                        <li>If <strong>there is no ceiling</strong>, take it by streaming or into a file. The combined call prevents the deadlock but leaves a memory problem</li>
+                        <li>Streaming is structurally superior because <strong>its memory ceiling is one line</strong>. 200000 lines were handled in 0.31 seconds</li>
+                        <li>However, streaming is <strong>affected by the output buffering of the child</strong>. Section 9 covers that</li>
+                    </ul>
+
+                    <h2>5. The trap that catches people most - two pipes, one reader</h2>
+                    <p>So far there has been one pipe. Real code usually opens <strong>both</strong> standard output and standard error as pipes, which is natural since you want the error messages too. But the reading code is usually singular. <strong>Here you get two pipes and one reader.</strong></p>
+                    <pre><code>--- 2-5. the classic trap: stdout AND stderr piped, only stdout read ---
+  stdout.read() has NOT returned after 4.0s -&gt; DEADLOCK
+  child alive : True   (it is blocked writing stderr)</code></pre>
+                    <p>The child writes 200000 bytes to standard error and only 10 bytes to standard output. The parent reads standard output only. <strong>Even though standard output holds just 10 bytes, the read never finished.</strong> It had not returned after four seconds and the child was alive.</p>
+                    <p>What makes this case vicious is that <strong>there is nothing wrong with the stream I am reading.</strong> Standard output is 10 bytes, one four-hundredth of the buffer. However long you stare at the code, no picture of an oversized output appears. The blockage is in <strong>the other pipe, the one I opened and never look at</strong>.</p>
+                    <p>Node reproduced the same thing. And Node has one more layer, so the boundary is much larger.</p>
+                    <pre><code>node v22.16.0 / win32 / 10.0.19045
+
+--- 4-1. spawn, never touch child.stdout, wait for close ---
+  child writes     1024 B: close fired, code=0 (93 ms)
+  child writes     4096 B: close fired, code=0 (92 ms)
+  child writes    65536 B: close fired, code=0 (95 ms)
+  child writes  1048576 B: TIMEOUT after 2500 ms -&gt; DEADLOCK
+
+--- 4-2. exact boundary for the paused-stream case (bisect) ---
+  largest output that does NOT hang : 131072 B
+  smallest output that DOES hang    : 131073 B
+  probes: 18
+
+--- 4-5. stdout AND stderr piped, only stdout consumed ---
+  only stdout consumed: TIMEOUT after 3000 ms -&gt; DEADLOCK</code></pre>
+                    <p>Note that <strong>65536 bytes passed</strong>. In Python that size would have blocked long before. Node holds data read from the operating system pipe in its own stream buffer, so it survives longer. Which means <strong>in Node this defect surfaces later and only on larger data.</strong> That is not good news. It means the chance of finding it during development is that much lower.</p>
+                    <p>The Node documentation describes the situation precisely. It states that by default pipes for standard input, output and error are established between the parent process and the spawned subprocess, that these pipes have limited and platform-specific capacity, and that if the subprocess writes beyond that limit without the output being captured, the subprocess blocks waiting for the pipe buffer to accept more data. <strong>The phrase platform-specific capacity is exactly what the table in section 1 shows.</strong></p>
+
+                    <h2>6. Fix two, three and four - read together, use files, or merge</h2>
+                    <p>The two-pipe problem has three directions of fix. All three were run and confirmed.</p>
+                    <pre><code>--- 2-6. FIX B: read stderr concurrently in a thread ---
+  stdout 10 B, stderr 200000 B, rc=0, 0.10s -&gt; no deadlock
+
+--- 2-7. FIX B': communicate() reads both streams at once ---
+  communicate() -&gt; stdout 10 B, stderr 200000 B, rc=0, 0.20s
+
+--- 2-8. FIX C: give the child a real file instead of a pipe ---
+  wait() first with files: rc=0 in 0.10s
+  out.tmp 10 B, err.tmp 200000 B
+
+--- 2-9. FIX D: merge stderr into stdout (one pipe, one reader) ---
+  merged read 200010 B, rc=0, 0.09s
+  first 4 bytes b'EEEE'  last 4 bytes b'OOOO'
+  count O=10  E=200000</code></pre>
+                    <p><strong>Fix two, read together.</strong> A separate thread read standard error while the main thread read standard output. What had not finished after four seconds finished in 0.10 seconds. In an asynchronous runtime a concurrent await does the same job. The principle is single: <strong>there must be as many readers as there are streams opened as pipes.</strong></p>
+                    <p><strong>Fix three, take it into a file.</strong> Item 2-8 is interesting. When the output lands in a temporary file, <strong>waiting first is safe.</strong> That is the very order which produced an endless wait in section 2, yet this time it finished in 0.10 seconds. The reason is clear. <strong>A regular file has no such state as full.</strong> A pipe is a fixed-size box while a file grows as far as the disk allows. There is no reason for the writer to wait, so the very premise of the deadlock disappears.</p>
+                    <p><strong>Fix four, merge them.</strong> Merging standard error into standard output leaves one pipe, so one reader suffices. All 200010 bytes arrived in 0.09 seconds. But the first four bytes of the result are <code>EEEE</code> and <strong>the last four are <code>OOOO</code></strong>. The child wrote standard output first, yet standard error came first in the result. <strong>The ordering flipped.</strong></p>
+                    <h3>6.1 The price of merging - ordering scrambles</h3>
+                    <p>I confirmed the effect again with a short example, making the child alternate three writes to each stream.</p>
+                    <pre><code>--- 2-10. the price of merging: ordering gets scrambled ---
+  merged (default buffering):
+    ERR-0
+    ERR-1
+    ERR-2
+    OUT-0
+    OUT-1
+    OUT-2
+  merged (PYTHONUNBUFFERED=1):
+    OUT-0
+    ERR-0
+    OUT-1
+    ERR-1
+    OUT-2
+    ERR-2
+  same bytes? False</code></pre>
+                    <p>The real order the child wrote is OUT-0, ERR-0, OUT-1, ERR-1, OUT-2, ERR-2. Merged with default settings, <strong>three standard error lines came first and three standard output lines afterwards.</strong> It reads as a completely different story.</p>
+                    <p>The cause is not the pipe but <strong>the program own output buffer</strong>. Standard error is usually unbuffered and goes out immediately, while standard output switches to block buffering when attached to a pipe and leaves <strong>all at once at exit</strong>. That is what rearranges the time order. Turning on the unbuffered switch restored the real order exactly.</p>
+                    <ul>
+                        <li><strong>Do not merge logs whose order matters.</strong> Where progress and errors must be read chronologically this is fatal</li>
+                        <li>Merging is convenient when <strong>you do not look at the order</strong>. Storing the whole output as one blob on failure is perfectly fine</li>
+                        <li>To keep both the ordering and the single pipe, <strong>run the child unbuffered.</strong> The second block above is exactly that</li>
+                        <li>Picking out just the error lines later is impossible. <strong>Merging destroys the origin information</strong></li>
+                    </ul>
+                    <p>The Node side fixes were confirmed symmetrically.</p>
+                    <pre><code>--- 4-3. FIX: consume the stream (data listener) ---
+  4 MB with a data listener: close code=0, read 4194304 B (100 ms)
+
+--- 4-4. FIX: resume() alone is enough (discard the data) ---
+  4 MB with resume() only: close code=0 (101 ms)
+
+--- 4-6. FIX: consume both streams ---
+  both consumed: close code=0, stdout 10 B, stderr 400000 B (91 ms)
+
+--- 4-9. FIX: stream straight to a file, no memory, no pipe limit ---
+  4 MB to a file descriptor: close code=0, file 4194304 B (91 ms)
+
+--- 4-7. spawnSync reads both for you: no deadlock, but memory ---
+  spawnSync 4 MB : status=0, stdout 4194304 B, 116 ms
+  maxBuffer 1024 : status=null, error=ENOBUFS
+
+--- 4-8. execFile has a default maxBuffer ---
+  execFile 4 MB default maxBuffer -&gt; error code=ERR_CHILD_PROCESS_STDIO_MAXBUFFER</code></pre>
+                    <p>Item 4-4 is interesting. <strong>Merely discarding the data breaks the deadlock.</strong> Even if you will not use the content, letting the stream flow keeps the child unblocked. Of course if you never intended to look at the output, <strong>not creating the pipe</strong> is the right answer. The Node documentation says plainly to use the ignore option if the output will not be consumed.</p>
+                    <p>Items 4-7 and 4-8 show the character of bounded approaches. The default ceiling of the file-executing helper is documented as one megabyte, and going over it <strong>produces an error instead of a hang.</strong> The child is terminated and the output truncated. That is far better than a deadlock. <strong>Failing loudly always beats stopping quietly.</strong></p>
+
+                    <h2>7. Shell pipelines - flow control is not a bug</h2>
+                    <p>The same principle operates in the shell, yet there it is usually <strong>not a problem</strong>. Understanding why gives you the criterion that separates deadlock from flow control.</p>
+                    <pre><code>bash 5.2.37(1)-release on Msys / MINGW64_NT-10.0-19045
+
+--- 3-1. capacity of a SHELL pipe: writer pushes, reader sleeps ---
+  bytes the writer got in before it blocked : 65536 (128 B granularity)
+
+--- 3-2. same probe, 16 B granularity ---
+  bytes accepted : 65536
+
+--- 3-3. flow control is NOT a bug: slow reader only slows the writer ---
+  pipeline exit=0  elapsed=2455 ms  (reader slept 2s, still COMPLETED)
+
+--- 3-4. reader closes early: writer gets SIGPIPE (the opposite problem) ---
+row
+row
+  PIPESTATUS = 141 0</code></pre>
+                    <p>Item 3-1 is the second row of the table in section 1. The shell pipe capacity is <strong>65536 bytes</strong>, sixteen times larger than the native pipe on the same machine. Measuring at two different granularities gave the same value.</p>
+                    <p>Item 3-3 is the point of this section. The downstream end was made to read nothing for two seconds. The upstream end filled 65536 bytes and waited. <strong>Yet the pipeline completed normally in 2455 milliseconds with exit code zero.</strong> The downstream woke after two seconds, started reading, and the upstream resumed and ran to the end.</p>
+                    <p>This is <strong>flow control</strong>. A pipe automatically matches the speed of a fast producer to a slow consumer. The producer waiting is not waste but <strong>a design that avoids unbounded memory use</strong>. Without this device a producer would eat all memory in front of a slow consumer.</p>
+                    <table>
+                        <thead>
+                            <tr><th>Aspect</th><th>Flow control (normal)</th><th>Deadlock (an incident)</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>state of the writer</td><td>waiting</td><td>waiting (identical)</td></tr>
+                            <tr><td>state of the reader</td><td><strong>will read eventually</strong></td><td><strong>is waiting for something else</strong></td></tr>
+                            <tr><td>as time passes</td><td>progress resumes</td><td>stays that way forever</td></tr>
+                            <tr><td>measured here</td><td>exit code 0 after 2455 ms</td><td>no change until the timeout</td></tr>
+                            <tr><td>how to tell them apart</td><td colspan="2"><strong>sample progress twice and compare.</strong> Moving means flow control, frozen means deadlock</td></tr>
+                        </tbody>
+                    </table>
+                    <p>The first two rows are the key. <strong>Looking only at the writer, the two are indistinguishable.</strong> Both are waiting on a write to a pipe. The difference lies with the reader. So diagnosis must always look at <strong>both sides together</strong>.</p>
+                    <p>Item 3-4 is the opposite accident. When the reader finishes first, the writer is <strong>signalled</strong> rather than made to wait. The first status slot showing 141 is the trace of that. The meaning of that value and the exit code conventions of pipelines were covered in <a href="shell_exit_code_pipefail.html">exit codes and pipes</a>, so here I only note the direction. <strong>A deadlock happens because the reader does not read, this happens because the reader left first.</strong></p>
+                    <p>One more observation is worth adding. With a native Windows program as the upstream in the same situation, a <strong>write error</strong> appeared instead of a signal. The exit code was 1 and the message indicated an invalid argument. <strong>So even the way the fact that the reader is gone gets delivered depends on the environment.</strong> To identify a cause from an exit code you must check your own environment first.</p>
+
+                    <h2>8. The buffer is not one layer</h2>
+                    <p>So far only the pipe buffer has been discussed, but there is one more layer: <strong>the program own output buffer</strong>. The two are entirely separate, and mixing them up misdirects diagnosis.</p>
+                    <pre><code>--- 5-1. what Python says about its own stdout buffering ---
+  plain          : isatty=False line_buffering=False
+  into a pipe    : isatty=False line_buffering=False
+  with -u        : isatty=False line_buffering=False write_through=True
+  buffer size    : io.DEFAULT_BUFFER_SIZE = 8192
+
+--- 5-6. two independent layers: how many bytes arrive per read ---
+  default buffering  : chunk sizes [8268, 212]
+                       2 chunks, 8480 bytes total
+  PYTHONUNBUFFERED=1 : first 10 chunk sizes [212, 4240, 4028]
+                       3 chunks, 8480 bytes total
+  one line is 210 bytes; the default run hands them over in 8192 B blocks</code></pre>
+                    <p>The child writes forty lines of 210 bytes, 8480 bytes in total. With default settings the parent received <strong>just two chunks, of 8268 and 212 bytes</strong>. Forty writes arrived in two deliveries. The <strong>program output buffer size</strong> of 8192 decided that unit.</p>
+                    <p>The difference between the two layers needs to be set out.</p>
+                    <table>
+                        <thead>
+                            <tr><th>Layer</th><th>Value here</th><th>When it fills</th><th>How to change it</th><th>Symptom</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><strong>program output buffer</strong></td><td>8192 B (Python stdio)</td><td>flushes to the operating system</td><td>unbuffered switch, environment variable</td><td>output arrives <strong>clumped and late</strong></td></tr>
+                            <tr><td><strong>pipe buffer</strong></td><td>4096 B (this path)</td><td><strong>the writer waits</strong></td><td>usually not changeable</td><td>the process <strong>stops</strong></td></tr>
+                            <tr><td>Node stream buffer</td><td>16384 B (high water mark)</td><td>pauses reading for a while</td><td>stream option</td><td>the stall boundary <strong>grows</strong></td></tr>
+                            <tr><td>a regular file</td><td>effectively unlimited</td><td>never fills</td><td>not applicable</td><td><strong>no deadlock at all</strong></td></tr>
+                        </tbody>
+                    </table>
+                    <p>This table matters in diagnosis because <strong>the two layers produce different symptoms</strong>. The output buffer creates <strong>delay</strong> and the pipe buffer creates <strong>a stop</strong>. Logs arriving late and the process being stuck are different problems with different fixes.</p>
+                    <p>On the writing side Node made another choice. That was measured too.</p>
+                    <pre><code>node v22.16.0
+--- 8-1. Node adds its OWN buffer on top of the OS pipe ---
+  child.stdout.readableHighWaterMark : 16384
+  child.stderr.readableHighWaterMark : 16384
+  child.stdin.writableHighWaterMark  : 16384
+
+--- 8-3. write() return value tells you the buffer is full ---
+  bytes handed to write()            : 1048576
+  write() first returned false at    : 16384 B
+  socket.writableLength (queued)     : 1048576
+  -&gt; Node queues in memory instead of blocking; the queue is unbounded</code></pre>
+                    <p>1048576 bytes were pushed into the child standard input. The write function <strong>started returning false at the 16384-byte mark</strong>, signalling that the buffer was full. Yet <strong>it did not block.</strong> All 1048576 bytes handed over piled into a memory queue.</p>
+                    <ul>
+                        <li>Node <strong>converted the write-side deadlock into memory growth.</strong> Instead of stopping, the queue grows without bound</li>
+                        <li>Ignore the return value and you get <strong>memory exhaustion instead of deadlock</strong>. Only the symptom changes, the problem stays</li>
+                        <li>Conversely <strong>the read side still deadlocks.</strong> The 131073 bytes in section 5 is that</li>
+                        <li>So a different runtime turns <strong>the same cause into a different symptom</strong>. The judgement that we are fine because we use Node is only half right</li>
+                    </ul>
+
+                    <h2>9. Why progress output never appears</h2>
+                    <p>This is the representative symptom created by the output buffer of section 8. Progress logs do not appear in real time. I measured arrival times of the same program under three conditions, a program that prints six lines at 0.3 second intervals.</p>
+                    <pre><code>--- 5-2. six lines through a pipe, DEFAULT buffering (arrival times) ---
+    +2019 ms  progress 0/6
+    +2074 ms  progress 1/6
+    +2125 ms  progress 2/6
+    +2177 ms  progress 3/6
+    +2237 ms  progress 4/6
+    +2294 ms  progress 5/6
+
+--- 5-3. the same program with PYTHONUNBUFFERED=1 ---
+    + 200 ms  progress 0/6
+    + 504 ms  progress 1/6
+    + 812 ms  progress 2/6
+    +1108 ms  progress 3/6
+    +1413 ms  progress 4/6
+    +1702 ms  progress 5/6
+
+--- 5-5. does stdbuf help a Python child? ---
+    +2223 ms  progress 0/6
+    +2276 ms  progress 1/6
+    +2328 ms  progress 2/6
+    +2384 ms  progress 3/6
+    +2439 ms  progress 4/6
+    +2492 ms  progress 5/6</code></pre>
+                    <p>With default settings <strong>all six lines arrived at once, after 2019 milliseconds</strong> — after the program had finished. To someone expecting one line every 0.3 seconds it looks like <strong>two seconds of no progress at all</strong>. With the unbuffered switch on, the arrivals were 200, 504, 812, 1108, 1413 and 1702 milliseconds, <strong>the expected spacing</strong>.</p>
+                    <p>Item 5-5 is the trap. I prefixed an external buffering-control tool and it had <strong>no effect at all.</strong> Clumping from 2223 milliseconds onward is the same as the default. That tool adjusts the buffering of the C standard library, while this runtime uses its own buffer. <strong>When a tool is applied and nothing changes, the tool may not reach that layer.</strong></p>
+                    <ul>
+                        <li>Most missing progress output is <strong>not a slow program but data pooling in a buffer</strong>. The programs in 5-2 and 5-3 are completely identical</li>
+                        <li>What gets fixed is <strong>the producer side</strong>. The reader can do nothing. Data that never entered the pipe cannot be read</li>
+                        <li>Use the switch that matches the runtime. The environment variable and the command option gave <strong>nearly identical results</strong> here (200 versus 210 milliseconds)</li>
+                        <li>This delay is <strong>unrelated to deadlock.</strong> Confusing the two makes you fix the wrong thing</li>
+                    </ul>
+                    <div class="callout">
+                        <p><strong>★What I could not reproduce.</strong> The standard explanation of this symptom is that output is line buffered when attached to a terminal and switches to block buffering when attached to a pipe. But <strong>a comparison against a real terminal could not be reproduced in this environment.</strong> The runs are non-interactive, so the terminal test never returned true on any path, and attaching a pseudo terminal tool only produced a message refusing because standard input is not a terminal. So all output above is <strong>the pipe case</strong>, and the terminal behaviour <strong>was not measured</strong>. What is confirmed stops at this: with a pipe attached, turning on the buffering switch restores the arrival spacing.</p>
+                    </div>
+
+                    <h2>10. Both sides waiting for each other - the two-way deadlock</h2>
+                    <p>So far only the output direction. When you must also feed <strong>a large input</strong> to the child, the deadlock appears in its purest form: the parent writes all the input, then reads the output. And here an unexpected result came out.</p>
+                    <pre><code>--- 6-1. child A (reads all, then writes) - like sort ---
+  payload     4096 B -&gt; ok         (wrote 4096 B, echoed 4096 B, 0.09s)
+  payload    65536 B -&gt; ok         (wrote 65536 B, echoed 65536 B, 0.09s)
+  payload  1048576 B -&gt; ok         (wrote 1048576 B, echoed 1048576 B, 0.10s)
+  payload  4194304 B -&gt; ok         (wrote 4194304 B, echoed 4194304 B, 0.14s)
+
+--- 6-2. child B (streaming filter) - like cat / grep / sed ---
+  payload     1024 B -&gt; ok         (wrote 1024 B before stopping, 0.10s)
+  payload     4096 B -&gt; ok         (wrote 4096 B before stopping, 0.10s)
+  payload     8192 B -&gt; ok         (wrote 8192 B before stopping, 0.09s)
+  payload    16384 B -&gt; DEADLOCK   (wrote 10240 B before stopping, 3.01s)
+  payload    65536 B -&gt; DEADLOCK   (wrote 10240 B before stopping, 3.01s)
+  payload  1048576 B -&gt; DEADLOCK   (wrote 10240 B before stopping, 3.01s)
+
+--- 6-3. verify the bracket, then bisect the streaming case ---
+  bracket check: 1 B hangs=False   65536 B hangs=True
+  largest payload that survives : 9216 B
+  smallest payload that hangs   : 9217 B
+  probes : 16</code></pre>
+                    <p><strong>The result split completely according to what kind of child it was.</strong> This is the most practical finding of the whole experiment.</p>
+                    <ul>
+                        <li>A child that <strong>reads everything before writing</strong> (the sorting-tool family) did not deadlock even at four megabytes. The child keeps reading so the parent write never blocks, and by the time writing is done the parent has moved on to reading</li>
+                        <li>A <strong>streaming filter that writes while reading</strong> (the search and substitute family) deadlocked from 9217 bytes. When the child blocks on its output pipe it stops reading, and then the parent write blocks too</li>
+                        <li>So <strong>the same parent code passes or hangs depending on the other side.</strong> This is where the accident of swapping one tool in a pipeline and suddenly hanging comes from</li>
+                        <li>Which means you cannot judge from the parent code alone. <strong>You have to know whether the child streams or not</strong></li>
+                    </ul>
+                    <p>Decompose the boundary of 9216 bytes and the structure becomes visible. <strong>4096 plus 4096 plus 1024 equals 9216.</strong> The child output pipe fills with 4096 bytes, the parent input pipe fills with 4096 bytes, and with a final 1024-byte chunk in flight the circle closes. <strong>The sum of the two pipe capacities appeared directly as the boundary.</strong> That is the arithmetic evidence of both sides waiting for each other.</p>
+                    <pre><code>--- 6-4. FIX: feed and drain at the same time ---
+  communicate() 4 MB in -&gt; 4194304 B out, rc=0, 0.12s
+
+--- 6-5. FIX: writer thread + reader in the main thread ---
+  writer thread + main-thread reader -&gt; 4194304 B, rc=0, 0.12s</code></pre>
+                    <p>There is only one fix. <strong>Do the feeding and the draining at the same time.</strong> Whether you hand it to the combined call or move the writing to a separate thread, four megabytes finished in 0.12 seconds. Separate the order and it deadlocks, overlap it and it resolves.</p>
+
+                    <h2>11. A procedure for diagnosing a hang</h2>
+                    <p>Now the practical situation. A hung process sits in front of you and you must decide whether this is the problem. Five steps, no special tooling. I created a deadlock deliberately and walked the procedure.</p>
+                    <pre><code>--- 7-1. start a pipeline that is stuck on purpose, then look at it ---
+  step 1: are both ends still alive?
+          372     369     365      22220  ?         197609 13:40:40 /usr/bin/sleep
+          373     370     370       7504  ?         197609 13:40:40 .../python      
+
+  step 2: is the writer making progress? (sample the counter twice)
+    bytes written at t=2s : 65536
+    bytes written at t=4s : 65536
+    -&gt; FROZEN at the same byte count
+
+  step 3: is it burning CPU (a loop) or waiting (blocked)?
+    CPU seconds sample 1 : 0.109375
+    CPU seconds sample 2 : 0.109375
+    -&gt; equal CPU time + alive process = BLOCKED, not looping
+
+  step 4: the decisive test - shrink the payload
+     65536 B payload -&gt; writer exit=0  (0 = finished on its own)
+    400000 B payload -&gt; writer exit=124  (124 = still blocked when timeout killed it)
+    got 65536 B in before blocking
+    same code, only the size changed -&gt; the cause is the pipe buffer</code></pre>
+                    <p>Reading the four steps in order narrows the verdict.</p>
+                    <ul>
+                        <li><strong>Step 1, confirm life.</strong> <strong>Both appear</strong> in the process list. Nothing crashed, they are alive and waiting. That alone erases the crash hypothesis</li>
+                        <li><strong>Step 2, confirm progress.</strong> Bytes written read <strong>65536 at both</strong> the two-second and four-second marks. Frozen. That is the criterion from the table in section 7</li>
+                        <li><strong>Step 3, confirm CPU.</strong> Cumulative CPU time held at <strong>0.109375 then 0.109375</strong>. A spin loop would raise that value. It did not rise, so this is waiting rather than computing</li>
+                        <li><strong>Step 4, the decisive test.</strong> The same code ran twice with only the size changed. 65536 bytes exited normally with <strong>code 0</strong>, while 400000 bytes was killed while still blocked and left <strong>124</strong>. The amount that got in was exactly 65536 bytes, the shell pipe capacity</li>
+                        <li><strong>Step 5, read the code.</strong> Check whether a wait call sits before the read, and whether any stream is opened as a pipe and left unconsumed. If the four previous steps hold, the cause is certainly here</li>
+                    </ul>
+                    <p>It is worth stressing why step 4 is decisive. <strong>Nothing but the size was changed.</strong> Same code, same environment, same input content. Yet the results diverged. No clearer evidence exists. And this test <strong>requires no special tooling whatsoever.</strong></p>
+                    <table>
+                        <thead>
+                            <tr><th>Observation</th><th>Verdict</th><th>Next action</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>both alive and CPU time frozen</td><td>blocked somewhere</td><td>use steps 2 and 4 to confirm the pipe</td></tr>
+                            <tr><td>alive and CPU time rising</td><td>a spin loop</td><td><strong>not a pipe problem.</strong> Read the logic</td></tr>
+                            <tr><td>progress identical in two samples</td><td>stopped</td><td>deadlock is likely</td></tr>
+                            <tr><td>progress slow but moving</td><td>flow control</td><td><strong>normal.</strong> Improve the slow side</td></tr>
+                            <tr><td>passes when you shrink the size</td><td><strong>pipe buffer deadlock confirmed</strong></td><td>apply the fixes from sections 4, 6 and 10</td></tr>
+                            <tr><td>hangs regardless of size</td><td>not a pipe problem</td><td>look at locks, network, waiting on input</td></tr>
+                            <tr><td>child finished but parent did not</td><td>a stream unconsumed or unclosed</td><td>count the streams opened as pipes</td></tr>
+                        </tbody>
+                    </table>
+                    <p>A word on tools. In this environment only <strong>listing processes and reading CPU time</strong> were available. There was no tool for open files and no debugger, and while a system call tracer existed it <strong>could not attach to an already running native process.</strong> So the procedure above is deliberately built from <strong>things that work anywhere</strong>. Progress sampling and the shrink test work in an environment with no tools at all.</p>
+
+                    <h2>12. Timeouts, streaming, and when the parent dies</h2>
+                    <p>Three more things that catch people in practice. The first is the timeout trap.</p>
+                    <pre><code>--- 9-1. wait(timeout=) does NOT kill the child; run(timeout=) does ---
+  Popen.wait(1.5) raised TimeoutExpired
+  child alive right after the exception : True
+  after an explicit kill(), alive        : False
+
+--- 9-2. run(timeout=) on a big output: does it survive? ---
+  run(capture_output=True, timeout=5) -&gt; rc=0, 2097152 B, 1.23s
+
+--- 9-3. the trap: check_output on a child that also writes stderr ---
+  check_output, stderr NOT a pipe (DEVNULL) -&gt; 10 B, 0.38s
+  check_output(stderr=PIPE)  -&gt; 10 B, 1.15s</code></pre>
+                    <p>Item 9-1 matters. A ceiling was placed on the wait call and the exception arrived, yet <strong>the child was still alive.</strong> A timeout means I stop waiting, not I end the other party. It disappeared only after an explicit kill.</p>
+                    <ul>
+                        <li>Set a timeout without killing and <strong>orphan processes accumulate.</strong> In an environment where the batch runs repeatedly, that quietly eats resources</li>
+                        <li>The place that catches the exception <strong>must call the kill</strong>. And it must reap the process afterwards</li>
+                        <li>As 9-2 and 9-3 show, <strong>the high-level calls handle this for you.</strong> A two megabyte output completed inside the ceiling, and opening standard error as a pipe did not deadlock</li>
+                        <li>So unless there is a reason to assemble it yourself, <strong>using the high-level call is safer.</strong> Most deadlocks come out of hand-assembled code</li>
+                    </ul>
+                    <p>The second is when the parent dies first. I checked what becomes of the child in two varieties.</p>
+                    <pre><code>--- 10-1. orphan that keeps WRITING to the dead parent's pipe ---
+  1.5s after the parent exited, still running : False
+  -&gt; its next write failed, so it terminated on its own
+
+--- 10-2. orphan that is NOT writing (just sleeping) ---
+  1.5s after the parent exited, still running : True
+  -&gt; nothing ever tells it the parent is gone; it just keeps sleeping
+  had to be killed explicitly</code></pre>
+                    <p>The results split. <strong>A child that keeps writing died by itself</strong>, because its next write failed. Meanwhile <strong>a child that waits without writing survived</strong>, because nothing gives it an occasion to learn that the parent is gone. It disappeared only after an explicit kill.</p>
+                    <ul>
+                        <li>The expectation that children get cleaned up when the parent dies is <strong>only half right.</strong> It holds only for children that keep writing</li>
+                        <li>A pipe informs you of the absence of the other side <strong>only when you write.</strong> A process that reads or sleeps receives no signal at all</li>
+                        <li>So code that spawns children needs <strong>handling that cleans them up on the parent exit path</strong>. It must exist on the exception path as well as the normal one</li>
+                        <li>This can behave differently <strong>depending on the operating system and process group settings</strong>. The results above are measurements from this environment</li>
+                    </ul>
+
+                    <h2>13. The decision table - what to choose</h2>
+                    <p>The measurements so far, compressed into practical decisions. Three things decide it: <strong>output size, whether standard error is used, and whether order matters</strong>.</p>
+                    <table>
+                        <thead>
+                            <tr><th>Situation</th><th>Choose</th><th>Measured here</th><th>Watch out for</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>small output, known ceiling</td><td>one high-level call</td><td>1048576 B / 0.10 s</td><td>whole thing in memory. Record the ceiling in code</td></tr>
+                            <tr><td>large output or no ceiling</td><td>redirect to a file</td><td>4194304 B / 91 ms</td><td>temp-file cleanup and disk headroom are yours</td></tr>
+                            <tr><td>handle output live</td><td>consume line by line</td><td>200000 lines / 0.31 s, largest object 12 chars</td><td>late because of the child buffer. Run it unbuffered</td></tr>
+                            <tr><td>standard error also needed</td><td>consume both streams at once</td><td>200000 B / 0.10 s</td><td><strong>reading one side only always deadlocks</strong></td></tr>
+                            <tr><td>only error text, order irrelevant</td><td>merge error into output</td><td>200010 B / 0.09 s</td><td><strong>order scrambles.</strong> Origin information is lost too</td></tr>
+                            <tr><td>keep order and one pipe</td><td>merge but run the child unbuffered</td><td>real order confirmed restored</td><td>you must control the child</td></tr>
+                            <tr><td>large input also needed</td><td>write and read at the same time</td><td>4194304 B / 0.12 s</td><td><strong>write everything then read is a two-way deadlock</strong></td></tr>
+                            <tr><td>output never used</td><td>point it at the null device</td><td>exits immediately</td><td>opening a pipe and ignoring it is the worst</td></tr>
+                        </tbody>
+                    </table>
+                    <p>Which calls are safe and which are dangerous per runtime is also set out. All of it was confirmed in this environment.</p>
+                    <table>
+                        <thead>
+                            <tr><th>Runtime</th><th>Safe (confirmed)</th><th>Dangerous (deadlock confirmed)</th><th>Boundary</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Python</td><td>combined call, high-level runner, file redirect, line-by-line streaming</td><td>wait first then read, reading only one of two pipes</td><td><strong>4097 B</strong></td></tr>
+                            <tr><td>Node asynchronous</td><td>attach a data listener, let it flow, pass a file descriptor, use ignore</td><td>wait for close without consuming, leave standard error alone</td><td><strong>131073 B</strong></td></tr>
+                            <tr><td>Node synchronous and convenience calls</td><td>bounded runner (error when exceeded)</td><td>setting the ceiling too low and failing</td><td>default ceiling 1 MB</td></tr>
+                            <tr><td>Shell</td><td>ordinary pipelines, splitting stages with files</td><td>almost never a problem (the downstream always reads)</td><td>waits at 65536 B, then resumes</td></tr>
+                        </tbody>
+                    </table>
+                    <p>The last row deserves attention. <strong>The reason this problem barely appears in shell pipelines is that the downstream tools always read.</strong> Standard tools are built to keep consuming their input. The problem arises when we write the parent process ourselves and <strong>write code that waits before reading</strong>.</p>
+
+                    <h2>14. Checklist and things not to do</h2>
+                    <p>Arranged so you can use it directly in a code review.</p>
+                    <ul>
+                        <li>Count whether <strong>every stream opened as a pipe has code consuming it</strong>. Streams and readers must match in number</li>
+                        <li>Check that the wait call comes <strong>after the read</strong>. If it comes before, that alone is a defect</li>
+                        <li>Check that every wait call has a <strong>timeout</strong>. Without one you cannot even investigate during an incident</li>
+                        <li>Check that the child is <strong>killed explicitly</strong> after a timeout. Catching the exception does not kill it</li>
+                        <li>Check that children with an unclear output ceiling are taken <strong>into a file or streamed</strong></li>
+                        <li>Check that some test sample is <strong>larger than the buffer capacity</strong>. Without one this path has never been verified</li>
+                        <li>Check that <strong>writing and reading run together</strong> where a large input is fed</li>
+                        <li>Check that logs whose order matters <strong>have not been merged</strong>. Merging breaks the chronology</li>
+                        <li>Check that children which must show progress run <strong>unbuffered</strong></li>
+                        <li>Check that <strong>no pipe is being created</strong> where the output is never used</li>
+                        <li>Check that the parent exit path has <strong>child cleanup</strong>. A sleeping child does not die by itself</li>
+                        <li>Check that the production buffer capacity was <strong>measured directly</strong>. It may differ from development</li>
+                    </ul>
+                    <p>And the things not to do.</p>
+                    <ul>
+                        <li>❌ <strong>A stream opened as a pipe and never consumed</strong> — overwhelmingly the most common cause in practice, and usually standard error</li>
+                        <li>❌ <strong>Wait first, read later</strong> — code that only passes up to 4096 bytes</li>
+                        <li>❌ Assuming <strong>the child also died</strong> because the wait failed — measured, it was still alive</li>
+                        <li>❌ <strong>Passing a review on small samples only</strong> — the boundary is crossed only by real data</li>
+                        <li>❌ Assuming a buffer capacity <strong>from another environment</strong> — one machine gave 4096, 65536 and 131072</li>
+                        <li>❌ <strong>Misdiagnosing a delayed progress log as a slow program</strong> — it is only pooled in a buffer and the cause is different</li>
+                        <li>❌ <strong>Merging two streams and then trusting the order</strong> — measured, the order flipped completely</li>
+                        <li>❌ <strong>Waiting without a timeout</strong> — it makes the reproduction experiment itself impossible. Every experiment here ran under a ceiling</li>
+                        <li>❌ Judging <strong>the code safe from the parent alone</strong> — as in section 10, the kind of child changes the result</li>
+                    </ul>
+
+                    <h2>References</h2>
+                    <ul>
+                        <li>The Open Group Base Specifications Issue 7, 2018 edition (IEEE Std 1003.1-2017) - <code>write</code> (blocking behaviour on a full pipe when the non-blocking flag is clear, the atomicity rule, and the signal when nothing has it open for reading): <a href="https://pubs.opengroup.org/onlinepubs/9699919799/functions/write.html" target="_blank" rel="noopener">pubs.opengroup.org</a></li>
+                        <li>The Open Group Base Specifications Issue 7, 2018 edition - <code>pipe</code> (creating a pipe and the initial flag state of both file descriptors): <a href="https://pubs.opengroup.org/onlinepubs/9699919799/functions/pipe.html" target="_blank" rel="noopener">pubs.opengroup.org</a></li>
+                        <li>Python documentation - <code>subprocess</code> (the deadlock warning on the wait call, the recommendation to use the combined call, and the note that data is buffered in memory): <a href="https://docs.python.org/3/library/subprocess.html" target="_blank" rel="noopener">docs.python.org</a></li>
+                        <li>Node.js documentation - <code>child_process</code> (that pipe capacity is limited and platform specific, the default output ceiling and what happens when it is exceeded, file descriptors and the ignore option): <a href="https://nodejs.org/api/child_process.html" target="_blank" rel="noopener">nodejs.org</a></li>
+                        <li>Related posts: <a href="shell_exit_code_pipefail.html">Exit codes and pipes - noticing a failing pipeline</a>, <a href="find_xargs_whitespace_trap.html">The whitespace trap in find and xargs</a>, <a href="shell_quoting_rules_guide.html">Shell quoting rules</a>, <a href="cp949_utf8_mojibake_guide.html">Locating where Hangul breaks</a></li>
+                    </ul>
+                </div>
+
+                <!-- md-artifact-start -->
+                    <div class="md-artifact" style="margin:2rem 0;border:1px solid #d7dce3;border-radius:10px;overflow:hidden;background:#fbfcfd;">
+                        <div style="display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;justify-content:space-between;padding:.7rem 1rem;background:#eef2f7;border-bottom:1px solid #d7dce3;">
+                            <span style="font-weight:700;font-size:.97rem;">📋 Checklist you can take with you</span>
+                            <span style="display:flex;gap:.5rem;align-items:center;">
+                                <code style="font-size:.82rem;color:#5a6675;background:transparent;padding:0;">pipe_buffer_deadlock.md</code>
+                                <button type="button" class="md-artifact-copy" style="cursor:pointer;border:1px solid #b9c2cf;background:#fff;color:#2c3e50;font-weight:600;line-height:1.3;border-radius:6px;padding:.32rem .7rem;font-size:.85rem;">Copy all</button>
+                            </span>
+                        </div>
+                        <pre style="margin:0;max-height:420px;overflow:auto;padding:1rem;background:#fbfcfd;font-size:.86rem;line-height:1.62;"><code class="nohighlight" style="background:transparent;padding:0;white-space:pre;"># Pipe Buffer Deadlock — Child Process Review Sheet
+
+&gt; Source: braindetox.kr — The Real Reason Your Child Process Hangs
+&gt; Evidence: measured on Windows 10 / bash 5.2.37 (MSYS2) / Python 3.13.3 / Node.js 22.16.0
+&gt; Paste this file into an AI assistant and say: review our code against these rules.
+&gt; ⚠ Buffer capacity differs per OS, shell and runtime. The numbers below are measurements from the environment above. Measure yours again.
+
+## 0. The principle in one line
+
+A pipe is a **finite buffer**. When it is full the writer waits — that is not a bug, that is **flow control**.
+The problem appears when the person who should read is already waiting. That is when **both sides wait for each other**.
+
+## 1. Measured capacity per layer (reference)
+
+| Layer | Measured | Meaning |
+|---|---|---|
+| Native Windows anonymous pipe | 4096 B | Python os.pipe and subprocess PIPE |
+| MSYS2 shell pipe | 65536 B | the bash cmd1 pipe cmd2 form |
+| Node stream highWaterMark | 16384 B | a userland buffer stacked on the OS pipe |
+| Node unconsumed stdout stall boundary | 131073 B | measured; not the plain sum of the two above |
+| Python stdio buffer | 8192 B | io.DEFAULT_BUFFER_SIZE, a separate layer from the pipe |
+
+## 2. Measured deadlock boundaries
+
+| Pattern | Passes | Deadlocks | Reading of the boundary |
+|---|---|---|---|
+| Python: wait first, child writes to stdout | up to 4096 B | 4097 B and above | the pipe capacity itself |
+| Node: no data listener, waiting for close | up to 131072 B | 131073 B and above | stream buffer plus libuv read-ahead |
+| Parent writes all input, reads later (streaming filter child) | up to 9216 B | 9217 B and above | 4096 plus 4096 plus 1024 |
+| Parent writes all input, reads later (slurping child) | 4 MB still passes | — | the child keeps draining, so nothing blocks |
+
+## 3. Choosing how to run a child
+
+| Situation | Choose | Watch out for |
+|---|---|---|
+| Output is small with a known ceiling | one high-level call (run, check_output, spawnSync) | everything is held in memory. Document the ceiling in code |
+| Output is large or unbounded | redirect to a file descriptor | you own temp-file cleanup and disk headroom |
+| Output must be handled live | consume line by line | the child stdio buffer delays it. Run the child unbuffered |
+| You also need stderr | consume both streams at once (thread, async, or a high-level call) | reading only one side always deadlocks |
+| You only need stderr text and order is irrelevant | merge stderr into stdout | the two streams buffer differently, so ordering scrambles |
+| The child also takes a large input | write and read at the same time (separate thread or a combined API) | writing everything and reading later is a two-way deadlock |
+| Output is discarded entirely | point it at the null device | opening a PIPE and ignoring it is the worst case |
+
+## 4. Safe call patterns
+
+### Python
+
+```python
+import subprocess
+
+# (1) small output: take it all at once. Both streams are drained for you
+r = subprocess.run(cmd, capture_output=True, timeout=60)
+
+# (2) large output: land it in files, and only then is wait-first safe
+with open("/tmp/demo/out.log", "wb") as fo, open("/tmp/demo/err.log", "wb") as fe:
+    p = subprocess.Popen(cmd, stdout=fo, stderr=fe)
+    rc = p.wait(timeout=600)
+
+# (3) live handling: consume line by line, holding one line at a time
+p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                     text=True, bufsize=1)
+for line in p.stdout:
+    handle(line)
+p.wait(timeout=600)
+
+# (4) large input plus large output: let one call do the feeding and draining
+out, err = p2.communicate(payload, timeout=600)
+```
+
+**Forbidden patterns**
+
+```python
+p = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+p.wait()                 # waits forever once the output exceeds the buffer
+out = p.stdout.read()    # this line is never reached
+
+p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+out = p.stdout.read()    # a full stderr stops the child, so this read never ends
+```
+
+### Node.js
+
+```javascript
+const { spawn, execFile } = require("child_process");
+
+// (1) small output: the 1 MB default ceiling reports an error instead of hanging
+execFile(cmd, args, { maxBuffer: 4 * 1024 * 1024, timeout: 60000 }, cb);
+
+// (2) large output: stream it straight into a file descriptor
+const fd = fs.openSync("/tmp/demo/out.log", "w");
+const child = spawn(cmd, args, { stdio: ["ignore", fd, "inherit"] });
+
+// (3) consume both streams
+const c = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+c.stdout.on("data", onOut);
+c.stderr.on("data", onErr);      // without this line a full stderr stalls everything
+c.on("close", onDone);
+
+// (4) if you will not look at the output, do not create the pipe
+spawn(cmd, args, { stdio: "ignore" });
+```
+
+**Forbidden pattern**
+
+```javascript
+const c = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+c.on("close", done);   // nobody consumes stdout or stderr, so close never fires
+```
+
+### Shell
+
+```bash
+# flow control is normal. A slow consumer only slows the producer down
+producer | consumer
+
+# break large intermediate results with a file
+producer &gt; /tmp/demo/stage1.tsv
+consumer &lt; /tmp/demo/stage1.tsv
+
+# if the reader finishes first the producer is signalled. Check the codes
+producer | head -n 100
+echo "${PIPESTATUS[0]} ${PIPESTATUS[1]}"
+
+# if progress logs arrive in clumps, run the producer unbuffered
+PYTHONUNBUFFERED=1 producer.py | tee /tmp/demo/run.log
+```
+
+## 5. Diagnosing a hang, in five steps
+
+1. **Confirm it is alive.** If both parent and child appear in the process list, nothing died — they are waiting.
+2. **Sample CPU time twice.** An unchanged value means a **block**, not a spin loop. Measured example: 0.109375 then 0.109375.
+3. **Sample progress twice.** Bytes written, output file size, last log line — check whether any of them moves.
+4. **The decisive test: shrink the input.** If the same code stops hanging below a size, the cause is the **buffer**, not your logic.
+   - Measured example: 65536 B exited normally (0), 400000 B was still blocked when killed (124), having accepted 65536 B.
+5. **Read the order in the code.** Does a wait call come before the read? Is any piped stream left unconsumed?
+
+| Observation | Verdict |
+|---|---|
+| Alive and CPU time frozen | blocked on a pipe (or some other I O wait) |
+| Alive and CPU time climbing | a spin loop. Not a pipe problem |
+| Passes when you shrink the size | **pipe buffer deadlock confirmed** |
+| Hangs regardless of size | not a pipe problem. Suspect locks, network, or input |
+| Child finished but parent did not | the parent never closed or never consumed a stream |
+
+## 6. Review sentences you can paste
+
+- What is the ceiling on this child output? If there is none, switch to a file or to streaming.
+- stderr is opened as a pipe but I see no code consuming it. Reading one side only is a deadlock.
+- The wait call sits before the read. Swap the order, or move to a combined API.
+- You write the whole input before reading output. Against a streaming filter that is a two-way deadlock.
+- There is no timeout. Every wait needs a ceiling, and the child needs an explicit kill after it.
+- The test input is small, so this path has never been exercised. Add a sample larger than the buffer.
+- Progress logs arrive in clumps. Attaching a pipe switches to block buffering. Run the producer unbuffered.
+
+## 7. Checklist
+
+- [ ] every stream opened as a pipe has **code consuming it**
+- [ ] the wait call comes **after** the read (or a combined API is used)
+- [ ] every wait call has a **timeout**
+- [ ] the child is **killed explicitly** after a timeout (a failed wait does not mean it died)
+- [ ] children with an unclear output ceiling go to a **file or a stream**
+- [ ] the test sample is **larger than the buffer capacity**
+- [ ] when feeding a large input, **writing and reading run together**
+- [ ] logs whose order matters are **not merged** (merging scrambles them)
+- [ ] children that must show progress run **unbuffered**
+- [ ] if the output is unused, **no pipe is created**
+- [ ] there is a path that **cleans up children** when the parent dies
+- [ ] the production buffer capacity was **measured directly** (it may differ from development)
+
+## 8. Do not
+
+- ❌ leave a piped stream **unconsumed** — the most common cause by far
+- ❌ **wait first, read later** — it only passes on small output
+- ❌ **assume the child died** because the wait failed — measured: it was still alive
+- ❌ pass a review on small samples only — the boundary is crossed only by real data
+- ❌ **assume a buffer size from another environment** — one machine gave 4096, 65536 and 131072
+- ❌ **misread a delayed progress log as a slow program** — it is only pooled in a buffer
+- ❌ merge two order-sensitive streams and then **trust the ordering**
+- ❌ wait without a timeout — it makes even the reproduction experiment impossible
+</code></pre>
+                        <p style="margin:0;padding:.6rem 1rem;font-size:.82rem;color:#5a6675;border-top:1px solid #e3e8ee;">Copy and paste it straight into your notes or an AI assistant.</p>
+                    </div>
+                    <script>
+                    (function(){
+                      if (window.__mdArtifactBound) return;
+                      window.__mdArtifactBound = true;
+                      document.addEventListener('click', function(ev){
+                        var btn = ev.target.closest && ev.target.closest('.md-artifact-copy');
+                        if (!btn) return;
+                        var box = btn.closest('.md-artifact');
+                        var code = box && box.querySelector('pre code');
+                        if (!code) return;
+                        var text = code.textContent;
+                        var label = btn.textContent;
+                        var ok = function(){
+                          btn.textContent = "Copied";
+                          setTimeout(function(){ btn.textContent = label; }, 1600);
+                          if (typeof gtag === 'function') {
+                            gtag('event', 'md_copy', { slug: "pipe_buffer_deadlock", lang: "en", chars: text.length });
+                          }
+                        };
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                          navigator.clipboard.writeText(text).then(ok).catch(function(){ fallback(); });
+                        } else { fallback(); }
+                        function fallback(){
+                          var ta = document.createElement('textarea');
+                          ta.value = text; ta.setAttribute('readonly','');
+                          ta.style.position='fixed'; ta.style.left='-9999px';
+                          document.body.appendChild(ta); ta.select();
+                          try { document.execCommand('copy'); ok(); } catch(e) {}
+                          document.body.removeChild(ta);
+                        }
+                      });
+                    })();
+                    </script>
+                    <!-- md-artifact-end -->
+
+                <div class="share-section">
+                    <h3>Share this post</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">Copy Link</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../../blog.html" class="back-link">Back to list</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Free tools you may find useful</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/json_formatter.html">JSON Formatter</a></li>
+      <li><a href="../static/regex_tester.html">Regex Tester</a></li>
+      <li><a href="../static/jwt_decoder.html">JWT Decoder Generator 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 Encoder/Decoder</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">See all tools &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+<!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Related Posts</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="sql_left_join_where_becomes_inner.html">A WHERE Clause Turns Your LEFT JOIN Into an INNER JOIN - Where ON Ends and WHERE Begins 2026</a></li>
+      <li><a href="sql_not_in_null_empty_result.html">One NULL in a NOT IN List Empties the Whole Result - SQL Three-Valued Logic 2026</a></li>
+      <li><a href="json_number_precision_loss.html">The Last Digits of a 64-bit ID Change in JSON - Where Number Precision Disappears 2026</a></li>
+      <li><a href="monotonic_vs_wall_clock.html">Measuring Elapsed Time on a Wall Clock Gives You Negative Durations - Where the Monotonic Clock Belongs 2026</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('Link copied. Paste it into the Threads app to share.');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('Link copied.'); });
+    });
+    </script>
+</body>
+</html>

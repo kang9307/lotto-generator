@@ -1,0 +1,956 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>zip 里的文件名在哪一步坏掉 - 谁用什么编码写的 2026</title>
+    <meta name="description" content="在 Windows 上压缩的 zip 换个环境解压就乱码。zip 规范并不强制文件名编码，名字只是一串字节。本文直接读取通用位标志的第 11 位与文件名字段的原始十六进制字节，用实测输出区分乱码的原因与能否复原。">
+    <meta name="keywords" content="zip 文件名乱码, zip 编码, cp949, UTF-8, 通用位标志, 第 11 位, EFS, Unicode Path Extra Field, 0x7075, 中央目录, PKWARE APPNOTE, bsdtar, Compress-Archive, unzip, NFD, 韩文文件名, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/zip_filename_encoding_korean.html">
+
+    <meta property="og:title" content="zip 里的文件名在哪一步坏掉 - 谁用什么编码写的">
+    <meta property="og:description" content="文件名是一串字节，怎么读取取决于一个标志位和工具的猜测。我们直接把中央目录拆开验证。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/zip_filename_encoding_korean.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-07-30">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="zip 里的文件名在哪一步坏掉">
+    <meta name="twitter:description" content="怎样从字节里读出第 11 位。从乱码形态反推原因与能否复原的判断表。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "zip 里的文件名在哪一步坏掉 - 谁用什么编码写的",
+      "alternativeHeadline": "Where Korean File Names Break Inside a ZIP - Who Wrote Them, and in Which Encoding",
+      "datePublished": "2026-07-30",
+      "dateModified": "2026-07-30",
+      "inLanguage": "zh-CN",
+      "articleSection": "开发/基础设施",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "zip 文件名乱码, zip 编码, cp949, UTF-8, 通用位标志, 第 11 位, Unicode Path Extra Field, 0x7075, 中央目录, PKWARE APPNOTE, NFD",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/zip_filename_encoding_korean.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "zip 文件名乱码的根本原因是什么",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "因为 zip 规范从未把文件名编码定死。压缩包里的文件名只是一串字节，唯一能说明这串字节属于哪种编码的手段，就是通用位标志的第 11 位。PKWARE APPNOTE 4.4.4 只写了 「If this bit is set, the filename and comment fields for this file MUST be encoded using UTF-8」，附录 D 则描述该位未置位时的情形: 「The ZIP format has historically supported only the original IBM PC character encoding set」。也就是说该位为 0 时根本没有声明编码的机制。实际拆开来看，在韩文 Windows 上生成的压缩包，文件名字段里原样放着 cp949 字节，而第 11 位是 0。这个包在韩文 Windows 上解压完全正常，换个环境就乱。制作方和解压方都没有违规，是规范留了一块空白。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "怎样判断收到的 zip 属于哪一种情况",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "看中央目录里的两个值就够了。一个是通用位标志的第 11 位，另一个是文件名字段的原始字节。手工读取会得到四种组合。第 11 位置位且字节是合法 UTF-8，属于已声明的 UTF-8，在任何地方解压都安全。第 11 位为 0 且字节只能按 cp949 解码，属于未声明的 cp949，在韩文 Windows 之外会乱。第 11 位为 0 且字节只能按 UTF-8 解码，属于未声明的 UTF-8，反而在韩文 Windows 上会乱。第 11 位为 0 但带有 Unicode 路径扩展字段，在尊重该字段的工具上就是正常的。在实测环境中，Python 的 zipfile、Windows 自带的 tar、Expand-Archive 和 UnZip 6.00 都读取了这个扩展字段并返回了正确的名字。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "乱掉的文件名还能恢复吗",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "压缩包里的字节还在就能恢复，已经被替换字符吃掉就恢复不了。实测的情况是这样。用 Python 的 zipfile 读取未声明的 cp949 压缩包，名字显示为 「║╕░φ╝¡.txt」，把它按 cp437 重新编码得到 BA B8 B0 ED BC AD 2E 74 78 74，与原始字节完全一致，再按 cp949 解码就还原成 「보고서.txt」。反过来，只要某个工具在读取阶段插入了替换字符，事情就结束了。10 字节的名字经过替换字符再以 UTF-8 保存后膨胀到 22 字节，想按 cp437 还原时因为替换字符没有对应值而失败。判断标准很简单: 不要看落到磁盘上的名字，先看压缩包里的字节，字节完好再动手恢复。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "为什么这个问题在韩国特别频繁",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "因为 cp949 时代的文件和习惯还在流通。系统 ANSI 代码页为 949 的 Windows 遇到第 11 位为 0 的压缩包时，按 949 解释是自然选择，于是同类环境之间互相传递时什么问题都不会暴露。只有接收方是别的环境时故障才出现。实测发现，今天 Windows 10 自带的 tar 命令在生成 zip 时，把文件名写成 cp949 字节并且不置第 11 位。这不是特意翻出来的老工具，而是随操作系统附带的标准工具就这样。反方向也存在。用同一个 tar 解压未声明的 UTF-8 压缩包，名字变成了 「蹂닿퀬__txt」，连扩展名都没了。两个方向的事故同时存在，正是韩国环境的特点。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "要安全分发压缩包需要先定下什么",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "明确定下四件事就行。第一，用会置第 11 位的工具制作。实测环境里 Python 的 zipfile 和 PowerShell 的 Compress-Archive 都为非 ASCII 名字置位，而 Windows 自带的 tar 没有置位，光是指定工具就能解决大半。第二，定下文件名规则。对外分发的压缩包把名字限制为 ASCII，编码问题在原理上就消失了；如果必须用非 ASCII 名字，就连规范化形式也一并定下。分解形式的名字在压缩包里占 22 字节，合成形式占 13 字节，两个名字做字符串比较并不相等。第三，检查路径分隔符。规范要求必须用正斜杠，而实测的工具之一原样写入了反斜杠。第四，交付方式。不要让文件名承载含义，把名字和说明另外写进清单文件一起发出去，名字坏了也还有办法对应。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/zip_filename_encoding_korean.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/zip_filename_encoding_korean.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/zip_filename_encoding_korean.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/zip_filename_encoding_korean.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/zip_filename_encoding_korean.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="zip 里的文件名在哪一步坏掉 - 谁用什么编码写的">
+                <meta itemprop="datePublished" content="2026-07-30">
+                <meta itemprop="dateModified" content="2026-07-30">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="zip 文件名乱码, zip 编码, cp949, UTF-8, 第 11 位, Unicode Path Extra Field, 中央目录, NFD">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/zip_filename_encoding_korean.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">zip 里的文件名在哪一步坏掉 - 谁用什么编码写的</h1>
+                    <h2 class="post-subtitle">文件名是一串字节。怎么读取这串字节，取决于一个标志位和工具的猜测</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-07-30">2026-07-30</span>
+                        <span class="post-category" itemprop="articleSection">开发/基础设施</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <h2>引子: 收到的压缩包一解开，名字全乱了</h2>
+                    <p>从合作方收到一个 zip，下载解压，文件都在，名字却变成了 <code>║╕░φ╝¡.txt</code>、<code>1║╨▒Γ ╕┼├Γ.xlsx</code> 这样的东西。问对方，对方说 「我们这边看着是好的」。反过来的情况同样常见: 自己压缩后发出去，对方回话说名字乱了，而自己机器上一切正常。</p>
+                    <p>这段对话之所以无休止地重复，是因为<strong>双方都没有做错任何事</strong>。这时最常见的建议是 「用 UTF-8 压缩」，这话只对了一半。zip 压缩包里的文件名就是一串<strong>字节</strong>。能够说明这串字节属于哪种编码的手段只有<strong>一个标志位</strong>，而这个位为 0 时该按什么读，<strong>规范并没有规定。</strong></p>
+                    <p>所以这篇文章讲的不是改设置，而是<strong>把压缩包拆成字节，直接读文件名字段和标志位</strong>。这两个值一看，坏掉的原因当场确定，能不能救回来也当场分明。下面所有输出都来自真实运行。</p>
+                    <div class="callout">
+                        <p><strong>运行环境。</strong>压缩包是用 <code>struct</code> 逐字节拼出来的，读取时也没有交给标准库，而是手工解析中央目录。所有脚本都先存成文件再执行，因为把混有非 ASCII 字符和反斜杠的代码作为 shell 参数传递会被悄悄改形。工作路径统一写成 <code>\work\demo</code> 这样的占位形式。</p>
+                        <p><strong>本文不涉及的部分。</strong>文件<strong>内容</strong>的编码误转换及其诊断方法，已在 <a href="cp949_utf8_mojibake_guide.html">cp949 与 UTF-8，两类编码错误</a> 中讲过。Unicode 规范化的原理在 <a href="korean_unicode_nfc_nfd.html">NFC 与 NFD</a> 里。这里只盯住一点: <strong>zip 压缩包里的文件名字段。</strong></p>
+                    </div>
+                    <pre><code>--- environment ---
+Windows 10 Pro 10.0.19045   system ANSI code page 949   console code page 65001
+Python            3.13.3 (MSC v.1943 64 bit, AMD64)
+Node.js           v22.16.0
+PowerShell        5.1.19041.6456
+tar (Windows)     bsdtar 3.5.2 - libarchive 3.5.2   (ships in system32)
+tar (MSYS2)       GNU tar 1.35
+unzip             UnZip 6.00 of 20 April 2009, Info-ZIP
+bash              GNU bash 5.2.37 (MSYS2)   LANG=   LC_CTYPE=C.UTF-8
+
+not available here
+  Info-ZIP zip      not installed
+  7-Zip (7z)        not installed
+  Node.js archives  no zip archive API in core; zlib gives DEFLATE only</code></pre>
+
+                    <h2>1. 规范没有规定的东西</h2>
+                    <p>zip 格式的规范是 PKWARE 的 APPNOTE 文档。它关于文件名编码的内容短得惊人。通用位标志<strong>第 11 位</strong>的那一句话，实际上就是全部。</p>
+                    <blockquote>Bit 11: Language encoding flag (EFS). If this bit is set, the filename and comment fields for this file MUST be encoded using UTF-8.</blockquote>
+                    <p>这句话<strong>只谈该位置位时</strong>的情形。为 0 时呢？附录 D 给出答案: zip 格式<strong>历来只支持最初的 IBM PC 字符编码集</strong>。第 11 位尚未存在的年代，默认值是 DOS 时代的代码页，而使用其他编码时<strong>没有办法声明。</strong></p>
+                    <ul>
+                        <li>文件名字段只有<strong>长度和字节串</strong>，没有放编码名称的位置</li>
+                        <li>第 11 位<strong>只有置位才有意义。</strong>为 0 不等于 「不是 UTF-8」，而是 「没有声明」</li>
+                        <li>因此<strong>未声明的 UTF-8</strong> 压缩包是可以存在的，也不算违规，因为规范并没有强制置位</li>
+                        <li>同一份文档的 4.4.17 规定路径分隔符<strong>必须使用正斜杠</strong>。这一条是强制的。后面我们会遇到一个破坏这条规则的工具</li>
+                        <li>结论: <strong>文件名乱码不是谁的过错，而是规范的空白。</strong>各家工具用各自的猜测去填这块空白</li>
+                    </ul>
+                    <p>理解了这个结构，下一个问题就变了。不再是 「这是什么编码」，而是 <strong>「第 11 位置位了吗，那串字节又是什么」</strong>。两个问题打开压缩包就能立刻回答。</p>
+
+                    <h2>2. 把文件名字段拆成字节</h2>
+                    <p>先准备材料。同一个名字用两种编码写出来，字节差别是这样的。</p>
+                    <pre><code>--- 2-1. one name, two encodings ---
+name : 보고서.txt
+  utf-8 bytes : EB B3 B4 EA B3 A0 EC 84 9C 2E 74 78 74   (13 B)
+  cp949 bytes : BA B8 B0 ED BC AD 2E 74 78 74            (10 B)
+
+name : 1분기 매출.xlsx
+  utf-8 bytes : 31 EB B6 84 EA B8 B0 20 EB A7 A4 EC B6 9C 2E 78 6C 73 78   (19 B)
+  cp949 bytes : 31 BA D0 B1 E2 20 B8 C5 C3 E2 2E 78 6C 73 78               (15 B)</code></pre>
+                    <p>一个韩文字符在 UTF-8 里是 3 字节，在 cp949 里是 2 字节。所以<strong>同一个名字存在 13 字节和 10 字节两种形态</strong>。把这两串字节分别放进压缩包，手工解析中央目录。先看旧工具做出来的形态。</p>
+                    <pre><code>=== A_legacy_cp949.zip  (258 B) ===
+EOCD  entries=2  cd_offset=119  cd_size=117
+--- entry 1 ---
+  gp flag raw      : 0x0000   bin 0000000000000000
+  bit 11 (UTF-8)   : not set
+  name field len   : 10 bytes
+  name field hex   : BA B8 B0 ED BC AD 2E 74 78 74
+  as utf-8         : &lt;UnicodeDecodeError&gt;
+  as cp949         : [보고서.txt]
+  as cp437         : [║╕░φ╝¡.txt]
+  extra len        : 0 bytes  (no extra field)
+--- entry 2 ---
+  gp flag raw      : 0x0000   bin 0000000000000000
+  bit 11 (UTF-8)   : not set
+  name field len   : 15 bytes
+  name field hex   : 31 BA D0 B1 E2 20 B8 C5 C3 E2 2E 78 6C 73 78
+  as utf-8         : &lt;UnicodeDecodeError&gt;
+  as cp949         : [1분기 매출.xlsx]
+  as cp437         : [1║╨▒Γ ╕┼├Γ.xlsx]
+  extra len        : 0 bytes  (no extra field)</code></pre>
+                    <p>这段输出就是诊断的全部，看三行足矣。</p>
+                    <ul>
+                        <li><strong>标志位是 <code>0x0000</code></strong>。第 11 位为 0，所以这个压缩包没有声明编码</li>
+                        <li><strong>名字字节是 <code>BA B8 B0 ED BC AD</code></strong>。按 UTF-8 解码会抛异常，按 cp949 则干净读出。<strong>字节自己说明了编码</strong></li>
+                        <li>没有扩展字段，也没有把名字再存一份的地方</li>
+                        <li>判定是确定的: <strong>未声明的 cp949 压缩包</strong>。在韩文 Windows 上看着正常，在别处就乱</li>
+                    </ul>
+                    <p>这里要留意 <code>as cp437</code> 那一行。把文件名字节用 DOS 时代的默认代码页读出来就是 <code>║╕░φ╝¡.txt</code>。<strong>正是引子里的那串字符。</strong>也就是说本文开头的症状，不过是 「按规范默认值读取一个未声明的 cp949 压缩包」 的结果。</p>
+
+                    <h2>3. 第 11 位，唯一的声明</h2>
+                    <p>作为对照，把同一个名字以 UTF-8 字节存入并置位第 11 位。</p>
+                    <pre><code>=== B_utf8_flagged.zip  (272 B) ===
+EOCD  entries=2  cd_offset=126  cd_size=124
+--- entry 1 ---
+  gp flag raw      : 0x0800   bin 0000100000000000
+  bit 11 (UTF-8)   : SET
+  name field len   : 13 bytes
+  name field hex   : EB B3 B4 EA B3 A0 EC 84 9C 2E 74 78 74
+  as utf-8         : [보고서.txt]
+  as cp949         : &lt;UnicodeDecodeError&gt;
+  as cp437         : [δ│┤Ω│á∞ä£.txt]
+  extra len        : 0 bytes  (no extra field)
+--- entry 2 ---
+  gp flag raw      : 0x0800   bin 0000100000000000
+  bit 11 (UTF-8)   : SET
+  name field len   : 19 bytes
+  name field hex   : 31 EB B6 84 EA B8 B0 20 EB A7 A4 EC B6 9C 2E 78 6C 73 78
+  as utf-8         : [1분기 매출.xlsx]
+  as cp949         : [1遺꾧린 留ㅼ텧.xlsx]
+  as cp437         : [1δ╢äΩ╕░ δºñ∞╢£.xlsx]
+  extra len        : 0 bytes  (no extra field)</code></pre>
+                    <p>标志位是 <code>0x0800</code>。写成二进制是 <code>0000100000000000</code>，<strong>只有从右数第 12 位被置起来</strong>，如此而已。这一个位就是 「这个名字是 UTF-8」 的声明，也是 zip 格式里唯一能传达编码的手段。</p>
+                    <h3>3.1 没有声明的 UTF-8 这个陷阱</h3>
+                    <p>还有第三种情况: 字节是 UTF-8，但第 11 位没有置起来。这同样不算违规。</p>
+                    <pre><code>=== C_utf8_noflag.zip  (141 B) ===
+EOCD  entries=1  cd_offset=60  cd_size=59
+--- entry 1 ---
+  gp flag raw      : 0x0000   bin 0000000000000000
+  bit 11 (UTF-8)   : not set
+  name field len   : 13 bytes
+  name field hex   : EB B3 B4 EA B3 A0 EC 84 9C 2E 74 78 74
+  as utf-8         : [보고서.txt]
+  as cp949         : &lt;UnicodeDecodeError&gt;
+  as cp437         : [δ│┤Ω│á∞ä£.txt]
+  extra len        : 0 bytes  (no extra field)</code></pre>
+                    <ul>
+                        <li>A 和 C 的<strong>标志位数值完全相同</strong>，都是 <code>0x0000</code></li>
+                        <li>但<strong>名字字节不同。</strong>A 只能按 cp949 读，C 只能按 UTF-8 读</li>
+                        <li>可见只看标志位不够。<strong>标志位为 0 时必须同时看字节的有效性</strong>，才能把两者分开</li>
+                        <li>C <strong>反而在韩文 Windows 上会乱。</strong>系统代码页是 949，就会把 UTF-8 字节按 949 去读</li>
+                        <li>A 和 C 造成方向相反的事故，这正是问题棘手之处: 修好一边的措施会制造另一边</li>
+                    </ul>
+
+                    <h2>4. 复现乱码 - 同一个名字的六副面孔</h2>
+                    <p>下面把乱掉的样本做出来并列。本文中乱掉的字符串本身就是资料，所以原样呈现。</p>
+                    <pre><code>--- 4-1. name 보고서.txt seen every wrong way ---
+cp949 bytes : BA B8 B0 ED BC AD 2E 74 78 74
+  as utf-8 with replace : [������.txt]
+  as cp437              : [║╕░φ╝¡.txt]
+  as latin-1            : [º¸°í¼­.txt]
+
+utf-8 bytes : EB B3 B4 EA B3 A0 EC 84 9C 2E 74 78 74
+  as cp949 with replace : [蹂닿퀬�꽌.txt]
+  as cp437              : [δ│┤Ω│á∞ä£.txt]
+
+--- 4-2. name 1분기 매출.xlsx, same treatment ---
+cp949 bytes : 31 BA D0 B1 E2 20 B8 C5 C3 E2 2E 78 6C 73 78
+  as cp437              : [1║╨▒Γ ╕┼├Γ.xlsx]
+  as utf-8 with replace : [1�б� ����.xlsx]
+
+utf-8 bytes : 31 EB B6 84 EA B8 B0 20 EB A7 A4 EC B6 9C 2E 78 6C 73 78
+  as cp949              : [1遺꾧린 留ㅼ텧.xlsx]
+  as cp437              : [1δ╢äΩ╕░ δºñ∞╢£.xlsx]</code></pre>
+                    <p>样本是有读法的。<strong>乱掉的字符属于哪一类，就说明了原因。</strong></p>
+                    <ul>
+                        <li>像 <code>║╕░φ╝¡</code> 这样<strong>制表符与希腊字母混杂，就是按 cp437 读的</strong>。DOS 代码页正好在那个区间放着制表符和希腊字母</li>
+                        <li>像 <code>1遺꾧린 留ㅼ텧</code> 这样<strong>汉字与谚文混在一起，就是把 UTF-8 字节按 cp949 读了</strong>。三字节写下的东西被两字节两字节地取走，偶然落在了合法字符上</li>
+                        <li>像 <code>������</code> 这样<strong>替换字符连成一串，就是把 cp949 字节按 UTF-8 读了</strong>。cp949 的字节组合大多不符合 UTF-8 的规则</li>
+                        <li><code>º¸°í¼­.txt</code> <strong>看得见的字符有五个</strong>，而原名只有三个字。最后那个字节 <code>AD</code> 在 latin-1 里是<strong>看不见的软连字符</strong>。想靠数字符个数来判断，就会在这里出错</li>
+                        <li>乱掉的样本里<strong>混进希腊字母和阿拉伯字母是正常的</strong>。它们与原文毫无关系，只是被错误套用的代码页在那个位置正好放着那个字符</li>
+                    </ul>
+                    <h3>4.1 扩展名消失的原因</h3>
+                    <p>上面的样本里 <code>蹂닿퀬�꽌.txt</code> 的点还在。可实际解压后落到磁盘上的名字却是 <code>蹂닿퀬__txt</code>，<strong>扩展名没了。</strong>把字节两个两个地捆起来看就明白了。</p>
+                    <pre><code>--- 4-3. why the extension disappears ---
+utf-8 bytes of the name : EB B3 B4 EA B3 A0 EC 84 9C 2E 74 78 74  (13 B)
+cp949 reads two at a time:
+  EB B3 -&gt; [蹂] U+8E42
+  B4 EA -&gt; [닿] U+B2FF
+  B3 A0 -&gt; [퀬] U+D02C
+  EC 84 -&gt; &lt;UnicodeDecodeError&gt;
+  9C 2E -&gt; &lt;UnicodeDecodeError&gt;
+  74 -&gt; [t] single byte
+  78 -&gt; [x] single byte
+  74 -&gt; [t] single byte
+
+the pair that eats the dot:
+  9C 2E   the byte 2E is the '.' of .txt
+          a cp949 lead byte 9C swallowed it
+
+what the platform decoder returned for the same bytes:
+  [蹂닿퀬??txt]
+  U+8E42 U+B2FF U+D02C U+003F U+003F U+0074 U+0078 U+0074   (8 chars)
+  chars illegal in a Windows file name : U+003F U+003F
+  the extractor replaced them with underscores -&gt; [蹂닿퀬__txt]</code></pre>
+                    <p>这条链条正是如此。把 UTF-8 名字按 2 字节为单位读取，导致<strong>首字节 <code>9C</code> 把那个点当成搭档拉了进去。</strong>这一对不是合法字符，于是变成问号；问号又是 Windows 文件名里不能用的字符，解压工具就换成了下划线。<strong>结果扩展名消失。</strong></p>
+                    <ul>
+                        <li>这不只是 「名字乱了」。<strong>扩展名没了，关联程序也就没了</strong>，双击打不开</li>
+                        <li>点被吃掉的条件是<strong>名字里最后一个非 ASCII 字符的第三个字节落在 cp949 首字节区间</strong>。因名字而异，有时会有时不会</li>
+                        <li>所以 「有的文件扩展名还在，有的没了」 这种现象会在同一个压缩包里同时出现</li>
+                        <li>靠扩展名有无来判断是否乱码的脚本，在这里会悄悄误判</li>
+                    </ul>
+
+                    <h2>5. 能不能还原 - 关键只在字节是否还在</h2>
+                    <p>看到乱掉的名字就想修。能修和不能修的情况，用运行结果分开。先看能修的一边。</p>
+                    <pre><code>--- 5-1. bytes preserved in the archive -&gt; reversible ---
+  as reported by reader : [║╕░φ╝¡.txt]
+  codepoints            : U+2551 U+2555 U+2591 U+03C6 U+255D U+00A1 U+002E U+0074 U+0078 U+0074
+  re-encode cp437       : BA B8 B0 ED BC AD 2E 74 78 74
+  decode cp949          : [보고서.txt]
+  round trip ok         : True
+
+  as reported by reader : [1║╨▒Γ ╕┼├Γ.xlsx]
+  codepoints            : U+0031 U+2551 U+2568 U+2592 U+0393 U+0020 U+2555 U+253C U+251C U+0393 U+002E U+0078 U+006C U+0073 U+0078
+  re-encode cp437       : 31 BA D0 B1 E2 20 B8 C5 C3 E2 2E 78 6C 73 78
+  decode cp949          : [1분기 매출.xlsx]
+  round trip ok         : True</code></pre>
+                    <p>步骤是两步。<strong>用读取工具当初套用的编码重新编码，把原始字节找回来，再用正确的编码解码。</strong>这里工具套用了 cp437，所以按 cp437 还原、按 cp949 读取。字节与原始<strong>完全一致</strong>就是成功的证据。</p>
+                    <h3>5.1 两种还原不了的情况</h3>
+                    <pre><code>--- 5-2. what a lossy reader left on disk ---
+  on disk        : [¦©¦Ý+¡.txt]
+  codepoints     : U+00A6 U+00A9 U+00A6 U+00DD U+002B U+00A1 U+002E U+0074 U+0078 U+0074
+    encode cp437    : &lt;UnicodeEncodeError&gt;
+    encode latin-1  : A6 A9 A6 DD 2B A1 2E 74 78 74
+    encode cp949    : &lt;UnicodeEncodeError&gt;
+  original bytes were BA B8 B0 ED BC AD 2E 74 78 74   -&gt; no encoding brings them back
+
+  on disk        : [٦¦ۦáýä£.txt]
+  codepoints     : U+0666 U+00A6 U+06E6 U+00E1 U+00FD U+00E4 U+00A3 U+002E U+0074 U+0078 U+0074
+    encode cp437    : &lt;UnicodeEncodeError&gt;
+    encode latin-1  : &lt;UnicodeEncodeError&gt;
+    encode cp949    : &lt;UnicodeEncodeError&gt;
+
+--- 5-3. replacement characters destroy the name for good ---
+  original bytes     : BA B8 B0 ED BC AD 2E 74 78 74
+  decoded utf-8/repl : [������.txt]
+  codepoints         : U+FFFD U+FFFD U+FFFD U+FFFD U+FFFD U+FFFD U+002E U+0074 U+0078 U+0074
+  saved back as utf-8: EF BF BD EF BF BD EF BF BD EF BF BD EF BF BD EF BF BD 2E 74 78 74
+  same as original   : False
+  length 10 B -&gt; 22 B
+    encode cp437     : &lt;UnicodeEncodeError&gt;</code></pre>
+                    <p>两种失败的性质不同。</p>
+                    <ul>
+                        <li><strong>5-2 是工具把字节碾碎了。</strong>某些解压工具会把名字转写成自己那套字符集再写到磁盘。<code>BA B8</code> 变成了 <code>A6 A9</code>，不存在任何编码能把原始字节找回来</li>
+                        <li><strong>5-3 是替换字符吃掉了它们。</strong>替换字符不带任何关于它替代了哪个字节的信息。10 字节变成 22 字节不是信息变多，而是<strong>同一个值重复了六次</strong></li>
+                        <li>所以判断顺序很重要。<strong>不要看已经解压到磁盘上的名字，先看压缩包里的字节。</strong>压缩包完好就换个工具重新解压；已经用怪名字解出来的那批文件，删掉重来更快</li>
+                        <li>不要删掉原始压缩包文件，这是第一道防线。<strong>只要压缩包在，随时可以回头</strong></li>
+                    </ul>
+
+                    <h2>6. 制作方 - 哪些工具会置第 11 位</h2>
+                    <p>准备一个含非 ASCII 名字的文件夹，用本环境里可用的工具分别压缩，然后读中央目录。</p>
+                    <pre><code>--- 6-1. Python 3.13.3 zipfile, default settings ---
+  보고서.txt                 flag_bits=0x0800  bit11=SET
+  자료실/1분기 매출.csv        flag_bits=0x0800  bit11=SET
+  readme.txt                flag_bits=0x0000  bit11=not set
+  name field hex (first)   : EB B3 B4 EA B3 A0 EC 84 9C 2E 74 78 74
+  separator                : 2F  '/'
+  extra field              : none
+
+--- 6-2. PowerShell 5.1 Compress-Archive ---
+  name field hex : EC 9E 90 EB A3 8C EC 8B A4 5C 31 EB B6 84 EA B8 B0 20 EB A7 A4 EC B6 9C 2E 63 73 76
+  as utf-8       : [자료실\1분기 매출.csv]
+  bit 11         : SET
+  separator      : 5C  '\'   &lt;-- APPNOTE 4.4.17 requires 2F
+  extra field    : none
+
+--- 6-3. Windows tar.exe (bsdtar 3.5.2), tar -a -c -f out.zip ---
+  gp flag raw    : 0x0008   bin 0000000000001000
+  bit 11         : not set
+  name field hex : BA B8 B0 ED BC AD 2E 74 78 74
+  as cp949       : [보고서.txt]
+  as utf-8       : &lt;UnicodeDecodeError&gt;
+  extra fields   : 0x5455 extended timestamp (13 B), 0x7875 (11 B)
+  separator      : 2F  '/'</code></pre>
+                    <p>结果分得很清楚，整理成表。<strong>这张表只收录了在上述环境中确认过的内容。</strong></p>
+                    <table>
+                        <thead>
+                            <tr><th>工具</th><th>名字字节</th><th>第 11 位</th><th>分隔符</th><th>扩展字段</th><th>判定</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Python 3.13.3 <code>zipfile</code></td><td>UTF-8</td><td><strong>置位</strong> (ASCII 名字不置)</td><td><code>2F</code></td><td>无</td><td><strong>安全</strong></td></tr>
+                            <tr><td>PowerShell 5.1 <code>Compress-Archive</code></td><td>UTF-8</td><td><strong>置位</strong></td><td><code>5C</code> <strong>违反规范</strong></td><td>无</td><td>名字安全，路径要注意</td></tr>
+                            <tr><td>Windows <code>tar.exe</code> (bsdtar 3.5.2)</td><td><strong>cp949</strong></td><td><strong>不置位</strong></td><td><code>2F</code></td><td><code>0x5455</code>, <code>0x7875</code></td><td><strong>出了这个环境就乱</strong></td></tr>
+                            <tr><td>Node.js v22.16.0</td><td colspan="4">核心里没有 zip 压缩包 API。<code>zlib</code> 只提供 DEFLATE 压缩</td><td>不适用</td></tr>
+                            <tr><td>Info-ZIP <code>zip</code></td><td colspan="4">本环境未安装，无法确认</td><td>未确认</td></tr>
+                            <tr><td>7-Zip <code>7z</code></td><td colspan="4">本环境未安装，无法确认</td><td>未确认</td></tr>
+                        </tbody>
+                    </table>
+                    <p>第三行是本文最实用的发现。<strong>今天 Windows 10 自带的 tar 命令，把文件名写成 cp949 字节且不置第 11 位。</strong>这不是特意翻出来的老工具，而是随操作系统附带的标准工具就这样。在没有 <code>zip</code> 命令的环境里，<code>tar -a -c -f out.zip</code> 是很自然的选择，而这样做出来的压缩包<strong>在同一代码页环境之外必定会乱。</strong></p>
+                    <p>第一行也藏着一个陷阱。Python 的 <code>zipfile</code> <strong>只有在名字含非 ASCII 字符时</strong>才置第 11 位，<code>readme.txt</code> 的标志位是 <code>0x0000</code>。也就是说同一个压缩包里各条目的标志位可能不同，<strong>只检查第一条的判别脚本在这里就会出错。</strong></p>
+
+                    <h2>7. 读取方 - 同一个压缩包交给四个工具</h2>
+                    <p>现在反过来。把前面做好的 A (cp949、无标志位)、B (UTF-8、置位)、C (未声明的 UTF-8) 分别用四个工具解压，读<strong>落到磁盘上的名字的字节</strong>。</p>
+                    <pre><code>--- 7-1. names as they landed on disk ---
+Python 3.13.3 zipfile, namelist()
+  A -&gt; [║╕░φ╝¡.txt]        U+2551 U+2555 U+2591 U+03C6 U+255D U+00A1 ...
+  B -&gt; [보고서.txt]          U+BCF4 U+ACE0 U+C11C ...
+  C -&gt; [δ│┤Ω│á∞ä£.txt]     U+03B4 U+2502 U+2524 U+03A9 U+2502 U+00E1 U+221E U+00E4 U+00A3 ...
+
+Windows tar.exe (bsdtar 3.5.2)
+  A -&gt; [보고서.txt]  [1분기 매출.xlsx]     correct
+  B -&gt; [보고서.txt]  [1분기 매출.xlsx]     correct
+  C -&gt; [蹂닿퀬__txt]   U+8E42 U+B2FF U+D02C U+005F U+005F U+0074 U+0078 U+0074
+
+PowerShell Expand-Archive
+  A -&gt; [보고서.txt]  [1분기 매출.xlsx]     correct
+  B -&gt; [보고서.txt]  [1분기 매출.xlsx]     correct
+  C -&gt; Exception: Illegal characters in path.   nothing extracted
+
+UnZip 6.00 (Info-ZIP, MSYS2)
+  A -&gt; bytes on disk C2 A6 C2 A9 C2 A6 C3 9D 2B C2 A1 2E 74 78 74   [¦©¦Ý+¡.txt]
+  B -&gt; bytes on disk D9 A6 C2 A6 DB A6 C3 A1 C3 BD C3 A4 C2 A3 2E 74 78 74   [٦¦ۦáýä£.txt]
+  C -&gt; bytes on disk D9 A6 C2 A6 DB A6 C3 A1 C3 BD C3 A4 C2 A3 2E 74 78 74   same as B</code></pre>
+                    <p>整理成表是这样。</p>
+                    <table>
+                        <thead>
+                            <tr><th>读取工具</th><th>A: cp949、无标志位</th><th>B: UTF-8、置位</th><th>C: UTF-8、无标志位</th><th>是否看第 11 位</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Python 3.13.3 <code>zipfile</code></td><td><code>║╕░φ╝¡.txt</code> (套用 cp437)</td><td>正常</td><td><code>δ│┤Ω│á∞ä£.txt</code></td><td><strong>看。</strong>为 0 时退回 cp437</td></tr>
+                            <tr><td>Windows <code>tar.exe</code></td><td><strong>正常</strong></td><td>正常</td><td><code>蹂닿퀬__txt</code> <strong>扩展名丢失</strong></td><td>看。为 0 时退回 ANSI 949</td></tr>
+                            <tr><td>PowerShell <code>Expand-Archive</code></td><td><strong>正常</strong></td><td>正常</td><td><strong>抛异常中断，什么都没解出来</strong></td><td>看。为 0 时退回 ANSI 949</td></tr>
+                            <tr><td>UnZip 6.00 (MSYS2)</td><td><code>¦©¦Ý+¡.txt</code></td><td><code>٦¦ۦáýä£.txt</code></td><td>与 B 相同</td><td><strong>不看。</strong>套用自家转换表</td></tr>
+                        </tbody>
+                    </table>
+                    <p>这张表就是 「我们这边看着是好的」 的真相。<strong>同一个压缩包在某个工具里正常，在另一个工具里就乱。</strong>其中特别值得注意的有三点。</p>
+                    <ul>
+                        <li><strong>Windows 的工具能正确读出 A。</strong>没有第 11 位时它套用系统 ANSI 代码页，而那正是 949。在韩国做、在韩国解，什么问题都没有。<strong>只有接收方是别的环境时问题才会暴露</strong></li>
+                        <li><strong>C 在 Windows 上最糟。</strong>tar 连扩展名都弄没了，Expand-Archive 直接抛异常<strong>一个文件都没解出来。</strong>不是得到一堆难看的名字，而是整个作业失败</li>
+                        <li><strong>UnZip 6.00 无视了第 11 位。</strong>B 已经明确声明是 UTF-8，它仍套用自家的字符转换把名字字节碾了。因为这是 2009 年的版本。<strong>老工具并不知道自己有义务遵守声明</strong></li>
+                        <li>这里出现的阿拉伯字母 <code>٦</code> 和 <code>ۦ</code> 与原文毫无关系。工具生成的字节 <code>D9 A6</code>、<code>DB A6</code> 后来被当作 UTF-8 解释，<strong>落进了阿拉伯字母区</strong>。乱掉的样本里混进毫不相干的字符，就是这种双重解释造成的</li>
+                        <li>实务教训只有一句。<strong>收到 「乱了」 的反馈，先问对方用的是什么工具。</strong>原因可能不在压缩包而在工具</li>
+                    </ul>
+
+                    <h2>8. 目录名与长名字</h2>
+                    <p>有文件夹结构时、名字很长时会有什么不同，也确认了一下。</p>
+                    <pre><code>=== F_dir_long_cp949.zip  (524 B) ===
+EOCD  entries=3  cd_offset=244  cd_size=258
+--- entry 1 ---
+  bit 11 : not set
+  name field len   : 7 bytes
+  name field hex   : C0 DA B7 E1 BD C7 2F
+  as cp949         : [자료실/]
+--- entry 2 ---
+  name field len   : 17 bytes
+  name field hex   : C0 DA B7 E1 BD C7 2F BA B8 B0 ED BC AD 2E 74 78 74
+  as cp949         : [자료실/보고서.txt]
+--- entry 3 ---
+  name field len   : 96 bytes
+  name field hex   : BF F9 B0 A3 BA B8 B0 ED BC AD 5F BF F9 B0 A3 BA B8 B0 ED
+                     BC AD 5F BF F9 B0 A3 BA B8 B0 ED BC AD 5F BF F9 B0 A3 BA
+                     B8 B0 ED BC AD 5F BF F9 B0 A3 BA B8 B0 ED BC AD 5F BF F9
+                     B0 A3 BA B8 B0 ED BC AD 5F BF F9 B0 A3 BA B8 B0 ED BC AD
+                     5F BF F9 B0 A3 BA B8 B0 ED BC AD 5F 32 30 32 36 2E 74 78 74
+  as cp949         : [월간보고서_월간보고서_월간보고서_월간보고서_월간보고서_
+                      월간보고서_월간보고서_월간보고서_2026.txt]
+
+--- 8-1. extracted with Windows tar.exe on this machine ---
+  \자료실
+  \자료실\보고서.txt                                          name length 7 chars
+  \월간보고서_월간보고서_..._2026.txt                          name length 56 chars
+  archive name field for that last one : 96 bytes for 56 characters</code></pre>
+                    <p>确认了三件事。</p>
+                    <ul>
+                        <li><strong>目录会作为单独条目存入，名字以斜杠结尾。</strong>整条路径都装在一个名字字段里，所以文件夹名一乱，<strong>它下面所有条目的路径都会跟着乱</strong></li>
+                        <li><strong>分隔符字节 <code>2F</code> 是安全的。</strong>它不落在 cp949 的首字节区间，所以不会像 4.1 节的点那样被吃掉。前面那个写 <code>5C</code> 的工具，等于自己扔掉了这道保险</li>
+                        <li><strong>名字字段的长度限制按字节计。</strong>56 个字符的名字在 cp949 下是 96 字节，同样的名字用 UTF-8 写会更长。也就是说<strong>改用 UTF-8 会让名字变长</strong>，撞上路径长度上限的时点会提前</li>
+                        <li>也可以做出目录条目用 UTF-8 而下级条目用 cp949 的压缩包。规范允许逐条目的标志位，所以<strong>一个压缩包里混两种编码</strong>是可能的</li>
+                    </ul>
+
+                    <h2>9. 分解形式的名字进入压缩包之后</h2>
+                    <p>同一个 보고서 在 Unicode 内部也存在两种码位序列: 合成形式和分解成字母的形式。把分解形式的名字放进压缩包确认。规范化的原理本身在 <a href="korean_unicode_nfc_nfd.html">NFC 与 NFD</a>，这里只看<strong>它在压缩包名字字段里呈现出的样子。</strong></p>
+                    <pre><code>=== D_nfd_name.zip  (159 B) ===
+--- entry 1 ---
+  gp flag raw      : 0x0800   bin 0000100000000000
+  bit 11 (UTF-8)   : SET
+  name field len   : 22 bytes
+  name field hex   : E1 84 87 E1 85 A9 E1 84 80 E1 85 A9 E1 84 89 E1 85 A5 2E 74 78 74
+  as utf-8         : [보고서.txt]
+  as cp949         : &lt;UnicodeDecodeError&gt;
+
+--- 9-1. the same name, composed vs decomposed ---
+  reported name      : [보고서.txt]
+  codepoints         : U+1107 U+1169 U+1100 U+1169 U+1109 U+1165 U+002E U+0074 U+0078 U+0074
+  char count         : 10
+  after composing    : [보고서.txt]  U+BCF4 U+ACE0 U+C11C U+002E U+0074 U+0078 U+0074  (7 chars)
+  decomposed == composed : False
+  utf-8 bytes decomposed : E1 84 87 E1 85 A9 E1 84 80 E1 85 A9 E1 84 89 E1 85 A5 2E 74 78 74 (22 B)
+  utf-8 bytes composed   : EB B3 B4 EA B3 A0 EC 84 9C 2E 74 78 74 (13 B)
+  decomposed to cp949    : &lt;UnicodeEncodeError&gt;
+  composed to cp949      : BA B8 B0 ED BC AD 2E 74 78 74
+
+--- 9-2. after extracting it, look for the file by its composed name ---
+  Test-Path with composed name : False
+  Test-Path with on-disk name  : True
+  string equal                 : False
+  directory filter by composed : 0 matches
+  equal after composing        : True</code></pre>
+                    <p>9-2 是本节的要点。<strong>屏幕上显示为 보고서.txt 的文件确实在磁盘上，可用这个名字去找却说没有。</strong>不是文件不存在，而是<strong>它以另一串码位存在。</strong></p>
+                    <ul>
+                        <li>名字字段是 <strong>22 字节</strong>，比合成形式的 13 字节<strong>多 9 字节</strong>。把字母一个个分开写，每个字要花三次三字节</li>
+                        <li>第 11 位是置起来的，<strong>声明完美无缺。</strong>确实是 UTF-8，解码也成功。这不是编码问题，而是<strong>规范化形式的问题</strong></li>
+                        <li>分解形式的名字<strong>根本无法编码成 cp949。</strong>cp949 里只有完整音节，没有组合用字母区的映射。所以这个名字在用旧工具重新压缩的路径上必定崩</li>
+                        <li>解压工具<strong>会把收到的形式原样写到磁盘</strong>，不会替你规范化。实测环境里那个十个字符的分解形式名字就那样留着</li>
+                        <li>脚本里写死名字去找文件的地方会<strong>悄悄返回 0 条。</strong>不是报错，而是按 「没有该文件」 处理，很难察觉</li>
+                        <li>对策是<strong>比较之前把两边规范化成同一形式。</strong>最后一行显示规范化之后就相等了</li>
+                    </ul>
+
+                    <h2>10. Unicode 路径扩展字段 0x7075</h2>
+                    <p>规范里还有一条迂回路: 不置第 11 位，而把名字用 UTF-8 <strong>再存一份</strong>的扩展字段。APPNOTE 4.6.9 定义的 Unicode 路径扩展字段，头部标识是 <code>0x7075</code>。做了一个含该字段的压缩包来读。</p>
+                    <pre><code>=== E_cp949_with_up.zip  (179 B) ===
+--- entry 1 ---
+  gp flag raw      : 0x0000   bin 0000000000000000
+  bit 11 (UTF-8)   : not set
+  name field len   : 10 bytes
+  name field hex   : BA B8 B0 ED BC AD 2E 74 78 74
+  as utf-8         : &lt;UnicodeDecodeError&gt;
+  as cp949         : [보고서.txt]
+  extra len        : 22 bytes
+    header id 0x7075 (Info-ZIP Unicode Path) len=18
+      hex  : 01 00 D6 47 7B EB B3 B4 EA B3 A0 EC 84 9C 2E 74 78 74
+      ver=1  crc32-of-header-name=0x7B47D600
+      unicode name : [보고서.txt]
+
+--- 10-1. who honours it ---
+  Python 3.13.3 zipfile   -&gt; [보고서.txt]   U+BCF4 U+ACE0 U+C11C ...   honoured
+  Windows tar.exe         -&gt; [보고서.txt]                              honoured
+  PowerShell Expand-Archive -&gt; [보고서.txt]                            honoured
+  UnZip 6.00              -&gt; bytes EB B3 B4 EA B3 A0 EC 84 9C 2E 74 78 74   honoured
+  UnZip 6.00 with -UU     -&gt; bytes C2 A6 C2 A9 C2 A6 C3 9D 2B C2 A1 2E 74 78 74   ignored
+
+--- 10-2. which of our tools WRITE this field ---
+  Python zipfile            : no
+  PowerShell Compress-Archive : no
+  Windows tar.exe           : no (writes 0x5455 and 0x7875 instead)</code></pre>
+                    <p>结果很有意思。<strong>确认的四个工具全都尊重了这个字段。</strong>连无视第 11 位的 UnZip 6.00 也读了它并给出正确名字。明确给出忽略该字段的选项后又乱了，说明默认行为就是 「尊重」。</p>
+                    <ul>
+                        <li>字段结构是<strong>版本 1 字节 + 头部名字的 CRC 4 字节 + UTF-8 名字。</strong>有 CRC，所以当别的工具改写过头部名字时，可以察觉这个字段已经过时</li>
+                        <li>Python 的 <code>zipfile</code> 读到这个字段就<strong>覆盖头部的名字</strong>，于是第 5 节的 cp437 还原步骤就不需要了</li>
+                        <li>不过<strong>确认的三个工具里没有一个会写这个字段。</strong>读取被广泛支持，写入却很少见</li>
+                        <li>APPNOTE 自己也写明，用了第 11 位就不需要这个扩展字段。<strong>新做的压缩包走第 11 位这条路才对</strong></li>
+                        <li>这个字段的实用价值在于<strong>诊断</strong>。收到的压缩包里有它，就能不靠猜测知道原始名字</li>
+                    </ul>
+
+                    <h2>11. tar 是怎么处理的 - 根本没有声明</h2>
+                    <p>作为对照组确认了 tar。把同一个名字分别用 UTF-8 和 cp949 存入并读头部。</p>
+                    <pre><code>=== P_utf8.tar (built with encoding utf-8) ===
+  header name field (first 20 B) : EB B3 B4 EA B3 A0 EC 84 9C 2E 74 78 74 00 00 00 00 00 00 00
+  magic at offset 257            : 'ustar\x0000'
+  'hdrcharset' present in file   : False
+
+=== P_cp949.tar (built with encoding cp949) ===
+  header name field (first 20 B) : BA B8 B0 ED BC AD 2E 74 78 74 00 00 00 00 00 00 00 00 00 00
+  magic at offset 257            : 'ustar\x0000'
+  'hdrcharset' present in file   : False
+
+--- 11-1. reading each tar with the wrong assumed encoding ---
+  file=utf8    read-as=utf-8   -&gt; ['보고서.txt']
+  file=utf8    read-as=cp949   -&gt; ['蹂닿퀬�꽌.txt']
+  file=cp949   read-as=utf-8   -&gt; ['������.txt']
+  file=cp949   read-as=cp949   -&gt; ['보고서.txt']
+
+--- 11-2. does the pax format record a charset? ---
+  pax tar size          : 10240 B
+  contains 'hdrcharset' : False
+
+--- 11-3. GNU tar 1.35 listing a tar.gz built on this machine ---
+  보고서.txt
+  readme.txt
+  자료실/
+  자료실/1분기 매출.csv
+  gzip header first 16 B : 1F 8B 08 00 00 00 00 00 00 03 ED D6 CF 4A C3 40</code></pre>
+                    <p>差别很清楚。tar 的名字字段是<strong>用空字节填满的 100 字节定长位置</strong>，既没有声明编码的位，也没有相应字段。两个文件<strong>结构完全相同</strong>，只有字节不同。</p>
+                    <table>
+                        <thead>
+                            <tr><th>项目</th><th>zip</th><th>tar (ustar)</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>名字编码声明</td><td>通用标志位第 11 位</td><td><strong>没有</strong></td></tr>
+                            <tr><td>辅助手段</td><td>扩展字段 <code>0x7075</code></td><td>没有 (实测 pax 输出里没有 <code>hdrcharset</code>)</td></tr>
+                            <tr><td>名字字段</td><td>长度 + 可变字节串</td><td>100 字节定长，空字节填充</td></tr>
+                            <tr><td>逐条目混用编码</td><td>可以 (标志位按条目存在)</td><td>无法区分</td></tr>
+                            <tr><td>乱掉时的判别</td><td>标志位 + 字节</td><td><strong>只能靠字节有效性猜</strong></td></tr>
+                            <tr><td>压缩层</td><td>按条目压缩，在包内</td><td>从外面整体包裹 (gzip 等)</td></tr>
+                        </tbody>
+                    </table>
+                    <p>也就是说在这一点上 <strong>zip 优于 tar。</strong>zip 至少有一个可以置起来的位，tar 连这个都没有。tar 在实务中问题较少，不是因为格式更好，而是因为<strong>使用 tar 的环境大多已经统一到 UTF-8。</strong>在代码页混杂的环境里用 tar，诊断比 zip 更难。</p>
+
+                    <h2>12. 名字和内容是两回事</h2>
+                    <p>在一个压缩包里故意做了一个<strong>名字是 UTF-8、内容是 cp949</strong> 的条目。本节确认这个组合在规范上完全没有问题。内容编码的诊断方法已在 <a href="cp949_utf8_mojibake_guide.html">cp949 与 UTF-8，两类编码错误</a> 中讲过，这里只强调<strong>两层互不相干这一事实。</strong></p>
+                    <pre><code>--- 12-1. name layer and content layer disagree, on purpose ---
+  entry name         : [보고서.txt]  bit11=SET
+  name bytes (utf-8) : EB B3 B4 EA B3 A0 EC 84 9C 2E 74 78 74
+  content bytes      : C7 D1 B1 DB 20 B5 A5 C0 CC C5 CD 0A
+  content as utf-8   : '�ѱ� ������\n'
+  content as cp949   : [한글 데이터]
+
+--- 12-2. is the content encoding recorded anywhere? ---
+  internal_attr = 0x0000     (bit 0 is a text/binary hint only)
+  per-entry fields available :
+    CRC, comment, compress_size, compress_type, create_system, create_version,
+    date_time, external_attr, extra, extract_version, file_size, flag_bits,
+    header_offset, internal_attr, orig_filename, volume
+  none of them names the content encoding</code></pre>
+                    <ul>
+                        <li>第 11 位<strong>只作用于文件名和注释</strong>，规范写得很死，文件内容不在其列</li>
+                        <li>把条目拥有的字段全部列出来，<strong>也找不到写内容编码的位置</strong>。只有一个暗示文本还是二进制的位</li>
+                        <li>所以 「名字显示正常，内容应该也没问题」 没有依据。<strong>两层之间不共享任何信息</strong></li>
+                        <li>反过来也成立。名字乱掉的压缩包，内容可能完好无损。解压与名字无关，会原样还原字节</li>
+                        <li>实务中必须<strong>把两层分开确认</strong>: 名字看中央目录，内容看解出来的字节</li>
+                    </ul>
+
+                    <h2>13. 诊断顺序 - 收到的压缩包属于哪一种</h2>
+                    <p>把前面所有判别一次跑完的检查器写好了。中央目录里的<strong>标志位、名字字节的有效性、扩展字段的有无</strong>这三样就能完成分类。</p>
+                    <pre><code>archive                    bit11    ascii  utf8ok 949ok  0x7075 verdict
+--------------------------------------------------------------------------------------
+A_legacy_cp949.zip         clear    no     no     yes    no    undeclared cp949, breaks off Korean Windows
+B_utf8_flagged.zip         SET      no     yes    no     no    declared UTF-8, safe everywhere
+C_utf8_noflag.zip          clear    no     yes    no     no    undeclared UTF-8, breaks ON Korean Windows
+D_nfd_name.zip             SET      no     yes    no     no    declared UTF-8, safe everywhere
+E_cp949_with_up.zip        clear    no     no     yes    yes   legacy bytes + unicode path field
+F_dir_long_cp949.zip       clear    no     no     yes    no    undeclared cp949, breaks off Korean Windows
+G_name_vs_body.zip         SET      no     yes    no     no    declared UTF-8, safe everywhere
+T_ps_compress.zip          SET      no     yes    no     no    declared UTF-8, safe everywhere
+T_python_zipfile.zip       SET      no     yes    no     no    declared UTF-8, safe everywhere
+T_wintar.zip               clear    no     no     yes    no    undeclared cp949, breaks off Korean Windows</code></pre>
+                    <p>按顺序整理如下。</p>
+                    <ol>
+                        <li><strong>先不要解压，只看列表。</strong>一旦用错误的名字写到磁盘，就可能滑向第 5 节那些无法恢复的情形</li>
+                        <li><strong>从中央目录读第 11 位。</strong>置位了，名字就是 UTF-8；若仍然显示为乱码，原因不在压缩包而在读取工具</li>
+                        <li><strong>为 0 就看名字字节的有效性。</strong>只能按 UTF-8 读、只能按 cp949 读，还是两者皆可</li>
+                        <li><strong>找扩展字段 <code>0x7075</code>。</strong>有它就不必猜，UTF-8 名字就在里面</li>
+                        <li><strong>不要只看一个条目。</strong>ASCII 名字的标志位是 0，一个压缩包里可能混着两种编码</li>
+                        <li><strong>判定完再解压，并且不要删掉原始压缩包。</strong>只要压缩包在就能重来</li>
+                    </ol>
+                    <div class="callout">
+                        <p><strong>确实存在两种编码都有效的情况。</strong>某些字节串按 UTF-8 和按 cp949 都能无异常读出。只含 ASCII 的名字是最常见的例子，此外也有重叠区间。这时<strong>光看字节无法确定。</strong>有效性检查是缩小候选的工具，不会给出结论。所以最后的判断，往往还是人去读一遍名字，看它是否说得通。</p>
+                    </div>
+
+                    <h2>14. 判断表 - 从乱掉的形态倒推</h2>
+                    <p>把上面的运行结果整理成实务中可以直接用的形式。<strong>如果从本文只带走一样东西，就带这张表。</strong></p>
+                    <table>
+                        <thead>
+                            <tr><th>看到的名字</th><th>实际样本</th><th>推定原因</th><th>要确认的</th><th>能否恢复</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>制表符与希腊字母混杂</td><td><code>║╕░φ╝¡.txt</code></td><td>cp949 名字按 cp437 读，第 11 位为 0</td><td>名字字节按 cp949 是否有效</td><td><strong>可以。</strong>cp437 重编码后按 cp949 解码</td></tr>
+                            <tr><td>小写希腊字母与符号混杂</td><td><code>δ│┤Ω│á∞ä£.txt</code></td><td>UTF-8 名字按 cp437 读，第 11 位为 0</td><td>名字字节按 UTF-8 是否有效</td><td><strong>可以。</strong>cp437 重编码后按 UTF-8 解码</td></tr>
+                            <tr><td>汉字与谚文混在一起</td><td><code>1遺꾧린 留ㅼ텧.xlsx</code></td><td>UTF-8 名字按 cp949 读</td><td>是否为第 11 位为 0 的 UTF-8 包</td><td><strong>可以。</strong>cp949 重编码后按 UTF-8 解码</td></tr>
+                            <tr><td>汉字混杂 + <strong>扩展名丢失</strong></td><td><code>蹂닿퀬__txt</code></td><td>同上。点被首字节吃掉</td><td>原始压缩包里的名字字节</td><td><strong>从压缩包重新解压。</strong>从这个名字无法恢复</td></tr>
+                            <tr><td>替换字符连成串</td><td><code>������.txt</code></td><td>cp949 名字按 UTF-8 读</td><td>这个状态是否已被保存</td><td>只在列表里就可以，<strong>已保存则不行</strong></td></tr>
+                            <tr><td>带音符拉丁字母 + 阿拉伯字母</td><td><code>٦¦ۦáýä£.txt</code></td><td>旧工具用自家转换表改写了名字</td><td>工具版本与选项</td><td><strong>不行。</strong>换个工具重新解压</td></tr>
+                            <tr><td>字符数比原来多</td><td><code>º¸°í¼­.txt</code></td><td>按单字节代码页读，含不可见字符</td><td>打印出码位看看</td><td><strong>可以。</strong>latin-1 重编码后按 cp949</td></tr>
+                            <tr><td>看着正常却找不到</td><td><code>보고서.txt</code></td><td>以分解形式保存的名字</td><td>码位是否落在 <code>U+1100</code> 段</td><td><strong>可以。</strong>比较前先规范化</td></tr>
+                            <tr><td>解压抛异常中断</td><td>(没有文件出来)</td><td>未声明的 UTF-8 被按代码页读出禁用字符</td><td>第 11 位与名字字节</td><td><strong>数据完好。</strong>换工具解压</td></tr>
+                            <tr><td>一部分乱一部分正常</td><td>(混杂)</td><td>ASCII 名字标志位为 0 反而正常；逐条目混用编码</td><td>逐条检查每个条目的标志位</td><td>逐条目判定</td></tr>
+                        </tbody>
+                    </table>
+                    <p>用这张表有个注意点。<strong>拿它去套已经解压到磁盘上的名字就晚了。</strong>表里 「能否恢复」 这一栏，大多以原始压缩包还在为前提。所以顺序永远是<strong>先压缩包，后磁盘。</strong></p>
+
+                    <h2>15. 分发时要定下的事</h2>
+                    <p>换个立场。如果是自己做压缩包对外分发，要先定下什么？依据上面的实测有四项。</p>
+                    <table>
+                        <thead>
+                            <tr><th>决定项</th><th>选项</th><th>已确认的依据</th><th>建议</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>制作工具</td><td>置第 11 位 / 不置</td><td>Python 的 <code>zipfile</code> 和 <code>Compress-Archive</code> 会置，Windows 的 <code>tar.exe</code> 不置</td><td><strong>固定为会置第 11 位的工具</strong>并写进文档</td></tr>
+                            <tr><td>名字字符范围</td><td>只用 ASCII / 允许非 ASCII</td><td>ASCII 名字与标志位无关，在哪里都读得一样</td><td>对外分发<strong>建议 ASCII</strong>，内部则明确规则</td></tr>
+                            <tr><td>规范化形式</td><td>合成形式 / 分解形式</td><td>同一名字分成 13 字节和 22 字节，字符串比较失败</td><td><strong>统一为合成形式</strong>，制作时就规范化</td></tr>
+                            <tr><td>路径分隔符</td><td><code>2F</code> / <code>5C</code></td><td>APPNOTE 4.4.17 要求正斜杠，而一个工具写了 <code>5C</code></td><td>把成品的分隔符字节<strong>纳入检查</strong></td></tr>
+                            <tr><td>交付方式</td><td>名字承载含义 / 清单分离</td><td>名字一乱就分不清哪个文件是什么</td><td>随包附上清单文件，<strong>减少对名字的依赖</strong></td></tr>
+                            <tr><td>验证</td><td>肉眼确认 / 自动检查</td><td>只看第一个条目会漏掉标志位混用</td><td>分发前<strong>用程序检查每个条目的标志位</strong></td></tr>
+                        </tbody>
+                    </table>
+                    <ul>
+                        <li>最便宜的措施是<strong>把制作命令固定成一个。</strong>放一个生成压缩包的脚本，别让人自己挑工具</li>
+                        <li>第二是<strong>分发前的检查。</strong>读第 13 节那三个值，只要有一个条目第 11 位为 0 就判定失败，这类事故就从源头上被堵住</li>
+                        <li>如果确定接收方使用旧工具，<strong>把名字改成 ASCII 并在清单里记下原名</strong>更好，比依赖扩展字段可靠</li>
+                        <li>已经分发出去的压缩包如果还能修，<strong>重做一份才是正解。</strong>只改名字字段的编辑要同时对齐本地头部和中央目录，偏移量很容易错位</li>
+                        <li>写进内部规范文档的句子很短。「压缩包的文件名使用 UTF-8 并置通用标志位第 11 位。路径分隔符使用正斜杠。名字规范化为合成形式。」 三句话就能挡住本文所有事故</li>
+                    </ul>
+
+                    <h2>结语: 用规则去覆盖规范的空白</h2>
+                    <p>「用 UTF-8 压缩」 作为建议只对了一半。对的一半是因为使用会置第 11 位的工具确实能解决大部分问题，错的一半是因为它<strong>掩盖了 zip 并不强制文件名编码这个事实。</strong>一旦掩盖，下一次事故就无从诊断。</p>
+                    <p>把运行确认过的内容再整理一遍: 压缩包里的文件名只有<strong>长度和字节串</strong>。传达编码的手段是<strong>一个位</strong>，而这个位为 0 时该按什么读，规范没有规定。于是各家工具各自去猜，Windows 的工具套用系统代码页，Python 套用 DOS 默认值，老 unzip 套用自家转换表。<strong>三种猜测都不违反规范。</strong></p>
+                    <p>这也正是它在韩国特别频繁的原因。cp949 时代的文件和习惯还在流通，而在系统代码页为 949 的环境之间互相传递时<strong>什么都不会暴露。</strong>因为只有接收方是别的环境时故障才出现，制作方根本没有途径知道自己的压缩包会乱。确认了今天 Windows 自带的 <code>tar</code> 就在生产这种压缩包，是本文最实用的结论。</p>
+                    <p>现在马上能做的事有一件。<strong>打开一个最近对外发出去的压缩包，读一下第 11 位。</strong>置位了就可以放心。为 0 而且名字里有非 ASCII 字符的话，收到它的人此刻很可能正对着一堆乱码，<strong>只是没有告诉你而已。</strong></p>
+
+                    <h2>参考资料</h2>
+                    <ul>
+                        <li>PKWARE APPNOTE - .ZIP File Format Specification, 4.4.4 general purpose bit flag (第 11 位 Language encoding flag (EFS) 的定义: 「If this bit is set, the filename and comment fields for this file MUST be encoded using UTF-8」): <a href="https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT" target="_blank" rel="noopener">pkware.cachefly.net</a></li>
+                        <li>PKWARE APPNOTE - APPENDIX D Language Encoding (EFS) (第 11 位缺席时的默认值: 「The ZIP format has historically supported only the original IBM PC character encoding set」): <a href="https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT" target="_blank" rel="noopener">pkware.cachefly.net</a></li>
+                        <li>PKWARE APPNOTE - 4.4.17 file name (路径分隔符规定: 「All slashes MUST be forward slashes」，禁止驱动器字母与前导斜杠): <a href="https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT" target="_blank" rel="noopener">pkware.cachefly.net</a></li>
+                        <li>PKWARE APPNOTE - 4.6.9 Info-ZIP Unicode Path Extra Field (0x7075) (保存头部名字 UTF-8 副本的扩展字段，并说明有第 11 位时不需要它): <a href="https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT" target="_blank" rel="noopener">pkware.cachefly.net</a></li>
+                        <li>相关文章: <a href="cp949_utf8_mojibake_guide.html">cp949 与 UTF-8，两类编码错误</a>, <a href="korean_unicode_nfc_nfd.html">NFC 与 NFD - 同一个字在 Unicode 内部分岔时</a></li>
+                    </ul>
+                </div>
+
+                <!-- md-artifact-start -->
+                    <div class="md-artifact" style="margin:2rem 0;border:1px solid #d7dce3;border-radius:10px;overflow:hidden;background:#fbfcfd;">
+                        <div style="display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;justify-content:space-between;padding:.7rem 1rem;background:#eef2f7;border-bottom:1px solid #d7dce3;">
+                            <span style="font-weight:700;font-size:.97rem;">📋 可直接带走的检查清单</span>
+                            <span style="display:flex;gap:.5rem;align-items:center;">
+                                <code style="font-size:.82rem;color:#5a6675;background:transparent;padding:0;">zip_filename_encoding_korean.md</code>
+                                <button type="button" class="md-artifact-copy" style="cursor:pointer;border:1px solid #b9c2cf;background:#fff;color:#2c3e50;font-weight:600;line-height:1.3;border-radius:6px;padding:.32rem .7rem;font-size:.85rem;">复制全部</button>
+                            </span>
+                        </div>
+                        <pre style="margin:0;max-height:420px;overflow:auto;padding:1rem;background:#fbfcfd;font-size:.86rem;line-height:1.62;"><code class="nohighlight" style="background:transparent;padding:0;white-space:pre;"># zip 文件名编码 判别表
+
+## 0. 一句话
+
+zip 不用规范强制文件名编码。名字是一串字节，声明手段只有通用位标志的 **第 11 位**。该位为 0 时按什么读，各家工具各不相同。
+
+## 1. 先看的三样 (解压之前)
+
+| 看什么 | 位置 | 含义 |
+|---|---|---|
+| 通用位标志第 11 位 | 中央目录头部 +8，2 字节小端 | `0x0800` 即声明为 UTF-8 |
+| 文件名字段原始字节 | 头部 +46 起，按名字长度 | 判定 UTF-8 / cp949 有效性 |
+| 扩展字段 `0x7075` | 名字字段之后 | 有它就说明 UTF-8 名字又存了一份 |
+
+## 2. 乱码形态判别表
+
+| 看到的名字 | 样本 | 原因 | 能否恢复 |
+|---|---|---|---|
+| 制表符与希腊字母 | `║╕░φ╝¡.txt` | cp949 名字按 cp437 读 | 可以 (cp437 重编码后 cp949) |
+| 小写希腊字母与符号 | `δ│┤Ω│á∞ä£.txt` | UTF-8 名字按 cp437 读 | 可以 (cp437 重编码后 UTF-8) |
+| 汉字与谚文混杂 | `1遺꾧린 留ㅼ텧.xlsx` | UTF-8 名字按 cp949 读 | 可以 (cp949 重编码后 UTF-8) |
+| 汉字混杂 + 扩展名丢失 | `蹂닿퀬__txt` | 同上，点被首字节吃掉 | 从压缩包重新解压 |
+| 替换字符连成串 | `������.txt` | cp949 名字按 UTF-8 读 | 保存之前可以 |
+| 拉丁 + 阿拉伯字母 | `٦¦ۦáýä£.txt` | 旧工具套用自家转换表 | 不行。换工具解压 |
+| 字符数变多 | `º¸°í¼­.txt` | 单字节代码页，含不可见字符 | 可以 (latin-1 重编码后 cp949) |
+| 看着正常却找不到 | `보고서.txt` | 以分解形式保存的名字 | 可以。比较前先规范化 |
+| 解压抛异常中断 | (没有文件) | 未声明的 UTF-8 + 代码页解释 | 换工具解压 |
+
+## 3. 查看字节的命令
+
+```
+# 只列清单 (不解压)
+python -c "import zipfile,sys; z=zipfile.ZipFile(sys.argv[1]); [print(hex(i.flag_bits), i.filename) for i in z.infolist()]" archive.zip
+
+# 用十六进制看文件名字段
+python -c "import sys; b=open(sys.argv[1],'rb').read(); i=b.find(b'PK\x01\x02'); n=int.from_bytes(b[i+28:i+30],'little'); print(b[i+46:i+46+n].hex(' ').upper())" archive.zip
+
+# 还原 (工具套用了 cp437 的情况)
+python -c "print('SEEN'.encode('cp437').decode('cp949'))"
+
+# 名字字节在哪种编码下有效
+python -c "b=bytes.fromhex('BAB8B0EDBCAD'); [print(e, (lambda: b.decode(e))() if True else '') for e in ('utf-8','cp949')]"
+```
+
+## 4. 工具行为对照 (Windows 10 / ANSI 949 实测)
+
+### 制作方
+
+| 工具 | 名字字节 | 第 11 位 | 分隔符 | 判定 |
+|---|---|---|---|---|
+| Python 3.13.3 `zipfile` | UTF-8 | 置位 (ASCII 不置) | `2F` | 安全 |
+| PowerShell 5.1 `Compress-Archive` | UTF-8 | 置位 | `5C` 违反规范 | 名字安全 |
+| Windows `tar.exe` (bsdtar 3.5.2) | cp949 | **不置位** | `2F` | 出了这个环境就乱 |
+| Node.js v22 | 核心无 zip 压缩包 API | 不适用 | 不适用 | 不适用 |
+| Info-ZIP `zip` / 7-Zip | 本环境没有，未确认 | 未确认 | 未确认 | 未确认 |
+
+### 读取方
+
+| 工具 | cp949 + 无标志位 | UTF-8 + 置位 | UTF-8 + 无标志位 | `0x7075` |
+|---|---|---|---|---|
+| Python `zipfile` | 套用 cp437 → 乱 | 正常 | 乱 | 尊重 |
+| Windows `tar.exe` | 正常 | 正常 | 扩展名丢失 | 尊重 |
+| `Expand-Archive` | 正常 | 正常 | 抛异常，未解压 | 尊重 |
+| UnZip 6.00 | 乱 | **乱 (无视标志位)** | 乱 | 尊重 |
+
+## 5. 分发时的决定项
+
+- [ ] 制作工具已 **固定为会置第 11 位的那种**
+- [ ] 压缩包生成收拢进一个脚本，不让人自己挑工具
+- [ ] 对外分发的名字 **限制为 ASCII**，或允许非 ASCII 时把规则写进文档
+- [ ] 名字已 **规范化为合成形式** 再打包
+- [ ] 已确认路径分隔符是 `2F`
+- [ ] 已检查 **每一个条目** 的标志位 (不是只看第一个)
+- [ ] 随包附上清单文件，减少对名字的依赖
+- [ ] 保留原始压缩包 (唯一能重来的路径)
+
+## 6. 不要做的事
+
+- 判定之前就 **解压** — 用错误的名字写到磁盘会收窄恢复路径
+- **只检查第一个条目** — ASCII 名字标志位为 0，且允许逐条目混用
+- **靠扩展名有无判断乱码** — 点可能被首字节吃掉而消失
+- 只对名字字段做 **字节编辑** — 本地头部、中央目录与偏移量会错位
+- 「没抛异常所以是这种编码」 — 存在两种编码下都有效的字节串
+- 对使用旧工具的一方 **指望扩展字段** — 一个选项就能让它被忽略
+- 因为名字显示正常就 **推断内容也没问题** — 两层互不相干
+</code></pre>
+                        <p style="margin:0;padding:.6rem 1rem;font-size:.82rem;color:#5a6675;border-top:1px solid #e3e8ee;">复制后可直接粘贴到笔记应用或 AI 工具中。</p>
+                    </div>
+                    <script>
+                    (function(){
+                      if (window.__mdArtifactBound) return;
+                      window.__mdArtifactBound = true;
+                      document.addEventListener('click', function(ev){
+                        var btn = ev.target.closest && ev.target.closest('.md-artifact-copy');
+                        if (!btn) return;
+                        var box = btn.closest('.md-artifact');
+                        var code = box && box.querySelector('pre code');
+                        if (!code) return;
+                        var text = code.textContent;
+                        var label = btn.textContent;
+                        var ok = function(){
+                          btn.textContent = "已复制";
+                          setTimeout(function(){ btn.textContent = label; }, 1600);
+                          if (typeof gtag === 'function') {
+                            gtag('event', 'md_copy', { slug: "zip_filename_encoding_korean", lang: "zh", chars: text.length });
+                          }
+                        };
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                          navigator.clipboard.writeText(text).then(ok).catch(function(){ fallback(); });
+                        } else { fallback(); }
+                        function fallback(){
+                          var ta = document.createElement('textarea');
+                          ta.value = text; ta.setAttribute('readonly','');
+                          ta.style.position='fixed'; ta.style.left='-9999px';
+                          document.body.appendChild(ta); ta.select();
+                          try { document.execCommand('copy'); ok(); } catch(e) {}
+                          document.body.removeChild(ta);
+                        }
+                      });
+                    })();
+                    </script>
+                    <!-- md-artifact-end -->
+
+                <div class="share-section">
+                    <h3>分享这篇文章</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X (Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../../blog.html" class="back-link">返回列表</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/json_formatter.html">JSON 格式化工具</a></li>
+      <li><a href="../static/regex_tester.html">正则表达式测试器</a></li>
+      <li><a href="../static/jwt_decoder.html">JWT解码生成器 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 编码器/解码器</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+<!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="cp949_utf8_mojibake_guide.html">定位韩文乱码发生的那一点 - cp949 与 UTF-8，两种编码错误 2026</a></li>
+      <li><a href="sql_left_join_where_becomes_inner.html">给 LEFT JOIN 加上 WHERE 就变成了 INNER JOIN - ON 与 WHERE 的边界 2026</a></li>
+      <li><a href="sql_not_in_null_empty_result.html">NOT IN 列表里混进一个 NULL，结果就整个变空 - 不报错却返回0行的 SQL 三值逻辑 2026</a></li>
+      <li><a href="json_number_precision_loss.html">装进 JSON 的 64 位 ID 末尾会变 - 数字精度消失的位置 2026</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制。粘贴到 Threads 应用即可分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制。'); });
+    });
+    </script>
+</body>
+</html>

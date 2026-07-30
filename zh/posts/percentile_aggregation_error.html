@@ -1,0 +1,1031 @@
+<!DOCTYPE html>
+<!--
+ * Tech blog post template
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>把10台服务器的p99平均了 - 那个数字什么都不是 2026</title>
+    <meta name="description" content="面板上的p99是91毫秒，而真实的p99却是450毫秒。本文用固定随机种子的实际运行说明，为什么把各台服务器的百分位数取平均会偏离多达4.9倍，哪些指标可以合并，以及应该采集什么样的数据，才能在事后重新算出正确的结果。">
+    <meta name="keywords" content="p99, 百分位数, 分位数聚合, 平均的陷阱, 直方图, 延迟, 响应时间, 仪表板, 可观测性, 监控, 长尾, 尾部延迟, 分位数定义, 采集设计, SLO, 指标设计, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/percentile_aggregation_error.html">
+
+    <meta property="og:title" content="把10台服务器的p99平均了 - 那个数字什么都不是">
+    <meta property="og:description" content="百分位数不是一个值，而是分布的性质，而性质无法取平均。总和、计数、最大值可以合并，p99不能。这条界线用实际运行划开。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/percentile_aggregation_error.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-07-30">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="把10台服务器的p99平均了 - 那个数字什么都不是">
+    <meta name="twitter:description" content="按指标划分的可合并性判断表，以及识别被错误折叠的百分位数的流程。固定种子20260730可复现。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "把10台服务器的p99平均了 - 那个数字什么都不是",
+  "alternativeHeadline": "We Averaged the p99 of Ten Servers - That Number Is Nothing",
+  "datePublished": "2026-07-30",
+  "dateModified": "2026-07-30",
+  "inLanguage": "zh-CN",
+  "articleSection": "开发/基础设施",
+  "author": {
+    "@type": "Person",
+    "name": "BrainDetox"
+  },
+  "keywords": "p99, 百分位数, 分位数聚合, 直方图, 延迟, 仪表板, 可观测性, 分位数定义, 采集设计, SLO",
+  "publisher": {
+    "@type": "Organization",
+    "name": "BrainDetox",
+    "logo": {
+      "@type": "ImageObject",
+      "url": "https://braindetox.kr/site_logo.png"
+    }
+  },
+  "image": {
+    "@type": "ImageObject",
+    "url": "https://braindetox.kr/site_logo.png"
+  },
+  "mainEntityOfPage": "https://braindetox.kr/zh/posts/percentile_aggregation_error.html"
+}
+    </script>
+
+    <script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "为什么不能把各服务器的p99取平均?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "因为百分位数不是一个值，而是分布的性质，而性质无法取平均。这一点是实际跑出来的。10台服务器各1万条共10万条，只让1台状态不好时，各服务器p99的平均是138.51毫秒，而把全部请求合起来算出的真p99是209.67毫秒，砍掉了33.94%。原因在于数一数尾巴是谁造的：真p99之上的1001条全部来自那一台坏机器。它处理10%的流量，却占据尾部的100%，而简单平均只给了它十分之一的权重。要正确算出整体p99，必须知道每台服务器在整体前1%中所占的份额，而这个份额与流量份额毫无关系；一旦每台服务器只留下一个p99数字，计算这个份额的原料也随之消失。"
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "按请求数做加权平均能解决吗?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "不能。反例是跑出来的。当一台服务器接收80%的请求并且它就是慢的那台时，按请求数加权的平均是404.16毫秒，与真值449.63毫秒相差10.11%，相当接近。但把条件反转，让忙碌的服务器快、清闲的服务器慢，同一个加权平均给出137.07毫秒，比真值217.55毫秒低了36.99%。也就是说前一个情形里表现好的是情形而不是原理。还有更根本的问题：把所有权重乘以一个常数并不改变加权平均，因此任何从请求数推导出的权重都会给出与请求数加权相同的答案。正确的权重是各分组在整体前1%中所占的份额，而实际取出来看，占据85%流量的两个分组对尾部的贡献是0%。流量份额与尾部份额无关。"
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "为什么最大值可以合并而p99不行?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "因为最大值有一条从部分构建整体的折叠规则，而p99没有。在10个分组上验证时，各部分最大值的平均是605.33毫秒，与真最大值1107.77毫秒相差45.36%；而各部分最大值的最大值与真值完全一致。最小值也一样。原因在于信息的结构：能成为整体最大值的候选只有各部分的最大值，其余的值本来就不是候选，所以只留各部分最大值也保留了全部所需信息。p99不是这样，会成为整体p99的那个值可能位于某个部分内部的任何位置。在实际检验的案例里，真p99是209.67毫秒，它既不是坏机器的p99（1020.21毫秒），也不是其他机器的p99（约40毫秒）。所以p100不是百分位数家族里的极端成员，而是另一类统计量，名字相似正是误解的来源。"
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "要正确合并百分位数需要采集什么?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "要么保留全部原始数据，要么保留与之等效的可合并汇总。在实践中就是分桶直方图。依据是计数可以合并这个性质：把数值切成区间并保存每个桶的计数，那些计数就能在服务器之间相加，相加之后再求百分位数即可。跑一下差距很明显。在流量倾斜80%的集群上，各服务器p99取平均错了79.68%；而把同一份数据用只有7个桶的极粗直方图合并时误差是12.11%，112个桶时是0.25%，399个桶时是0.03%。造成差别的不是公式而是顺序：直方图方案在求任何百分位数之前先把计数加了起来。换成实践规则就是把合并这一步放在汇总之前。不过直方图终究是近似，运行所能确立的是误差不会超过包含真实秩的那个桶的宽度。"
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "怎么知道我面板上的p99是不是被错误合并的?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "换一个分组维度看看就行。正确计算的百分位数在改变归组单位时数值不变，被错误折叠的会变。把同样的10万条分别归成10组、5组、2组、1组并求「各组p99的平均」，得到128.39、159.47、190.62、198.82，晃了1.55倍。同一份数据，只改了归组方式。与之相对，求和、计数和最大值在四种情况下完全相同。这个对比就是诊断的全部。拉宽时间范围也是同一个检查，越拉宽p99越低就说明是把各窗口的值平均了。最强的检查是数超阈值条数：如果p99是X，按定义就应当有整体请求的1%超过X，所以日志里数出来的条数如果多得多，说明p99被低估了。如果只剩各服务器的百分位数且无法修改，那就用最大值而不是平均来折叠。在400个随机配置中，真p99超过各组p99最大值的次数是0次。"
+      }
+    }
+  ]
+}
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/percentile_aggregation_error.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/percentile_aggregation_error.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/percentile_aggregation_error.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/percentile_aggregation_error.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/percentile_aggregation_error.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="把10台服务器的p99平均了 - 那个数字什么都不是">
+                <meta itemprop="datePublished" content="2026-07-30">
+                <meta itemprop="dateModified" content="2026-07-30">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="p99, 百分位数, 分位数聚合, 直方图, 延迟, 仪表板, 可观测性, 分位数定义, 采集设计, SLO">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/percentile_aggregation_error.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">把10台服务器的p99平均了 - 那个数字什么都不是</h1>
+                    <h2 class="post-subtitle">百分位数无法合并。用固定随机种子可复现的计算，检验聚合错误与采集设计</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-07-30">2026-07-30</span>
+                        <span class="post-category" itemprop="articleSection">开发/基础设施</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+                    <h2>引言: 面板一切正常，用户却说很慢</h2>
+                    <p>响应时间面板上有一条p99曲线。整整一个月都平稳在90毫秒左右。可是工单在增加。页面经常卡住，点了支付按钮要转很久。自己去翻访问日志，超过400毫秒的请求一抓一大把。面板为什么没有把它们显示出来？</p>
+                    <p>常见的回答是「p99本来就丢掉百分之一」。这话没错，但不是这次的原因。真正的原因更简单也更糟。<strong>屏幕上那个90毫秒，压根就不是p99。</strong>它是10台服务器各自算出来的10个p99值取的平均。而百分位数并不是能靠取平均来合并的那类数字。</p>
+                    <p>本文用数字把这个差距摆出来。同样的10万条请求用两种方式做了汇总。先算每台服务器的p99再取平均，得到<strong>91.04毫秒</strong>；把全部请求倒进一个桶里再算p99，得到<strong>449.63毫秒</strong>。<strong>相差4.94倍。</strong>两个数字都顶着p99这个名字，也都不是程序出错的产物。两边都严格执行了各自被要求的运算。</p>
+                    <p>更麻烦的是这个错误很安静。屏幕上的值看着合理，单位也对，流量上来它会跟着上来，上线出问题它也会跟着变差。方向大体是对的，所以没有任何契机让人起疑。而且<strong>被错误合并的百分位数不会抛异常。</strong>编码错了会显示成乱码让你看见，聚合错了的数字看起来就只是个数字。</p>
+                    <p>在实际工作中，这个问题通常先以下面四种症状出现。</p>
+                    <ul>
+                        <li>面板上的p99一直平稳，可工单和日志里的<strong>慢请求条数</strong>却一起上涨</li>
+                        <li>把同一时间段按服务器拆开看，有一台明显很差，但在全局曲线上那个尖峰<strong>消失了</strong></li>
+                        <li>在面板上换一个分组维度（按主机 &rarr; 按地域 &rarr; 全部），<strong>「同一个p99」变成了另一个值</strong></li>
+                        <li>按分钟的p99曲线上有尖锐的峰，而同一屏上<strong>标着「本小时p99」的那个数字却风平浪静</strong></li>
+                    </ul>
+                    <p>后面两条是决定性线索，第12节和第9节会用计算说明原因。先把结论写在前面：<strong>百分位数不是一个值，而是分布的性质，而性质无法取平均。</strong>所以真正该问的不是「看p99还是看p95」，而是<strong>你当初采集了什么</strong>。采集设计决定指标精度。</p>
+                    <div class="callout">
+                        <p><strong>运行环境。</strong>下面所有输出都是在<strong>Windows 10 Pro (10.0.19045)</strong>上用<strong>Python 3.13.3</strong>真实运行的结果。只用了标准库，没有使用任何外部数值计算包。脚本是<strong>写成文件再执行</strong>的，没有通过shell参数或heredoc传递。</p>
+                        <p><strong>固定随机种子。</strong>所有随机数都是固定的。基准种子为<strong>20260730</strong>，第k节使用<code>random.Random(20260730 + k)</code>。正态随机数由<code>random()</code>之上的<strong>Box-Muller变换</strong>生成。在同一个Python里按同样顺序运行，本文的每一个数字都会原样出现。<strong>无法复现的例子不算证据。</strong>下面的产物框里放了精简版复现代码，它会原样重建第1节的三个数字。</p>
+                        <p><strong>数据全部是虚构的。</strong>没有使用任何真实服务的指标。延迟由对数正态分布生成，因为这与响应时间右侧长尾的观察相符，而本文的论点并不依赖于这个具体分布。百分位数的默认规则是<strong>最近秩(nearest-rank)</strong>：排序后取第<code>ceil(0.99 x n)</code>个值，因此结果始终指向一条真实发生过的请求。若某一节使用别的定义，会在该节说明。</p>
+                    </div>
+
+                    <h2>1. 一个反例 - 把10台服务器的p99取平均</h2>
+                    <p>条件刻意取得平常。10台服务器，每台1万条，合计10万条。9台健康，只有1台状态不好。这不是什么事故场景。某台的磁盘老了一点，隔壁容器在抢CPU，某台的内核版本没跟上 - 这是集群的常态。</p>
+                    <pre><code>python           : 3.13.3
+platform         : Windows-10-10.0.19045-SP0
+base seed        : 20260730   (section k uses random.Random(base seed + k))
+generator        : Mersenne Twister, normals via Box-Muller
+percentile rule  : nearest-rank unless a section says otherwise
+unit             : milliseconds
+
+==============================================================================
+1. average of per-server p99 vs the real pooled p99
+==============================================================================
+server     requests      p50      p95      p99      max
+------------------------------------------------------------------------------
+web-01       10000    17.99    31.90    40.82    82.82
+web-02       10000    18.02    32.56    40.47    71.75
+web-03       10000    18.11    32.05    40.38    68.75
+web-04       10000    17.91    31.50    39.90    75.24
+web-05       10000    17.98    31.63    40.63    76.76
+web-06       10000    18.00    31.97    41.07    70.41
+web-07       10000    17.87    32.14    40.88    77.30
+web-08       10000    17.88    32.00    40.55    76.58
+web-09       10000    18.00    31.82    40.19    65.51
+web-10       10000    30.00   379.58  1020.21 15169.20
+------------------------------------------------------------------------------
+requests total                       : 100000
+(a) MEAN of the 10 per-server p99    :   138.51 ms   [what many dashboards show]
+(b) TRUE p99 of all pooled requests  :   209.67 ms   [what users actually meet]
+(b) minus (a)                        :    71.16 ms
+(a) understates the truth by          :    33.94 %  of the truth
+ratio (b)/(a)                        :   1.5138 x
+
+for reference, other ways to fold the same 10 numbers:
+  MAX of per-server p99              :  1020.21 ms   deviation  +386.57 %
+  MIN of per-server p99              :    39.90 ms   deviation   -80.97 %
+  MEDIAN of per-server p99           :    40.59 ms   deviation   -80.64 %</code></pre>
+                    <p>表里只有<code>web-10</code>不一样。首先值得注意的是<strong>它的p50是30.00毫秒，还不到其他机器的两倍</strong>。只看中位数的话就是「有点慢」而已。可它的p99是1020.21毫秒，是其他机器的25倍。<strong>只在尾部坏掉的机器，中位数类指标抓不住。</strong></p>
+                    <p>接下来这两行是本文的心脏。把每台服务器的p99取平均得到<strong>138.51毫秒</strong>，把全部请求合起来算出的真正p99是<strong>209.67毫秒</strong>。差了71.16毫秒，砍掉了真值的<strong>33.94%</strong>。也就是1.51倍。</p>
+                    <p>用别的方式折叠这同样的10个数字，就更有意思了。</p>
+                    <ul>
+                        <li><strong>用最大值折叠</strong>得到1020.21毫秒 - 比真值高386.57%。严重高估，但<strong>它一次也没有掉到真值下面。</strong>第12节会说明这不是巧合</li>
+                        <li><strong>用中位数折叠</strong>得到40.59毫秒 - 低了80.64%。那台坏机器<strong>被彻底抹掉了。</strong>对离群点稳健这个通常令人满意的性质，在这里恰好反向起作用</li>
+                        <li><strong>用最小值折叠</strong>得到39.90毫秒 - 是个下界。没什么用，但方向是诚实的</li>
+                        <li><strong>用平均折叠</strong>得到138.51毫秒 - 既不是上界也不是下界，而且<strong>它不指向任何一条请求。</strong>10万条里也许确实有耗时138.51毫秒的请求，但那跟这个值为什么出现毫无关系</li>
+                        <li><strong>这10个数字怎么折叠都得不到209.67。</strong>那份信息在每台服务器做汇总的那一刻就已经被丢掉了</li>
+                    </ul>
+                    <p>丢掉的是什么，看一眼尾巴是谁造的就清楚了。这里统计了真p99之上那些请求的来源。</p>
+                    <pre><code>who actually populates the pooled tail (requests at or above 209.67 ms):
+  web-01         0 requests    0.00 % of the tail   (10.0 % of traffic)
+  web-02         0 requests    0.00 % of the tail   (10.0 % of traffic)
+  web-03         0 requests    0.00 % of the tail   (10.0 % of traffic)
+  web-04         0 requests    0.00 % of the tail   (10.0 % of traffic)
+  web-05         0 requests    0.00 % of the tail   (10.0 % of traffic)
+  web-06         0 requests    0.00 % of the tail   (10.0 % of traffic)
+  web-07         0 requests    0.00 % of the tail   (10.0 % of traffic)
+  web-08         0 requests    0.00 % of the tail   (10.0 % of traffic)
+  web-09         0 requests    0.00 % of the tail   (10.0 % of traffic)
+  web-10      1001 requests  100.00 % of the tail   (10.0 % of traffic)</code></pre>
+                    <p>1001条全部来自<code>web-10</code>。其余9台的贡献是<strong>0条</strong>。<code>web-10</code>处理10%的流量，却占据<strong>尾部的100%。</strong>而平均给了它十分之一的权重。所以砍掉了九成。</p>
+                    <p>百分位数聚合的核心到这里就显出来了。要正确算出整体p99，必须知道每台服务器<strong>在整体前1%里所占的份额</strong>。这个份额跟流量份额毫无关系（10%对100%）。而一旦每台服务器只留下一个p99数字，计算这个份额的原料也随之消失。<strong>被丢掉的不是精度，而是结构。</strong></p>
+                    <p>那么这个错误为什么能长期存活？只改一个条件，答案就出来了。把10台服务器都设成同一个分布，流量也均匀分配。</p>
+                    <pre><code>per-server p99 values : 128.99, 126.51, 125.63, 129.69, 118.68, 129.06, 132.86, 123.23, 129.23, 131.61
+MEAN of them          :   127.55 ms
+TRUE pooled p99       :   127.59 ms
+deviation             :    -0.03 %</code></pre>
+                    <p>取平均的p99是127.55毫秒，真正的p99是127.59毫秒。<strong>误差0.03%。</strong>实际上就是对的。</p>
+                    <p>这就是它不被发现的原因。<strong>平时是对的。</strong>只要集群是同质的、负载均衡分得均匀，这两个数字就贴在一起。而它们分道扬镳的时刻，正是某台机器掉队的时刻，也就是<strong>最需要这个指标的时刻。</strong></p>
+                    <ul>
+                        <li>正常时准确、异常时出错的指标，<strong>没法用来发现异常</strong> - 尽管这是指标唯一的用途</li>
+                        <li>验证也很难。平时把两个值一比，是一致的，于是得出「查过了，没问题」的结论。只在健康状态下做的验证，这个缺陷一定能通过</li>
+                        <li>误差的大小与<strong>同质性被破坏的程度成正比</strong>。而同质性被破坏本身，就是我们要找的那个事件。这是信号变强时仪表跟着坏掉的结构</li>
+                    </ul>
+
+                    <h2>2. 流量一旦倾斜，连误差的符号都会变</h2>
+                    <p>真实集群不会均匀地接收流量。金丝雀发布、洗牌分片、会话保持、可用区容量差异、给某个大客户的专属节点 - 造成倾斜的理由多得是。下面按一台服务器接收80%请求的情形重新计算。</p>
+                    <pre><code>--- case A: the BUSY server is the slow one ---
+server     requests   share      p99
+------------------------------------------------------------------------------
+app-01       80000   80.0 %   493.62
+app-02        2222    2.2 %    47.13
+app-03        2222    2.2 %    46.89
+app-04        2222    2.2 %    47.10
+app-05        2222    2.2 %    44.81
+app-06        2222    2.2 %    46.83
+app-07        2222    2.2 %    45.52
+app-08        2222    2.2 %    44.62
+app-09        2222    2.2 %    47.34
+app-10        2222    2.2 %    46.52
+------------------------------------------------------------------------------
+MEAN of per-server p99            :    91.04 ms
+request-count WEIGHTED mean of p99:   404.16 ms
+TRUE pooled p99                   :   449.63 ms
+mean  deviation from truth        :   -79.75 %   (ratio 0.2025 x)
+weighted deviation from truth     :   -10.11 %   (ratio 0.8989 x)</code></pre>
+                    <p>取平均的p99是<strong>91.04毫秒</strong>，真正的p99是<strong>449.63毫秒</strong>。<strong>4.94倍</strong>，低估了79.75%。第1节的33.94%扩大成了79.75%。原因很简单：真正制造尾巴的那台机器处理了80%的流量，而平均依然只给它十分之一的权重。</p>
+                    <p>那么按请求数加权不就行了？同一张表里也放了这一列。加权平均是404.16毫秒，低估10.11%。好多了。但必须确认这是原理还是巧合。于是把条件精确地反转：数字原封不动，只调换<strong>哪台服务器是忙碌的那台</strong>。</p>
+                    <pre><code>--- case B: the BUSY server is the fast one ---
+server     requests   share      p99
+------------------------------------------------------------------------------
+app-01       80000   80.0 %    45.22
+app-02        2222    2.2 %   433.31
+app-03        2222    2.2 %   543.06
+app-04        2222    2.2 %   513.11
+app-05        2222    2.2 %   560.31
+app-06        2222    2.2 %   486.16
+app-07        2222    2.2 %   423.37
+app-08        2222    2.2 %   620.89
+app-09        2222    2.2 %   489.19
+app-10        2222    2.2 %   471.45
+------------------------------------------------------------------------------
+MEAN of per-server p99            :   458.61 ms
+request-count WEIGHTED mean of p99:   137.07 ms
+TRUE pooled p99                   :   217.55 ms
+mean  deviation from truth        :  +110.80 %   (ratio 2.1080 x)
+weighted deviation from truth     :   -36.99 %   (ratio 0.6301 x)
+
+the sign of the error flips between the two cases:
+  case A  mean is -79.75 % off  (dashboard says 91.04 ms, reality 449.63 ms)
+  case B  mean is +110.80 % off  (dashboard says 458.61 ms, reality 217.55 ms)</code></pre>
+                    <p>现在忙碌的服务器很快，9台清闲的服务器很慢。取平均的p99是458.61毫秒，真值是217.55毫秒。这一次是<strong>高估110.80%</strong>。<strong>符号翻转了。</strong>而按请求数加权的平均是137.07毫秒，低估36.99% - 刚才表现不错的方法，在这里并不比简单平均更强。</p>
+                    <ul>
+                        <li>误差的<strong>符号会随情形改变。</strong>所以「大概乘上几倍来修正」这条路走不通。方向未知的误差是无法修正的</li>
+                        <li>情形A是面板显示91毫秒而实际是450毫秒。<strong>你看不见故障。</strong>引言里的症状正是这个</li>
+                        <li>情形B是面板显示459毫秒而实际是218毫秒。<strong>你在追一个不存在的故障。</strong>因为找不到原因，排查永远不会结束</li>
+                        <li>两个情形的服务器p99清单<strong>元素是完全一样的。</strong>不同的只是哪个值挨着大流量，而这个对应关系并不包含在p99清单里</li>
+                        <li>请求数加权在情形A里表现好，是因为一台机器过于压倒性，<strong>它自己的p99几乎就等于整体p99。</strong>这是情形，不是原理。第5节会继续深挖这一点</li>
+                    </ul>
+
+                    <h2>3. 最大值可以合并 - p100与p99的决定性差别</h2>
+                    <p>这里可能有一个反问：最大值不就是第100百分位吗？它也不能合并？算一下，答案就分开了。而这个分岔是本文最重要的概念节点。</p>
+                    <pre><code>per-group max : 402.68, 409.36, 451.85, 627.13, 577.14, 699.29, 517.51, 531.50, 1107.77, 729.08
+
+MEAN of per-group max :   605.3333 ms
+MAX  of per-group max :  1107.7706 ms
+TRUE max of pooled    :  1107.7706 ms
+mean equals truth     : False   (off by -45.36 %)
+max-of-max equals truth: True
+min-of-min equals truth: True</code></pre>
+                    <p>各组最大值取平均是605.33毫秒，真正的最大值是1107.77毫秒，低估45.36% - <strong>平均在这里同样是错的。</strong>但把各组最大值再取最大值，就<strong>完全一致</strong>：小数点后四位都一样，用浮点比较也是<code>True</code>。最小值同理。</p>
+                    <p>差别不在名字，而在运算的性质。最大值有一条从部分构建整体的<strong>折叠规则</strong>：两个集合并集的最大值，恒等于各集合最大值的最大值。p99没有这样的规则。<strong>不存在</strong>一个函数，能仅凭各集合的p99算出并集的p99。这不是说近似得不好，而是说这个函数不存在。</p>
+                    <ul>
+                        <li>最大值之所以可折叠，是因为<strong>每个部分的最大值已经携带了关于该部分所需的全部信息。</strong>能成为整体最大值的候选只有各部分的最大值，其余的值本来就不是候选</li>
+                        <li>p99不是这样。会成为整体p99的那个值，可能位于某个部分内部的<strong>任何位置。</strong>第1节里真正的p99是209.67，它既不是<code>web-10</code>的p99（1020.21），也不是其他机器的p99（约40）。它落在<code>web-10</code>中间的某处</li>
+                        <li>所以「p100可以而p99不行」是成立的。<strong>p100不是百分位数家族里的极端成员，而是另一类统计量</strong>，名字相似正是误解的来源</li>
+                        <li>这有实际含义。<strong>基于最大值的指标，按任何粒度聚合都是安全的</strong> - 最慢的请求、最长的队列、最大并发。你不需要怀疑它的计算路径。代价是它完全被一条请求左右，噪声很大。安全和有用是两回事</li>
+                    </ul>
+
+                    <h2>4. 能合并的指标与不能合并的指标</h2>
+                    <p>现在逐个指标来验。取6个分组，故意让大小各不相同（从3000到7500）。大小相同的话，简单平均和加权平均会碰巧相等，区别就看不出来了。另外，为了不让浮点舍入把「完全相等」这个判定弄模糊，先把数值转成<strong>整数微秒</strong>再计算。</p>
+                    <pre><code>6 groups, sizes: 3000, 3900, 4800, 5700, 6600, 7500   total 31500 requests
+all values are integer microseconds, so sums are exact integers.
+
+metric      fold used on the parts        recomputed      from raw data    exact
+------------------------------------------------------------------------------
+count       sum of counts                          31500            31500    True
+sum         sum of sums                       1498826643       1498826643    True
+max         max of maxes                         2181107          2181107    True
+min         min of mins                              337              337    True
+mean        plain mean of means               42220.2378       47581.7982    False
+mean        count-weighted mean of means      47581.7982       47581.7982    True
+p99         plain mean of p99s               267686.0000      373760.0000    False
+p99         count-weighted mean of p99s      318257.0000      373760.0000    False
+p50         plain mean of medians             24974.0000       25084.0000    False
+------------------------------------------------------------------------------
+
+the plain mean of means is off by -11.2681 % here; the weighted one is exact.
+no weighting rescues p99: see section 5.</code></pre>
+                    <p>表的最后一列就是本节的要点。计数、求和、最大、最小仅凭部分结果就能<strong>完全还原</strong>，那里的<code>True</code>是整数相等而不是近似。平均是有条件的：简单平均偏差11.2681%，按计数加权则<strong>完全相等</strong>。p99和p50用任何方式都还原不了。</p>
+                    <p>整理如下。</p>
+                    <table>
+                        <thead>
+                            <tr><th>指标</th><th>从部分折叠的方法</th><th>是否精确</th><th>要合并需要有什么</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>计数</td><td>各部分计数之和</td><td><strong>精确</strong></td><td>计数。它本身就是完整的</td></tr>
+                            <tr><td>求和</td><td>各部分和之和</td><td><strong>精确</strong></td><td>和。加法满足结合律</td></tr>
+                            <tr><td>最大</td><td>各部分最大值的最大</td><td><strong>精确</strong></td><td>一个最大值</td></tr>
+                            <tr><td>最小</td><td>各部分最小值的最小</td><td><strong>精确</strong></td><td>一个最小值</td></tr>
+                            <tr><td>平均</td><td>各部分平均的简单平均</td><td><strong>错误</strong></td><td>-- 分组大小不同就会偏</td></tr>
+                            <tr><td>平均</td><td>各部分平均按计数加权</td><td><strong>精确</strong></td><td><strong>和与计数。</strong>只留平均是不够的</td></tr>
+                            <tr><td>方差、标准差</td><td>由计数、和、平方和重算</td><td><strong>有条件精确</strong></td><td>三个都存下来就能还原</td></tr>
+                            <tr><td>中位数(p50)</td><td>没有折叠规则</td><td><strong>不可能</strong></td><td>原始数据或直方图</td></tr>
+                            <tr><td>p95、p99</td><td>没有折叠规则</td><td><strong>不可能</strong></td><td>原始数据或直方图</td></tr>
+                        </tbody>
+                    </table>
+                    <p>方差那两行是这张表里最有教益的。只存标准差就无法合并，存下计数、和、平方和三个值则能精确还原。<strong>同一个指标，会因为你存了什么而变成可合并或不可合并。</strong>这个性质正是第10节直方图方案的依据。</p>
+                    <ul>
+                        <li>「能不能合并」不是指标的属性，而是<strong>你所保存的那份汇总的属性</strong>。这一点直通本文的实践结论</li>
+                        <li>没有一起保存计数的平均是合不起来的。如果面板只留平均、丢掉计数，<strong>连平均都合不起来。</strong>而如表所示，这种情况的误差在11%量级，小到不容易被察觉</li>
+                        <li>百分位数无论额外保存什么辅助数字都还原不了。例外只有<strong>近似分布本身的那类汇总</strong>（分桶直方图之类），而那是一个结构，不是一个数字</li>
+                        <li>反过来读就是采集设计的规则。<strong>以后需要换粒度重算的指标，必须以可折叠的形式保存。</strong>存成不可折叠的形式，之后所有的重新聚合都是错的</li>
+                        <li>表里标着「不可能」的两行，偏偏是面板上使用频率最高的两个指标。这就是这个问题的规模</li>
+                    </ul>
+
+                    <h2>5. 为什么加权也救不回百分位数</h2>
+                    <p>第2节里请求数加权在一个情形下表现不错，于是这看起来像是「把权重选好就行」的问题。这里把多种加权方式全部作用在同一份数据上，看哪一种能作为原理站得住。</p>
+                    <pre><code>group  requests   weight      p99
+------------------------------------------------------------------------------
+a         60000   0.6000    65.06
+b         25000   0.2500    87.34
+c         10000   0.1000   920.90
+d          5000   0.0500  2504.83
+------------------------------------------------------------------------------
+TRUE pooled p99                 :   413.37 ms
+  plain mean of p99              :   894.53 ms   deviation  +116.40 %
+  count-weighted mean of p99     :   278.20 ms   deviation   -32.70 %
+  square-root-count weighted     :   521.03 ms   deviation   +26.04 %
+  tail-count weighted (0.01*n)   :   278.20 ms   deviation   -32.70 %
+  max of p99                     :  2504.83 ms   deviation  +505.95 %
+  min of p99                     :    65.06 ms   deviation   -84.26 %</code></pre>
+                    <p>真正的p99是413.37毫秒。简单平均高116.40%，请求数加权低32.70%，平方根加权高26.04%。没有一个是对的，也没有一个是稳定地朝同一方向偏的。</p>
+                    <p>请注意，按「请求数的0.01倍」加权的那一行，跟请求数加权得到了<strong>完全相同的值</strong>。把所有权重乘上一个常数，加权平均不会改变。也就是说，<strong>任何从请求数推导出来的权重，给出的答案都和请求数加权一样。</strong>因为没有新的信息进来。这就是「调权重」这条路撞墙的地方。</p>
+                    <p>那么正确的权重是什么？正确的权重是每个分组<strong>在整体前1%中所占的份额</strong>。这个值被直接取了出来。</p>
+                    <pre><code>group  share of traffic   share of the pooled top 1 percent
+------------------------------------------------------------------------------
+a               60.00 %                         0.00 %
+b               25.00 %                         0.00 %
+c               10.00 %                        42.86 %
+d                5.00 %                        57.14 %
+------------------------------------------------------------------------------</code></pre>
+                    <p>占据<strong>85%</strong>流量的分组a和b，对尾部的贡献是<strong>0%</strong>。造出尾巴的是只占15%流量的c和d。也就是说，正确的权重向量接近(0, 0, 0.4286, 0.5714)，而请求数权重是(0.6, 0.25, 0.1, 0.05)。这两个向量实际上指向相反的方向。</p>
+                    <ul>
+                        <li>正确的权重是<strong>各分组对尾部的贡献度</strong>，而这个值只有看原始数据才能得到。在只留下各服务器p99的那一刻，这份信息已经不在了</li>
+                        <li>所以这不是选权重的问题。这是在试图表达<strong>加权平均这个形式根本无法表达的值。</strong>是表达能力不够，不是系数没调好</li>
+                        <li>流量份额与尾部份额无关，这是实践上的核心。<strong>「接得多的服务器更重要」这条直觉在尾部不成立。</strong>安静的节点独自造出整条尾巴，是很常见的情况</li>
+                        <li>加权平均也有碰巧接近的时候（第2节情形A的10.11%）。但即便如此，<strong>要确认它确实接近，唯一的办法还是看原始数据。</strong>无法核对的近似不是近似，是猜测</li>
+                    </ul>
+
+                    <h2>6. 平均掩盖了什么 - 只用一节</h2>
+                    <p>使用百分位数的理由本身只做简短确认，因为那不是本文的主题。这里构造了平均响应时间几乎相同的两个分布。</p>
+                    <pre><code>shape                     mean      p50      p90      p99     p999      max
+------------------------------------------------------------------------------
+A near-normal             40.00    40.01    47.68    53.92    58.41    66.46
+B long tail               39.85    24.36    46.17   473.97  1670.75  6766.82
+------------------------------------------------------------------------------
+means differ by 0.38 %, but p99 differs by 8.79 x and p999 by 28.60 x.</code></pre>
+                    <p>平均是40.00和39.85，相差<strong>0.38%</strong>。p99是53.92和473.97，相差<strong>8.79倍</strong>，p99.9相差<strong>28.60倍</strong>。两个服务的「平均响应时间」报告实际上会是同一份文档，而用户体验截然不同。</p>
+                    <ul>
+                        <li>平均有用，是在分布像A那样对称的时候。真实的响应时间大多更接近B。这就是尾部指标存在的理由</li>
+                        <li>B的中位数(24.36)<strong>低于</strong>它的平均(39.85)。在长尾分布里，平均比大多数用户看到的还要差，于是「比平均更快的用户」成了多数派。平均谁也代表不了</li>
+                        <li>这一节到此为止。平均与尾部的关系本身是另一个主题，而<strong>本文的论点是在决定使用尾部指标之后，该如何合并它。</strong>第6节和第7节各占一节，不再展开</li>
+                    </ul>
+
+                    <h2>7. 百分位数的定义不止一种 - 只用一节</h2>
+                    <p>在跨工具比较数字之前，还有一件事要确认。「p95」这一个名字下面藏着好几种计算规则。这里把多种规则作用在一个n=20的小样本上。</p>
+                    <pre><code>n = 20 sorted sample: [12, 14, 15, 15, 18, 21, 24, 29, 33, 41, 55, 60, 78, 92, 140, 260, 410, 900, 1200, 3000]
+
+definition                                  p95        p99
+------------------------------------------------------------------------------
+nearest-rank ceil(p/100*n)                  1200.00    3000.00
+lower rank floor(p/100*n)                   1200.00    1200.00
+linear interp, inclusive (R-7)              1290.00    2658.00
+linear interp, exclusive, clamped           2910.00    3000.00
+statistics.quantiles inclusive              1290.00    2658.00
+statistics.quantiles exclusive              2910.00    4422.00
+------------------------------------------------------------------------------
+spread of p95 across definitions : 1200.00 to 2910.00 ms  (2.42 x)
+my linear-inclusive matches statistics inclusive at p95 : True
+my linear-exclusive matches statistics exclusive at p95 : True
+
+note the exclusive p99 cell: 4422.00 ms, while the largest observation is 3000.00 ms.
+that method is documented as being for a population that can hold more
+extreme values than the sample, so it is allowed to point past the data.
+my clamped variant caps at the maximum instead, which is why the two
+agree at p95 and part ways at p99. same name, two answers.
+
+same comparison on n = 200000 from one distribution:
+  nearest-rank             p99 =   127.8243 ms
+  lower rank               p99 =   127.8243 ms
+  linear inclusive         p99 =   127.8245 ms
+  linear exclusive         p99 =   127.8466 ms
+  spread : 0.0223 ms  (0.0175 % of the value)</code></pre>
+                    <p>同样的20个数字，p95从1200到2910都有，<strong>相差2.42倍</strong>。再看最后一行。排他式(exclusive)方法的p99是<strong>4422毫秒</strong>，而这个样本的最大值是3000毫秒。<strong>它返回了一个比任何观测值都大的数。</strong></p>
+                    <p>这不是bug。Python标准库文档写明该方法针对的是「可能拥有比样本中所见更极端的值的总体」，并且下侧切点按<code>i / (m + 1)</code>计算。它是按规格工作的。而我自己实现的那版在最大值处做了截断，所以两者在p95上一致，到p99才分开。<strong>同一个名字，两个答案。</strong></p>
+                    <table>
+                        <thead>
+                            <tr><th>定义</th><th>n=20时的p95</th><th>n=20时的p99</th><th>特点</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>最近秩（本文默认）</td><td>1200.00</td><td>3000.00</td><td>始终指向一个被观测到的值</td></tr>
+                            <tr><td>下位秩（向下取整）</td><td>1200.00</td><td>1200.00</td><td>复用同一个值，保守地偏低</td></tr>
+                            <tr><td>线性插值，含端型</td><td>1290.00</td><td>2658.00</td><td>把最小值看作0%，最大值看作100%</td></tr>
+                            <tr><td>线性插值，排他型（截断）</td><td>2910.00</td><td>3000.00</td><td>插值但被限制在观测范围之内</td></tr>
+                            <tr><td>线性插值，排他型（标准实现）</td><td>2910.00</td><td><strong>4422.00</strong></td><td><strong>返回比最大值3000更大的数</strong></td></tr>
+                        </tbody>
+                    </table>
+                    <p>样本变大之后这个差异就消失了。在20万个样本上，四种方法的p99跨度是<strong>0.0223毫秒</strong>，占该值的0.0175%。所以这个问题和聚合问题不是一个量级。</p>
+                    <ul>
+                        <li>跨工具比较数字时，<strong>先把定义对齐再比。</strong>各工具的默认定义可能不同，先查各自的文档。本文不对任何具体产品的内部实现下断言</li>
+                        <li>定义差异<strong>只在样本小的时候</strong>才成为问题。每分钟只有几十条请求的低流量端点就是危险区间，第8节讲的就是这个</li>
+                        <li><strong>定义差异不是本文这些4到5倍误差的原因。</strong>把两个问题混在一起就会错过真正的原因。数字差得离谱时，先查<strong>聚合路径</strong>，再去翻定义</li>
+                        <li>这一节也到此为止。逐一深挖各定义的特点是另一个主题</li>
+                    </ul>
+
+                    <h2>8. 样本一小，p99就是最大值的别名</h2>
+                    <p>撇开聚合不谈，如果一个窗口里的请求数本身就少，p99也是不稳定的。这里从同一个总体出发，只改变样本量反复计算。因为是对数正态分布，真p99可以解析地算出来，于是能对照估计值到底在瞄准哪里。</p>
+                    <pre><code>population: lognormal, median 20.0 ms, sigma 0.80
+analytic population p99 = median * exp(sigma * 2.3263478740408408) = 128.6133 ms
+
+     n   trials      p5   median      p95     min      max   p95/p5   which rank is used
+------------------------------------------------------------------------------
+   100     2000   75.89   109.77   166.90   53.84   300.51    2.199   rank 99 of 100 (1 above it)
+  1000     2000  109.97   126.51   148.66   94.90   176.01    1.352   rank 990 of 1000 (10 above it)
+ 10000      500  122.15   128.53   134.93  116.72   142.29    1.105   rank 9900 of 10000 (100 above it)
+100000      100  126.87   128.62   130.55  125.97   131.80    1.029   rank 99000 of 100000 (1000 above it)
+------------------------------------------------------------------------------
+
+a single n=100 window, its top 5 values : 63.23, 63.43, 67.21, 75.07, 80.44
+nearest-rank p99 of it                 : 75.07 ms   (the 99th of 100, i.e. 2nd largest)
+drop that one request and p99 becomes  : 80.44 ms</code></pre>
+                    <p>总体的真p99是128.6133毫秒。从100个样本估出的p99，下5%分位是75.89，上5%分位是166.90 - <strong>2.199倍的跨度</strong>在晃。2000次里最小出到53.84，最大出到300.51。到10万个样本时，这个跨度收窄到1.029倍。</p>
+                    <p>为什么晃得这么厉害，最右边那一列给出了答案。100个样本的p99是第99个值，<strong>在它上面的请求只有一条。</strong>这里打开了一个真实窗口来看。前5个是63.23、63.43、67.21、75.07、80.44，而p99是75.07。把那一条请求拿掉，p99就变成80.44。</p>
+                    <ul>
+                        <li>100个样本的p99实际上就是<strong>「第二慢的那条请求」</strong>。百分位数这个名字并不保证统计上的稳定性</li>
+                        <li>所以低流量端点的p99告警会被一条请求带着晃。把窗口拉宽，或者<strong>改用更低的分位数(p90、p95)</strong>才是诚实的做法。只有100条请求却盯着p99，跟盯着最大值然后管它叫p99差不多</li>
+                        <li>拉宽窗口和<strong>把各窗口的p99合并起来是两回事</strong>。后者按第9节所示是不成立的。要拉宽窗口，就得跨着更宽的窗口从原始数据重算</li>
+                        <li>不标出样本量的百分位数曲线是没法读的。<strong>把分母一起画出来。</strong>请求量骤降那一段的p99波动，可能是样本不足而不是性能变化</li>
+                    </ul>
+
+                    <h2>9. 时间轴也一样 - 60个1分钟p99拼不出1小时p99</h2>
+                    <p>到目前为止的分组轴是主机。换成时间，结果一样。每分钟1200条共60分钟，合计72000条。在中间的5分钟插入了一段性能劣化。这是照着真实故障的形状做的。</p>
+                    <pre><code>60 minutes x 1200 requests = 72000 requests
+per-minute p99, minutes 25 to 32 : 68.1, 77.8, 1130.7, 1868.3, 1208.6, 1041.3, 1525.5, 69.8
+
+fold applied to the 60 per-minute p99 values      value      deviation
+------------------------------------------------------------------------------
+mean                                                 175.68       -36.98 %
+median                                                68.07       -75.58 %
+max                                                 1868.28      +570.19 %
+min                                                   61.20       -78.05 %
+p95 of the 60 values                                1130.71      +305.61 %
+TRUE hourly p99 from raw requests                    278.77            -
+------------------------------------------------------------------------------</code></pre>
+                    <p>真正的1小时p99是<strong>278.77毫秒</strong>。把60个1分钟p99取平均得到175.68毫秒，低36.98%；取最大值得到1868.28毫秒，高570.19%；取中位数得到68.07毫秒，低75.58%。<strong>没有一种折叠是对的，而且误差跨度超过一个数量级。</strong></p>
+                    <p>这就是引言里最后一条症状的真相。按分钟曲线上的那些峰，和标着「本小时p99」的那一个数字，是<strong>两个不同的量</strong>，任何一个都算不出另一个。两个数字不一致，也不意味着其中哪一个是bug。</p>
+                    <ul>
+                        <li>时间轴并不会让百分位数变得可加。把12个5分钟p99拼成1小时，或把24个小时p99拼成一天，都是同一个错误</li>
+                        <li>在面板上<strong>改变时间范围时</strong>，要确认数字是怎么算的。会按图表横向像素数自动重新分桶的工具，正是在这里可能悄悄重新聚合。如果缩放会改变数值，那就是信号</li>
+                        <li>把告警阈值定在1分钟窗口，而周报用1小时窗口写，那么<strong>这两个数字无法互相验证。</strong>告警响了而报表风平浪静，可能是完全正常的行为</li>
+                        <li>用中位数折叠得到68.07毫秒。劣化的那5分钟被其余55分钟埋掉，<strong>彻底消失了。</strong>尾部事件在主机轴和时间轴上被稀释的方式完全一样</li>
+                    </ul>
+
+                    <h2>10. 直方图 - 一种真能合并的近似</h2>
+                    <p>那么就必须永远抱着10万条原始数据吗？有替代方案，而它的依据第4节里已经有了。<strong>计数可以合并。</strong>把数值切成区间（桶），保存每个桶的计数，那些计数就能在服务器之间相加。下面把它用在与第2节情形A相同的集群上。</p>
+                    <pre><code>same fleet as section 2 case A. TRUE pooled p99 = 438.6759 ms
+
+bucket scheme              buckets   est p99   deviation   bucket holding the answer
+------------------------------------------------------------------------------
+coarse                           7  491.7815     +12.11 %   [100.00, 500.00] width 400.00
+pow2                            15  478.8454      +9.16 %   [256.00, 512.00] width 256.00
+growth10                       112  439.7592      +0.25 %   [405.27, 445.79] width 40.53
+linear10                       399  438.8169      +0.03 %   [430.00, 440.00] width 10.00
+------------------------------------------------------------------------------
+
+for comparison, the mean of the same fleet's per-server p99 was -79.68 % off.
+
+what merging actually did: bucket counts were ADDED across the 10 servers
+before any percentile was computed. that is the whole difference.</code></pre>
+                    <p>改变桶边界反复计算。7个桶的粗糙方案高12.11%，15个2的幂次方案高9.16%，每档增长10%的112个桶只差<strong>0.25%</strong>，10毫秒间隔的399个桶只差<strong>0.03%</strong>。同一份数据上，各服务器p99取平均错了79.68%。<strong>连最粗糙的直方图都比p99取平均准确六倍以上。</strong></p>
+                    <p>造成差别的不是公式，而是<strong>顺序</strong>。直方图方案在求任何百分位数之前先把计数加了起来。各服务器p99方案则在每台机器上先把百分位数求掉了。全部区别就在这个顺序上。这也是本文的实践结论：<strong>把合并这一步放在汇总之前。</strong></p>
+                    <p>不过这终究是近似，误差的性质需要确认。</p>
+                    <pre><code>interpolation inside the last bucket assumes the values are spread evenly
+in it. checking that assumption on the bucket that held the answer:
+  bucket [256.00, 512.00] holds 2185 requests
+  if evenly spread, half of them would sit below 384.00 ms
+  actually below the midpoint : 1589 of 2185 = 72.72 %
+  so the values crowd the LOW edge here, and even interpolation
+  reads high for this bucket. with a different shape or different
+  boundaries the sign can go the other way, so treat this as a
+  measurement of THIS histogram, not a general rule.
+
+bounded claim you can rely on: the estimate stays inside the bucket that
+contains the true rank, so the error cannot exceed that bucket's width.
+checked here for every scheme above:
+  coarse       true 438.68 and est 491.78 both inside [100.00, 500.00] : True   abs error 53.1056 ms, bucket width 400.0000 ms
+  pow2         true 438.68 and est 478.85 both inside [256.00, 512.00] : True   abs error 40.1695 ms, bucket width 256.0000 ms
+  growth10     true 438.68 and est 439.76 both inside [405.27, 445.79] : True   abs error 1.0833 ms, bucket width 40.5265 ms
+  linear10     true 438.68 and est 438.82 both inside [430.00, 440.00] : True   abs error 0.1410 ms, bucket width 10.0000 ms</code></pre>
+                    <p>装着答案的那个桶（256到512毫秒）里有2185条。如果均匀分布，应该有一半落在中点384毫秒以下，而实际上<strong>72.72%</strong>落在下面。也就是说这个桶里的值挤在低的一侧，所以基于均匀假设的插值读高了。</p>
+                    <div class="callout">
+                        <p><strong>这里不下断言。</strong>上面的72.72%和误差的符号，是<strong>在这个分布和这组桶边界下观测到的。</strong>换一种分布形状或换一组边界，符号可能反过来。请不要从这一次运行里提炼出「直方图插值总是读高」这类通用规则。想知道自己那边误差的方向，就得用自己的数据和自己的桶边界做同样的检查。</p>
+                        <p>同理，<strong>本文也不对任何具体监控产品如何从直方图估计分位数下断言。</strong>插值方式和桶的定义在不同实现之间可能不同。请查阅你所用工具的文档。本节展示的是方法的性质，而不是哪个产品做了什么。</p>
+                    </div>
+                    <p>但运行确实立住了一个形状清楚的边界条件。估计值<strong>会停留在包含真实秩的那个桶之内</strong>，真值也在同一个桶里。因此误差的绝对值不会超过该桶的宽度。四种方案全部得到验证：粗糙方案误差53.1056毫秒对应桶宽400毫秒，最细方案误差0.1410毫秒对应桶宽10毫秒。</p>
+                    <ul>
+                        <li>减小误差的办法是<strong>把关心区间的桶做细</strong>。这比改插值方式更确定、更可预测</li>
+                        <li>哪个区间需要细，必须事先决定。这里p99落在400毫秒量级，所以那个区间重要。<strong>桶边界要设计成覆盖预期的延迟范围。</strong>事后再改边界，历史数据就没法比较了</li>
+                        <li>一旦有值落进最后一个桶（超出上限），那个点上的百分位数就算不出来了。<strong>上限要留得宽裕</strong> - 放到超时值之上是稳妥的做法</li>
+                        <li>直方图的存储成本是桶数乘以序列数。<strong>精度与成本直接互换。</strong>日志与链路追踪本身的存储成本，在<a href="clickhouse_observability_2026.html">ClickHouse可观测性那篇</a>里讲过</li>
+                        <li>除直方图之外，还有若干种用于近似分位数的汇总数据结构，误差保证的形式各不相同。<strong>最重要的共同点只有一个：它们都带有把各部分合并起来的运算，而一个百分位数字没有</strong></li>
+                    </ul>
+
+                    <h2>11. 用户遇到的不是请求，而是一屏页面</h2>
+                    <p>就算把请求的p99算准了，还剩一层。用户不是只发一个请求。一屏页面会打出好几个请求。跳过这一层，就无法解释「p99改善了为什么投诉没变」。</p>
+                    <pre><code>if a screen fires k independent requests and each has a 1 percent chance
+of landing above the request-level p99, the chance the screen contains at
+least one of them is 1 - 0.99^k:
+
+     k   P(at least one slow)   expected slow requests per screen
+------------------------------------------------------------------------------
+     1               1.0000 %                          0.010
+     2               1.9900 %                          0.020
+     3               2.9701 %                          0.030
+     5               4.9010 %                          0.050
+     8               7.7255 %                          0.080
+    10               9.5618 %                          0.100
+    20              18.2093 %                          0.200
+    30              26.0300 %                          0.300
+    50              39.4994 %                          0.500
+   100              63.3968 %                          1.000
+------------------------------------------------------------------------------
+at k = 69 the screen exceeds a coin flip: P = 50.0163 %</code></pre>
+                    <p>如果一屏打出k个请求，每个请求有1%的概率落在p99之上，那么这一屏至少包含一个慢请求的概率是1减去0.99的k次方。k=10时是9.5618%，k=20时是18.2093%，k=100时是63.3968%。<strong>到k=69就超过了掷硬币。</strong></p>
+                    <p>这一点不只靠计算，也做了实测。从第2节情形A的请求总体中每次抽出4万屏，并按两种方式计算每屏的延迟：取各请求的最大值（完全并行）和取它们的和（完全串行）。</p>
+                    <pre><code>request-level p50 = 24.33 ms   request-level p99 = 435.58 ms
+
+     k   screens   frac with a slow request   screen p50(max)  screen p99(max)  screen p50(sum)  screen p99(sum)
+------------------------------------------------------------------------------------------------------------------------
+     1     40000                     1.020 %             24.20            442.26             24.20            442.26
+     3     40000                     3.045 %             64.99            709.26            109.49            820.36
+     5     40000                     4.938 %             97.71            828.38            205.77           1058.17
+    10     40000                     9.433 %            159.16           1093.44            455.44           1658.83
+    20     40000                    18.088 %            232.84           1404.46            968.31           2552.58
+    40     40000                    32.992 %            336.73           1781.27           2008.24           4087.61
+------------------------------------------------------------------------------------------------------------------------</code></pre>
+                    <p>请求级p99是435.58毫秒。一屏打出20个请求时，串行p99是<strong>2552.58毫秒</strong>，并行p99是<strong>1404.46毫秒</strong>。请求指标一动不动，而页面指标翻了好几倍。「包含慢请求的页面」占比也吻合得很好：计算值18.2093%对实测值18.088%。</p>
+                    <ul>
+                        <li>所以一边改善请求p99一边增加每屏请求数，<strong>两个变化会互相抵消，面板上什么都不会发生。</strong>而这期间用户体感可能在变差</li>
+                        <li>每屏请求数通常哪儿都没记录。它会因为前端改动或加了组件而<strong>悄悄增长。</strong>只看后端指标的团队看不见这个变化</li>
+                        <li>并行化把求和变成取最大。表里k=20时从2552.58降到了1404.46。但那仍然是请求p99的三倍以上。<strong>并行化能减轻问题，但消除不了它</strong></li>
+                        <li>条件允许的话，<strong>按页面或按事务来测延迟</strong>，而不是按请求，请求百分位数放在其次。按页面测量的原始数据是一屏一行，所以第4节的问题也会一起变小</li>
+                    </ul>
+
+                    <h2>12. 诊断 - 判断眼前这个数字是不是被错误合并的</h2>
+                    <p>走到这一步只剩一个问题：怎么知道眼前这个p99是不是被错误合并过？面板不会展示它的算式，你也未必有条件去读查询语句。但有办法判断。<strong>正确计算的百分位数，换一个分组维度它的值不会变。</strong>被错误折叠的会变。</p>
+                    <pre><code>grouping            groups   mean of group p99   max of group p99   sum   count   max
+------------------------------------------------------------------------------------------------
+10 groups                10              128.39             916.06    2.67  100000 50869.28
+5 groups                  5              159.47             634.13    2.67  100000 50869.28
+2 groups                  2              190.62             340.29    2.67  100000 50869.28
+1 groups                  1              198.82             198.82    2.67  100000 50869.28
+------------------------------------------------------------------------------------------------
+TRUE pooled p99 = 198.82 ms
+
+the mean column moved from 128.39 to 198.82 as the grouping changed, a 1.55 x
+swing on identical data. sum, count and max did not move at all. that
+difference is the whole diagnosis.</code></pre>
+                    <p>把同样的10万条分别归成10组、5组、2组、1组，每次求「各组p99的平均」。结果从128.39变到159.47、190.62、198.82。<strong>晃了1.55倍。</strong>数据一条都没变，变的只是归组方式。</p>
+                    <p>与之相对，求和、计数、最大值在四种情况下完全相同，固定在2.67、100000、50869.28。<strong>这个对比就是诊断的全部。</strong>换分组维度会动的数字是被错误折叠的，不会动的数字是算对了的。</p>
+                    <p>最大值那一列也动了（从916.06到634.13、340.29、198.82），但方向<strong>只有一个</strong>，而且一次也没有落到真值下面。这是不是巧合，也验了。</p>
+                    <pre><code>the max column moved too, but only downward, and it never went below the
+truth. that is not a coincidence. checking the bounds over 400 random
+fleet configurations, all with a fixed seed:
+
+  trials                                   : 400
+  times pooled p99 exceeded max of group p99: 0
+  times pooled p99 fell below min of group p99: 0
+  worst overshoot above the max bound       : +0.000000 %
+  worst undershoot below the min bound      : +0.000000 %
+
+counting argument behind it: each group has at most 1 percent of its own
+requests above its own p99, so at most 1 percent of the pooled requests
+sit above the largest of those values. that makes max of group p99 an
+upper bound for the pooled p99, and min a lower bound. it is not the
+answer, but it is a bound, which a mean is not.
+
+so if per-group percentiles are all you have, fold with max, not mean.
+the bound tightens as groups get coarser; it is loosest when cardinality
+is highest, which is exactly when dashboards slice most finely.</code></pre>
+                    <p>在400个随机集群配置中，真p99超过各组p99最大值的次数是<strong>0次</strong>，落到它们最小值以下的次数也是<strong>0次</strong>。原因可以用计数论证给出：每个分组在自己p99之上最多只有自己请求的1%，因此在这些值中最大的那个之上，最多只有整体请求的1%。所以它是整体p99的<strong>上界</strong>，最小值同理成为下界。</p>
+                    <p>在实践中，当只剩下各服务器的百分位数时，这就是最好的选择。<strong>用最大值折叠，不要用平均。</strong>它不是答案，但它是一个界，而界可以支撑「最坏也不过如此」这样的判断。平均既不是上界也不是下界，因此支撑不了任何判断。而且这个界会随着分组变粗而收紧，也就是说<strong>在基数高的时候最松，而面板恰恰在那时切得最细。</strong></p>
+                    <table>
+                        <thead>
+                            <tr><th>检查</th><th>做什么</th><th>被错误合并的迹象</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>换分组维度</td><td>按主机 &rarr; 按地域 &rarr; 全局，换着归组单位看同一个指标</td><td><strong>数字会动。</strong>越粗越大就是被平均折叠了</td></tr>
+                            <tr><td>换时间范围</td><td>把窗口从1小时拉到6小时再到1天</td><td>越拉宽p99越<strong>低。</strong>是把各窗口的值平均了</td></tr>
+                            <tr><td>数超阈值条数</td><td>在日志里直接数超过面板p99值的请求数</td><td>比整体的1%<strong>多得多。</strong>p99被低估了</td></tr>
+                            <tr><td>上界检查</td><td>比较各服务器p99的最大值与全局p99</td><td>全局p99<strong>大于那个最大值。</strong>计算本身就错了</td></tr>
+                            <tr><td>单节点对照</td><td>挑最差的那个节点，比较它的p99与全局p99</td><td>全局<strong>低得多。</strong>被稀释了</td></tr>
+                        </tbody>
+                    </table>
+                    <ul>
+                        <li>最快的检查是<strong>换一下分组维度</strong>。两次点击，也不需要读查询语句。会动就是被错误折叠了</li>
+                        <li>时间范围检查抓的是第9节那个错误。<strong>缩放会改变p99的话，就怀疑重新聚合</strong></li>
+                        <li>超阈值计数检查是最强的。如果p99是X毫秒，那么按定义应当恰好有整体请求的1%超过X。<strong>这是定义，无从反驳。</strong>实际数出来是3%的话，真正的p99远在其上</li>
+                        <li>就算确认了算式没问题，第8节和第11节依然存在。<strong>算对了的p99在样本小的时候照样晃，而且它和用户在一屏上的体感是两个量</strong></li>
+                    </ul>
+
+                    <h2>13. 判断表 - 采集什么才能在事后重新计算</h2>
+                    <p>做个总结。这不是选指标的问题，而是<strong>留下什么的问题</strong>。没留下的东西，事后接上再好的工具也回不来。</p>
+                    <table>
+                        <thead>
+                            <tr><th>想看的东西</th><th>能否合并</th><th>该采集什么</th><th>只留这个就完了</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>总请求数</td><td><strong>可以</strong></td><td>计数器</td><td>-</td></tr>
+                            <tr><td>每秒吞吐</td><td><strong>可以</strong></td><td>计数器 + 时刻</td><td>-</td></tr>
+                            <tr><td>错误率</td><td><strong>可以</strong></td><td>错误计数器与总计数器<strong>分开存</strong></td><td><strong>只留比值</strong>就合不起来</td></tr>
+                            <tr><td>平均响应时间</td><td><strong>有条件</strong></td><td>和与计数</td><td><strong>只留平均值</strong>就合不起来</td></tr>
+                            <tr><td>标准差</td><td><strong>有条件</strong></td><td>计数、和、平方和</td><td><strong>只留标准差</strong>就合不起来</td></tr>
+                            <tr><td>最大、最小延迟</td><td><strong>可以</strong></td><td>最大值、最小值</td><td>-</td></tr>
+                            <tr><td>中位数、p90、p95、p99</td><td><strong>不可以</strong></td><td>原始数据或<strong>分桶直方图</strong></td><td>留下<strong>百分位数值</strong>就到头了</td></tr>
+                            <tr><td>页面、事务级延迟</td><td><strong>不可以</strong></td><td>页面级原始数据或直方图</td><td>只有请求级就还原不了</td></tr>
+                            <tr><td>慢请求条数</td><td><strong>可以</strong></td><td>按阈值分的计数器（实质上就是直方图）</td><td>-</td></tr>
+                            <tr><td>哪个节点在造尾巴</td><td><strong>不可以</strong></td><td>带节点标签的直方图</td><td>只有各节点百分位数就不行</td></tr>
+                        </tbody>
+                    </table>
+                    <p>最后一列是这张表的核心。<strong>比起采集什么，丢掉什么才是不可逆的决定。</strong>再看「慢请求条数」那一行。按阈值分的计数器其实就是直方图，而直方图可以合并。<strong>把「p99是多少」换个问法，问成「有多少条超过了500毫秒」，指标就变成可合并的那一类了。</strong>有时候换个问法是最便宜的解法。</p>
+                    <p>本文的全部运行结果汇总在一张表里。都是固定种子20260730跑出来的数字。</p>
+                    <table>
+                        <thead>
+                            <tr><th>情形</th><th>错误合并的值</th><th>真实值</th><th>误差</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>10台中1台劣化，流量均匀（p99取平均）</td><td>138.51 ms</td><td>209.67 ms</td><td>-33.94 %</td></tr>
+                            <tr><td>10台完全相同，流量均匀（p99取平均）</td><td>127.55 ms</td><td>127.59 ms</td><td><strong>-0.03 %</strong></td></tr>
+                            <tr><td>忙的服务器慢，80%倾斜（p99取平均）</td><td>91.04 ms</td><td>449.63 ms</td><td><strong>-79.75 %</strong></td></tr>
+                            <tr><td>忙的服务器快，80%倾斜（p99取平均）</td><td>458.61 ms</td><td>217.55 ms</td><td><strong>+110.80 %</strong></td></tr>
+                            <tr><td>60个1分钟p99取平均当作小时p99</td><td>175.68 ms</td><td>278.77 ms</td><td>-36.98 %</td></tr>
+                            <tr><td>60个1分钟p99取最大当作小时p99</td><td>1868.28 ms</td><td>278.77 ms</td><td>+570.19 %</td></tr>
+                            <tr><td>合并直方图，7个粗桶</td><td>491.78 ms</td><td>438.68 ms</td><td>+12.11 %</td></tr>
+                            <tr><td>合并直方图，399个细桶</td><td>438.82 ms</td><td>438.68 ms</td><td><strong>+0.03 %</strong></td></tr>
+                            <tr><td>该用最大值却用平均折叠（10组的最大值）</td><td>605.33 ms</td><td>1107.77 ms</td><td>-45.36 %</td></tr>
+                            <tr><td>同一份数据，只把分组从10个改成1个</td><td>128.39 ms</td><td>198.82 ms</td><td>-35.42 %</td></tr>
+                        </tbody>
+                    </table>
+                    <p>第二行是这张表里最危险的一行。<strong>负0.03%。</strong>在这个状态下做验证，会得出「我们的面板是准确的」这个结论，而这个结论只在集群保持同质期间成立。</p>
+
+                    <h2>14. 检查清单与不该做的事</h2>
+                    <p>整理成可以直接用于采集设计和面板检查的形式。</p>
+                    <ul>
+                        <li>[ ] 确认了面板的百分位数面板<strong>在哪一步计算百分位数</strong></li>
+                        <li>[ ] 换过分组维度，确认<strong>数字不会动</strong></li>
+                        <li>[ ] 拉宽过时间范围，确认p99不会下降</li>
+                        <li>[ ] 在日志里数了<strong>超阈值条数</strong>并与p99做了对照</li>
+                        <li>[ ] 在百分位数曲线上<strong>同时标出了请求数（分母）</strong></li>
+                        <li>[ ] 低流量端点采用更宽的窗口或<strong>更低的分位数</strong></li>
+                        <li>[ ] 延迟是<strong>以直方图采集</strong>的，而不是百分位数</li>
+                        <li>[ ] 直方图的桶覆盖<strong>预期延迟范围以及超时值之上</strong></li>
+                        <li>[ ] 保存平均时<strong>连同和与计数一起</strong>保存</li>
+                        <li>[ ] 保存错误率时<strong>分子与分母分开</strong>保存</li>
+                        <li>[ ] 在只剩各服务器百分位数的地方，用<strong>最大值而不是平均</strong>折叠</li>
+                        <li>[ ] <strong>页面与事务级延迟</strong>与请求级分开测量</li>
+                        <li>[ ] 跨工具比较数字之前<strong>对齐了百分位数定义</strong></li>
+                    </ul>
+                    <p>反过来是不该做的事。</p>
+                    <ul>
+                        <li>把各服务器、各窗口的百分位数<strong>取平均</strong> - 整篇文章讲的就是这个</li>
+                        <li>给百分位数<strong>加上请求数权重然后宣称「修好了」</strong> - 第5节里符号翻了过来</li>
+                        <li>只在正常状态下验证指标 - 第1b节里误差是0.03%</li>
+                        <li>把百分位数值本身存成时间序列而<strong>丢掉原始数据或直方图</strong> - 无法挽回</li>
+                        <li>把100条请求窗口的p99当作告警阈值 - 一条请求就能带着它晃</li>
+                        <li>数字差得离谱时<strong>先去翻百分位数定义</strong> - 定义差异大多在0.02%量级</li>
+                        <li>看一次就把直方图误差的符号<strong>推广成通则</strong> - 它取决于分布和边界</li>
+                        <li>只改善请求p99而不检查每屏请求数 - 第11节里会被抵消</li>
+                    </ul>
+
+                    <h2>参考资料</h2>
+                    <ul>
+                        <li><a href="https://docs.python.org/3/library/statistics.html" target="_blank" rel="noopener">Python 3 标准库 - statistics</a> ： <code>quantiles()</code>的含端型与排他型定义以及线性插值规则。第7节引用的「可能拥有比样本中所见更极端的值的总体」这句话，以及<code>i / (m + 1)</code>切点计算的出处</li>
+                        <li><a href="https://prometheus.io/docs/practices/histograms/" target="_blank" rel="noopener">Prometheus 官方文档 - Histograms and summaries</a> ： 明确警告在实例之间对预先算好的分位数取平均在统计上没有意义，并说明直方图的桶计数可以先相加再求分位数。与本文第10节关于顺序的论点是同一个落点</li>
+                        <li>本站: <a href="clickhouse_observability_2026.html">ClickHouse为何在可观测性之争中领先</a> - 想长期保留原始数据时该如何处理存储成本</li>
+                        <li>本站: <a href="cp949_utf8_mojibake_guide.html">如何定位韩文乱码的发生点</a> - 在编码领域处理「可恢复的损坏与不可恢复的损坏」这一同构问题</li>
+                    </ul>
+                </div>
+                <!-- md-artifact-start -->
+                    <div class="md-artifact" style="margin:2rem 0;border:1px solid #d7dce3;border-radius:10px;overflow:hidden;background:#fbfcfd;">
+                        <div style="display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;justify-content:space-between;padding:.7rem 1rem;background:#eef2f7;border-bottom:1px solid #d7dce3;">
+                            <span style="font-weight:700;font-size:.97rem;">📋 可直接带走的检查清单</span>
+                            <span style="display:flex;gap:.5rem;align-items:center;">
+                                <code style="font-size:.82rem;color:#5a6675;background:transparent;padding:0;">percentile_aggregation_error.md</code>
+                                <button type="button" class="md-artifact-copy" style="cursor:pointer;border:1px solid #b9c2cf;background:#fff;color:#2c3e50;font-weight:600;line-height:1.3;border-radius:6px;padding:.32rem .7rem;font-size:.85rem;">复制全部</button>
+                            </span>
+                        </div>
+                        <pre style="margin:0;max-height:420px;overflow:auto;padding:1rem;background:#fbfcfd;font-size:.86rem;line-height:1.62;"><code class="nohighlight" style="background:transparent;padding:0;white-space:pre;"># 百分位数聚合检查 - 可合并性判断表与复现代码
+
+&gt; 来源: braindetox.kr - 把10台服务器的p99平均了
+&gt; 依据: Windows 10 / Python 3.13.3 标准库，固定种子20260730 实测验证
+&gt; 把这个文件原样粘贴给AI，然后说「按这些标准检查我们的面板和采集设计」即可。
+&gt; 数据全部是虚构的，不是真实服务的指标。
+
+## 0. 一句话总结
+
+百分位数不是一个值，而是**分布的性质**。性质无法取平均。
+要合并就需要**原始数据或可合并的汇总（直方图）**。
+**把合并这一步放在汇总之前。**
+
+## 1. 可合并性判断表
+
+| 指标 | 从部分折叠的方法 | 是否精确 | 要合并需要有什么 |
+|---|---|---|---|
+| 计数 | 各部分计数之和 | 精确 | 计数 |
+| 求和 | 各部分和之和 | 精确 | 和 |
+| 最大 | 各部分最大值的最大 | 精确 | 最大值 |
+| 最小 | 各部分最小值的最小 | 精确 | 最小值 |
+| 平均 | 各部分平均的简单平均 | **错误** | - |
+| 平均 | 各部分平均按计数加权 | 精确 | **和与计数** |
+| 方差、标准差 | 由计数、和、平方和重算 | 有条件精确 | 三个都要 |
+| 中位数 p50 | 没有折叠规则 | **不可能** | 原始数据或直方图 |
+| p90、p95、p99 | 没有折叠规则 | **不可能** | 原始数据或直方图 |
+| 错误率 | 比值之间取平均 | **错误** | **分子与分母分开** |
+
+「能不能合并」不是指标的属性，而是**你所保存的那份汇总的属性**。
+
+## 2. 绝对不能做的聚合
+
+- 把各服务器p99取平均（观测误差 -33.94 % ~ -79.75 %）
+- 把各服务器p99按请求数加权平均（符号会翻转: -36.99 % / -10.11 %）
+- 把60个1分钟p99取平均当作小时p99（-36.98 %）
+- 把60个1分钟p99取最大当作小时p99（+570.19 %）
+- 对比值（错误率、成功率）取平均
+- 对各部分最大值取平均（-45.36 %）
+
+## 3. 观测到的误差（固定种子20260730）
+
+| 情形 | 错误合并的值 | 真实值 | 误差 |
+|---|---|---|---|
+| 10台中1台劣化，流量均匀 | 138.51 ms | 209.67 ms | -33.94 % |
+| 10台完全相同，流量均匀 | 127.55 ms | 127.59 ms | **-0.03 %** |
+| 忙的服务器慢，80 % 倾斜 | 91.04 ms | 449.63 ms | **-79.75 %** |
+| 忙的服务器快，80 % 倾斜 | 458.61 ms | 217.55 ms | **+110.80 %** |
+| 60个1分钟p99取平均 | 175.68 ms | 278.77 ms | -36.98 % |
+| 60个1分钟p99取最大 | 1868.28 ms | 278.77 ms | +570.19 % |
+| 合并直方图 7个桶 | 491.78 ms | 438.68 ms | +12.11 % |
+| 合并直方图 399个桶 | 438.82 ms | 438.68 ms | **+0.03 %** |
+| 只把分组从10个改成1个 | 128.39 ms | 198.82 ms | -35.42 % |
+
+**第二行是陷阱。**集群同质时误差只有0.03 %，验证会顺利通过。
+正常时准确、异常时出错的指标，没法用来发现异常。
+
+## 4. 复现代码（Python 3.13，仅标准库）
+
+```python
+import math, random
+
+def p99(xs):
+    s = sorted(xs)
+    return s[math.ceil(0.99 * len(s)) - 1]      # nearest-rank
+
+def nrm(rng, _s=[None]):                        # Box-Muller
+    if _s[0] is not None:
+        v = _s[0]; _s[0] = None; return v
+    u1 = rng.random() or 1e-12
+    u2 = rng.random()
+    r = math.sqrt(-2.0 * math.log(u1))
+    _s[0] = r * math.sin(2 * math.pi * u2)
+    return r * math.cos(2 * math.pi * u2)
+
+rng = random.Random(20260730 + 1)               # 第1节的种子
+
+def ln(med, sig, n):
+    return [math.exp(math.log(med) + sig * nrm(rng)) for _ in range(n)]
+
+groups = [ln(18.0, 0.35, 10000) for _ in range(9)] + [ln(30.0, 1.50, 10000)]
+per  = [p99(g) for g in groups]
+pool = [v for g in groups for v in g]
+
+print('mean of per-server p99 :', round(sum(per) / len(per), 2))   # 138.51
+print('true pooled p99        :', round(p99(pool), 2))             # 209.67
+print('max of per-server p99  :', round(max(per), 2))              # 1020.21 (上界)
+```
+
+三个数字原样出现就说明复现成功。
+
+## 5. 面板检查流程
+
+| 检查 | 做什么 | 被错误合并的迹象 |
+|---|---|---|
+| 换分组维度 | 按主机 → 按地域 → 全局 | **数字会动** |
+| 换时间范围 | 1小时 → 6小时 → 1天 | 越拉宽p99越**低** |
+| 数超阈值条数 | 在日志里数超过p99值的请求数 | 比整体的1 %**多得多** |
+| 上界检查 | 比较各服务器p99的最大值与全局p99 | 全局**大于那个最大值** |
+| 单节点对照 | 比较最差节点的p99与全局p99 | 全局**低得多** |
+
+**超阈值计数检查最强。**如果p99是X，按定义就有整体的1 %超过X。
+
+## 6. 采集设计规则
+
+- 延迟要**以直方图采集，而不是百分位数**
+- 直方图的桶要覆盖**预期延迟范围以及超时值之上**
+- 把关心区间（当前p99附近）的桶做**细** — 比改插值方式更确定
+- 保存平均时**连同和与计数一起**保存
+- 保存错误率时**分子与分母分开**保存
+- 保存标准差时保存**计数、和、平方和**
+- 不要把百分位数值存成时间序列而丢掉原始数据或直方图
+- 在百分位数曲线上**同时标出请求数（分母）**
+- 低流量端点采用更宽的窗口或**更低的分位数**
+- **页面与事务级延迟**与请求级分开测量
+- 跨工具比较数字之前**对齐百分位数定义**（各工具可能不同）
+
+## 7. 改不了时的次优解
+
+如果只剩各服务器的百分位数，就**用最大值折叠，不要用平均。**
+
+- 在400个随机集群配置中，真p99超过各组p99**最大值的次数为0**
+- 落到它们最小值以下的次数也是**0**
+- 依据: 每个分组在自己p99之上最多只有自己请求的1 % → 在这些值的最大者之上最多只有整体的1 % → 上界
+- 界可以支撑「最坏也不过如此」的判断，而平均既不是上界也不是下界
+- 界会随分组变粗而收紧。**在基数高的时候最松**
+
+## 8. 把百分位数算对之后仍然存在的两个问题
+
+- **样本不足**: 100条请求窗口的p99实际上就是第二慢的那条请求。2000次重复中估计值在53.84 ~ 300.51 ms之间晃动（真值128.61 ms）
+- **页面级体感**: 一屏打出k个请求时，至少含一个慢请求的概率是 1 - 0.99^k。k=20时为18.21 %，k=69时超过50 %。20个请求的页面串行p99是2552.58 ms（请求级p99是435.58 ms）
+
+## 9. 不该做的事
+
+- 把百分位数取平均
+- 加上权重然后宣称「修好了」
+- 只在正常状态下验证指标
+- 丢掉原始数据或直方图而只留百分位数值
+- 把100条请求窗口的p99当作告警阈值
+- 遇到大误差先去翻定义（定义差异大多在0.02 %量级）
+- 看一次就把直方图误差的符号推广成通则（取决于分布和边界）
+- 只改善请求p99而不检查每屏请求数
+</code></pre>
+                        <p style="margin:0;padding:.6rem 1rem;font-size:.82rem;color:#5a6675;border-top:1px solid #e3e8ee;">复制后可直接粘贴到笔记应用或 AI 工具中。</p>
+                    </div>
+                    <script>
+                    (function(){
+                      if (window.__mdArtifactBound) return;
+                      window.__mdArtifactBound = true;
+                      document.addEventListener('click', function(ev){
+                        var btn = ev.target.closest && ev.target.closest('.md-artifact-copy');
+                        if (!btn) return;
+                        var box = btn.closest('.md-artifact');
+                        var code = box && box.querySelector('pre code');
+                        if (!code) return;
+                        var text = code.textContent;
+                        var label = btn.textContent;
+                        var ok = function(){
+                          btn.textContent = "已复制";
+                          setTimeout(function(){ btn.textContent = label; }, 1600);
+                          if (typeof gtag === 'function') {
+                            gtag('event', 'md_copy', { slug: "percentile_aggregation_error", lang: "zh", chars: text.length });
+                          }
+                        };
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                          navigator.clipboard.writeText(text).then(ok).catch(function(){ fallback(); });
+                        } else { fallback(); }
+                        function fallback(){
+                          var ta = document.createElement('textarea');
+                          ta.value = text; ta.setAttribute('readonly','');
+                          ta.style.position='fixed'; ta.style.left='-9999px';
+                          document.body.appendChild(ta); ta.select();
+                          try { document.execCommand('copy'); ok(); } catch(e) {}
+                          document.body.removeChild(ta);
+                        }
+                      });
+                    })();
+                    </script>
+                    <!-- md-artifact-end -->
+
+                <div class="share-section">
+                    <h3>分享这篇文章</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../../blog.html" class="back-link">返回列表</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/json_formatter.html">JSON 格式化工具</a></li>
+      <li><a href="../static/regex_tester.html">正则表达式测试器</a></li>
+      <li><a href="../static/jwt_decoder.html">JWT解码生成器 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 编码器/解码器</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+<!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="sql_left_join_where_becomes_inner.html">给 LEFT JOIN 加上 WHERE 就变成了 INNER JOIN - ON 与 WHERE 的边界 2026</a></li>
+      <li><a href="sql_not_in_null_empty_result.html">NOT IN 列表里混进一个 NULL，结果就整个变空 - 不报错却返回0行的 SQL 三值逻辑 2026</a></li>
+      <li><a href="json_number_precision_loss.html">装进 JSON 的 64 位 ID 末尾会变 - 数字精度消失的位置 2026</a></li>
+      <li><a href="monotonic_vs_wall_clock.html">用墙上时钟测量经过时间会得到负数 - 该用单调时钟的地方 2026</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制！请粘贴到Threads应用中分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制！'); });
+    });
+    </script>
+</body>
+</html>
