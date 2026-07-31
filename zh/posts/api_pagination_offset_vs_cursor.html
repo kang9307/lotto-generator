@@ -1,0 +1,925 @@
+<!DOCTYPE html>
+<!--
+ * Technical blog post template
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>翻页时条目会消失 - 偏移量分页在结构上做不到的事 2026</title>
+    <meta name="description" content="翻到第二页，刚才还在列表里的条目不见了。偏移量分页为什么会漏掉和重复条目，游标问的又是什么，为什么排序存在并列时数据完全没变也会错开：全部用 SQLite 实际复现的输出、被漏掉的 id 与实测耗时来说明清楚。">
+    <meta name="keywords" content="分页, 偏移量分页, 游标分页, keyset 分页, OFFSET, LIMIT, 无限滚动, 稳定排序, 决胜列, 排序键, 不透明游标, API 设计, 列表接口, SQLite, 深分页, 总条数, has_next, 重复显示, 条目漏项, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/api_pagination_offset_vs_cursor.html">
+
+    <meta property="og:title" content="翻页时条目会消失 - 偏移量分页在结构上做不到的事">
+    <meta property="og:description" content="偏移量问的是「从第几个开始」，游标问的是「从哪里开始」。当列表在变动时，「第几个」这个问法本身就站不住。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/api_pagination_offset_vs_cursor.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-07-31">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="翻页时条目会消失 - 偏移量与游标">
+    <meta name="twitter:description" content="用真实输出点名消失的 id 与重复的 id，还有深分页的实测耗时。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "翻页时条目会消失 - 偏移量分页在结构上做不到的事",
+      "alternativeHeadline": "Items Vanish When You Turn the Page - What Offset Pagination Structurally Cannot Do",
+      "datePublished": "2026-07-31",
+      "dateModified": "2026-07-31",
+      "inLanguage": "zh-CN",
+      "articleSection": "开发/基础设施",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "分页, 偏移量分页, 游标分页, keyset 分页, OFFSET, LIMIT, 无限滚动, 稳定排序, 决胜列, 不透明游标, 列表接口, 深分页",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/api_pagination_offset_vs_cursor.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "偏移量分页为什么会让条目消失",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "偏移量指定的是从列表开头跳过多少条。因为基准点是列表的开头，前方一旦删掉一行，后面的全部内容就整体往前挪一格。实际运行的结果是这样的。第一页读到 id 1 到 5，随后删除 id 3 再读第二页，返回的是 id 7 到 11。用户实际看到的是 1,2,3,4,5,7,8,9,10,11，而 id 6 明明还留在表里，却一次都没有出现在屏幕上。它没有被删除，也没有被过滤掉，只是从两次请求的接缝处漏了下去。前方删掉两行就漏两条，删掉三行就漏三条。漏掉的数量与前方的变更量完全相等。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "同一条目显示两次也是同样的原因吗",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "是的，只是方向相反。前方插入一行，后面的全部内容就整体往后挪一格，于是第一页最后那条移到了第二页的开头。运行结果证实了这一点：第一页是 1,2,3,4,5，其间插入一行排在最前面的记录，再读第二页得到 5,6,7,8,9，id 5 出现了两次。无限滚动里同一张卡片看到两遍，症结就在这里。在新内容不断堆到顶部的信息流中，插入是持续发生的，所以重复不是例外而是默认结果。漏项和重复不是两个独立的缺陷，而是同一个性质的两个方向：基准点是列表的开头，而不是你正在看的那一行。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "数据完全没变，页与页之间也会错开吗",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "只要排序键存在并列就会。当排序无法唯一确定顺序时，SQL 不承诺并列行之间的先后。这里有一个实测案例：十行记录分数完全相同，同一条语句在不使用索引的计划下返回 11,12,13,14,15，在使用覆盖索引的计划下返回 13,17,15,19,20。如果第一页来自一个计划，第二页来自另一个计划，那么 id 11、12、14 会出现两次，而 id 17、19、20 一次都不会出现。十行的表里三条重复、三条丢失，而这期间没有任何插入、更新或删除。修法只有一句：在排序键末尾追加一个唯一列。加上之后，两个计划返回了完全一致的分页。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "改用游标分页就能解决所有问题吗",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "不能。游标消除了漏项和重复，但要放弃三样东西。第一，无法跳到任意页。运行中偏移量一次请求就到达的位置，游标走了四十次才到。没有任何算式能把页码换算成游标值。第二，往回翻需要另写一条查询。仅仅把比较符号反过来，返回的是整张表的第一页；正确做法是反转排序取数，再在应用层把行反转回来。第三，改变排序会让游标失效。运行中把旧游标套用到新排序上，完全没有报错，却安静地返回了错误的行集合，漏掉了本该在那一页的一条记录。所以令牌必须记录自己是为哪一种排序签发的，一旦与请求不符就要拒绝。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "深分页实际上有多慢",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "在这台机器上，从五十万行的表里每次读二十条，中位数是这样的：偏移量 0 时 0.034 毫秒，一万时 0.168 毫秒，十万时 8.6 毫秒，四十万时 33.6 毫秒。同样深度下游标查询稳定在 0.034 毫秒，也就是十万处相差 236 倍，四十万处约 950 倍。数一数引擎实际执行的指令数就清楚了：偏移量一万约两万步，十万约二十万步，四十万约八十万步，而返回的行数始终是二十。被跳过的行仍要先被生成出来再丢弃。游标查询在任何深度都只有一百步左右。不过这是一台机器上的一次测量，换引擎、换存储，绝对值都会变。不变的是方向。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/api_pagination_offset_vs_cursor.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/api_pagination_offset_vs_cursor.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/api_pagination_offset_vs_cursor.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/api_pagination_offset_vs_cursor.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/api_pagination_offset_vs_cursor.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="翻页时条目会消失 - 偏移量分页在结构上做不到的事">
+                <meta itemprop="datePublished" content="2026-07-31">
+                <meta itemprop="dateModified" content="2026-07-31">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="分页, 偏移量分页, 游标分页, keyset 分页, 稳定排序, 决胜列, 不透明游标, 列表接口">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/api_pagination_offset_vs_cursor.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">翻页时条目会消失 - 偏移量分页在结构上做不到的事</h1>
+                    <h2 class="post-subtitle">偏移量问「从第几个开始」，游标问「从哪里开始」 - 漏项与重复不是缺陷，而是问法的性质</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-07-31">2026-07-31</span>
+                        <span class="post-category" itemprop="articleSection">开发/基础设施</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <h2>开场：翻到第二页，刚才看到的条目不见了</h2>
+                    <p>在列表页往下滚，翻到第二页，可是刚才还在眼前的一条不见了。退回去再进来，有时会出现，有时不会。反过来，同一张卡片有时又会出现两次。刷新一下一切正常，于是这类现象最后往往被归档为<strong>「偶尔会这样，复现不了」</strong>。</p>
+                    <p>它其实完全能复现。<strong>条件对了就是百分之百复现。</strong> 而那个条件并不特殊，无非是<strong>列表在被读取的同时发生了变化</strong>——也就是说，任何有真实用户的服务都在持续满足它。</p>
+                    <p>原因不在代码写错，而在<strong>问法的性质</strong>。偏移量分页向数据库提的是这样一个问题。</p>
+                    <ul>
+                        <li><strong>偏移量的问法。</strong>「从列表开头<strong>跳过 N 条之后</strong>给我 20 条」——基准点是<strong>列表的开头</strong></li>
+                        <li><strong>游标的问法。</strong>「从我最后看到的<strong>这一行之后</strong>给我 20 条」——基准点是<strong>那一行本身</strong></li>
+                    </ul>
+                    <p>列表静止时，两个问法给出相同答案。但<strong>列表一动，「第几个」所指的对象就开始晃。</strong> 前面删掉一行，后面的一切就往前挪一格，原来的「第 6 行」现在是「第 5 行」。可请求仍然写着「跳过 5 条」。<strong>于是就漏掉了一行。这不是缺陷，这就是那个问题的答案本来的样子。</strong></p>
+                    <div class="callout">
+                        <p><strong>运行环境。</strong> 本文所有输出均在 <strong>Windows 10 Pro (10.0.19045)</strong> 上，使用 <strong>Python 3.13.3 (win32)</strong> 的标准 <code>sqlite3</code> 模块与 <strong>SQLite 3.49.1</strong> 实际运行得到。脚本全部保存为文件后执行。示例中的表、列与数据都是虚构的。</p>
+                        <p><strong>不对其他引擎下断言。</strong> 下面的数值与执行计划都是<strong>在这个引擎上测得的</strong>。换一种数据库，绝对值和计划的写法都会不同。不过<strong>被偏移量跳过的行仍需由服务端生成后再丢弃</strong>，以及<strong>排序不唯一时顺序没有保证</strong>，这两点属于 SQL 通则，文档中也有明确记载（见参考资料）。</p>
+                        <p><strong>本文不涉及的内容。</strong> SQL 的连接边界、<code>NULL</code> 三值逻辑这类语法陷阱，已经在 <a href="sql_left_join_where_becomes_inner.html">LEFT JOIN 与 WHERE</a> 和 <a href="sql_not_in_null_empty_result.html">NOT IN 与 NULL</a> 里讲过。这里只看<strong>分页这一种问法</strong>。</p>
+                    </div>
+
+                    <h2>1. 复现 - 前面删一行，后面就少一行</h2>
+                    <p>二十行的表，每次读五条。先做一个什么都不发生的基线，再在<strong>第一页和第二页之间删掉前方的一行</strong>。</p>
+                    <pre><code>python 3.13.3 / win32
+sqlite3 library 3.49.1
+
+--- 1-1. baseline: nothing changes between the two reads ---
+page 1 (LIMIT 5 OFFSET 0)  : [1, 2, 3, 4, 5]
+page 2 (LIMIT 5 OFFSET 5)  : [6, 7, 8, 9, 10]
+seen so far                : [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+expected 1..10             : True
+
+--- 1-2. A ROW IN FRONT IS DELETED between page 1 and page 2 ---
+page 1 (LIMIT 5 OFFSET 0)  : [1, 2, 3, 4, 5]
+meanwhile: DELETE FROM post WHERE id = 3   (id 3 was on page 1)
+table now                  : [1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13] ...
+page 2 (LIMIT 5 OFFSET 5)  : [7, 8, 9, 10, 11]
+what the user actually saw : [1, 2, 3, 4, 5, 7, 8, 9, 10, 11]
+still in the table but NEVER SHOWN : [6]
+--&gt; id 6 was skipped. it was never deleted, never filtered. it just fell through the seam.</code></pre>
+                    <p>用户看到的列表是 <code>1, 2, 3, 4, 5, 7, 8, 9, 10, 11</code>。<strong><code>id 6</code> 不见了。</strong> 可 <code>id 6</code> 从来没被删过。它此刻仍在表里，仍满足查询条件，也不涉及任何权限。<strong>它只是从两次请求的接缝处漏了下去。</strong></p>
+                    <p>一句话概括：读第一页时 <code>id 6</code> 是第 6 行。<code>id 3</code> 被删后，<code>id 6</code> 变成了第 5 行。而第二页的请求仍然说「跳过前面 5 条」。<strong>于是 <code>id 6</code> 成了「要跳过的 5 条」里的最后一条，被丢掉了。</strong></p>
+                    <h3>1.1 漏掉的数量与前方变更量完全相等</h3>
+                    <pre><code>--- 1-4. how far the seam moves, by number of front-side changes ---
+deleted in front   page 2 starts at   skipped ids
+---------------------------------------------------------
+0                  6                   -
+1                  7                   [6]
+2                  8                   [6, 7]
+3                  9                   [6, 7, 8]</code></pre>
+                    <ul>
+                        <li>前方删掉 k 行，<strong>就正好漏掉 k 条</strong>。这是算术，不是偶然，也不是概率</li>
+                        <li>漏掉的总是<strong>下一页的开头部分</strong>，所以在用户眼里更像「滚动跳了一下」，而不像出错</li>
+                        <li>不是删除、而是<strong>不再满足过滤条件</strong>，效果完全一样。状态从「待处理」变成「已完成」而离开列表，同样算作前方删除</li>
+                        <li>也就是说<strong>改动越频繁的列表，漏项越频繁</strong>。这解释了为什么安静的主数据表看不出问题，而订单、通知列表会爆出来</li>
+                        <li>最糟的是<strong>数据导出</strong>。人看的界面顶多是「咦，有点怪」，而批处理逐页拉取入库时，<strong>漏项就是实打实的数据丢失</strong></li>
+                    </ul>
+
+                    <h2>2. 反方向 - 前面插一行，同一条目就出现两次</h2>
+                    <p>这次不删，改成<strong>插入一行排在最前面的记录</strong>，其余条件完全一致。</p>
+                    <pre><code>--- 1-3. A ROW IN FRONT IS INSERTED between page 1 and page 2 ---
+page 1 (LIMIT 5 OFFSET 0)  : [1, 2, 3, 4, 5]
+meanwhile: INSERT id = 0   (sorts BEFORE everything on page 1)
+table now                  : [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11] ...
+page 2 (LIMIT 5 OFFSET 5)  : [5, 6, 7, 8, 9]
+what the user actually saw : [1, 2, 3, 4, 5, 5, 6, 7, 8, 9]
+shown TWICE                : [5]
+--&gt; id 5 is the last row of page 1 and the first row of page 2.</code></pre>
+                    <p><strong><code>id 5</code> 出现了两次</strong>——它既是第一页的最后一行，又成了第二页的第一行。前面挤进一行，后面的一切都往后挪了一格，于是「跳过 5 条」这个指令<strong>实际上只跳到了原来的第 4 行为止</strong>。</p>
+                    <p>这里的要点是<strong>漏项与重复并不是两个独立的缺陷</strong>。二者都源自<strong>同一个性质</strong>：基准点是列表的开头。前面变短就漏，前面变长就叠。</p>
+                    <div class="callout">
+                        <p><strong>为什么无限滚动是最糟的组合。</strong> 最新优先的信息流，<strong>结构上就是新行不断落在最前面的列表</strong>——也就是说上面那个插入每隔几秒就发生一次。用偏移量做无限滚动，<strong>重复就成了默认行为，而不是边缘情况</strong>。「偶尔看到同一篇两次」的反馈大多是这个，而在客户端按 id 去重只是遮住症状。<strong>这期间丢掉的条目，不会因为去重而回来。</strong></p>
+                    </div>
+
+                    <h2>3. 什么都没变也会错开 - 并列与不稳定排序</h2>
+                    <p>到这里为止，问题都是因为列表变了。但有一种情况，<strong>数据一个字都没变</strong>也会发生同样的损坏：<strong>排序键里存在并列。</strong></p>
+                    <p>十行记录分数完全相同，只用 <code>ORDER BY score</code> 分页，分别在没有索引和有索引的状态下各跑一次。</p>
+                    <pre><code>--- 2-1. every row has the SAME score. ORDER BY score alone. ---
+rows: id 11..20, all score = 50
+
+plan A (no index, table scan + sort)
+  query plan      : SCAN card | USE TEMP B-TREE FOR ORDER BY
+  page 1          : [11, 12, 13, 14, 15]
+  page 2          : [16, 17, 18, 19, 20]
+plan B (index on score,name)
+  query plan      : SCAN card USING COVERING INDEX idx_card_score_name
+  page 1          : [13, 17, 15, 19, 20]
+  page 2          : [12, 16, 18, 14, 11]</code></pre>
+                    <p><strong>同一条语句给出了完全不同的顺序。</strong> 两者都没错。<code>ORDER BY score</code> 只要求按分数排序，而分数全都相同，于是引擎<strong>可以按任意顺序返回并列的行</strong>。计划 A 用的是存储顺序，计划 B 用的是索引里记录的顺序（按名称）。</p>
+                    <p>现在让用户的第一页来自计划 A，第二页来自计划 B。</p>
+                    <pre><code>--- 2-2. the same user, one plan per page (replica swap, new index, ANALYZE) ---
+page 1 from plan A : [11, 12, 13, 14, 15]
+page 2 from plan B : [12, 16, 18, 14, 11]
+user saw           : [11, 12, 13, 14, 15, 12, 16, 18, 14, 11]
+shown twice        : [11, 12, 14]
+never shown        : [17, 19, 20]
+
+--- 2-3. add a unique tiebreaker: ORDER BY score, id ---
+plan A page 1      : [11, 12, 13, 14, 15]
+plan B page 1      : [11, 12, 13, 14, 15]
+page 1 plan A + page 2 plan B : [11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+shown twice        : -
+never shown        : -</code></pre>
+                    <p>一张十行的表里，<strong>三条重复、三条消失。</strong> 而这期间没有 <code>INSERT</code>、没有 <code>DELETE</code>、也没有 <code>UPDATE</code>。这就是「数据没动，列表怎么会这样」的答案。</p>
+                    <p>修法只有一句。<strong>在排序键末尾追加一个唯一列。</strong> 把 <code>ORDER BY score</code> 改成 <code>ORDER BY score, id</code> 之后，两个计划给出了一致的结果——因为顺序终于可以被唯一确定了。</p>
+                    <pre><code>--- 2-4. is the sort key unique? a one-line check ---
+  score  rows=10 distinct=1  usable alone as a page key: NO
+  name   rows=10 distinct=10  usable alone as a page key: yes
+  id     rows=10 distinct=10  usable alone as a page key: yes</code></pre>
+                    <ul>
+                        <li>这个检查对真实数据跑一次就够。<strong>行数与去重数不相等，说明该列单独不能充当分页键</strong></li>
+                        <li><strong>实务中危险的排序键</strong>基本就那几种：状态值、分类、优先级、星级评分、「热度」分值——并列都很常见</li>
+                        <li><strong>秒级时间戳同样危险。</strong> 一次批量导入就会让几百条落在同一秒里</li>
+                        <li>把浮点分值当排序键会<strong>悄悄产生并列</strong>，而且计算公式一改，昨天的顺序就可能变了</li>
+                        <li>这个问题<strong>换成游标也不会消失。</strong> 后面会看到，游标同样要求顺序被唯一确定</li>
+                    </ul>
+
+                    <h2>4. 游标 - 不问「第几个」，改问「从哪里」</h2>
+                    <p>把同样的场景用游标再跑一遍，<strong>改变的只有请求第二页的方式</strong>：不说「跳过 5 条」，而是问 <strong>「给我 id 大于 5 的」</strong>。</p>
+                    <pre><code>--- 3-1. same DELETE scenario, cursor instead of OFFSET ---
+page 1 (LIMIT 5)           : [1, 2, 3, 4, 5]
+cursor = last id seen      : 5
+meanwhile: DELETE id = 3
+page 2 (WHERE id &gt; 5)      : [6, 7, 8, 9, 10]
+user saw                   : [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+in the table but not shown : -
+shown twice                : -
+
+--- 3-2. same INSERT scenario, cursor instead of OFFSET ---
+page 1 (LIMIT 5)           : [1, 2, 3, 4, 5]
+meanwhile: INSERT id = 0
+page 2 (WHERE id &gt; 5)      : [6, 7, 8, 9, 10]
+user saw                   : [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+shown twice                : -
+note: id 0 sorted in BEHIND the cursor, so this reader will never see it.
+      the cursor did not lose it - it answered from where you were.</code></pre>
+                    <pre><code>--- 3-3. side by side, same two edits ---
+scenario            offset page 2      cursor page 2      verdict
+-----------------------------------------------------------------------
+delete id 3         [7, 8, 9, 10, 11]  [6, 7, 8, 9, 10]   offset=skip cursor=clean
+insert id 0         [5, 6, 7, 8, 9]    [6, 7, 8, 9, 10]   offset=dup cursor=clean</code></pre>
+                    <p>面对同样的两次改动，<strong>偏移量一次漏项、一次重复，而游标两次都干净。</strong> 这不是因为游标更聪明，而是因为<strong>它问的是另一个问题</strong>。「大于 5」这个条件，无论前面发生什么，含义都不会改变。</p>
+                    <p>3-2 最后那行注释很关键。插入的 <code>id 0</code> 落在<strong>游标后面</strong>，所以这位读者始终不会看到它。把这称作「游标丢了条目」是误读。用户问的是<strong>「我所在位置之后的内容」</strong>，而 <code>id 0</code> 在那个位置之前。<strong>想看到新进来的内容，那是刷新的职责，不是分页的职责。</strong></p>
+                    <table>
+                        <thead>
+                            <tr><th>维度</th><th>偏移量</th><th>游标</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>在问什么</td><td><strong>从第 N 个起取 20 条</strong></td><td><strong>从这一行之后取 20 条</strong></td></tr>
+                            <tr><td>基准点</td><td>列表的开头</td><td>最后看到的那一行</td></tr>
+                            <tr><td>前方被删除时</td><td>相应地<strong>漏掉</strong></td><td>无影响</td></tr>
+                            <tr><td>前方被插入时</td><td>相应地<strong>重复</strong></td><td>无影响（该行不显示）</td></tr>
+                            <tr><td>跳到任意页</td><td><strong>可以</strong></td><td>不行</td></tr>
+                            <tr><td>上一页</td><td>把偏移量调小即可</td><td><strong>需要另一条查询</strong></td></tr>
+                            <tr><td>总页数</td><td>可显示（有代价）</td><td>原理上不存在</td></tr>
+                            <tr><td>更改排序</td><td>照常工作</td><td><strong>游标失效</strong></td></tr>
+                            <tr><td>深处的开销</td><td>随位置线性增长</td><td>与位置无关</td></tr>
+                            <tr><td>排序唯一性</td><td>需要</td><td><strong>需要</strong></td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2>5. 排序键不唯一时的游标</h2>
+                    <p>如果游标只用「大于最后看到的排序列值」来构造，<strong>并列的一整块会整体消失。</strong> 用一张有六行优先级为 5 的表验证了这一点。</p>
+                    <pre><code>--- 5-1. sort key is NOT unique: prio has ties ---
+  prio=5  rows=6
+  prio=3  rows=2
+  prio=1  rows=2
+
+--- 5-2. naive cursor on the sort column alone LOSES the tied rows ---
+  page 1                       : [1, 2, 3, 4]
+  page 2 with WHERE prio &lt; 5   : [7, 8, 9, 10]
+  user saw                     : [1, 2, 3, 4, 7, 8, 9, 10]
+  rows with prio=5 never shown : [5, 6]</code></pre>
+                    <p><strong><code>id 5</code> 和 <code>id 6</code> 消失了。</strong> 第一页最后一行的优先级是 5，于是下一次请求要的是「优先级小于 5 的」，而两条还没看过的优先级 5 记录正好落在这个条件之外。</p>
+                    <p>解法是让<strong>游标携带整个排序键</strong>，把决胜列和排序列一起比较。</p>
+                    <pre><code>--- 5-3. the cursor must carry the WHOLE key, and compare it as a whole ---
+  cursor = (prio=5, id=4)
+  WHERE prio &lt; ? OR (prio = ? AND id &gt; ?) : [5, 6, 7, 8]
+  user saw                     : [1, 2, 3, 4, 5, 6, 7, 8]
+  missing                      : -</code></pre>
+                    <h3>5.1 元组简写的陷阱</h3>
+                    <p>很多资料会介绍 <code>(prio, id) &lt; (?, ?)</code> 这种<strong>元组比较简写</strong>。它写起来短、也能用上索引，但<strong>排序方向一旦混用就会悄悄出错。</strong></p>
+                    <pre><code>--- 5-4. the row-value shorthand (a, b) &lt; (?, ?) is accepted but WRONG here ---
+  WHERE (prio, id) &lt; (5, 4)    : [1, 2, 3, 7]  &lt;- no error raised
+  expanded OR form gave        : [5, 6, 7, 8]
+  the tuple form re-showed     : [1, 2, 3]
+  because (prio,id) &lt; (5,4) means prio&lt;5 OR (prio=5 AND id&lt;4),
+  but the sort is prio DESC, id ASC - the second column runs the other way.
+  the shorthand encodes ONE direction for the whole key. mixed sorts need the OR form.
+  same direction (prio ASC, id ASC) is fine : [10, 7, 8, 1]</code></pre>
+                    <ul>
+                        <li><strong>不会报错。</strong> 它只是把用户已经看过的三行又返回一遍。没有测试就发现不了</li>
+                        <li>原因很简单：<code>(prio, id) &lt; (5, 4)</code> 表示<strong>两列都取更小的一侧</strong>，而排序是 <code>prio</code> 降序加 <code>id</code> 升序，<strong>第二列的方向正好相反</strong></li>
+                        <li>如果所有方向一致，简写就是正确的。<strong>方向混用时要用 <code>OR</code> 展开式</strong></li>
+                        <li>「最新优先 + id 升序」正是这个陷阱，而这种组合非常常见</li>
+                    </ul>
+                    <pre><code>--- 5-5. walking the whole table with the composite cursor ---
+  page 1 -&gt; [1, 2, 3, 4]   next cursor = (prio=5, id=4)
+  page 2 -&gt; [5, 6, 7, 8]   next cursor = (prio=3, id=8)
+  page 3 -&gt; [9, 10]   next cursor = (prio=1, id=10)
+  total rows walked            : 10 of 10
+  duplicates                   : -
+  missing                      : -
+
+--- 5-6. index the engine needs for that cursor ---
+   SEARCH task USING COVERING INDEX idx_task (prio&lt;?)
+  the index columns must match the ORDER BY columns, in order, including direction.</code></pre>
+                    <p>最后这行是实务中最常被忽略的部分。<strong>索引必须在列序和方向上都与排序键一致</strong>，游标查询才能走到索引。否则就算改成游标，性能上也一无所得。</p>
+
+                    <h2>6. 游标做不到的三件事</h2>
+                    <p>这里要调转方向。如果只说到「用游标吧」就收尾，就会把<strong>游标所放弃的东西</strong>漏出设计之外。三件事分别做了实际验证。</p>
+                    <h3>6.1 无法跳到任意页</h3>
+                    <pre><code>--- 3-4. what a cursor CANNOT do: jump to page 40 ---
+offset: SELECT ... LIMIT 5 OFFSET 195  -&gt; [196, 197, 198, 199, 200]   (1 round trip)
+cursor: walk page by page to reach the same rows -&gt; [196, 197, 198, 199, 200]   (40 round trips)
+there is no arithmetic that turns 'page 40' into a cursor value.
+a cursor names a ROW. a page number names a COUNT.</code></pre>
+                    <p>到达同样这五行，偏移量用了<strong>一次</strong>往返，游标走了<strong>四十次</strong>。而且这不是靠优化能缩短的性质。<strong>不存在把「第 40 页」换算成游标值的算式</strong>，因为游标指的是<strong>一行</strong>，页码指的是<strong>一个数量</strong>。</p>
+                    <h3>6.2 往回翻需要单独设计</h3>
+                    <pre><code>--- 3-5. what a cursor CANNOT do: go back one page ---
+forward from 100           : [101, 102, 103, 104, 105]
+naive 'back' (id &lt; 100 ASC): [1, 2, 3, 4, 5]   &lt;- wrong, that is the FIRST page of the table
+correct back (DESC + flip) : [95, 96, 97, 98, 99]
+a backward page needs a second query with the ORDER BY reversed,
+then the rows reversed again before rendering. two code paths, not one.</code></pre>
+                    <p>只把比较符号反过来，返回的是<strong>整张表的第一页</strong>，这是常见错误。正确做法是<strong>反转排序取数，再在应用层把行反转回来</strong>，也就是分页逻辑要写两套。</p>
+                    <h3>6.3 改变排序会让游标失效</h3>
+                    <pre><code>--- 3-6. what a cursor CANNOT do: survive a change of sort order ---
+sorted by id, page 1       : [1, 2, 3]  cursor = id 3
+user switches to sort=price, old cursor reused:
+  WHERE id &gt; 3 ORDER BY price : [4, 7, 5]
+  what page 1 of sort=price actually is : [4, 7, 2]
+  ids missing from the reused-cursor page: [2]
+the cursor encodes a POSITION IN ONE ORDERING. change the ordering and it is noise.
+--&gt; the token must carry the sort key it was minted for, and be rejected on mismatch.</code></pre>
+                    <p>用户点了表头改成「按价格排序」，前端却<strong>原封不动地把旧游标带了过去。</strong> 结果是 <code>[4, 7, 5]</code>，而按价格排序的第一页应该是 <code>[4, 7, 2]</code>。<strong><code>id 2</code> 在没有任何报错的情况下被漏掉了。</strong> 游标表示的是<strong>某一种排序内部的位置</strong>，排序一变，这个值就毫无意义。</p>
+                    <ul>
+                        <li>把游标以<strong>原始 id</strong> 的形式暴露出去，就没有任何办法阻止这类事故，因为服务端无从知道这个值来自哪一种排序</li>
+                        <li>过滤条件变化时同理。换了搜索词，<strong>列表本身就是另一个列表</strong>，游标必须丢弃</li>
+                        <li>改变页大小在游标方式下是安全的；在偏移量方式下，它会<strong>把每个页码所指的位置整体挪动</strong></li>
+                        <li>归纳起来，游标是「列表定义 + 排序 + 位置」的<strong>三元组</strong>。前两项一变，第三项就作废</li>
+                    </ul>
+
+                    <h2>7. 性能 - 深分页的代价</h2>
+                    <p>前面讲的是正确性，性能是另一条轴，而这里差距同样很大。用一张<strong>五十万行</strong>的表，每次读二十条。<strong>丢掉 1 次预热，测 10 次取中位数</strong>。</p>
+                    <pre><code>python 3.13.3 / win32 / sqlite 3.49.1
+rows = 500000  page size = 20  repeats = 11 (first discarded), median reported
+
+--- 4-1. OFFSET gets slower the deeper you go ---
+query                                   median ms   min     max     first id
+--------------------------------------------------------------------------------
+LIMIT 20 OFFSET 0                    0.034   0.033   0.041   1
+LIMIT 20 OFFSET 1000                 0.044   0.043   0.047   1001
+LIMIT 20 OFFSET 10000                0.168   0.141   0.395   10001
+LIMIT 20 OFFSET 100000               8.623   7.813   9.398   100001
+LIMIT 20 OFFSET 400000              33.644  32.398  38.283   400001
+LIMIT 20 OFFSET 499980              42.154  41.150  50.930   499981
+
+--- 4-2. the cursor query does not care how deep you are ---
+query                                   median ms   min     max     first id
+--------------------------------------------------------------------------------
+WHERE id &gt; 0      LIMIT 20            0.034   0.033   0.044   1
+WHERE id &gt; 1000   LIMIT 20            0.034   0.034   0.041   1001
+WHERE id &gt; 10000  LIMIT 20            0.034   0.034   0.036   10001
+WHERE id &gt; 100000 LIMIT 20            0.034   0.034   0.063   100001
+WHERE id &gt; 400000 LIMIT 20            0.034   0.034   0.036   400001
+WHERE id &gt; 499980 LIMIT 20            0.035   0.034   0.036   499981</code></pre>
+                    <p>偏移量<strong>随深度成比例变慢</strong>，游标<strong>在任何深度都一样</strong>。把两张表按同一深度对齐来看：</p>
+                    <pre><code>--- 4-3. head to head at the same depth ---
+depth      offset median ms   cursor median ms   ratio
+---------------------------------------------------------
+1000                0.045              0.034      1.3x
+10000               0.144              0.035      4.1x
+100000              8.088              0.034    236.1x
+400000             33.101              0.035    949.8x
+
+--- 4-4. query plans behind those numbers ---
+  offset  SCAN event
+  cursor  SEARCH event USING INTEGER PRIMARY KEY (rowid&gt;?)
+  offset walks the table from the top. cursor seeks straight to the key.</code></pre>
+                    <p>在深度 1,000 处只有 <strong>1.3 倍，实际上没有差别。</strong> 这一点很重要：只会用到浅层页面的界面，把偏移量改成游标<strong>什么也得不到。</strong> 差距从 10,000 之后拉开，到 100,000 时变成 236 倍。</p>
+                    <p>数一数引擎实际执行的指令数，原因就一目了然。</p>
+                    <pre><code>--- 4-5. counting the work: VDBE steps the engine actually executed ---
+  query                                    approx VDBE steps   rows returned
+  ------------------------------------------------------------------------
+  LIMIT 20 OFFSET 1000                          2100   20
+  LIMIT 20 OFFSET 10000                        20200   20
+  LIMIT 20 OFFSET 100000                      200100   20
+  LIMIT 20 OFFSET 400000                      800100   20
+  WHERE id &gt; 1000     LIMIT 20                 100   20
+  WHERE id &gt; 10000    LIMIT 20                 100   20
+  WHERE id &gt; 100000   LIMIT 20                 200   20
+  WHERE id &gt; 400000   LIMIT 20                 100   20
+  the offset query's work grows with the offset. the cursor query's does not.</code></pre>
+                    <ul>
+                        <li>偏移量 400,000 时，引擎<strong>跑了八十万步只返回二十行</strong>，其余都是生成之后又丢掉的</li>
+                        <li>游标在任何深度都只有<strong>一百步左右</strong>，因为它定位一次、读二十条就结束了</li>
+                        <li>这属于 SQL 通则。文档里写着<strong>「被 OFFSET 子句跳过的行仍必须在服务端内部被计算，因此较大的 OFFSET 可能低效」</strong>（见参考资料）</li>
+                        <li>它在实务中之所以可怕，是因为<strong>平时看不见</strong>。人不会翻到深页，而爬虫和批处理会</li>
+                        <li>换句话说<strong>深分页通常是自动化在踩。</strong> 一个列表接口在夜里占满数据库的画面，就是这么来的</li>
+                    </ul>
+                    <div class="callout">
+                        <p><strong>不要把这些数字一般化。</strong> 上面的值是<strong>在这台机器上测的一次结果</strong>：本地文件数据库、缓存充裕、没有网络、没有并发负载。<strong>换引擎、换存储，绝对值和倍率都会不同。</strong> 不变的不是数字，而是<strong>「偏移量随深度增长，游标不随」这个方向</strong>，而上面的指令数计量正好解释了它。想自己测的话，就在自己的数据规模上把偏移量 0 和最大深度各测多次，比较中位数即可。</p>
+                    </div>
+
+                    <h2>8. 附带返回总条数的代价</h2>
+                    <p>列表接口通常会连同「总共多少条」一起返回。这个数字是要付代价的，这一点却很少被意识到。</p>
+                    <pre><code>--- 4-6. the total-count problem ---
+  SELECT COUNT(*) FROM event                             10.947 ms   -&gt; 500000
+  SELECT COUNT(*) FROM event WHERE bucket = 3             2.455 ms   -&gt; 71429
+  capped: COUNT over a LIMIT 1001 subquery                0.103 ms   -&gt; 1001
+  page+1 probe: LIMIT 21, has_more = len == 21            0.014 ms   -&gt; 21 rows
+
+  full filtered count vs capped count ratio : 23.9x
+  the capped count answers 'more than 1000?' at a fraction of the cost.
+  page+1 answers only 'is there a next page?' - the cheapest honest answer.</code></pre>
+                    <p>统计带过滤条件的总数花了 <strong>2.455 毫秒</strong>。同样条件下<strong>读一页只要 0.034 毫秒</strong>，也就是说<strong>总条数比页面本身贵 70 倍以上。</strong> 列表接口慢的原因不是分页，而是<strong>随手带上的总数</strong>，这种情况在现实中相当常见。</p>
+                    <table>
+                        <thead>
+                            <tr><th>方式</th><th>回答的问题</th><th>本机测量</th><th>适用处</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>全量 <code>COUNT(*)</code></td><td>精确多少条</td><td>2.455 ms</td><td>后台表格、小表</td></tr>
+                            <tr><td>封顶计数</td><td>是否多于 1,000 条</td><td>0.103 ms</td><td>显示「1000+」</td></tr>
+                            <tr><td><code>LIMIT page+1</code> 探测</td><td>是否还有下一页</td><td>0.014 ms</td><td>无限滚动</td></tr>
+                            <tr><td>基于统计的估算</td><td>大约多少条</td><td>未测量</td><td>仪表盘概览</td></tr>
+                        </tbody>
+                    </table>
+                    <p>总数还有准确性的问题：<strong>送出的那一刻它就已经过时。</strong></p>
+                    <pre><code>--- 4-7. the count is stale the moment you send it ---
+  count read at request time : 71429
+  count after one insert     : 71430
+  a total shipped with page 1 describes a table that no longer exists by page 2.</code></pre>
+                    <ul>
+                        <li>随第一页送出的「71,429 条」，到第二页时早已是另一个值。<strong>看着精确，其实并不准确</strong></li>
+                        <li>所以「约 71,000 条」或「1000+」这类<strong>近似与封顶的写法反而更诚实</strong>，代价也低得多</li>
+                        <li>绝大多数界面只需要知道<strong>还有没有下一页</strong>。那就用 <code>LIMIT 21</code> 要 21 条，返回 21 条就判定还有，然后只吐出 20 条</li>
+                        <li>数一数真正需要精确总数的界面有几个。<strong>通常只有后台那一张表格</strong></li>
+                    </ul>
+
+                    <h2>9. 什么场景用什么</h2>
+                    <p>本文的结论不是「改用游标」。答案取决于<strong>这个界面究竟在问什么</strong>。</p>
+                    <table>
+                        <thead>
+                            <tr><th>场景 / 用途</th><th>推荐</th><th>理由</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>无限滚动信息流</td><td><strong>游标</strong></td><td>前方持续插入，且界面上没有页码</td></tr>
+                            <tr><td>实时通知 · 时间线</td><td><strong>游标</strong></td><td>新内容堆在前面，重复成为默认结果</td></tr>
+                            <tr><td>后台表格（带页码）</td><td><strong>偏移量</strong> + 固定排序</td><td>「跳到第 37 页」就是需求。给深度设上限，引导改用筛选</td></tr>
+                            <tr><td>搜索结果前 N 条</td><td><strong>偏移量</strong>（带上限）</td><td>没人翻到深页。把最大偏移量堵住</td></tr>
+                            <tr><td>数据导出 · 批处理</td><td><strong>游标</strong>（优先快照）</td><td>漏一条就是数据丢失。尽量固定时点</td></tr>
+                            <tr><td>审计日志浏览</td><td><strong>游标</strong></td><td>只追加的表，与游标完全贴合</td></tr>
+                            <tr><td>少量固定列表（几百条）</td><td>都行</td><td>差异测不出来。选简单的那个</td></tr>
+                        </tbody>
+                    </table>
+                    <ul>
+                        <li><strong>不要硬把游标塞进后台表格。</strong> 页码是需求时，偏移量就是对的工具。要做的是把排序变唯一并堵住最大深度</li>
+                        <li><strong>不要用偏移量做无限滚动。</strong> 这是唯一一个让重复变成默认结果的组合</li>
+                        <li><strong>导出要重新考虑分页本身。</strong> 尽量用事务快照或固定时点把列表冻住再读；实在不行就用游标，并加上<strong>漏项校验</strong></li>
+                        <li>一个接口兼顾两个界面时，<strong>两种方式都支持也没问题</strong>：同时接受页码参数和游标参数，收到游标就按游标处理</li>
+                        <li>迁移时<strong>先把排序唯一性做好</strong>。没做好就改游标，会新引入第 5 节那种并列漏项</li>
+                    </ul>
+
+                    <h2>10. 游标里该装什么 - 不透明令牌</h2>
+                    <p>把游标以 <code>?after_id=1041</code> 的形式直接暴露，就无法防住 6.3 节那个事故，因为<strong>服务端不知道这个值来自哪一种排序</strong>。所以游标应当是<strong>不透明令牌</strong>。</p>
+                    <pre><code>--- 3-7. an opaque token carries the ordering with it ---
+token for sort=price_asc, last row (price=500,id=5):
+   eyJ2IjoxLCJzIjoicHJpY2VfYXNjIiwiayI6WzUwMCw1XX0
+  reused with sort=price_asc : ([500, 5], 'ok')
+  reused with sort=id_asc    : (None, 'token was minted for sort=price_asc, request says sort=id_asc -&gt; reject')</code></pre>
+                    <p>在令牌里记下<strong>它是为哪一种排序签发的</strong>，那么旧游标一旦被套用到换了排序的请求上，<strong>服务端就能拒绝</strong>。它会显式失败，而不是安静地返回一个错误的列表。</p>
+                    <table>
+                        <thead>
+                            <tr><th>字段</th><th>取值</th><th>为什么需要</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>版本</td><td>令牌结构版本</td><td>游标格式变更时可以<strong>安全拒绝</strong>旧令牌</td></tr>
+                            <tr><td>排序标识</td><td>如 <code>price_asc</code> 这样的字符串</td><td><strong>阻断</strong>在另一种排序下的复用</td></tr>
+                            <tr><td>键值数组</td><td>全部排序列 + 决胜列</td><td>真正的位置，防止第 5 节的并列漏项</td></tr>
+                            <tr><td>签名</td><td>用服务端密钥生成的短 MAC</td><td>阻止客户端<strong>改值去扒区间</strong></td></tr>
+                        </tbody>
+                    </table>
+                    <ul>
+                        <li><strong>不要装：</strong> 内部表名、用户标识、权限信息。<strong>游标表示位置，不表示身份</strong></li>
+                        <li>把令牌用 base64 包一层<strong>不是加密</strong>，谁都能解开。真要保密就得加密，而不是签名</li>
+                        <li>没有下一页时，<strong>最好把令牌从响应里去掉</strong>。送空字符串只会给客户端多加一个分支</li>
+                        <li>给页大小参数设<strong>上限</strong>。没有上限的大小指定本身就是一条事故路径</li>
+                        <li>把过滤条件也编进令牌，还能防住<strong>搜索词换了却仍复用游标</strong>的情况</li>
+                    </ul>
+
+                    <h2>11. 检查清单</h2>
+                    <p>整理成可以直接对照现有列表接口逐条核对的形式。</p>
+                    <ul>
+                        <li><strong><code>ORDER BY</code> 末尾带唯一列了吗？</strong> 没有的话，第 3 节的错位可能已经在发生了</li>
+                        <li><strong>用真实数据确认过排序键是否唯一吗？</strong> 数一次行数和去重数即可</li>
+                        <li><strong>索引与排序键的列序和方向一致吗？</strong> 不一致的话，改成游标也得不到性能收益</li>
+                        <li><strong>游标携带的是整个排序键吗？</strong> 只带一个排序列会让并列的一整块漏掉</li>
+                        <li><strong>元组简写有没有用在方向混用的排序上？</strong>「最新优先 + id 升序」是典型的高风险组合</li>
+                        <li><strong>令牌带排序标识、并在不匹配时拒绝吗？</strong> 没有的话，改排序就变成一次安静的漏项</li>
+                        <li><strong>令牌带版本号吗？</strong> 这样才能在客户端已发布的情况下安全地更改格式</li>
+                        <li><strong>上一页是独立查询吗？</strong> 只反转比较符号的代码返回的是第一页</li>
+                        <li><strong><code>OFFSET</code> 有最大深度上限吗？</strong> 没有的话爬虫会去踩</li>
+                        <li><strong>页大小有上限吗？</strong></li>
+                        <li><strong>总数是不是每次请求都在重算？</strong> 是的话，看看能否换成封顶计数或「是否还有下一页」</li>
+                        <li><strong>导出路径避开偏移量了吗？</strong> 那里的漏项不是显示问题，而是数据丢失</li>
+                        <li><strong>有并发修改的场景测试吗？</strong> 读第一页、删掉前方一行、再读第二页，断言没有漏项</li>
+                        <li><strong>客户端是不是在用去重掩盖症状？</strong> 重复能被掩盖，<strong>但漏掉的仍然漏着</strong></li>
+                    </ul>
+
+                    <h2>12. 本文没有验证的部分</h2>
+                    <p>把没验证的写成验证过的，会误导后来的人。这里把边界讲清楚。</p>
+                    <ul>
+                        <li><strong>其他数据库引擎的实际行为。</strong> 第 7 节的数值和 4-4 的计划文字都是<strong>在这个引擎上测得的</strong>。其他引擎是否做了相应优化，没有用运行验证过，因此不下断言</li>
+                        <li><strong>隔离级别的影响。</strong> 本实验在单一连接上交替执行写入与读取。隔离级别和快照行为会改变它在真实服务中的暴露方式</li>
+                        <li><strong>复制延迟。</strong> 第 3 节里「如果计划不同」的情形是以计划差异复现的，并没有真的用两台只读副本来跑</li>
+                        <li><strong>大规模并发负载。</strong> 第 7 节是单进程测量，没有测量并发请求较多时深分页对其他请求的影响</li>
+                        <li><strong>搜索引擎与文档存储的分页。</strong> 那些自带滚动或检索上下文概念的产品，本文没有涉及</li>
+                        <li><strong>令牌的密码学强度。</strong> 第 10 节的签名只是用来示意结构，密钥管理与轮换策略没有展开</li>
+                        <li><strong>统计估算总数的误差。</strong> 它只作为第 8 节表格里的一行出现，实际误差率没有测量</li>
+                    </ul>
+                    <p>不过这些没验证的项目有个共同点：<strong>它们问的全是「在这个环境里有多少」。</strong> 本文的论点不在量级，而在<strong>问法的性质</strong>，而这一点不会因为换了引擎就改变。</p>
+
+                    <h2>结论：「第几个」在变动的列表上站不住</h2>
+                    <p>把跑出来的结果归纳一下：前方删掉一行时，<strong><code>id 6</code> 消失了。</strong> 前方插入一行时，<strong><code>id 5</code> 出现了两次。</strong> 数据完全没变，但排序键存在并列时，<strong>三条重复、三条消失。</strong> 同样的场景改用游标，三次都干干净净。</p>
+                    <p>可是如果就此以「所以要用游标」收尾，那只说了一半。游标<strong>失去了跳页的能力</strong>，上一页<strong>需要另写一条查询</strong>，排序一改就<strong>不报错地返回错误列表</strong>。而在浅层页面上，它的性能优势也只有 1.3 倍。</p>
+                    <p>所以真正的结论是：<strong>偏移量问「从第几个开始」，游标问「从哪里开始」。</strong> 列表静止时两个问法答案一致，但<strong>当列表在动，「第几个」就不再指向任何固定的东西。</strong> 漏项和重复正是这种不稳定显现在屏幕上的样子，它们<strong>是问法的性质，不是缺陷</strong>。该改的是问法，不是代码。</p>
+                    <p>现在马上能做一件事：<strong>打开列表接口的 <code>ORDER BY</code>，看看它末尾有没有唯一列。</strong> 如果没有，那个列表就处在「数据一点没变也可能在页与页之间错开」的状态。而且这种错位<strong>一刷新就消失，于是被登记成无法复现。</strong></p>
+
+                    <h2>参考资料</h2>
+                    <ul>
+                        <li>PostgreSQL 文档 - LIMIT and OFFSET（指出被 OFFSET 跳过的行仍必须在服务端内部计算，因此较大的 OFFSET 可能低效；以及不强制唯一顺序时，不同的 LIMIT/OFFSET 取值会给出不一致的结果）: <a href="https://www.postgresql.org/docs/current/queries-limit.html" target="_blank" rel="noopener">postgresql.org</a></li>
+                        <li>SQLite 文档 - SELECT 语法（ORDER BY、LIMIT、OFFSET 各子句的定义与文法）: <a href="https://www.sqlite.org/lang_select.html" target="_blank" rel="noopener">sqlite.org</a></li>
+                        <li>相关文章: <a href="sql_left_join_where_becomes_inner.html">给 LEFT JOIN 加上 WHERE 就变成了 INNER JOIN</a>、<a href="sql_not_in_null_empty_result.html">NOT IN 列表里混进一个 NULL，结果就整个变空</a>、<a href="json_number_precision_loss.html">装进 JSON 的 64 位 ID 末尾会变</a>、<a href="api_docs_governance_2026.html">API 文档为什么总是落后于代码</a></li>
+                    </ul>
+                </div>
+
+                <!-- md-artifact-start -->
+                    <div class="md-artifact" style="margin:2rem 0;border:1px solid #d7dce3;border-radius:10px;overflow:hidden;background:#fbfcfd;">
+                        <div style="display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;justify-content:space-between;padding:.7rem 1rem;background:#eef2f7;border-bottom:1px solid #d7dce3;">
+                            <span style="font-weight:700;font-size:.97rem;">📋 可直接带走的检查清单</span>
+                            <span style="display:flex;gap:.5rem;align-items:center;">
+                                <code style="font-size:.82rem;color:#5a6675;background:transparent;padding:0;">api_pagination_offset_vs_cursor.md</code>
+                                <button type="button" class="md-artifact-copy" style="cursor:pointer;border:1px solid #b9c2cf;background:#fff;color:#2c3e50;font-weight:600;line-height:1.3;border-radius:6px;padding:.32rem .7rem;font-size:.85rem;">复制全部</button>
+                            </span>
+                        </div>
+                        <pre style="margin:0;max-height:420px;overflow:auto;padding:1rem;background:#fbfcfd;font-size:.86rem;line-height:1.62;"><code class="nohighlight" style="background:transparent;padding:0;white-space:pre;"># 偏移量 vs 游标分页 — 选型判断表与实现骨架
+
+&gt; 来源: braindetox.kr — 翻到第二页，刚才的条目不见了
+&gt; 依据: Windows 10 Pro / Python 3.13.3 / SQLite 3.49.1 实际运行验证（单机、单次测量）
+&gt; 把这个文件直接贴给 AI，写「按这些标准检查我们的列表 API」即可。
+&gt; ⚠ 结论不是「用游标」。偏移量问的是「从第几个开始」，游标问的是「从哪里开始」。当列表在变动时，「第几个」这个问法本身就站不住。
+
+## 0. 前提 — 这是两个不同的问题
+
+| | 偏移量 | 游标 |
+|---|---|---|
+| 在问什么 | **从第 N 个起取 20 条** | **从这一行之后取 20 条** |
+| 基准点 | 列表的**开头** | 最后看到的**那一行** |
+| 列表变动时 | 基准点整体错位 | 基准点仍贴在那一行上 |
+| 跳到任意页 | **可以** | 不行 |
+| 总页数 | 可显示（有代价） | 原理上不存在 |
+| 深处的开销 | 随位置线性增长 | **与位置无关** |
+
+**漏项与重复不是偏移量的缺陷，而是「第几个」这个问法的性质。**
+
+## 1. 三十秒自查
+
+- [ ] 列表在被人翻阅时**是否有写入**（用户动态、订单、通知）→ 若是且用偏移量，漏项和重复已经在发生
+- [ ] `ORDER BY` 的列**是否唯一** → 否则同一页在不同执行中可能返回不同的行
+- [ ] `OFFSET` 最大值**是否超过一万** → 深页会出现延迟尖刺
+- [ ] 是否**每次请求都统计总数** → 这可能比取那一页本身还贵
+- [ ] 是否把**原始 id 直接当游标**暴露 → 排序一改就会静默返回错误结果
+
+## 2. 选型判断表
+
+| 场景 / 用途 | 推荐 | 理由 |
+|---|---|---|
+| 无限滚动信息流 | **游标** | 前方持续插入，且界面上根本没有页码 |
+| 实时通知 · 时间线 | **游标** | 新内容不断堆在前面。用偏移量时重复是默认结果 |
+| 后台管理表格（带页码） | **偏移量** + 固定排序 | 「跳到第 37 页」就是需求。给深度设上限，引导用户改用筛选 |
+| 搜索结果前 N 条 | **偏移量**（带上限） | 没人翻到深页。把 `OFFSET` 的最大值堵住 |
+| 数据导出 / 批处理 | **游标**（优先快照） | 漏一条就是数据丢失。尽量用事务快照或固定时点 |
+| 审计日志浏览 | **游标** | 只追加的表正是游标最贴合的场景 |
+| 少量固定列表（几百条） | 都行 | 差异测不出来。选简单的那个 |
+
+**不要硬把游标塞进后台表格。** 如果页码是需求，偏移量就是对的工具。要做的是把排序变唯一并限制深度。
+
+## 3. 稳定排序规则 — 没有例外
+
+**在排序键末尾追加一个唯一列。** 不加的话，即使数据一个字都没变，页与页之间也会错开。
+
+```sql
+-- 差: score 存在并列时，顺序会随执行计划变化
+SELECT id FROM card ORDER BY score DESC LIMIT 20 OFFSET 20;
+
+-- 好: 决胜列把顺序钉死为唯一的一种
+SELECT id FROM card ORDER BY score DESC, id ASC LIMIT 20 OFFSET 20;
+```
+
+```sql
+-- 一行判断排序键是否唯一
+SELECT COUNT(*) AS rows, COUNT(DISTINCT score) AS distinct_key FROM card;
+-- 两个数字不相等，说明该列单独无法充当分页键
+```
+
+- 索引也要与排序键**同列序、同方向**建立: `CREATE INDEX ... ON card(score DESC, id ASC)`
+- 用可空列排序时，`NULLS FIRST/LAST` 的处理各引擎不同 → 要么移出排序键，要么用 `COALESCE` 固定
+- 不要拿浮点数当排序键，并列会悄悄出现
+
+## 4. 游标实现骨架
+
+### 4.1 单一唯一键（最简单）
+
+```sql
+-- 第一页
+SELECT id, title FROM post ORDER BY id ASC LIMIT 21;
+-- 下一页（最后看到的 id = 整数 last_id）
+SELECT id, title FROM post WHERE id &gt; :last_id ORDER BY id ASC LIMIT 21;
+```
+
+用 `LIMIT 21` 要 21 条，若真返回 21 条就判定还有下一页，然后只吐出 20 条。这是不做任何统计就拿到 `has_next` 的最省办法。
+
+### 4.2 复合键（排序列不唯一时）
+
+```sql
+-- 排序: prio DESC, id ASC / 游标: (last_prio, last_id)
+SELECT id, prio FROM task
+WHERE prio &lt; :last_prio OR (prio = :last_prio AND id &gt; :last_id)
+ORDER BY prio DESC, id ASC
+LIMIT 21;
+```
+
+**陷阱:** 元组简写 `(prio, id) &lt; (:last_prio, :last_id)` 只有在**所有排序方向一致**时才正确。方向混用时它不会报错，只会返回错误的行。上面的 `OR` 展开式永远安全。
+
+### 4.3 往回翻（另一条查询）
+
+```sql
+-- 回退一页: 反转 ORDER BY 取数，再在应用层把行反转回来
+SELECT id FROM post WHERE id &lt; :first_id ORDER BY id DESC LIMIT 20;
+-- 渲染前对结果执行 reverse()
+```
+
+`WHERE id &lt; :first_id ORDER BY id ASC` 给你的是**整张表的第一页**。这是常见错误。
+
+### 4.4 不透明令牌
+
+```python
+# cursor.py - 令牌对客户端而言必须是无意义的字符串
+import base64, json, hmac, hashlib
+
+SECRET = b"server-side-key-from-config"
+
+def mint(sort: str, key: list) -&gt; str:
+    body = json.dumps({"v": 1, "s": sort, "k": key}, separators=(",", ":")).encode()
+    sig = hmac.new(SECRET, body, hashlib.sha256).digest()[:8]
+    return base64.urlsafe_b64encode(body + sig).decode().rstrip("=")
+
+def parse(token: str, sort: str):
+    pad = "=" * (-len(token) % 4)
+    raw = base64.urlsafe_b64decode(token + pad)
+    body, sig = raw[:-8], raw[-8:]
+    if not hmac.compare_digest(sig, hmac.new(SECRET, body, hashlib.sha256).digest()[:8]):
+        raise ValueError("cursor tampered")
+    d = json.loads(body)
+    if d.get("v") != 1:
+        raise ValueError("cursor version not supported")
+    if d.get("s") != sort:
+        raise ValueError("cursor was minted for a different ordering")
+    return d["k"]
+```
+
+**令牌里要装什么**
+
+| 字段 | 取值 | 为什么 |
+|---|---|---|
+| `v` | 结构版本 | 游标格式变更时可以安全拒绝旧令牌 |
+| `s` | 排序标识（如 `price_asc`） | 阻止旧游标被套用到换了排序的请求上 |
+| `k` | 排序键值数组 | 真正的位置：全部排序列 + 决胜列 |
+| 签名 | 8 字节 HMAC | 阻止客户端改值去扒不该看到的区间 |
+
+**不要装:** 内部表名、用户标识、权限信息。游标表示位置，不表示身份。
+
+## 5. 总数该怎么给
+
+| 方式 | 回答的问题 | 开销 | 适用处 |
+|---|---|---|---|
+| 全量 `COUNT(*)` | 精确多少条 | 最高 | 后台表格、小表 |
+| 封顶计数（`LIMIT n+1` 子查询） | 是否多于 n 条 | 极低 | 显示「1000+ 条」 |
+| `LIMIT page+1` 探测 | 是否还有下一页 | 最低 | 无限滚动 |
+| 基于统计的估算 | 大约多少条 | 低 | 仪表盘概览 |
+
+```sql
+-- 封顶计数: 只精确数到 1000，超出就显示「1000+」
+SELECT COUNT(*) FROM (SELECT 1 FROM event WHERE bucket = 3 LIMIT 1001);
+```
+
+- **总数在送出的那一刻就已经过时。** 随第一页给出的数字，到第二页时早已是另一个值
+- 数一数真正需要精确总数的界面有几个。通常一个也没有
+- 游标分页下「第 3 页 / 共 N 页」原理上做不出来。改 UI 才是正解
+
+## 6. 响应结构
+
+```json
+{
+  "items": [ { "id": 1041, "title": "..." } ],
+  "page_info": {
+    "has_next": true,
+    "next_cursor": "eyJ2IjoxLCJzIjoiaWRfYXNjIiwiayI6WzEwNDFdfQ",
+    "has_prev": true,
+    "prev_cursor": "eyJ2IjoxLCJzIjoiaWRfYXNjIiwiayI6WzEwMjJdfQ",
+    "approx_total": "1000+"
+  }
+}
+```
+
+- 没有下一页时**不要放** `next_cursor`（别给空字符串）。客户端的分支会更简单
+- 只接受**服务端自己签发**的游标，不让客户端能够构造
+- 给页大小参数设**上限**。没有上限的 `limit` 本身就是一条事故路径
+
+## 7. 检查清单
+
+- [ ] `ORDER BY` 末尾带了**唯一列**
+- [ ] 索引与排序键**同列序、同方向**
+- [ ] 排序列不唯一时，游标装的是**整个键**
+- [ ] 没有把元组简写用在**方向混用**的排序上
+- [ ] 游标令牌带**排序标识**，不匹配就**拒绝**
+- [ ] 游标令牌带**版本号**，格式可以演进
+- [ ] 游标令牌有**签名**，或服务端以其他方式校验
+- [ ] 往回翻是**独立查询**，不是复用正向查询
+- [ ] 若使用 `OFFSET`，设有**最大深度上限**
+- [ ] 页大小设有**上限**
+- [ ] 不在每次请求重算总数（或已改为封顶计数）
+- [ ] 无限滚动用 **`LIMIT page+1`** 得出 `has_next`
+- [ ] 导出路径用**快照或游标**，不用偏移量
+- [ ] 分页逻辑有**并发修改测试**（读第一页 → 删掉前方一行 → 读第二页，断言没有漏项）
+
+## 8. 不要做
+
+- ❌ **只按有并列的列排序** — 数据一点没变，页与页也会错开
+- ❌ **把原始 id 直接当游标暴露** — 排序一变就静默返回错误结果
+- ❌ **给游标式接口配页码 UI** — 去实现一个不可能存在的东西，只会做成半成品
+- ❌ **无限制放行深 `OFFSET`** — 一个列表接口就能把数据库占满
+- ❌ **游标里只装排序列** — 并列的那一整块会整体消失
+- ❌ **每次请求都 `COUNT(*)`** — 它比取那一页更贵的情况并不少见
+- ❌ **得出「换成游标就全解决」的结论** — 跳页、回退、换排序依然需要设计
+</code></pre>
+                        <p style="margin:0;padding:.6rem 1rem;font-size:.82rem;color:#5a6675;border-top:1px solid #e3e8ee;">复制后可直接粘贴到笔记应用或 AI 工具中。</p>
+                    </div>
+                    <script>
+                    (function(){
+                      if (window.__mdArtifactBound) return;
+                      window.__mdArtifactBound = true;
+                      document.addEventListener('click', function(ev){
+                        var btn = ev.target.closest && ev.target.closest('.md-artifact-copy');
+                        if (!btn) return;
+                        var box = btn.closest('.md-artifact');
+                        var code = box && box.querySelector('pre code');
+                        if (!code) return;
+                        var text = code.textContent;
+                        var label = btn.textContent;
+                        var ok = function(){
+                          btn.textContent = "已复制";
+                          setTimeout(function(){ btn.textContent = label; }, 1600);
+                          if (typeof gtag === 'function') {
+                            gtag('event', 'md_copy', { slug: "api_pagination_offset_vs_cursor", lang: "zh", chars: text.length });
+                          }
+                        };
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                          navigator.clipboard.writeText(text).then(ok).catch(function(){ fallback(); });
+                        } else { fallback(); }
+                        function fallback(){
+                          var ta = document.createElement('textarea');
+                          ta.value = text; ta.setAttribute('readonly','');
+                          ta.style.position='fixed'; ta.style.left='-9999px';
+                          document.body.appendChild(ta); ta.select();
+                          try { document.execCommand('copy'); ok(); } catch(e) {}
+                          document.body.removeChild(ta);
+                        }
+                      });
+                    })();
+                    </script>
+                    <!-- md-artifact-end -->
+
+                <div class="share-section">
+                    <h3>分享本文</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">返回列表</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/json_formatter.html">JSON 格式化工具</a></li>
+      <li><a href="../static/regex_tester.html">正则表达式测试器</a></li>
+      <li><a href="../static/jwt_decoder.html">JWT解码生成器 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 编码器/解码器</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+<!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="sql_left_join_where_becomes_inner.html">给 LEFT JOIN 加上 WHERE 就变成了 INNER JOIN - ON 与 WHERE 的边界 2026</a></li>
+      <li><a href="sql_not_in_null_empty_result.html">NOT IN 列表里混进一个 NULL，结果就整个变空 - 不报错却返回0行的 SQL 三值逻辑 2026</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制！请粘贴到Threads应用中分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制！'); });
+    });
+    </script>
+</body>
+</html>

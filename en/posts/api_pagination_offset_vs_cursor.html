@@ -1,0 +1,925 @@
+<!DOCTYPE html>
+<!--
+ * Technical blog post template
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="en">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Items Vanish When You Turn the Page - What Offset Pagination Structurally Cannot Do 2026</title>
+    <meta name="description" content="You turn to page two and an item you just saw is gone. Why offset pagination skips and duplicates rows, and what a cursor asks instead, reproduced in SQLite.">
+    <meta name="keywords" content="pagination, offset pagination, cursor pagination, keyset pagination, OFFSET, LIMIT, infinite scroll, stable sort, tiebreaker, sort key, opaque cursor, API design, list API, SQLite, deep offset, total count, has_next, duplicate rows, skipped rows, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/en/posts/api_pagination_offset_vs_cursor.html">
+
+    <meta property="og:title" content="Items Vanish When You Turn the Page - What Offset Pagination Structurally Cannot Do">
+    <meta property="og:description" content="Offset asks which position. A cursor asks from where. While the list moves, which position stops meaning anything stable.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/en/posts/api_pagination_offset_vs_cursor.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="en_US">
+    <meta property="article:published_time" content="2026-07-31">
+    <meta property="article:section" content="Dev &amp; Infra">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Items Vanish When You Turn the Page - Offset vs Cursor">
+    <meta name="twitter:description" content="The skipped id and the duplicated id, named from real output. Plus measured timings for deep offsets.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "Items Vanish When You Turn the Page - What Offset Pagination Structurally Cannot Do",
+      "alternativeHeadline": "Offset Asks Which Position, a Cursor Asks From Where - Skips and Duplicates Explained",
+      "datePublished": "2026-07-31",
+      "dateModified": "2026-07-31",
+      "inLanguage": "en-US",
+      "articleSection": "Dev & Infra",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "pagination, offset pagination, cursor pagination, keyset pagination, OFFSET, LIMIT, infinite scroll, stable sort, tiebreaker, opaque cursor, list API, deep offset",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/en/posts/api_pagination_offset_vs_cursor.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "Why do items disappear with offset pagination?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "An offset says how many rows to skip counting from the start of the list. Because the anchor is the start of the list, deleting one row in front pulls everything behind it one slot forward. Here is what running it showed. Page one returned ids 1 through 5. Then id 3 was deleted, and page two returned ids 7 through 11. What the user actually saw was 1,2,3,4,5,7,8,9,10,11 and id 6 never appeared on screen even though it is still sitting in the table. It was not deleted and it did not fail a filter. It fell through the seam between two requests. If two rows are removed in front, two rows go missing; if three are removed, three go missing. The number of skipped rows equals the number of front-side changes exactly."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Is a row shown twice caused by the same thing?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Yes, only in the opposite direction. Inserting a row in front pushes everything behind it one slot back, so the last item of page one moves to the front of page two. Running it confirmed this. Page one was 1,2,3,4,5; a row that sorts ahead of everything was inserted, and page two came back as 5,6,7,8,9. Id 5 appeared twice. That is exactly what people report as seeing the same card twice in an infinite scroll. In a newest-first feed, inserts at the front happen constantly, so duplication becomes the default behaviour rather than the exception. Skips and duplicates are not two separate defects. They are two directions of one property: the anchor is the start of the list, not the row you were looking at."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Can pages drift apart even when no data changes at all?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "They can, when the sort key contains ties. SQL makes no promise about the relative order of rows the ORDER BY cannot distinguish. Here is a measured case. With ten rows that all share the same score, the same statement returned 11,12,13,14,15 under a plan that sorted in a temporary structure, and 13,17,15,19,20 under a plan that read a covering index. If page one comes from one plan and page two from the other, ids 11, 12 and 14 appear twice while ids 17, 19 and 20 never appear at all. Three duplicated and three lost out of ten rows, with not a single insert, update or delete in between. The fix is one clause: append a unique column to the sort key. After doing that, both plans returned identical pages."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Does switching to cursor pagination solve everything?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "No. A cursor removes skips and duplicates but gives up three things. First, you cannot jump to an arbitrary page. In the run, offset reached a given set of rows in one round trip while the cursor needed forty. There is no arithmetic that converts a page number into a cursor value. Second, going backward needs a separate query. Simply flipping the comparison operator returns the first page of the table; you have to fetch with the ordering reversed and then reverse the rows again in the application. Third, changing the sort order invalidates the cursor. In the run, reusing an old cursor under a new ordering raised no error at all and quietly returned the wrong set of rows, dropping one item that belonged on that page. That is why the token has to record which ordering it was minted for and be rejected when the request disagrees."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How slow is a deep offset in practice?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "On this machine, reading twenty rows at a time from a five hundred thousand row table gave these medians: 0.034 ms at offset 0, 0.168 ms at ten thousand, 8.6 ms at one hundred thousand and 33.6 ms at four hundred thousand. The cursor query stayed at 0.034 ms at every depth, which is a 236-fold gap at one hundred thousand and roughly 950-fold at four hundred thousand. Counting the instructions the engine actually executed explains it: about twenty thousand steps at offset ten thousand, two hundred thousand at one hundred thousand, and eight hundred thousand at four hundred thousand, while the rows returned stayed at twenty every time. Skipped rows still have to be produced before being thrown away. The cursor query stayed around one hundred steps at any depth. This is one measurement on one machine, though. The absolute numbers change with a different engine and storage. The direction is what holds."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/api_pagination_offset_vs_cursor.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/api_pagination_offset_vs_cursor.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/api_pagination_offset_vs_cursor.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/api_pagination_offset_vs_cursor.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/api_pagination_offset_vs_cursor.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="Items Vanish When You Turn the Page - What Offset Pagination Structurally Cannot Do">
+                <meta itemprop="datePublished" content="2026-07-31">
+                <meta itemprop="dateModified" content="2026-07-31">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="pagination, offset pagination, cursor pagination, keyset pagination, stable sort, tiebreaker, opaque cursor, list API">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/en/posts/api_pagination_offset_vs_cursor.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">Items Vanish When You Turn the Page - What Offset Pagination Structurally Cannot Do</h1>
+                    <h2 class="post-subtitle">Offset asks which position, a cursor asks from where - skips and duplicates are not bugs but a property of the question</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-07-31">2026-07-31</span>
+                        <span class="post-category" itemprop="articleSection">Dev &amp; Infra</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <h2>Opening: you turn to page two and the item you just saw is gone</h2>
+                    <p>You scroll down a list, page two loads, and an item that was on screen a second ago is simply not there. Go back and forward again and it may reappear, or it may not. Sometimes the opposite happens and the same card shows up twice. A refresh makes everything look fine, so the ticket usually ends up filed as <strong>happens occasionally, cannot reproduce</strong>.</p>
+                    <p>It reproduces perfectly. <strong>Given the right conditions it happens one hundred percent of the time.</strong> And those conditions are not exotic: they amount to <strong>the list changing while it is being read</strong>, which is to say, any service with real users.</p>
+                    <p>The cause is not a coding mistake. It lives in <strong>the shape of the question</strong>. Offset pagination asks the database this:</p>
+                    <ul>
+                        <li><strong>The offset question.</strong> Give me 20 rows <strong>after skipping N</strong> from the beginning of the list. The anchor is <strong>the start of the list</strong></li>
+                        <li><strong>The cursor question.</strong> Give me 20 rows <strong>after this row</strong> I last saw. The anchor is <strong>a row</strong></li>
+                    </ul>
+                    <p>On a frozen list the two questions return the same answer. But <strong>the moment the list moves, the phrase which position stops pointing at anything fixed.</strong> Delete one row in front and everything behind it slides forward one slot, so what was the sixth row is now the fifth. The request still says skip five. <strong>So one row gets skipped. That is not a bug; that is what the answer to that question is.</strong></p>
+                    <div class="callout">
+                        <p><strong>Environment.</strong> Every output below was produced on <strong>Windows 10 Pro (10.0.19045)</strong> using the standard <code>sqlite3</code> module of <strong>Python 3.13.3 (win32)</strong> with <strong>SQLite 3.49.1</strong>. All scripts were saved to files and executed. Every table, column and value in the examples is fictional.</p>
+                        <p><strong>No claims about other engines.</strong> The numbers and query plans below were <strong>measured on this engine</strong>. Absolute values and plan names differ elsewhere. What is general SQL, and documented as such, is that <strong>rows skipped by an offset still have to be computed by the server before being discarded</strong>, and that <strong>order is not guaranteed when the sort does not determine it uniquely</strong> (see References).</p>
+                        <p><strong>What this article does not cover.</strong> Syntax traps like join boundaries and three-valued <code>NULL</code> logic are already covered in <a href="sql_left_join_where_becomes_inner.html">LEFT JOIN and WHERE</a> and <a href="sql_not_in_null_empty_result.html">NOT IN and NULL</a>. Here we look at <strong>one shape of question</strong> only: pagination.</p>
+                    </div>
+
+                    <h2>1. Reproducing it - delete one row in front, lose one row behind</h2>
+                    <p>Twenty rows read five at a time. First a baseline where nothing happens, then the same read with <strong>one row in front deleted between page one and page two.</strong></p>
+                    <pre><code>python 3.13.3 / win32
+sqlite3 library 3.49.1
+
+--- 1-1. baseline: nothing changes between the two reads ---
+page 1 (LIMIT 5 OFFSET 0)  : [1, 2, 3, 4, 5]
+page 2 (LIMIT 5 OFFSET 5)  : [6, 7, 8, 9, 10]
+seen so far                : [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+expected 1..10             : True
+
+--- 1-2. A ROW IN FRONT IS DELETED between page 1 and page 2 ---
+page 1 (LIMIT 5 OFFSET 0)  : [1, 2, 3, 4, 5]
+meanwhile: DELETE FROM post WHERE id = 3   (id 3 was on page 1)
+table now                  : [1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13] ...
+page 2 (LIMIT 5 OFFSET 5)  : [7, 8, 9, 10, 11]
+what the user actually saw : [1, 2, 3, 4, 5, 7, 8, 9, 10, 11]
+still in the table but NEVER SHOWN : [6]
+--&gt; id 6 was skipped. it was never deleted, never filtered. it just fell through the seam.</code></pre>
+                    <p>The user saw <code>1, 2, 3, 4, 5, 7, 8, 9, 10, 11</code>. <strong><code>id 6</code> is missing.</strong> And <code>id 6</code> was never deleted. It is still in the table, it satisfies the query, and there is no permission involved. <strong>It simply fell through the seam between two requests.</strong></p>
+                    <p>In one sentence: when page one was read, <code>id 6</code> was the sixth row. Deleting <code>id 3</code> made it the fifth row. The page-two request still says <strong>skip the first five</strong>. <strong>So <code>id 6</code> became the last of the five to skip, and was thrown away.</strong></p>
+                    <h3>1.1 The number lost equals the number changed</h3>
+                    <pre><code>--- 1-4. how far the seam moves, by number of front-side changes ---
+deleted in front   page 2 starts at   skipped ids
+---------------------------------------------------------
+0                  6                   -
+1                  7                   [6]
+2                  8                   [6, 7]
+3                  9                   [6, 7, 8]</code></pre>
+                    <ul>
+                        <li>Remove k rows in front and <strong>exactly k rows disappear.</strong> This is arithmetic, not chance</li>
+                        <li>The lost rows are always at <strong>the head of the next page</strong>, which is why it reads to a user as a small scroll jump rather than an error</li>
+                        <li>A row <strong>falling out of the filter</strong> has the same effect as a delete. A status moving from pending to done drops it from the list, and that counts as a front-side removal</li>
+                        <li>So <strong>the more a list is edited, the more often rows vanish.</strong> That is why a quiet master table never shows this and an orders or notifications list does</li>
+                        <li>The worst case is <strong>data export</strong>. On screen it is an oddity; in a batch job that walks pages and loads them somewhere, <strong>a skip is straightforward data loss</strong></li>
+                    </ul>
+
+                    <h2>2. The other direction - insert one row in front, see the same item twice</h2>
+                    <p>Same setup, but this time <strong>a row that sorts ahead of everything is inserted</strong> instead of deleted.</p>
+                    <pre><code>--- 1-3. A ROW IN FRONT IS INSERTED between page 1 and page 2 ---
+page 1 (LIMIT 5 OFFSET 0)  : [1, 2, 3, 4, 5]
+meanwhile: INSERT id = 0   (sorts BEFORE everything on page 1)
+table now                  : [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11] ...
+page 2 (LIMIT 5 OFFSET 5)  : [5, 6, 7, 8, 9]
+what the user actually saw : [1, 2, 3, 4, 5, 5, 6, 7, 8, 9]
+shown TWICE                : [5]
+--&gt; id 5 is the last row of page 1 and the first row of page 2.</code></pre>
+                    <p><strong><code>id 5</code> appeared twice</strong> - last row of page one and first row of page two. One row slid in at the front, everything behind moved back a slot, and the instruction <strong>skip five</strong> now effectively skips only through what used to be the fourth row.</p>
+                    <p>What matters here is that <strong>skips and duplicates are not two separate defects.</strong> Both fall out of <strong>one property</strong>: the anchor is the start of the list. Shorten the front and you skip; lengthen it and you overlap.</p>
+                    <div class="callout">
+                        <p><strong>Why infinite scroll is the worst combination.</strong> A newest-first feed is <strong>structurally a list where new rows keep landing at the very front</strong> - which is to say, the insert above happens every few seconds. Build infinite scroll on offsets and <strong>duplication becomes the default behaviour, not an edge case</strong>. Most reports of seeing the same post twice are this, and de-duplicating by id on the client only hides the symptom. <strong>The items lost in between do not come back from de-duplication.</strong></p>
+                    </div>
+
+                    <h2>3. Pages drift apart with no changes at all - ties and unstable ordering</h2>
+                    <p>So far the trouble came from the list changing. But the same damage happens <strong>with zero data changes</strong> in one situation: <strong>when the sort key contains ties.</strong></p>
+                    <p>Ten rows all carrying the same score, paginated by <code>ORDER BY score</code> alone, run once without an index and once with one.</p>
+                    <pre><code>--- 2-1. every row has the SAME score. ORDER BY score alone. ---
+rows: id 11..20, all score = 50
+
+plan A (no index, table scan + sort)
+  query plan      : SCAN card | USE TEMP B-TREE FOR ORDER BY
+  page 1          : [11, 12, 13, 14, 15]
+  page 2          : [16, 17, 18, 19, 20]
+plan B (index on score,name)
+  query plan      : SCAN card USING COVERING INDEX idx_card_score_name
+  page 1          : [13, 17, 15, 19, 20]
+  page 2          : [12, 16, 18, 14, 11]</code></pre>
+                    <p><strong>The same statement returns completely different orders.</strong> Neither is wrong. <code>ORDER BY score</code> only demands ordering by score, and every score is identical, so the engine is <strong>free to return tied rows in any order it likes</strong>. Plan A used storage order, plan B used the order written in the index.</p>
+                    <p>Now let the user receive page one from plan A and page two from plan B.</p>
+                    <pre><code>--- 2-2. the same user, one plan per page (replica swap, new index, ANALYZE) ---
+page 1 from plan A : [11, 12, 13, 14, 15]
+page 2 from plan B : [12, 16, 18, 14, 11]
+user saw           : [11, 12, 13, 14, 15, 12, 16, 18, 14, 11]
+shown twice        : [11, 12, 14]
+never shown        : [17, 19, 20]
+
+--- 2-3. add a unique tiebreaker: ORDER BY score, id ---
+plan A page 1      : [11, 12, 13, 14, 15]
+plan B page 1      : [11, 12, 13, 14, 15]
+page 1 plan A + page 2 plan B : [11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+shown twice        : -
+never shown        : -</code></pre>
+                    <p>In a ten-row table, <strong>three rows duplicated and three vanished.</strong> No <code>INSERT</code>, no <code>DELETE</code>, no <code>UPDATE</code> happened in between. This is the answer to <strong>the data has not changed, why does the list look like this</strong>.</p>
+                    <p>The fix is one clause. <strong>Append a unique column to the sort key.</strong> Changing <code>ORDER BY score</code> to <code>ORDER BY score, id</code> made both plans agree, because the ordering could finally be determined uniquely.</p>
+                    <pre><code>--- 2-4. is the sort key unique? a one-line check ---
+  score  rows=10 distinct=1  usable alone as a page key: NO
+  name   rows=10 distinct=10  usable alone as a page key: yes
+  id     rows=10 distinct=10  usable alone as a page key: yes</code></pre>
+                    <ul>
+                        <li>Run this check once against real data. <strong>If the row count and the distinct count differ, that column alone cannot be a page key</strong></li>
+                        <li><strong>The dangerous sort keys in practice</strong> are the obvious ones: status, category, priority, star rating, popularity score. Ties are common in all of them</li>
+                        <li><strong>Second-resolution timestamps are dangerous too.</strong> A bulk import puts hundreds of rows in the same second</li>
+                        <li>Floating-point scores <strong>produce ties silently</strong>, and a change to the scoring formula can reorder yesterday's results</li>
+                        <li>This problem <strong>does not go away by switching to a cursor.</strong> As shown later, a cursor also requires a uniquely determined order</li>
+                    </ul>
+
+                    <h2>4. The cursor - asking from where instead of which position</h2>
+                    <p>Now the same scenarios with a cursor. <strong>Only the page-two request changes.</strong> Instead of skip five, it asks <strong>give me rows whose id is greater than 5</strong>.</p>
+                    <pre><code>--- 3-1. same DELETE scenario, cursor instead of OFFSET ---
+page 1 (LIMIT 5)           : [1, 2, 3, 4, 5]
+cursor = last id seen      : 5
+meanwhile: DELETE id = 3
+page 2 (WHERE id &gt; 5)      : [6, 7, 8, 9, 10]
+user saw                   : [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+in the table but not shown : -
+shown twice                : -
+
+--- 3-2. same INSERT scenario, cursor instead of OFFSET ---
+page 1 (LIMIT 5)           : [1, 2, 3, 4, 5]
+meanwhile: INSERT id = 0
+page 2 (WHERE id &gt; 5)      : [6, 7, 8, 9, 10]
+user saw                   : [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+shown twice                : -
+note: id 0 sorted in BEHIND the cursor, so this reader will never see it.
+      the cursor did not lose it - it answered from where you were.</code></pre>
+                    <pre><code>--- 3-3. side by side, same two edits ---
+scenario            offset page 2      cursor page 2      verdict
+-----------------------------------------------------------------------
+delete id 3         [7, 8, 9, 10, 11]  [6, 7, 8, 9, 10]   offset=skip cursor=clean
+insert id 0         [5, 6, 7, 8, 9]    [6, 7, 8, 9, 10]   offset=dup cursor=clean</code></pre>
+                    <p>Against the same two edits, <strong>offset skipped once and overlapped once, while the cursor was clean both times.</strong> Not because the cursor is cleverer, but because <strong>it asked a different question</strong>. The condition greater than 5 does not change meaning no matter what happens in front of it.</p>
+                    <p>The closing note of 3-2 matters. The inserted <code>id 0</code> landed <strong>behind the cursor</strong>, so this reader will never see it. Calling that a lost item misreads the situation. The user asked for <strong>what comes after where I was</strong>, and <code>id 0</code> is before that place. <strong>Seeing newly arrived rows is the job of a refresh, not of pagination.</strong></p>
+                    <table>
+                        <thead>
+                            <tr><th>Aspect</th><th>Offset</th><th>Cursor</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>What it asks</td><td><strong>20 rows from position N</strong></td><td><strong>20 rows after this row</strong></td></tr>
+                            <tr><td>Anchor</td><td>start of the list</td><td>the row you last saw</td></tr>
+                            <tr><td>Row deleted in front</td><td><strong>skips</strong> that many</td><td>no effect</td></tr>
+                            <tr><td>Row inserted in front</td><td><strong>overlaps</strong> that many</td><td>no effect (row stays unseen)</td></tr>
+                            <tr><td>Jump to arbitrary page</td><td><strong>yes</strong></td><td>no</td></tr>
+                            <tr><td>Previous page</td><td>just lower the offset</td><td><strong>needs a separate query</strong></td></tr>
+                            <tr><td>Total page count</td><td>possible (at a cost)</td><td>does not exist in principle</td></tr>
+                            <tr><td>Changing the sort</td><td>keeps working</td><td><strong>cursor becomes invalid</strong></td></tr>
+                            <tr><td>Cost at depth</td><td>grows with position</td><td>independent of position</td></tr>
+                            <tr><td>Unique ordering</td><td>required</td><td><strong>required</strong></td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2>5. Cursors when the sort key is not unique</h2>
+                    <p>Building the cursor from the sort column alone makes <strong>an entire tied block disappear.</strong> Confirmed on a table with six rows at priority 5.</p>
+                    <pre><code>--- 5-1. sort key is NOT unique: prio has ties ---
+  prio=5  rows=6
+  prio=3  rows=2
+  prio=1  rows=2
+
+--- 5-2. naive cursor on the sort column alone LOSES the tied rows ---
+  page 1                       : [1, 2, 3, 4]
+  page 2 with WHERE prio &lt; 5   : [7, 8, 9, 10]
+  user saw                     : [1, 2, 3, 4, 7, 8, 9, 10]
+  rows with prio=5 never shown : [5, 6]</code></pre>
+                    <p><strong><code>id 5</code> and <code>id 6</code> vanished.</strong> The last row of page one had priority 5, so the next request asked for priority below 5, and the two unseen rows at priority 5 fell outside that condition.</p>
+                    <p>The remedy is for <strong>the cursor to carry the whole sort key</strong> and compare the tiebreaker along with the sort column.</p>
+                    <pre><code>--- 5-3. the cursor must carry the WHOLE key, and compare it as a whole ---
+  cursor = (prio=5, id=4)
+  WHERE prio &lt; ? OR (prio = ? AND id &gt; ?) : [5, 6, 7, 8]
+  user saw                     : [1, 2, 3, 4, 5, 6, 7, 8]
+  missing                      : -</code></pre>
+                    <h3>5.1 The trap in the tuple shorthand</h3>
+                    <p>Many write-ups suggest the <strong>row-value shorthand</strong> <code>(prio, id) &lt; (?, ?)</code>. It is short and uses indexes well, but <strong>it goes silently wrong when sort directions are mixed.</strong></p>
+                    <pre><code>--- 5-4. the row-value shorthand (a, b) &lt; (?, ?) is accepted but WRONG here ---
+  WHERE (prio, id) &lt; (5, 4)    : [1, 2, 3, 7]  &lt;- no error raised
+  expanded OR form gave        : [5, 6, 7, 8]
+  the tuple form re-showed     : [1, 2, 3]
+  because (prio,id) &lt; (5,4) means prio&lt;5 OR (prio=5 AND id&lt;4),
+  but the sort is prio DESC, id ASC - the second column runs the other way.
+  the shorthand encodes ONE direction for the whole key. mixed sorts need the OR form.
+  same direction (prio ASC, id ASC) is fine : [10, 7, 8, 1]</code></pre>
+                    <ul>
+                        <li><strong>No error is raised.</strong> It just hands back three rows the user already saw. Without a test, nobody finds it</li>
+                        <li>The reason is simple. <code>(prio, id) &lt; (5, 4)</code> means <strong>smaller on both columns</strong>, but the sort is <code>prio</code> descending with <code>id</code> ascending, so <strong>only the second column runs the other way</strong></li>
+                        <li>If every direction matches, the shorthand is correct. <strong>If they are mixed, use the expanded <code>OR</code> form</strong></li>
+                        <li>Newest-first plus an ascending id tiebreaker is exactly this trap, and it is a very common combination</li>
+                    </ul>
+                    <pre><code>--- 5-5. walking the whole table with the composite cursor ---
+  page 1 -&gt; [1, 2, 3, 4]   next cursor = (prio=5, id=4)
+  page 2 -&gt; [5, 6, 7, 8]   next cursor = (prio=3, id=8)
+  page 3 -&gt; [9, 10]   next cursor = (prio=1, id=10)
+  total rows walked            : 10 of 10
+  duplicates                   : -
+  missing                      : -
+
+--- 5-6. index the engine needs for that cursor ---
+   SEARCH task USING COVERING INDEX idx_task (prio&lt;?)
+  the index columns must match the ORDER BY columns, in order, including direction.</code></pre>
+                    <p>That last line is the part most often missed. <strong>The index has to match the sort key in column order and in direction</strong> for the cursor query to use it. Otherwise switching to a cursor buys no performance at all.</p>
+
+                    <h2>6. Three things a cursor cannot do</h2>
+                    <p>Here the argument turns. Ending at use a cursor leaves <strong>what a cursor gives up</strong> out of the design. Each of the three was checked by running it.</p>
+                    <h3>6.1 It cannot jump to an arbitrary page</h3>
+                    <pre><code>--- 3-4. what a cursor CANNOT do: jump to page 40 ---
+offset: SELECT ... LIMIT 5 OFFSET 195  -&gt; [196, 197, 198, 199, 200]   (1 round trip)
+cursor: walk page by page to reach the same rows -&gt; [196, 197, 198, 199, 200]   (40 round trips)
+there is no arithmetic that turns 'page 40' into a cursor value.
+a cursor names a ROW. a page number names a COUNT.</code></pre>
+                    <p>Reaching the same five rows took offset <strong>one round trip</strong> and the cursor <strong>forty</strong>. This is not something optimisation can fix. <strong>No formula converts page 40 into a cursor value</strong>, because a cursor names <strong>a row</strong> while a page number names <strong>a count</strong>.</p>
+                    <h3>6.2 Going backward needs a separate design</h3>
+                    <pre><code>--- 3-5. what a cursor CANNOT do: go back one page ---
+forward from 100           : [101, 102, 103, 104, 105]
+naive 'back' (id &lt; 100 ASC): [1, 2, 3, 4, 5]   &lt;- wrong, that is the FIRST page of the table
+correct back (DESC + flip) : [95, 96, 97, 98, 99]
+a backward page needs a second query with the ORDER BY reversed,
+then the rows reversed again before rendering. two code paths, not one.</code></pre>
+                    <p>Flipping only the comparison operator returns <strong>the first page of the table</strong> - a common mistake. Done properly you must <strong>fetch with the ordering reversed and reverse the rows again in the application</strong>, which means two pagination code paths instead of one.</p>
+                    <h3>6.3 Changing the sort invalidates the cursor</h3>
+                    <pre><code>--- 3-6. what a cursor CANNOT do: survive a change of sort order ---
+sorted by id, page 1       : [1, 2, 3]  cursor = id 3
+user switches to sort=price, old cursor reused:
+  WHERE id &gt; 3 ORDER BY price : [4, 7, 5]
+  what page 1 of sort=price actually is : [4, 7, 2]
+  ids missing from the reused-cursor page: [2]
+the cursor encodes a POSITION IN ONE ORDERING. change the ordering and it is noise.
+--&gt; the token must carry the sort key it was minted for, and be rejected on mismatch.</code></pre>
+                    <p>The user clicked a column header to sort by price and the front end <strong>sent the existing cursor along unchanged.</strong> The result was <code>[4, 7, 5]</code> where the real first page by price is <code>[4, 7, 2]</code>. <strong><code>id 2</code> was dropped with no error.</strong> A cursor denotes <strong>a position within one ordering</strong>, so once the ordering changes the value means nothing.</p>
+                    <ul>
+                        <li>Exposing the cursor as a <strong>raw id</strong> makes this impossible to prevent, because the server cannot tell which ordering the value came from</li>
+                        <li>The same applies to filters. Change the search term and <strong>it is a different list entirely</strong>, so the cursor must be discarded</li>
+                        <li>Changing the page size is safe under cursors. Under offsets it <strong>moves what every page number points at</strong></li>
+                        <li>In short a cursor is a <strong>triple</strong> of list definition, ordering and position. Change either of the first two and the third is void</li>
+                    </ul>
+
+                    <h2>7. Performance - what a deep offset costs</h2>
+                    <p>Correctness was one axis; performance is another, and the gap there is large too. A <strong>five hundred thousand row</strong> table, read twenty rows at a time. <strong>One warm-up run discarded, ten runs measured, median reported.</strong></p>
+                    <pre><code>python 3.13.3 / win32 / sqlite 3.49.1
+rows = 500000  page size = 20  repeats = 11 (first discarded), median reported
+
+--- 4-1. OFFSET gets slower the deeper you go ---
+query                                   median ms   min     max     first id
+--------------------------------------------------------------------------------
+LIMIT 20 OFFSET 0                    0.034   0.033   0.041   1
+LIMIT 20 OFFSET 1000                 0.044   0.043   0.047   1001
+LIMIT 20 OFFSET 10000                0.168   0.141   0.395   10001
+LIMIT 20 OFFSET 100000               8.623   7.813   9.398   100001
+LIMIT 20 OFFSET 400000              33.644  32.398  38.283   400001
+LIMIT 20 OFFSET 499980              42.154  41.150  50.930   499981
+
+--- 4-2. the cursor query does not care how deep you are ---
+query                                   median ms   min     max     first id
+--------------------------------------------------------------------------------
+WHERE id &gt; 0      LIMIT 20            0.034   0.033   0.044   1
+WHERE id &gt; 1000   LIMIT 20            0.034   0.034   0.041   1001
+WHERE id &gt; 10000  LIMIT 20            0.034   0.034   0.036   10001
+WHERE id &gt; 100000 LIMIT 20            0.034   0.034   0.063   100001
+WHERE id &gt; 400000 LIMIT 20            0.034   0.034   0.036   400001
+WHERE id &gt; 499980 LIMIT 20            0.035   0.034   0.036   499981</code></pre>
+                    <p>Offset <strong>slows down in proportion to depth</strong>; the cursor <strong>stays flat</strong>. Placing them side by side at equal depth:</p>
+                    <pre><code>--- 4-3. head to head at the same depth ---
+depth      offset median ms   cursor median ms   ratio
+---------------------------------------------------------
+1000                0.045              0.034      1.3x
+10000               0.144              0.035      4.1x
+100000              8.088              0.034    236.1x
+400000             33.101              0.035    949.8x
+
+--- 4-4. query plans behind those numbers ---
+  offset  SCAN event
+  cursor  SEARCH event USING INTEGER PRIMARY KEY (rowid&gt;?)
+  offset walks the table from the top. cursor seeks straight to the key.</code></pre>
+                    <p>At depth 1,000 the ratio is <strong>1.3x, effectively nothing.</strong> That is important: on a screen that only ever serves shallow pages, converting offset to cursor <strong>buys you nothing</strong>. The gap opens past 10,000 and reaches 236x at 100,000.</p>
+                    <p>Counting the instructions the engine actually ran makes the reason plain.</p>
+                    <pre><code>--- 4-5. counting the work: VDBE steps the engine actually executed ---
+  query                                    approx VDBE steps   rows returned
+  ------------------------------------------------------------------------
+  LIMIT 20 OFFSET 1000                          2100   20
+  LIMIT 20 OFFSET 10000                        20200   20
+  LIMIT 20 OFFSET 100000                      200100   20
+  LIMIT 20 OFFSET 400000                      800100   20
+  WHERE id &gt; 1000     LIMIT 20                 100   20
+  WHERE id &gt; 10000    LIMIT 20                 100   20
+  WHERE id &gt; 100000   LIMIT 20                 200   20
+  WHERE id &gt; 400000   LIMIT 20                 100   20
+  the offset query's work grows with the offset. the cursor query's does not.</code></pre>
+                    <ul>
+                        <li>At offset 400,000 the engine ran <strong>eight hundred thousand steps to return twenty rows.</strong> The rest was produced and thrown away</li>
+                        <li>The cursor stayed around <strong>one hundred steps</strong> at every depth, because it seeks once and reads twenty entries</li>
+                        <li>This is a property of SQL generally. The documentation states that <strong>rows skipped by an OFFSET clause still have to be computed inside the server, therefore a large OFFSET might be inefficient</strong> (see References)</li>
+                        <li>What makes it dangerous in practice is that <strong>it is invisible day to day.</strong> Humans do not visit deep pages. Crawlers and batch jobs do</li>
+                        <li>So <strong>deep offsets are usually walked by automation</strong>, which is how a single list endpoint ends up occupying the database overnight</li>
+                    </ul>
+                    <div class="callout">
+                        <p><strong>Do not generalise these numbers.</strong> They are <strong>one measurement on one machine</strong>: a local file database with plenty of cache, no network, no concurrent load. <strong>On a different engine and different storage both the absolute values and the ratios will differ.</strong> What holds is not the numbers but <strong>the direction - offset grows with depth, cursor does not</strong> - and the step counts above explain why. To measure it yourself, time offset 0 and your maximum depth several times each at your own data size and compare medians.</p>
+                    </div>
+
+                    <h2>8. What shipping a total count costs</h2>
+                    <p>List endpoints usually return a total alongside the page. That number is rarely recognised as having a price attached.</p>
+                    <pre><code>--- 4-6. the total-count problem ---
+  SELECT COUNT(*) FROM event                             10.947 ms   -&gt; 500000
+  SELECT COUNT(*) FROM event WHERE bucket = 3             2.455 ms   -&gt; 71429
+  capped: COUNT over a LIMIT 1001 subquery                0.103 ms   -&gt; 1001
+  page+1 probe: LIMIT 21, has_more = len == 21            0.014 ms   -&gt; 21 rows
+
+  full filtered count vs capped count ratio : 23.9x
+  the capped count answers 'more than 1000?' at a fraction of the cost.
+  page+1 answers only 'is there a next page?' - the cheapest honest answer.</code></pre>
+                    <p>Counting the filtered total took <strong>2.455 ms</strong>. Reading one page under the same conditions took <strong>0.034 ms</strong>, so <strong>the total costs more than seventy times the page itself.</strong> It is genuinely common for a slow list endpoint to be slow because of <strong>the count shipped with it</strong>, not the pagination.</p>
+                    <table>
+                        <thead>
+                            <tr><th>Approach</th><th>Question it answers</th><th>Measured here</th><th>Where it fits</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Full <code>COUNT(*)</code></td><td>exactly how many</td><td>2.455 ms</td><td>Admin tables, small tables</td></tr>
+                            <tr><td>Capped count</td><td>more than 1,000?</td><td>0.103 ms</td><td>Showing 1000+</td></tr>
+                            <tr><td><code>LIMIT page+1</code> probe</td><td>is there a next page?</td><td>0.014 ms</td><td>Infinite scroll</td></tr>
+                            <tr><td>Statistics-based estimate</td><td>roughly how many</td><td>not measured</td><td>Dashboard summaries</td></tr>
+                        </tbody>
+                    </table>
+                    <p>There is an accuracy problem too. <strong>A total is stale the moment you send it.</strong></p>
+                    <pre><code>--- 4-7. the count is stale the moment you send it ---
+  count read at request time : 71429
+  count after one insert     : 71430
+  a total shipped with page 1 describes a table that no longer exists by page 2.</code></pre>
+                    <ul>
+                        <li>The 71,429 shipped with page one is already a different number by the time page two loads. <strong>It looks precise without being accurate</strong></li>
+                        <li>So <strong>about 71,000 or 1000+ is the more honest presentation</strong>, and it is far cheaper as well</li>
+                        <li>Most screens only need to know <strong>whether there is a next page</strong>. If so, request <code>LIMIT 21</code>, treat 21 returned rows as there is more, and emit only 20</li>
+                        <li>Count how many screens truly need an exact total. <strong>Usually it is one admin table</strong></li>
+                    </ul>
+
+                    <h2>9. What to use where</h2>
+                    <p>The conclusion of this article is not switch to cursors. The answer depends on <strong>what the screen is actually asking</strong>.</p>
+                    <table>
+                        <thead>
+                            <tr><th>Screen / use</th><th>Recommended</th><th>Why</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Infinite-scroll feed</td><td><strong>Cursor</strong></td><td>Front-side inserts are constant and there are no page numbers on screen</td></tr>
+                            <tr><td>Live notifications / timeline</td><td><strong>Cursor</strong></td><td>New rows pile up in front, making duplication the default</td></tr>
+                            <tr><td>Admin table with page numbers</td><td><strong>Offset</strong> + fixed ordering</td><td>Jump to page 37 is the requirement. Cap the depth, steer users to filters</td></tr>
+                            <tr><td>Top-N search results</td><td><strong>Offset</strong> (capped)</td><td>Nobody visits deep pages. Block the maximum offset</td></tr>
+                            <tr><td>Data export / batch</td><td><strong>Cursor</strong> (snapshot first)</td><td>A skip is data loss. Freeze a point in time where possible</td></tr>
+                            <tr><td>Audit log browsing</td><td><strong>Cursor</strong></td><td>Append-only tables fit cursors perfectly</td></tr>
+                            <tr><td>Small fixed list (hundreds)</td><td>Either</td><td>The difference is not measurable. Take the simpler one</td></tr>
+                        </tbody>
+                    </table>
+                    <ul>
+                        <li><strong>Do not force a cursor into an admin table.</strong> If page numbers are the requirement, offset is the right tool. Make the ordering unique and cap the depth instead</li>
+                        <li><strong>Do not use offsets for infinite scroll.</strong> It is the one combination where duplication is the default outcome</li>
+                        <li><strong>Rethink pagination entirely for exports.</strong> Freeze the list with a transaction snapshot or a fixed point in time and read from that. Where that is impossible, use a cursor and add <strong>a completeness check</strong></li>
+                        <li>If one endpoint serves two screens, <strong>supporting both is fine</strong>. Accept a page parameter and a cursor parameter, and prefer the cursor when present</li>
+                        <li>When migrating, <strong>unique ordering comes first</strong>. Switch to cursors without it and you introduce the tied-row loss from section 5</li>
+                    </ul>
+
+                    <h2>10. What to put in the cursor - the opaque token</h2>
+                    <p>Exposing the cursor as <code>?after_id=1041</code> makes the failure in 6.3 unpreventable, because <strong>the server cannot know which ordering that value came from</strong>. So a cursor should be an <strong>opaque token</strong>.</p>
+                    <pre><code>--- 3-7. an opaque token carries the ordering with it ---
+token for sort=price_asc, last row (price=500,id=5):
+   eyJ2IjoxLCJzIjoicHJpY2VfYXNjIiwiayI6WzUwMCw1XX0
+  reused with sort=price_asc : ([500, 5], 'ok')
+  reused with sort=id_asc    : (None, 'token was minted for sort=price_asc, request says sort=id_asc -&gt; reject')</code></pre>
+                    <p>Recording <strong>which ordering the token was minted for</strong> lets the server <strong>reject</strong> an old cursor the instant it is reused under a different sort. It fails explicitly instead of quietly returning the wrong list.</p>
+                    <table>
+                        <thead>
+                            <tr><th>Field</th><th>Value</th><th>Why it is needed</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Version</td><td>token schema version</td><td>Lets you <strong>reject old tokens safely</strong> when the format changes</td></tr>
+                            <tr><td>Sort identifier</td><td>a string such as <code>price_asc</code></td><td><strong>Blocks reuse</strong> under a different ordering</td></tr>
+                            <tr><td>Key value array</td><td>every sort column plus the tiebreaker</td><td>The real position. Prevents the tied-row loss from section 5</td></tr>
+                            <tr><td>Signature</td><td>a short MAC from a server-side secret</td><td>Stops a client <strong>editing the value to scrape a range</strong></td></tr>
+                        </tbody>
+                    </table>
+                    <ul>
+                        <li><strong>What stays out:</strong> internal table names, user identifiers, permission data. <strong>A cursor is a position, not an identity</strong></li>
+                        <li>Wrapping a token in base64 <strong>is not encryption.</strong> Anyone can unwrap it. If it must be secret, encrypt rather than sign</li>
+                        <li>When there is no next page, <strong>omit the token from the response</strong>. Sending an empty string adds a branch on the client</li>
+                        <li>Put <strong>a ceiling</strong> on the page-size parameter. An uncapped size is an incident path by itself</li>
+                        <li>Encoding the filter into the token as well catches <strong>a cursor reused after the search term changed</strong></li>
+                    </ul>
+
+                    <h2>11. Checklist</h2>
+                    <p>Written so you can hold it against the list endpoint you have right now.</p>
+                    <ul>
+                        <li><strong>Does the <code>ORDER BY</code> end with a unique column?</strong> If not, the drift from section 3 may already be happening</li>
+                        <li><strong>Have you verified against real data that the sort key is unique?</strong> Count rows and distinct values once</li>
+                        <li><strong>Does the index match the sort key in column order and direction?</strong> Otherwise switching to a cursor gains nothing</li>
+                        <li><strong>Does the cursor carry the whole sort key?</strong> Carrying only the sort column drops entire tied blocks</li>
+                        <li><strong>Is the tuple shorthand kept away from mixed-direction sorts?</strong> Newest-first plus ascending id is the classic risk</li>
+                        <li><strong>Does the token carry a sort identifier and get rejected on mismatch?</strong> Without it, a sort change becomes a silent loss</li>
+                        <li><strong>Does the token carry a version?</strong> That is how you change the format while clients are still deployed</li>
+                        <li><strong>Is the previous page a separate query?</strong> Code that only flips the operator returns the first page</li>
+                        <li><strong>Is there a maximum depth on <code>OFFSET</code>?</strong> Without one, crawlers will walk it</li>
+                        <li><strong>Is there a maximum page size?</strong></li>
+                        <li><strong>Is the total recomputed on every request?</strong> If so, check whether a capped count or a has-next flag would do</li>
+                        <li><strong>Is the export path free of offsets?</strong> A skip there is data loss, not a display glitch</li>
+                        <li><strong>Is there a concurrent-modification test?</strong> Read page one, delete a row in front, read page two, assert nothing was skipped</li>
+                        <li><strong>Is the client hiding the symptom by de-duplicating?</strong> Duplicates get hidden, but <strong>the losses remain</strong></li>
+                    </ul>
+
+                    <h2>12. What this article did not verify</h2>
+                    <p>Writing up unverified things as verified misleads whoever reads next. The limits, stated plainly.</p>
+                    <ul>
+                        <li><strong>How other database engines actually behave.</strong> The numbers in section 7 and the plan text in 4-4 were <strong>measured on this engine</strong>. Whether other engines optimise this differently was not tested, so no claim is made</li>
+                        <li><strong>The effect of isolation levels.</strong> The experiments alternated writes and reads on a single connection. Isolation and snapshot behaviour can change how visible this is in a real service</li>
+                        <li><strong>Replication lag.</strong> The if the plans differ situation in section 3 was reproduced as a plan difference, not by running two actual read replicas</li>
+                        <li><strong>Large-scale concurrency.</strong> Section 7 is a single-process measurement. The impact of deep offsets on other concurrent requests was not measured</li>
+                        <li><strong>Search engines and document stores.</strong> Products with their own scroll or search-context concepts were not covered</li>
+                        <li><strong>Cryptographic strength of the token.</strong> The signature in section 10 illustrates the structure; key management and rotation were not addressed</li>
+                        <li><strong>Error rates of statistics-based estimates.</strong> It appears as a row in the section 8 table, but the actual error was not measured</li>
+                    </ul>
+                    <p>The unverified items share a trait, though. <strong>They are all questions of how much in this environment.</strong> The argument here is not about magnitude but about <strong>the shape of the question</strong>, and that stays the same when the engine changes.</p>
+
+                    <h2>Conclusion: which position stops meaning anything on a moving list</h2>
+                    <p>Summarising what running it showed: with one row deleted in front, <strong><code>id 6</code> disappeared.</strong> With one row inserted in front, <strong><code>id 5</code> appeared twice.</strong> With no data changes at all but ties in the sort key, <strong>three rows duplicated and three vanished.</strong> The same scenarios under a cursor came out clean every time.</p>
+                    <p>Stopping there with so use a cursor would be half the story. The cursor <strong>lost the ability to jump to a page</strong>, <strong>needed a separate query</strong> for the previous page, and <strong>returned a wrong list with no error</strong> when the sort changed. On shallow pages its performance advantage was only 1.3x.</p>
+                    <p>So the real conclusion is this. <strong>Offset asks which position; a cursor asks from where.</strong> On a frozen list the two questions agree, but <strong>while the list moves, which position no longer points at anything fixed.</strong> Skips and duplicates are that instability showing up on screen, and they are <strong>a property of the question, not a bug</strong>. What needs fixing is the question, not the code.</p>
+                    <p>There is one thing you can do right now. <strong>Open the <code>ORDER BY</code> of your list endpoint and see whether it ends with a unique column.</strong> If it does not, that list can drift between pages with no data changing at all. And because <strong>a refresh makes it go away, it gets filed as not reproducible.</strong></p>
+
+                    <h2>References</h2>
+                    <ul>
+                        <li>PostgreSQL documentation - LIMIT and OFFSET (states that rows skipped by an OFFSET clause still have to be computed inside the server so a large OFFSET might be inefficient, and that different LIMIT/OFFSET values give inconsistent results unless a predictable ordering is enforced): <a href="https://www.postgresql.org/docs/current/queries-limit.html" target="_blank" rel="noopener">postgresql.org</a></li>
+                        <li>SQLite documentation - SELECT syntax (definitions and grammar of the ORDER BY, LIMIT and OFFSET clauses): <a href="https://www.sqlite.org/lang_select.html" target="_blank" rel="noopener">sqlite.org</a></li>
+                        <li>Related posts: <a href="sql_left_join_where_becomes_inner.html">A WHERE Clause Turns Your LEFT JOIN Into an INNER JOIN</a>, <a href="sql_not_in_null_empty_result.html">One NULL in a NOT IN List Empties the Whole Result</a>, <a href="json_number_precision_loss.html">The Last Digits of a 64-bit ID Change in JSON</a>, <a href="api_docs_governance_2026.html">Why API Docs Always Lag Behind Code</a></li>
+                    </ul>
+                </div>
+
+                <!-- md-artifact-start -->
+                    <div class="md-artifact" style="margin:2rem 0;border:1px solid #d7dce3;border-radius:10px;overflow:hidden;background:#fbfcfd;">
+                        <div style="display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;justify-content:space-between;padding:.7rem 1rem;background:#eef2f7;border-bottom:1px solid #d7dce3;">
+                            <span style="font-weight:700;font-size:.97rem;">📋 Checklist you can take with you</span>
+                            <span style="display:flex;gap:.5rem;align-items:center;">
+                                <code style="font-size:.82rem;color:#5a6675;background:transparent;padding:0;">api_pagination_offset_vs_cursor.md</code>
+                                <button type="button" class="md-artifact-copy" style="cursor:pointer;border:1px solid #b9c2cf;background:#fff;color:#2c3e50;font-weight:600;line-height:1.3;border-radius:6px;padding:.32rem .7rem;font-size:.85rem;">Copy all</button>
+                            </span>
+                        </div>
+                        <pre style="margin:0;max-height:420px;overflow:auto;padding:1rem;background:#fbfcfd;font-size:.86rem;line-height:1.62;"><code class="nohighlight" style="background:transparent;padding:0;white-space:pre;"># Offset vs Cursor Pagination — Decision Table and Implementation Skeleton
+
+&gt; Source: braindetox.kr — Items Vanish When You Turn the Page
+&gt; Evidence: Windows 10 Pro / Python 3.13.3 / SQLite 3.49.1, run directly (one machine, one measurement)
+&gt; Paste this file into an AI tool and say: check our list API against these criteria.
+&gt; ⚠ The conclusion is not use cursors. Offset asks which position; a cursor asks from where. While the list moves, which position stops meaning anything stable.
+
+## 0. The premise — these are two different questions
+
+| | Offset | Cursor |
+|---|---|---|
+| What it asks | **20 rows starting at position N** | **20 rows after this row** |
+| Anchor | the **start** of the list | the **row** you last saw |
+| When the list changes | the anchor slides wholesale | the anchor stays glued to that row |
+| Jump to arbitrary page | **yes** | no |
+| Total page count | possible (at a cost) | does not exist in principle |
+| Cost at depth | grows with position | **independent of position** |
+
+**Skips and duplicates are not an offset bug. They are a property of the question which position.**
+
+## 1. Thirty-second self-diagnosis
+
+- [ ] Does the list take **writes** while people read it (user feeds, orders, notifications)? If so and you use offset, skips and duplicates are already happening
+- [ ] Is the `ORDER BY` column **unique**? If not, the same page can return different rows on different runs
+- [ ] Does `OFFSET` ever exceed **ten thousand**? Latency spikes at depth
+- [ ] Are you counting the **total on every request**? That can cost more than the page itself
+- [ ] Are you exposing the **raw id as the cursor**? Changing the sort order then produces silently wrong results
+
+## 2. Decision table
+
+| Screen / use | Recommended | Why |
+|---|---|---|
+| Infinite-scroll feed | **Cursor** | Front-side inserts are constant, and there are no page numbers on screen |
+| Live notifications / timeline | **Cursor** | New rows pile up in front. With offset, duplication is the default |
+| Admin table with page numbers | **Offset** + fixed ordering | Jump to page 37 is the requirement. Cap the depth and push users toward filters |
+| Top-N search results | **Offset** (capped) | Nobody visits deep pages. Enforce a maximum `OFFSET` |
+| Data export / batch | **Cursor** (snapshot first) | A skip here is data loss. Prefer a transaction snapshot or a fixed point in time |
+| Audit log browsing | **Cursor** | Append-only tables are exactly where cursors fit perfectly |
+| Small fixed list (hundreds of rows) | Either | The difference is not measurable. Take the simpler one |
+
+**Do not force a cursor into an admin table.** If page numbers are a requirement, offset is the right tool. Make the ordering unique and cap the depth instead.
+
+## 3. Stable ordering rule — no exceptions
+
+**Append a unique column to the end of the sort key.** Without it, pages drift apart even when no data changes at all.
+
+```sql
+-- Bad: if score has ties, the order depends on the execution plan
+SELECT id FROM card ORDER BY score DESC LIMIT 20 OFFSET 20;
+
+-- Good: the tiebreaker pins the order down to exactly one
+SELECT id FROM card ORDER BY score DESC, id ASC LIMIT 20 OFFSET 20;
+```
+
+```sql
+-- One line to check whether the sort key is unique
+SELECT COUNT(*) AS rows, COUNT(DISTINCT score) AS distinct_key FROM card;
+-- If the two numbers differ, that column alone cannot serve as a page key
+```
+
+- Build the index in the **same column order and same direction** as the sort key: `CREATE INDEX ... ON card(score DESC, id ASC)`
+- Sorting on a nullable column means `NULLS FIRST/LAST` handling differs per engine. Drop it from the key or pin it with `COALESCE`
+- Never use a floating-point column as a sort key. Ties appear silently
+
+## 4. Cursor implementation skeleton
+
+### 4.1 Single unique key (simplest)
+
+```sql
+-- First page
+SELECT id, title FROM post ORDER BY id ASC LIMIT 21;
+-- Next page (last id seen = integer last_id)
+SELECT id, title FROM post WHERE id &gt; :last_id ORDER BY id ASC LIMIT 21;
+```
+
+Ask for 21 rows with `LIMIT 21`; if 21 come back there is a next page, and you return only 20. This is the cheapest way to get `has_next` without counting anything.
+
+### 4.2 Composite key (when the sort column is not unique)
+
+```sql
+-- Sort: prio DESC, id ASC / cursor: (last_prio, last_id)
+SELECT id, prio FROM task
+WHERE prio &lt; :last_prio OR (prio = :last_prio AND id &gt; :last_id)
+ORDER BY prio DESC, id ASC
+LIMIT 21;
+```
+
+**Trap:** the tuple shorthand `(prio, id) &lt; (:last_prio, :last_id)` is only correct when **every sort direction is the same**. With mixed directions it returns the wrong rows without raising an error. The expanded `OR` form above is always safe.
+
+### 4.3 Going backward (a separate query)
+
+```sql
+-- One page back: flip the ORDER BY to fetch, then flip the rows in the application
+SELECT id FROM post WHERE id &lt; :first_id ORDER BY id DESC LIMIT 20;
+-- reverse() the result before rendering
+```
+
+`WHERE id &lt; :first_id ORDER BY id ASC` gives you the **first page of the table**. This is a common mistake.
+
+### 4.4 Opaque token
+
+```python
+# cursor.py - the token must be a meaningless string to the client
+import base64, json, hmac, hashlib
+
+SECRET = b"server-side-key-from-config"
+
+def mint(sort: str, key: list) -&gt; str:
+    body = json.dumps({"v": 1, "s": sort, "k": key}, separators=(",", ":")).encode()
+    sig = hmac.new(SECRET, body, hashlib.sha256).digest()[:8]
+    return base64.urlsafe_b64encode(body + sig).decode().rstrip("=")
+
+def parse(token: str, sort: str):
+    pad = "=" * (-len(token) % 4)
+    raw = base64.urlsafe_b64decode(token + pad)
+    body, sig = raw[:-8], raw[-8:]
+    if not hmac.compare_digest(sig, hmac.new(SECRET, body, hashlib.sha256).digest()[:8]):
+        raise ValueError("cursor tampered")
+    d = json.loads(body)
+    if d.get("v") != 1:
+        raise ValueError("cursor version not supported")
+    if d.get("s") != sort:
+        raise ValueError("cursor was minted for a different ordering")
+    return d["k"]
+```
+
+**What goes in the token**
+
+| Field | Value | Why |
+|---|---|---|
+| `v` | schema version | Lets you reject old tokens safely when the cursor format changes |
+| `s` | sort identifier (`price_asc`, ...) | Blocks an old cursor from being reused under a different ordering |
+| `k` | array of sort key values | The actual position: every sort column plus the tiebreaker |
+| signature | 8-byte HMAC | Stops a client from editing the value to scrape a range it should not see |
+
+**What stays out:** internal table names, user identifiers, permission data. A cursor is a position, not an identity.
+
+## 5. How to answer the total-count question
+
+| Approach | Question it answers | Cost | Where it fits |
+|---|---|---|---|
+| Full `COUNT(*)` | exactly how many | highest | Admin tables, small tables |
+| Capped count (`LIMIT n+1` subquery) | more than n? | very low | Showing 1000+ |
+| `LIMIT page+1` probe | is there a next page? | lowest | Infinite scroll |
+| Statistics-based estimate | roughly how many | low | Dashboard summaries |
+
+```sql
+-- Capped count: count exactly up to 1000, show anything beyond as 1000+
+SELECT COUNT(*) FROM (SELECT 1 FROM event WHERE bucket = 3 LIMIT 1001);
+```
+
+- **A total is stale the moment you send it.** The number shipped with page 1 is already different by page 2
+- Count how many screens genuinely need an exact total. Usually the answer is none
+- Page 3 of N is impossible in principle under cursor pagination. Changing the UI is the correct answer
+
+## 6. Response shape
+
+```json
+{
+  "items": [ { "id": 1041, "title": "..." } ],
+  "page_info": {
+    "has_next": true,
+    "next_cursor": "eyJ2IjoxLCJzIjoiaWRfYXNjIiwiayI6WzEwNDFdfQ",
+    "has_prev": true,
+    "prev_cursor": "eyJ2IjoxLCJzIjoiaWRfYXNjIiwiayI6WzEwMjJdfQ",
+    "approx_total": "1000+"
+  }
+}
+```
+
+- When there is no next page, **omit** `next_cursor` rather than sending an empty string. Client branching gets simpler
+- Only accept a cursor the **server itself issued**. Clients must not be able to construct one
+- Put a **ceiling** on the page-size parameter. An uncapped `limit` is an incident path all by itself
+
+## 7. Checklist
+
+- [ ] The `ORDER BY` ends with a **unique column**
+- [ ] The index matches the sort key in **column order and direction**
+- [ ] When the sort column is not unique, the cursor carries the **whole key**
+- [ ] The tuple shorthand is not used on a **mixed-direction** sort
+- [ ] The cursor token carries a **sort identifier** and is **rejected** on mismatch
+- [ ] The cursor token carries a **version** so the format can evolve
+- [ ] The cursor token is **signed**, or the server validates it some other way
+- [ ] Going backward is a **separate query**, not the forward one reused
+- [ ] If you use `OFFSET`, there is a **maximum depth**
+- [ ] There is a **maximum page size**
+- [ ] The total is not recomputed on every request (or has become a capped count)
+- [ ] Infinite scroll derives `has_next` from **`LIMIT page+1`**
+- [ ] The export path uses a **snapshot or a cursor**, not an offset
+- [ ] Pagination has a **concurrent-modification test**: read page 1, delete a row in front, read page 2, assert nothing was skipped
+
+## 8. Do not
+
+- ❌ **Sort on a column with ties alone** — pages drift apart even with zero data changes
+- ❌ **Expose the raw id as the cursor** — a change of sort order then ships silently wrong results
+- ❌ **Put page numbers on a cursor API** — you end up half-implementing something that cannot exist
+- ❌ **Allow unbounded deep `OFFSET`** — one list endpoint can occupy the database
+- ❌ **Carry only the sort column in the cursor** — the whole tied block disappears
+- ❌ **Run `COUNT(*)` on every request** — it often costs more than fetching the page
+- ❌ **Conclude that switching to cursors solves everything** — jumping, going back, and changing the sort still have to be designed
+</code></pre>
+                        <p style="margin:0;padding:.6rem 1rem;font-size:.82rem;color:#5a6675;border-top:1px solid #e3e8ee;">Copy and paste it straight into your notes or an AI assistant.</p>
+                    </div>
+                    <script>
+                    (function(){
+                      if (window.__mdArtifactBound) return;
+                      window.__mdArtifactBound = true;
+                      document.addEventListener('click', function(ev){
+                        var btn = ev.target.closest && ev.target.closest('.md-artifact-copy');
+                        if (!btn) return;
+                        var box = btn.closest('.md-artifact');
+                        var code = box && box.querySelector('pre code');
+                        if (!code) return;
+                        var text = code.textContent;
+                        var label = btn.textContent;
+                        var ok = function(){
+                          btn.textContent = "Copied";
+                          setTimeout(function(){ btn.textContent = label; }, 1600);
+                          if (typeof gtag === 'function') {
+                            gtag('event', 'md_copy', { slug: "api_pagination_offset_vs_cursor", lang: "en", chars: text.length });
+                          }
+                        };
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                          navigator.clipboard.writeText(text).then(ok).catch(function(){ fallback(); });
+                        } else { fallback(); }
+                        function fallback(){
+                          var ta = document.createElement('textarea');
+                          ta.value = text; ta.setAttribute('readonly','');
+                          ta.style.position='fixed'; ta.style.left='-9999px';
+                          document.body.appendChild(ta); ta.select();
+                          try { document.execCommand('copy'); ok(); } catch(e) {}
+                          document.body.removeChild(ta);
+                        }
+                      });
+                    })();
+                    </script>
+                    <!-- md-artifact-end -->
+
+                <div class="share-section">
+                    <h3>Share this article</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">Copy Link</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">Back to list</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Free tools you may find useful</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/json_formatter.html">JSON Formatter</a></li>
+      <li><a href="../static/regex_tester.html">Regex Tester</a></li>
+      <li><a href="../static/jwt_decoder.html">JWT Decoder Generator 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 Encoder/Decoder</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">See all tools &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+<!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Related Posts</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="sql_left_join_where_becomes_inner.html">A WHERE Clause Turns Your LEFT JOIN Into an INNER JOIN - Where ON Ends and WHERE Begins 2026</a></li>
+      <li><a href="sql_not_in_null_empty_result.html">One NULL in a NOT IN List Empties the Whole Result - SQL Three-Valued Logic 2026</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('Link copied. Paste it into the Threads app to share!');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('Link copied!'); });
+    });
+    </script>
+</body>
+</html>
