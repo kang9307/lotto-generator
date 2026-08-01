@@ -1,0 +1,913 @@
+<!DOCTYPE html>
+<!--
+ * Technical blog post template
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="en">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Masking at the Output Is Already Too Late - Stopping Sensitive Values at the Source 2026</title>
+    <meta name="description" content="Deleted it from the log, still found it in the backup. Why output-stage masking is too late, how a whole object leaks new fields by itself, run on Node 22.">
+    <meta name="keywords" content="log masking, sensitive data, PII in logs, allowlist serialization, wrapper type, toJSON, util.inspect.custom, error context, log collector, data minimization, log leak, structured logging, schema drift, log retention, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/en/posts/sensitive_data_at_source.html">
+
+    <meta property="og:title" content="Masking at the Output Is Already Too Late - Stopping Sensitive Values at the Source">
+    <meta property="og:description" content="Output-stage masking only blocks the formats you already know. And by then the copies have already multiplied.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/en/posts/sensitive_data_at_source.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="en_US">
+    <meta property="article:published_time" content="2026-08-01">
+    <meta property="article:section" content="Development/Infrastructure">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Masking at the Output Is Already Too Late">
+    <meta name="twitter:description" content="Do not choose what to strip. Choose what to include. Eight reproductions, all actually run.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "Masking at the Output Is Already Too Late - Stopping Sensitive Values at the Source",
+      "alternativeHeadline": "Output-Stage Masking Only Catches the Formats You Already Know",
+      "datePublished": "2026-08-01",
+      "dateModified": "2026-08-01",
+      "inLanguage": "en-US",
+      "articleSection": "Development/Infrastructure",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "log masking, sensitive data, PII in logs, allowlist serialization, wrapper type, toJSON, error context, log collector, data minimization, schema drift",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/en/posts/sensitive_data_at_source.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "Is a regex masker at the output stage not enough?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "It is not, for two reasons. First, a regex matches a shape while sensitive data is defined by meaning. Running nine harmless format variants through a typical masker, only the two shapes the rule was written for were covered and seven passed straight through. A separator changing from a hyphen to a space, a country code appearing in front, or an employee number gaining one digit was enough to defeat the rule. Every upstream format change becomes a silent hole and nothing fails loudly. Second, the same rule is wrong in the other direction too. An order code or a build tag that happens to fit the shape gets destroyed, and the debugging information goes with it. So a pattern rule carries two failure modes at once: it misses, and it destroys. That is why output-stage masking works as a tourniquet but can never be the fix."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Why is logging a whole object dangerous?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Because fields added later join the log automatically, with no change to the logging code. This was reproduced directly. A call serialized a three-field object into a log line. Later another team attached three more fields for an unrelated feature. The logging call was untouched, yet all three new fields appeared in the output. The number of lines changed to cause that was zero. Worse, this is not a single path. Spreading the object into a context or nesting it one level deep made no difference, because the serializer walks the entire tree. The person who added the field never read the logging code, and the person who wrote the logging code does not know the field exists. Neither of them did anything wrong, and the value leaks anyway."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "What does stopping it at the source actually mean?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "It means never holding the value as a plain string, and wrapping it in a type that yields the original only through an explicit call. The implementation verified here defines four hooks together: string conversion, the serialization hook, the runtime inspection hook, and primitive coercion. With all four covered, thirteen accidental paths were checked including template literals, string concatenation, array joins, serialization, nested serialization, inspection output and three format specifiers, and the original never appeared once. A half wrapper that implements only string conversion leaked the original through serialization and inspection. A half wrapper is more dangerous than none because it reads as safe. It also matters that the only way to the original is one named method, so a code search lists every real use site. Searching by field name does not produce that list, because the field name is everywhere."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How is a list of fields to strip different from a list of fields to include?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "They fail in opposite directions. A strip list emits any field it does not know. An include list drops any field it does not know. When run, both rules looked equally fine on the schema they were written for. Then the schema moved: the same data arrived under a different naming convention, a new field nobody announced was attached, and a nested structure appeared. The strip list let all three through and the include list blocked all three. The rule has to be safe while nobody updates it, so that direction is the correct one. The cost is that a field you needed for debugging disappears, and to keep that from being silent you can emit just the count of dropped fields. That tells you the schema moved without telling you what moved."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How do you find the risky spots in logs you already have?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "The first pass looks at key names, not value shapes, because value formats vary with whatever is upstream while key names are comparatively stable. The second pass matters more: list every key that did not match the risk list and have a person read it once. In the sample there were fourteen distinct keys and seven of them were off the list. That list is finite, so reading it once finishes the job, and a value-shape scan cannot produce that list at all. Rank by blast radius rather than by count. Multiplying the number of risky keys by retention days by the number of destinations puts a quiet log kept for a year in four places above a noisy one kept for two weeks. The scope of personal data handling and the retention periods must be decided by checking the applicable laws and your internal policy."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/sensitive_data_at_source.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/sensitive_data_at_source.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/sensitive_data_at_source.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/sensitive_data_at_source.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/sensitive_data_at_source.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="Masking at the Output Is Already Too Late - Stopping Sensitive Values at the Source">
+                <meta itemprop="datePublished" content="2026-08-01">
+                <meta itemprop="dateModified" content="2026-08-01">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="log masking, sensitive data, allowlist serialization, wrapper type, error context, log collector, data minimization">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/en/posts/sensitive_data_at_source.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">Masking at the Output Is Already Too Late - Stopping Sensitive Values at the Source</h1>
+                    <h2 class="post-subtitle">Output-stage masking only blocks the formats you know, and by then the copies have multiplied</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-08-01">2026-08-01</span>
+                        <span class="post-category" itemprop="articleSection">Development/Infrastructure</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <h2>Introduction: Deleted from the log, still there in the backup</h2>
+                    <p>The usual sequence goes like this. Someone reading a log spots a value that should not be there. A masking rule is written and shipped in a hurry. The next day the log screen is clean. Then about a month later, someone unpacking an old backup for an incident review finds the same value again.</p>
+                    <p>In that story the masking rule did its job. The problem is <strong>the moment it started working</strong>. By then the value had already gone to standard output, been written to a file, been shipped to a collector, been rotated, and landed in a backup. Masking at the output stage means <strong>fixing one copy after several have already been made</strong>.</p>
+                    <p>So the claim of this article is not that you should mask more. Masking is the last line of defence, and the real fix is <strong>keeping the value out of the log path in the first place</strong>. To do that you have to flip the direction of the rule. <strong>Do not choose what to strip out. Choose what to put in.</strong></p>
+                    <ul>
+                        <li><strong>Output-stage masking only blocks the patterns you know.</strong> A small format change passes straight through, and nothing fails</li>
+                        <li><strong>Logging a whole object drags in fields added later.</strong> The logging code is unchanged while the leaking set grows</li>
+                        <li><strong>By the time you decide to fix it, several copies exist.</strong> Nobody knows which copies still hold the value</li>
+                        <li><strong>Wrap the value and mistakes stop producing it.</strong> Concatenate it into a string, put it in a log, same result</li>
+                    </ul>
+                    <div class="callout">
+                        <p><strong>Environment.</strong> Every output below was actually run on <strong>Windows 10 Pro (10.0.19045)</strong> with <strong>Node.js v22.16.0 (win32)</strong>. Every script was saved to a file and executed, and files were created only inside a temporary directory.</p>
+                        <p><strong>All example values are fake, matching the format only.</strong> Digit counts are correct but every digit is zero (<code>000000-0000000</code>, <code>0000-0000-0000-0000</code>, <code>010-0000-0000</code>), and the email uses a reserved domain that can never receive mail. <strong>None of this is real personal data.</strong> The article covers only the <strong>structure</strong> of how values escape, not any method of circumvention or extraction.</p>
+                        <p><strong>What this article does not cover.</strong> Deciding <strong>which data may go into an external tool and how the internal rules should be written</strong> belongs to <a href="llm_data_security_policy_2026.html">Can Company Data Go Into an LLM</a>. The <strong>level convention</strong> for deciding what gets logged at which severity was covered in <a href="log_level_convention.html">Why WARN Becomes a Landfill</a>, so it is not repeated here. The <strong>general procedure</strong> for flipping a denylist into an allowlist is in <a href="allowlist_over_denylist_validation.html">A Denylist Is Always Late</a>. This article is that principle applied to <strong>one point: the log path</strong>.</p>
+                        <p><strong>On the law.</strong> Organizations handling personal data carry obligations around collection, storage and destruction. However, <strong>this article quotes no statute and no amount</strong>. Scope and retention periods vary by business model and jurisdiction, so <strong>check the applicable laws and your internal policy</strong> to decide. What this article covers is only the technical implementation.</p>
+                    </div>
+
+                    <h2>1. Log a whole object and later fields come along</h2>
+                    <p>Start with the most important reproduction. Understanding this one is half the article. <strong>The defect is not that a sensitive value was logged, it is that nobody pinned down the set of things that get logged.</strong></p>
+                    <p>Take a call that serializes a whole object into a log line, then let time pass and have <strong>another team add fields for an unrelated feature</strong>. The logging call is not touched.</p>
+                    <pre><code>node v22.16.0 / win32
+--- 1-1. release v1: the object has 3 fields ---
+signup ok {"id":"u-0001","nickname":"tester","createdAt":"2026-08-01T00:00:00Z"}
+
+--- 1-2. release v2: product adds fields. the log call is UNCHANGED ---
+signup ok {"id":"u-0001","nickname":"tester","createdAt":"2026-08-01T00:00:00Z","phone":"010-0000-0000","cardNumber":"0000-0000-0000-0000","nationalId":"000000-0000000"}
+
+--- 1-3. diff: what the log gained without a code change ---
+fields logged in v1 : 3  id,nickname,createdAt
+fields logged in v2 : 6  id,nickname,createdAt,phone,cardNumber,nationalId
+newly leaking        : phone,cardNumber,nationalId
+lines of code changed to cause this : 0</code></pre>
+                    <p>The last line summarizes the whole article. <strong>The number of lines changed to cause this is zero.</strong> The person who added the fields never read the logging code, and the person who wrote the logging code does not know the fields exist. <strong>Neither did anything wrong, and the value leaks.</strong></p>
+                    <p>This class of defect does not get caught in code review. All the reviewer sees is a change that adds three fields, and taken on its own that change is perfectly fine. <strong>The problem lives in the distance between two changes.</strong></p>
+                    <h3>1.1 Spreading and nesting behave identically</h3>
+                    <p>It is natural to think you just need to avoid passing the object directly. Two common workarounds are not workarounds at all.</p>
+                    <pre><code>--- 1-4. the same happens through spread, nesting and ORM rows ---
+spread into context  : {"requestId":"r-0001","id":"u-0001","nickname":"tester","createdAt":"2026-08-01T00:00:00Z","phone":"010-0000-0000","card ...
+nested one level     : nationalId still present
+depth does not help  : JSON.stringify walks the whole tree</code></pre>
+                    <ul>
+                        <li><strong>Spreading into a context object</strong> selects nothing. The same fields simply moved up one level</li>
+                        <li><strong>Wrapping one level deep</strong> does nothing either. The serializer walks the whole tree, so depth is not a defence</li>
+                        <li><strong>Passing a database row object straight through</strong> is the worst case. Adding a column widens the log, and columns are added by people with no connection to logging</li>
+                        <li><strong>Attaching the entire request body to a context</strong> has the same shape. Server code does not decide what a client sends</li>
+                        <li>They share one property. <strong>The party that fixes the scope is not the party writing the log.</strong> That is the definition of the defect</li>
+                    </ul>
+
+                    <h2>2. Output-stage masking only blocks the formats you know</h2>
+                    <p>The first response that comes to mind is a regex applied just before output, and it is genuinely common. Where it breaks down was checked <strong>with harmless values only</strong>: phone-shaped and employee-number-shaped strings, all digits zero.</p>
+                    <pre><code>node v22.16.0 / win32
+--- 2-1. a typical output-stage masker ---
+input                                 after masking
+------------------------------------------------------------------------------
+contact 010-0000-0000 assigned        contact 010-****-**** assigned
+contact 010 0000 0000 assigned        contact 010 0000 0000 assigned   &lt;- NOT MASKED
+contact 01000000000 assigned          contact 01000000000 assigned   &lt;- NOT MASKED
+contact +82-10-0000-0000 assigned     contact +82-10-0000-0000 assigned   &lt;- NOT MASKED
+contact 010.0000.0000 assigned        contact 010.0000.0000 assigned   &lt;- NOT MASKED
+owner EMP-000000 approved             owner EMP-****** approved
+owner EMP000000 approved              owner EMP000000 approved   &lt;- NOT MASKED
+owner emp-000000 approved             owner emp-000000 approved   &lt;- NOT MASKED
+owner EMP-0000001 approved            owner EMP-0000001 approved   &lt;- NOT MASKED
+
+samples: 9   missed: 7</code></pre>
+                    <p><strong>Seven of the nine went straight through.</strong> And every reason they did is trivial.</p>
+                    <ul>
+                        <li>The separator changed <strong>from a hyphen to a space or a dot</strong>. The day an upstream system changes its normalization, the rule stops working</li>
+                        <li><strong>There is no separator at all.</strong> That is the common shape when stored in a database</li>
+                        <li><strong>A country code appeared in front.</strong> One layer normalizing to an international form produces this</li>
+                        <li><strong>The case differs.</strong> A single missing flag on the regex is the whole story</li>
+                        <li><strong>The employee number gained one digit.</strong> Only the numbering policy changed, and the rule missed</li>
+                        <li>What they share is that <strong>nothing fails</strong>. There is no signal saying the masking did not apply</li>
+                    </ul>
+                    <h3>2.1 It is wrong in the other direction too</h3>
+                    <p>There is a second, less discussed failure mode: the rule <strong>destroying what it should have left alone</strong>.</p>
+                    <pre><code>--- 2-2. why the rule cannot be finished ---
+the masker matches shapes. the data is defined by MEANING.
+every upstream format change is a silent hole, and nothing fails loudly.
+
+--- 2-3. and the rule can be too greedy in the other direction ---
+order 010-0000-0000 shipped           order 010-****-**** shipped   &lt;- masked, but this was not personal data
+build EMP-000000 finished             build EMP-****** finished   &lt;- masked, but this was not personal data
+
+a pattern rule has two failure modes at once: it misses, and it destroys.</code></pre>
+                    <p>An order code and a build tag happened to fit the shape. Here masking <strong>destroys a non-sensitive value and blocks debugging</strong>. People then loosen the rule, and the loosened rule starts missing again. This pendulum never settles.</p>
+                    <p>The root cause fits in one sentence. <strong>A regex matches a shape; sensitive data is defined by meaning.</strong> The same eleven digits are personal data in one context and an order number in another, and that difference is not inside the value.</p>
+                    <table>
+                        <thead>
+                            <tr><th>Where you block it</th><th>What it blocks</th><th>When a new field appears</th><th>Reach across copies</th><th>Undo</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><strong>At the source (wrapper type)</strong></td><td>The value never exists as a string</td><td><strong>No effect</strong> (only wrapped values are handled)</td><td>No new copy is created</td><td>Revert the code</td></tr>
+                            <tr><td><strong>At event assembly (allowlist)</strong></td><td>Everything but the fields you chose</td><td><strong>Excluded automatically</strong></td><td>Everything below the logger</td><td>Revert the code</td></tr>
+                            <tr><td>Logger serializer</td><td>Fields whose names you know</td><td>Passes if the name is unknown</td><td>Only where that logger is used</td><td>Revert the config</td></tr>
+                            <tr><td>Collector rule</td><td>Values matching the pattern</td><td>Passes if the pattern differs</td><td><strong>Global at once</strong>, existing copies excluded</td><td><strong>Immediate</strong></td></tr>
+                            <tr><td>Post-hoc scrubbing</td><td>Only what you found</td><td>Unknown</td><td>The one copy you touched</td><td><strong>None</strong> (original destroyed)</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2>3. By the time you decide to fix it, several copies exist</h2>
+                    <p>Now the third axis. The two previous sections were about <strong>what</strong> gets missed; this one is about <strong>when</strong>. The ordinary life of a single log line was traced by running it.</p>
+                    <pre><code>node v22.16.0 / win32
+--- 3-1. one log line is written once ---
+written to app.log : level=info event=payment user=u-0001 card=0000-0000-0000-0000
+
+--- 3-2. the ordinary lifecycle of that file, step by step ---
+ 1. process stdout captured           supervisor-stdout.log
+ 2. shipper forwards a copy           shipper-buffer.log
+ 3. shipper local spool               shipper-spool.log
+ 4. collector index segment           collector-segment-0001.log
+ 5. rotated on size                   app.log.1
+ 6. nightly backup archive            backup-2026-08-01.log
+ 7. incident snapshot                 incident-copy.log
+ 8. ticket export attachment          ticket-4021-export.log</code></pre>
+                    <p><strong>Not one of those eight steps is unusual.</strong> A supervisor captures process stdout, a shipper reads and forwards it, the shipper spools locally in case the collector is slow, the file rotates on size, a nightly job backs it up, an incident produces a snapshot, and someone attaches it to a ticket. All of it is normal operation.</p>
+                    <p>Now apply masking, and count.</p>
+                    <pre><code>--- 3-3. now the fix lands: mask at the output stage ---
+app.log rewritten  : level=info event=payment user=u-0001 card=****-****-****-0000
+
+--- 3-4. count the copies that still hold the original ---
+  app.log                       masked
+  app.log.1                     STILL HAS THE VALUE
+  backup-2026-08-01.log         STILL HAS THE VALUE
+  collector-segment-0001.log    STILL HAS THE VALUE
+  incident-copy.log             STILL HAS THE VALUE
+  shipper-buffer.log            STILL HAS THE VALUE
+  shipper-spool.log             STILL HAS THE VALUE
+  supervisor-stdout.log         STILL HAS THE VALUE
+  ticket-4021-export.log        STILL HAS THE VALUE
+
+files total          : 9
+files still holding  : 8
+files you fixed      : 1</code></pre>
+                    <p><strong>Eight of nine copies still hold the original.</strong> You fixed one. And <strong>a different person sets the retention on each of those eight</strong>.</p>
+                    <ul>
+                        <li>Rotated files are governed by <strong>server configuration</strong>, usually owned by infrastructure rather than the application team</li>
+                        <li>Collector segments are governed by <strong>collector policy</strong>. If an index exists, the value is searchable too</li>
+                        <li>Backups are governed by <strong>backup policy</strong>. Typically the longest, and the hardest to reach into</li>
+                        <li>Incident snapshots and ticket attachments are governed by <strong>nobody</strong>. If the person who made them forgets, they stay forever</li>
+                        <li>So before you can say it was deleted, <strong>this list has to exist</strong>. In most organizations it does not</li>
+                    </ul>
+                    <h3>3.1 Eight is only what you can enumerate</h3>
+                    <pre><code>--- 3-5. and these are the ones you can enumerate ---
+not counted here: collector replicas, object-storage versions,
+search-engine inverted index, alert payloads already delivered,
+an engineer terminal scrollback, and any chat message quoting the line.
+the retention clock of each copy is set by a different owner.</code></pre>
+                    <p>This is where the central claim of the article comes from. <strong>Chasing copies is a fight you cannot win.</strong> The moment the value is born the copies are already scheduled, and every later measure touches only a subset of them. <strong>You have to move the fight earlier, to before the value enters that path.</strong></p>
+
+                    <h2>4. The error object carries it for you</h2>
+                    <p>However well you tidy up your logging calls, one path remains. <strong>Exceptions.</strong> They print without anyone deciding to log anything.</p>
+                    <pre><code>node v22.16.0 / win32
+--- 4-1. route A: the value goes into the message ---
+e.message           : invalid nationalId: 000000-0000000
+first stack line    : Error: invalid nationalId: 000000-0000000
+
+--- 4-2. route B: the value rides on a property ---
+e2.message          : payment declined   (clean)
+JSON of e2.context  : {"request":{"userId":"u-0001","phone":"010-0000-0000","nationalId":"000000-0000000"},"attempt":2}
+
+--- 4-3. what each common serializer emits ---
+JSON.stringify(e2)            : {"name":"AppError","context":{"request":{"userId":"u-0001","phone":"010-0000-0000","nationalId":"000000-0000000"},"attempt":2}}
+  -&gt; CONTAINS nationalId
+String(e2)                    : AppError: payment declined
+  -&gt; clean
+util.inspect(e2) contains     : CONTAINS nationalId
+console.error path uses inspect, so the terminal shows it too</code></pre>
+                    <p>The two routes have different characters.</p>
+                    <ul>
+                        <li><strong>Route A is visible.</strong> Putting the value into a validation failure message is a helpful habit, so it is very common and therefore leaks very commonly. Put it in the message and it lands in the first stack line too</li>
+                        <li><strong>Route B is invisible.</strong> The message is clean while the whole request hangs off a context property. And that habit is a <strong>recommended</strong> one, so it spreads further</li>
+                        <li>Judging by the message alone is wrong. <strong>What the serializer walks</strong> determines what actually leaves</li>
+                        <li>Terminal output goes through the same inspection path, so <strong>it shows on screen too</strong></li>
+                    </ul>
+                    <h3>4.1 Cause chains, unhandled exceptions and a safe-looking trap</h3>
+                    <pre><code>--- 4-4. the cause chain carries it further ---
+outer.message                 : checkout failed   (clean)
+inspect(outer) contains       : CONTAINS nationalId
+a wrapper error looks innocent while dragging the original context
+
+--- 4-5. why JSON.stringify(err) looks safe and is not ---
+JSON.stringify(new Error(payload.phone)) : {}
+message and stack are non-enumerable, so plain JSON drops them,
+which is exactly why teams add a custom error serializer,
+and the custom serializer is what puts message, stack and context back in.
+
+--- 4-6. an unhandled rejection prints it with no logging code at all ---
+uncaught handler saw : AppError: payment declined
+full text contains   : CONTAINS nationalId
+
+nobody called a logger here. the runtime did.</code></pre>
+                    <p>4-5 is the instructive one. The default serialization turns an error into an <strong>empty object</strong>, because message and stack are non-enumerable. Teams then hit the annoyance that errors do not show up in logs and <strong>add a dedicated error serializer</strong>. That serializer puts the message, the stack and the context back in. <strong>They remove the safe default themselves.</strong></p>
+                    <ul>
+                        <li>An outer error wrapping a cause <strong>looks even safer because its message is clean</strong>, while it drags the inner context along</li>
+                        <li>Unhandled exceptions are printed by the runtime <strong>without anyone calling a logger</strong>. Auditing logging calls will never list this path</li>
+                        <li>So you need a rule that error contexts carry <strong>identifiers only</strong>: request id, user id, order id</li>
+                        <li>Validation messages should say <strong>what was wrong rather than the value</strong>. Format mismatch on field nationalId is enough</li>
+                        <li>This rule <strong>enforces itself</strong> once the wrapper from section 5 is in place, because a wrapped value put into a message does not produce the original</li>
+                    </ul>
+
+                    <h2>5. Stop it at the source with a wrapper you must unwrap</h2>
+                    <p>Now the fix. The idea is simple. <strong>Do not carry a sensitive value as a string.</strong> Wrap it in a <strong>type that yields the original only through an explicit call</strong>. From that point on, mistakes expose a placeholder rather than a value.</p>
+                    <pre><code>const util = require('util');
+const RAW = Symbol('raw');
+
+class Secret {
+  constructor(value, label) {
+    this[RAW] = value;
+    this.label = label || 'secret';
+  }
+  // explicit, greppable, the only way out
+  expose() { return this[RAW]; }
+  // every implicit path returns the same placeholder
+  toString() { return '[' + this.label + ' redacted]'; }
+  toJSON()   { return '[' + this.label + ' redacted]'; }
+  [util.inspect.custom]() { return '[' + this.label + ' redacted]'; }
+  [Symbol.toPrimitive]() { return '[' + this.label + ' redacted]'; }
+}
+
+const phone = new Secret('010-0000-0000', 'phone');</code></pre>
+                    <p>Covering the four hooks <strong>together</strong> is the point. Miss one and everything leaves through that hole. Thirteen paths where a mistake can happen were picked and run.</p>
+                    <pre><code>node v22.16.0 / win32
+--- 5-2. every accidental path, checked ---
+  template literal        [phone redacted]                  ok
+  string concat           [phone redacted]                  ok
+  String()                [phone redacted]                  ok
+  array join              [phone redacted] x                ok
+  JSON.stringify          "[phone redacted]"                ok
+  JSON nested             {"user":{"contact":"[phone redacted]"}}ok
+  util.inspect            [phone redacted]                  ok
+  util.inspect nested     { user: { contact: [phone redacted] } }ok
+  util.format %s          [phone redacted]                  ok
+  util.format %j          "[phone redacted]"                ok
+  util.format %o          [phone redacted]                  ok
+  String.prototype.concat contact [phone redacted]          ok
+  implicit in +           n=[phone redacted]                ok
+
+paths checked : 13   leaked : 0</code></pre>
+                    <p><strong>Thirteen paths, zero leaks.</strong> Put it in a template literal, add it to a string, join it in an array, serialize it, serialize it nested, swap the format specifier three ways, and the original never appears. That is what stopping it at the source means in practice. <strong>You are not forbidding mistakes, you are making mistakes harmless.</strong></p>
+                    <pre><code>--- 5-3. console.log goes through inspect, so it is covered too ---
+  direct  : [phone redacted]
+  nested  : {
+  requestId: 'r-0001',
+  user: { id: 'u-0001', contact: [phone redacted] }
+}
+
+--- 5-4. the only way to the value is a call you can grep for ---
+  phone.expose() : 010-0000-0000
+  a code search for .expose( lists every real use site.
+  a code search for the field name does not, because the field is everywhere.</code></pre>
+                    <p>The last two lines of 5-4 are the biggest operational win. <strong>The only route to the original is one named method</strong>, so a single code search lists every place the value is genuinely used in raw form. Searching by field name does not produce that list, because the field name is everywhere. <strong>The audit surface shrinks from hundreds of places to a dozen.</strong></p>
+                    <h3>5.1 A half implementation is worse than none</h3>
+                    <pre><code>--- 5-5. what happens if you implement only half of it ---
+  toString only, template : [redacted]
+  toString only, JSON     : {"v":"010-0000-0000"}   &lt;- LEAK
+  toString only, inspect  : HalfSecret { v: '010-0000-0000' }   &lt;- LEAK
+  a partial wrapper is worse than none: it reads as safe.
+
+--- 5-6. the strict variant: refuse instead of substituting ---
+  concat -&gt; TypeError: Secret must be unwrapped with .expose() before use
+  JSON  -&gt; "[phone redacted]"   (toJSON still substitutes, so logs never crash)
+  throwing catches mistakes in tests; substituting keeps production quiet.
+  a common split: throw in dev and test, substitute in production.
+
+--- 5-7. the wrapper does not survive the network boundary ---
+  after JSON round trip : {"contact":"[phone redacted]"}
+  the type is a source-side guard. across a boundary you must re-wrap on parse.</code></pre>
+                    <ul>
+                        <li><strong>A wrapper implementing only string conversion</strong> hid the value on screen but emitted the original through serialization and inspection. And that is the actual log path</li>
+                        <li>A half wrapper is <strong>more dangerous than none</strong>, because whoever reads the code concludes that it is wrapped and therefore safe</li>
+                        <li><strong>The strict variant</strong> throws when you try to use it as a string. It catches mistakes immediately in tests, at the risk of creating a new production incident</li>
+                        <li>A common compromise is to <strong>throw in development and test, substitute in production</strong>. The serialization hook keeps substituting on both sides so logs never crash</li>
+                        <li><strong>The wrapper does not cross boundaries.</strong> Serialize and send it and the other side receives a placeholder, so the receiving side has to re-wrap. This approach has to be <strong>established per service</strong></li>
+                        <li>Also, <strong>a type system makes it stronger</strong>. Passing a wrapped value where a string is required fails at compile time</li>
+                    </ul>
+
+                    <h2>6. Choose the fields to include, not the fields to strip</h2>
+                    <p>The wrapper protects the <strong>value</strong>. But the problem in section 1 was not the value, it was the <strong>scope</strong>. This section pins the scope down. Only one question is in play here: how to keep sensitive fields out.</p>
+                    <pre><code>// direction 1. choose what to strip
+const DENY = ['phone', 'cardNumber', 'nationalId'];
+function denylist(obj) {
+  const out = { ...obj };
+  for (const k of DENY) delete out[k];
+  return out;
+}
+
+// direction 2. choose what to include
+const ALLOW = ['id', 'nickname', 'createdAt', 'plan'];
+function allowlist(obj) {
+  const out = {};
+  for (const k of ALLOW) if (k in obj) out[k] = obj[k];
+  return out;
+}</code></pre>
+                    <p>On the schema they were written for, the two functions are <strong>indistinguishable</strong>. That is why this defect survives so long.</p>
+                    <pre><code>node v22.16.0 / win32
+--- 6-1. both rules look fine on the schema they were written for ---
+  denylist (v2)  : {"id":"u-0001","nickname":"tester","createdAt":"2026-08-01","plan":"basic"}
+  allowlist(v2)  : {"id":"u-0001","nickname":"tester","createdAt":"2026-08-01","plan":"basic"}
+
+--- 6-2. now the schema moves. neither rule is edited ---
+  denylist (v3)  : {"id":"u-0001","nickname":"tester","createdAt":"2026-08-01","plan":"basic","national_id":"000000-0000000","backupPhone":"010-0000-0000","kyc":{"documentNo":"D-000000000"}}
+  allowlist(v3)  : {"id":"u-0001","nickname":"tester","createdAt":"2026-08-01","plan":"basic"}
+
+  sensitive values present in denylist output  : id-shaped value, phone-shaped value, document-shaped value
+  sensitive values present in allowlist output : none</code></pre>
+                    <p>The schema was moved in three directions. <strong>The same data arrived under a different naming convention</strong>, <strong>a new field nobody announced</strong> was attached, and <strong>a nested structure</strong> appeared. The strip list let all three through; the include list blocked all three. This is the exact mirror of section 1. <strong>What leaked automatically there is blocked automatically here.</strong></p>
+                    <pre><code>--- 6-3. the asymmetry, stated plainly ---
+  denylist  fails OPEN : an unknown field is emitted
+  allowlist fails CLOSED: an unknown field is dropped
+  a new field is added by someone who has never read the logging code.
+  so the rule has to be safe when nobody updates it.
+
+--- 6-4. what you lose, and how to notice ---
+  fields dropped from the log : phone, cardNumber, nationalId, national_id, backupPhone, kyc
+  a field you needed for debugging is now missing, and that is the cost.
+  make it visible instead of silent:
+  {"id":"u-0001","nickname":"tester","createdAt":"2026-08-01","plan":"basic","_dropped":6}
+  the count tells you the schema moved, without telling you what moved.
+
+--- 6-5. the allowlist has to be applied at build time, not at write time ---
+  event object keys : ["id","nickname","createdAt","plan"]
+  the wide object never reaches the logger, so no later stage can widen it.
+  narrowing inside the logger is one layer too late: everything upstream
+  of the logger, including error handlers, still sees the wide object.</code></pre>
+                    <ul>
+                        <li><strong>They fail in opposite directions.</strong> A strip list emits unknown fields; an include list drops them. The rule must be safe while nobody updates it, so the latter is correct</li>
+                        <li><strong>There is a cost.</strong> A field you needed for debugging silently disappears. That is the real price of an allowlist and it should not be hidden</li>
+                        <li>6-4 shows a cheap way to make the cost <strong>not silent</strong>: emit just the <strong>count</strong> of dropped fields. It says the schema moved without saying what moved</li>
+                        <li>When that number suddenly grows, it is a signal that <strong>something upstream changed</strong> and a prompt to review the allowlist</li>
+                        <li><strong>Where you apply it is decisive.</strong> Narrowing inside the logger is one layer too late. Everything above the logger, especially error handlers, still sees the wide object</li>
+                        <li>So the narrowing belongs at <strong>the moment the event object is built</strong>. If the wide object never reaches the logger, no later stage can widen it again</li>
+                    </ul>
+
+                    <h2>7. When only the last four digits may show, where do you cut?</h2>
+                    <p>Partial display is a real requirement. A support agent needs the last four digits of a card to verify a caller. The requirement itself is legitimate. The question is <strong>where you cut</strong>.</p>
+                    <pre><code>node v22.16.0 / win32
+--- 7-1. the requirement: a support screen shows the last 4 digits ---
+  requested display value : ****-****-****-0000
+
+--- 7-2. attempt A: keep both on the same record ---
+  record  : {"userId":"u-0001","cardNumber":"0000-0000-0000-0000","cardLast4":"0000"}
+  the display value exists, and so does the original, one key apart.
+  every whole-object log, error context and API response carries both.
+  the partial value did not reduce anything. it added a field.
+
+--- 7-3. attempt B: cut at the source, keep only the derived value ---
+  record  : {"userId":"u-0001","cardLast4":"0000","card":"[card redacted]"}
+  inspect : { userId: 'u-0001', cardLast4: '0000', card: [card redacted] }
+  the screen gets cardLast4. the logger gets cardLast4. nothing else is reachable
+  without calling .expose(), and .expose() is greppable.
+
+--- 7-4. the two attempts under the same accidental log line ---
+  A : {"msg":"checkout","data":{"userId":"u-0001","cardNumber":"0000-0000-0000-0000","cardLast4":"0000"}}
+      -&gt; ORIGINAL PRESENT
+  B : {"msg":"checkout","data":{"userId":"u-0001","cardLast4":"0000","card":"[card redacted]"}}
+      -&gt; derived value only</code></pre>
+                    <p>7-2 is a very common mistake. <strong>The cut value and the original sit side by side in the same object.</strong> The screen uses the cut value so the requirement is met. But <strong>the moment that object is logged whole, the original goes with it.</strong> Partial display reduced nothing; it added a field.</p>
+                    <p>7-3 is the answer. <strong>Cut once at the boundary, keep only the derived value, and leave the original wrapped.</strong> Then both the screen and the logger receive only the cut value.</p>
+                    <pre><code>--- 7-5. cutting late produces drift ---
+  input                : "0000 0000 0000 0000"
+  last4  (digits only) : 0000
+  last4v2(naive slice) : "0000"
+  same field name, two values, depending on which layer computed it.
+  cutting once at the boundary makes the answer single-valued.
+
+--- 7-6. a partial value is still personal data ---
+  one record may hold several partials : {"u-0001":["0000","010-0000","a***@example.invalid"]}
+  each is harmless alone. joined on the same subject they narrow the set.
+  so a partial is a display format, not a declassification.
+  keep the same retention and access rules on it.</code></pre>
+                    <ul>
+                        <li>7-5 is the <strong>second problem</strong> with cutting late. When cutting code appears in several layers, <strong>the same field name carries different values</strong>. One strips to digits before cutting, the other just slices the end of the string</li>
+                        <li>On an input containing spaces the two results diverged. One is four digits, the other is <strong>four characters including a space</strong>. You end up with a value that looks different depending on the screen, and that comes back as a support ticket</li>
+                        <li><strong>Cutting once at the boundary</strong> makes this problem disappear by definition, because there is exactly one place that produces the derived value</li>
+                        <li>7-6 is the final caution. <strong>A partial value is still personal data.</strong> Any one of them is harmless, but several partials attached to the same subject narrow the set</li>
+                        <li>So a partial is <strong>a display format, not a declassification</strong>. Keep the same retention and access rules you apply to the original</li>
+                        <li>The exact digit count and display scope vary by industry and contract. <strong>Check the applicable laws, your internal policy and any payment network rules</strong> to decide</li>
+                    </ul>
+
+                    <h2>8. Finding the risky spots in existing logs, and the order of rollout</h2>
+                    <p>Everything so far was about what to do from now on. This section is about what to do with what has already piled up. Diagnosis takes two passes.</p>
+                    <pre><code>node v22.16.0 / win32
+--- 8-1. build a sample log tree ---
+  api.log       3 lines
+  worker.log    2 lines
+  auth.log      2 lines
+  batch.log     3 lines
+
+--- 8-2. pass 1: key names, not value shapes ---
+  file          lines   risky keys found
+  ----------------------------------------------------------------------
+  api.log       3       phone(1) context.cardNumber(1)
+  worker.log    2       -
+  auth.log      2       authorization(1) password(1)
+  batch.log     3       national_id(1) nationalId(1) email(1)
+
+--- 8-3. pass 2: key inventory, to catch names you did not list ---
+  distinct keys in the sample : 14
+  matched the risk list       : 7
+  NOT on the risk list        : 7
+  lvl, msg, path, userId, context, jobId, durationMs
+  read this list by hand once. that is the review, and it is finite.
+  a value-shape scan cannot produce this list at all.</code></pre>
+                    <p>The first pass searches <strong>key names rather than value shapes</strong>. As section 2 showed, value formats vary with whatever is upstream, while key names are comparatively stable. Nested keys have to be captured by path, which is how <code>context.cardNumber</code> was caught.</p>
+                    <p>But <strong>the second pass matters more</strong>: list every key that did not match the risk list and have a person read it once. In the sample there were fourteen distinct keys and seven of them were off the list. That list is <strong>finite</strong>. Reading it once finishes the job. And it is <strong>a list a value-shape scan cannot produce at all</strong>.</p>
+                    <pre><code>--- 8-4. rank by blast radius, not by count ---
+  file          keys   retain   copies   score
+  ----------------------------------------------------------
+  batch.log     3      365d     3        3285
+  auth.log      2      365d     4        2920
+  api.log       2      90d      4        720
+  worker.log    0      14d      1        0
+  score = risky keys x retention days x number of destinations.
+  a low-volume line kept for a year in four places outranks a noisy one kept for two weeks.
+
+--- 8-5. order of work, by how hard each step is to undo ---
+  # action                                cost      undo                  buys you
+  ------------------------------------------------------------------------------------------------------------
+  1   collector-side drop rule              minutes   fully reversible      stops NEW copies today
+  2   shorten retention on the worst file   minutes   reversible            shrinks the window
+  3   purge existing copies                 days      NOT reversible        needs an owner list first
+  4   allowlist the event builders          weeks     reversible by revert  the actual fix
+  5   wrapper type on the fields            weeks     reversible by revert  makes step 4 hold
+  6   remove the collector rule             minutes   reversible            only after 4 and 5 are verified</code></pre>
+                    <p>8-4 ranks by <strong>blast radius rather than count</strong>, multiplying risky keys by retention days by destination count. That pushed <strong>a quiet log kept for a year and replicated to three places</strong> above a noisy one kept for three months. Sorted by count the order would have been reversed.</p>
+                    <p>One point in the rollout is contested: <strong>collector first or code first?</strong> The answer in 8-5 is collector first, and the reason is not that it is a better fix.</p>
+                    <table>
+                        <thead>
+                            <tr><th>Step</th><th>Reach</th><th>Time</th><th>Undo</th><th>Limit</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><strong>1. Collector drop rule</strong></td><td>Global at once</td><td>Minutes</td><td><strong>Fully reversible</strong></td><td>Same pattern limits as section 2</td></tr>
+                            <tr><td>2. Shorten retention</td><td>That log</td><td>Minutes</td><td>Reversible</td><td>Existing copies unaffected</td></tr>
+                            <tr><td>3. Purge existing copies</td><td>Only what you purged</td><td>Days</td><td><strong>None</strong></td><td>Needs an owner list first</td></tr>
+                            <tr><td><strong>4. Allowlist at event assembly</strong></td><td>Deployed services</td><td>Weeks</td><td>Revert the code</td><td>Per service</td></tr>
+                            <tr><td><strong>5. Wrapper type on fields</strong></td><td>Wrapped fields</td><td>Weeks</td><td>Revert the code</td><td>Does not cross boundaries</td></tr>
+                            <tr><td>6. Remove the collector rule</td><td>Global at once</td><td>Minutes</td><td>Reversible</td><td>Forbidden before 4 and 5 verify</td></tr>
+                        </tbody>
+                    </table>
+                    <ul>
+                        <li><strong>The collector rule comes first because it is a tourniquet.</strong> It applies globally with no deploy, and it can be pulled off just as fast if it is wrong</li>
+                        <li>At the same time, <strong>a tourniquet is not treatment</strong>. It does nothing for copies already made, and it is exactly the pattern matching section 2 showed to be incomplete</li>
+                        <li><strong>Do not rush the purge.</strong> It is the only irreversible step, and running it without an owner list means you cannot claim it was deleted</li>
+                        <li>Code work is ordered 4 then 5 because the allowlist pins the scope and the wrapper keeps it pinned. Reversed, new unwrapped fields keep arriving</li>
+                        <li>Step 6 happens <strong>only after verification</strong>, and verification is simple: turn the collector rule off, run the same scan in staging, and confirm the risky key count is zero</li>
+                        <li>For a new service <strong>the order is reversed</strong>. Do 4 and 5 only; no collector rule is needed</li>
+                    </ul>
+                    <h3>8.1 Checklist</h3>
+                    <ul>
+                        <li>Found every place a logging call receives <strong>a whole object</strong> (including spreads, nesting, database rows and request bodies)</li>
+                        <li><strong>Listed the fields to include</strong> at the point the event object is built. Did not specify fields to strip</li>
+                        <li>Applied the allowlist <strong>at event assembly, not inside the logger</strong></li>
+                        <li>Emitted the <strong>count</strong> of dropped fields so schema drift is detectable</li>
+                        <li>Applied a <strong>wrapper type</strong> to sensitive fields, implementing <strong>all four</strong> hooks</li>
+                        <li>Grepped the wrapper's <strong>unwrap call</strong> and reviewed every use site</li>
+                        <li>Established a rule that <strong>error contexts carry identifiers only</strong></li>
+                        <li>Validation failure messages carry <strong>the field name, not the value</strong></li>
+                        <li>Checked <strong>what the custom error serializer walks</strong></li>
+                        <li>Partial display is cut <strong>once at the boundary</strong> and not stored next to the original</li>
+                        <li>Partial values carry <strong>the same retention and access rules as the original</strong></li>
+                        <li>Scanned existing logs <strong>by key name</strong> and had a person read <strong>every key off the list</strong></li>
+                        <li>Ranked by <strong>key count x retention days x destination count</strong></li>
+                        <li>Documented <strong>the destination list and owner</strong> for each log copy</li>
+                        <li>Confirmed handling scope and retention against <strong>the applicable laws and internal policy</strong></li>
+                    </ul>
+
+                    <h2>Conclusion: do not choose what to strip, choose what to include</h2>
+                    <p>Laying the verified results out one line at a time: logging a whole object gained three leaking fields <strong>with zero lines changed</strong>. An output-stage regex <strong>missed seven</strong> of nine harmless format variants and destroyed two non-sensitive values at the same time. A single log line became <strong>nine copies</strong> through ordinary operations, and masking fixed <strong>one</strong> of them.</p>
+                    <p>The other side was verified too. A wrapper covering four hooks produced <strong>zero leaks across thirteen accidental paths</strong>. A serializer that chose what to include let nothing through even after <strong>the schema moved in three directions</strong>. In the same situation, the version that chose what to strip let all three through.</p>
+                    <p>So the conclusion is not to mask better. <strong>Masking is the last line of defence.</strong> Output-stage masking blocks only the patterns you know, and by then the copying is finished. The real fix lives <strong>before</strong> the value enters the log path, and the rule to apply there is singular. <strong>Do not choose what to strip; choose what to include.</strong> Only a rule that leans toward dropping unknown fields survives the years in which nobody updates it.</p>
+                    <p>There is something you can do right now. <strong>Find one logging call that receives a whole object and print that object's field list today.</strong> If you cannot remember when you last checked that list, then you also do not know what has been added since. The second pass in section 8 exists to finish that check in one go.</p>
+
+                    <h2>References</h2>
+                    <ul>
+                        <li>OWASP Cheat Sheet Series - Logging Cheat Sheet (the list of data that must not be recorded in logs, and the recommendation to remove, mask or pseudonymize before logging rather than filtering after collection): <a href="https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html" target="_blank" rel="noopener">cheatsheetseries.owasp.org</a></li>
+                        <li>Node.js Documentation - util.inspect.custom (the symbol by which an object declares its own inspection output, and the note that <code>console.log</code> goes through this path): <a href="https://nodejs.org/api/util.html#utilinspectcustom" target="_blank" rel="noopener">nodejs.org/api/util</a></li>
+                        <li>MDN - JSON.stringify (the rule that a <code>toJSON</code> return value is serialized instead of the object, and that only enumerable own properties are visited): <a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/JSON/stringify" target="_blank" rel="noopener">developer.mozilla.org</a></li>
+                        <li>Related posts: <a href="allowlist_over_denylist_validation.html">A Denylist Is Always Late - How to Flip It Into an Allowlist</a>, <a href="log_level_convention.html">Why WARN Becomes a Landfill - Log Level Convention</a>, <a href="llm_data_security_policy_2026.html">Can Company Data Go Into an LLM</a></li>
+                    </ul>
+                </div>
+
+                <!-- md-artifact-start -->
+                    <div class="md-artifact" style="margin:2rem 0;border:1px solid #d7dce3;border-radius:10px;overflow:hidden;background:#fbfcfd;">
+                        <div style="display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;justify-content:space-between;padding:.7rem 1rem;background:#eef2f7;border-bottom:1px solid #d7dce3;">
+                            <span style="font-weight:700;font-size:.97rem;">📋 Checklist you can take with you</span>
+                            <span style="display:flex;gap:.5rem;align-items:center;">
+                                <code style="font-size:.82rem;color:#5a6675;background:transparent;padding:0;">sensitive_data_at_source.md</code>
+                                <button type="button" class="md-artifact-copy" style="cursor:pointer;border:1px solid #b9c2cf;background:#fff;color:#2c3e50;font-weight:600;line-height:1.3;border-radius:6px;padding:.32rem .7rem;font-size:.85rem;">Copy all</button>
+                            </span>
+                        </div>
+                        <pre style="margin:0;max-height:420px;overflow:auto;padding:1rem;background:#fbfcfd;font-size:.86rem;line-height:1.62;"><code class="nohighlight" style="background:transparent;padding:0;white-space:pre;"># Stopping Sensitive Values at the Source — Wrapper, Allowlist, Triage
+
+&gt; Source: braindetox.kr — Masking at the Output Is Already Too Late
+&gt; Basis: verified by running on Windows 10 / Node.js v22.16.0
+&gt; Paste this file into an AI assistant and ask it to review your log path against these criteria.
+&gt; Every example value below is fake and matches only the format. Digit counts are right, all digits are zero.
+&gt; Decide the scope of personal data handling and retention periods by checking the applicable laws and your internal policy.
+
+## 0. The one-line principle
+
+Masking is the last line of defence. The real fix is keeping the value out of the log path,
+and the rule to use there is singular. **Do not choose what to strip; choose what to include.**
+
+| Approach | On an unknown field | Verdict |
+|---|---|---|
+| List of fields to strip | Emits it (fail open) | Leaks as soon as the schema moves |
+| List of fields to include | Drops it (fail closed) | **Use this one** |
+| Output regex | Passes if the format differs | A tourniquet, not a fix |
+
+## 1. Wrapper type — the original comes out only when you unwrap it
+
+Cover **all four** hooks. Miss one and everything leaves through that hole.
+
+```js
+const util = require('util');
+const RAW = Symbol('raw');
+
+class Secret {
+  constructor(value, label) {
+    this[RAW] = value;
+    this.label = label || 'secret';
+  }
+  // the only exit. it is named, so a code search lists every use site
+  expose() { return this[RAW]; }
+
+  toString() { return '[' + this.label + ' redacted]'; }   // templates, concat
+  toJSON()   { return '[' + this.label + ' redacted]'; }   // serialization
+  [util.inspect.custom]() { return '[' + this.label + ' redacted]'; }  // console.log
+  [Symbol.toPrimitive]() { return '[' + this.label + ' redacted]'; }   // implicit coercion
+}
+```
+
+Zero leaks across the 13 verified paths:
+template literal / string concat / String() / array join / JSON.stringify /
+nested JSON / util.inspect / nested inspect / format %s / format %j /
+format %o / String.prototype.concat / the + operator
+
+Cautions:
+- **Half an implementation is worse than none.** toString alone still leaks through serialization and inspection
+- A common compromise is to throw in dev and test, substitute in production. Keep toJSON substituting on both
+- **It does not cross boundaries.** Serialize and send it and the other side gets a placeholder. Re-wrap on receipt
+
+## 2. Allowlist serialization — narrow at the moment the event is built
+
+```js
+const ALLOW = ['id', 'nickname', 'createdAt', 'plan'];
+
+function allowlist(obj) {
+  const out = {};
+  for (const k of ALLOW) if (k in obj) out[k] = obj[k];
+  return out;
+}
+
+// where you narrow is decisive. here, not inside the logger.
+function buildEvent(user) {
+  const picked = allowlist(user);
+  const droppedCount = Object.keys(user).length - Object.keys(picked).length;
+  return { event: 'signup', user: picked, _dropped: droppedCount };
+}
+```
+
+- Narrowing inside the logger is one layer too late. Error handlers and anything above still see the wide object
+- Emitting the dropped count tells you the schema moved **without telling you what moved**
+- If that number suddenly grows, it signals an upstream change. Review the allowlist
+
+## 3. Error context rules
+
+- **Do not put the value in a validation failure message.** Format mismatch on field nationalId is enough
+- Error contexts carry **identifiers only**: request id, user id, order id
+- An outer error wrapping a cause looks clean in its message but **drags the inner context along**
+- Unhandled exceptions are printed by the runtime **without a logger call**. Auditing log calls will not find them
+- Do not relax because default serialization turns errors into empty objects. **A custom serializer puts it back**
+
+## 4. Triage procedure — two passes
+
+1) **Pass 1: search key names** (not value shapes)
+   - Nested keys by full path: context.cardNumber
+   - Value formats vary with whatever is upstream; key names are comparatively stable
+2) **Pass 2: list every key off the risk list and have a person read it**
+   - The list is finite. Reading it once finishes the job
+   - A value-shape scan cannot produce this list at all
+3) **Priority = risky key count x retention days x destination count**
+   - Do not sort by volume. A quiet log kept long and widely outranks a noisy one
+
+## 5. Rollout order — hardest to undo goes last
+
+| # | Step | Time | Undo | Buys you |
+|---|---|---|---|---|
+| 1 | Collector drop rule | Minutes | **Fully reversible** | Stops new copies today |
+| 2 | Shorten retention | Minutes | Reversible | Shrinks the exposure window |
+| 3 | Purge existing copies | Days | **None** | Owner list comes first |
+| 4 | Allowlist at event assembly | Weeks | Revert the code | **The actual fix** |
+| 5 | Wrapper type on fields | Weeks | Revert the code | Keeps step 4 holding |
+| 6 | Remove the collector rule | Minutes | Reversible | Only after 4 and 5 verify |
+
+- The collector goes first not because it is a better fix but because it is a **tourniquet**
+- For a new service the order reverses. Do 4 and 5 only; no collector rule needed
+
+## 6. Checklist
+
+- [ ] Found every place a logging call takes **a whole object** (spreads, nesting, DB rows, request bodies)
+- [ ] **Listed the fields to include** at event assembly (not the fields to strip)
+- [ ] Applied the allowlist **at event assembly, not inside the logger**
+- [ ] Emitted the **count** of dropped fields
+- [ ] Applied a wrapper to sensitive fields with **all four hooks** implemented
+- [ ] Grepped the unwrap call and reviewed **every use site**
+- [ ] Established that error contexts carry **identifiers only**
+- [ ] Validation failure messages carry **the field name, not the value**
+- [ ] Checked **what the custom error serializer walks**
+- [ ] Partial display is cut **once at the boundary** and not stored next to the original
+- [ ] Partial values carry **the same retention and access rules as the original**
+- [ ] Scanned existing logs **by key name** and read **every key off the list**
+- [ ] Ranked by **key count x retention days x destination count**
+- [ ] Documented **the destination list and owner** for each log copy
+- [ ] Confirmed handling scope and retention against **the applicable laws and internal policy**
+
+## 7. Do not
+
+- ❌ Pass objects, DB rows or request bodies **whole** into logs — new fields follow with zero lines changed
+- ❌ Treat output regex masking **as the fix** — format variants defeat it and it destroys harmless values
+- ❌ Keep the cut value and **the original in the same object** — one whole-object log emits both
+- ❌ Put **the value** in a validation failure message — it lands in the first stack line too
+- ❌ **Purge first** without an owner list — it is the only irreversible step
+- ❌ Add a collector rule and **call it done** — it does nothing for copies already made
+- ❌ Implement the wrapper **halfway** — it is more dangerous because it reads as safe
+</code></pre>
+                        <p style="margin:0;padding:.6rem 1rem;font-size:.82rem;color:#5a6675;border-top:1px solid #e3e8ee;">Copy and paste it straight into your notes or an AI assistant.</p>
+                    </div>
+                    <script>
+                    (function(){
+                      if (window.__mdArtifactBound) return;
+                      window.__mdArtifactBound = true;
+                      document.addEventListener('click', function(ev){
+                        var btn = ev.target.closest && ev.target.closest('.md-artifact-copy');
+                        if (!btn) return;
+                        var box = btn.closest('.md-artifact');
+                        var code = box && box.querySelector('pre code');
+                        if (!code) return;
+                        var text = code.textContent;
+                        var label = btn.textContent;
+                        var ok = function(){
+                          btn.textContent = "Copied";
+                          setTimeout(function(){ btn.textContent = label; }, 1600);
+                          if (typeof gtag === 'function') {
+                            gtag('event', 'md_copy', { slug: "sensitive_data_at_source", lang: "en", chars: text.length });
+                          }
+                        };
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                          navigator.clipboard.writeText(text).then(ok).catch(function(){ fallback(); });
+                        } else { fallback(); }
+                        function fallback(){
+                          var ta = document.createElement('textarea');
+                          ta.value = text; ta.setAttribute('readonly','');
+                          ta.style.position='fixed'; ta.style.left='-9999px';
+                          document.body.appendChild(ta); ta.select();
+                          try { document.execCommand('copy'); ok(); } catch(e) {}
+                          document.body.removeChild(ta);
+                        }
+                      });
+                    })();
+                    </script>
+                    <!-- md-artifact-end -->
+
+                <div class="share-section">
+                    <h3>Share this article</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">Copy Link</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">Back to list</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Free tools you may find useful</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/json_formatter.html">JSON Formatter</a></li>
+      <li><a href="../static/regex_tester.html">Regex Tester</a></li>
+      <li><a href="../static/jwt_decoder.html">JWT Decoder Generator 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 Encoder/Decoder</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">See all tools &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+<!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Related Posts</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="allowlist_over_denylist_validation.html">A Denylist Is Always Late - How to Flip It Into an Allowlist 2026</a></li>
+      <li><a href="log_level_convention.html">Why WARN Becomes a Landfill - Agreeing on a Log Level Convention 2026</a></li>
+      <li><a href="llm_data_security_policy_2026.html">Can Company Data Go Into an LLM - Criteria and Internal Policy 2026</a></li>
+      <li><a href="cp949_utf8_mojibake_guide.html">Locating Where Hangul Breaks - cp949, UTF-8 and the Two Kinds of Encoding Error 2026</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('Link copied. Paste it into the Threads app to share!');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('Link copied!'); });
+    });
+    </script>
+</body>
+</html>
