@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<!--
+ * 技术博客文章模板
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>把大型MoE装进单张GPU - 从内存算术到卡住的地方 2026</title>
+    <meta name="description" content="284B的MoE能装进单张GPU这句话实际要求什么。权重字节的算法、总参数与激活参数的区别、量化无法缩小的KV缓存、ROCm上能用与尚未支持的部分、并发上升时每流速度崩掉的临界点，以及在自己设备上测量的完整步骤，一次说清楚。">
+    <meta name="keywords" content="DeepSeek V4 Flash, MI300X, 单卡GPU大模型, MoE 激活参数, KV缓存计算, 显存估算, ROCm, vLLM, SGLang, FP8 KV缓存, FP4量化, HBM3, 推理服务, OOM, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/deepseek_v4_flash_single_gpu_2026.html">
+
+    <meta property="og:title" content="把大型MoE装进单张GPU - 从内存算术到卡住的地方">
+    <meta property="og:description" content="284B能装进192GB不是因为模型小，而是因为权重文件本来就以约四比特发布。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/deepseek_v4_flash_single_gpu_2026.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-08-05">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="把大型MoE装进单张GPU">
+    <meta name="twitter:description" content="量化只缩小权重，KV缓存是另一笔账。装进单卡之后先崩的不是内存，而是并发。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "把大型MoE装进单张GPU - 从内存算术到卡住的地方",
+      "alternativeHeadline": "284B能装进192GB不是因为模型小",
+      "datePublished": "2026-08-05",
+      "dateModified": "2026-08-05",
+      "inLanguage": "zh-CN",
+      "articleSection": "开发/基础设施",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "DeepSeek V4 Flash, MI300X, 单卡GPU大模型, MoE 激活参数, KV缓存计算, 显存估算, ROCm, vLLM, SGLang, FP8 KV缓存",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/deepseek_v4_flash_single_gpu_2026.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "284B参数的模型为什么能装进一张192GB的卡",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "不是因为模型小，而是因为权重文件本身就以低精度发布。权重占用的容量由每个参数的字节数决定，而不是参数个数。把284B用BF16存放，每个参数两字节，约为568GB；用FP8也约为284GB。两者都装不进一张192GB的卡。DeepSeek-V4-Flash的官方权重采用混合格式，MoE专家参数用FP4，注意力、归一化和路由参数用FP8。当每个参数的平均字节数降到一以下，权重文件本身就落在160GB上下，单卡才有了余地。这不是用户额外量化的结果，而是发布版本一开始就处于那个状态。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "MoE模型是不是只需要放下激活参数的显存",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "不是。这个误解毁掉的单卡方案比任何其他误解都多。DeepSeek-V4-Flash总参数284B，每个token激活13B。激活参数是处理一个token时真正参与乘法的部分，决定计算量和速度。但哪些专家被选中是路由器逐token当场决定的。你无法预知下一个token需要哪些专家，所以全部专家必须常驻显存。也就是说，总参数写内存账单，激活参数写算力账单。MoE的价值恰恰在于这两者的错位，而不是显存会缩到激活参数那么大。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "量化之后KV缓存会跟着一起变小吗",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "权重量化和KV缓存是两条独立的轴。把权重从FP16降到FP4，KV缓存一个字节也不会减少，因为KV缓存的大小由层数、KV头配置、头维度、每元素字节数、上下文长度和并发序列数相乘决定。要缩小它，只能单独降低KV精度、缩短上下文，或者减少并发序列。在vLLM里通过kv-cache-dtype选项单独指定KV精度，ROCm路径使用fp8_e4m3这个取值。实务中常见的失败是只算权重就选卡，忘掉KV预算，一旦把上下文调大就因显存不足而崩溃。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "单卡配置能给多个用户提供服务吗",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "总吞吐会上升，但每个人感受到的速度下降很快。公开的单张MI300X配置测量显示，单流解码为每秒168.6个token。八个并发流时总量为每秒542个token，每流中位数降到90.3。在64流突发下总量停在每秒830个token。也就是流数增加八倍而总量只有1.5倍，可以判定卡在此处饱和。因此单卡配置适合接近批量为一的实验、夜间批处理，以及可以排队的公司内部单一负载。它不适合带有响应时间承诺的多用户交互式服务。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "在ROCm上部署大模型最常卡在哪里",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "卡住的不是模型，而是安装和内核层。vLLM文档要求ROCm 6.3以上，并列出gfx90a、gfx942和gfx950系列，但预构建的wheel只提供Python 3.12版本，且仅有ROCm 7.0和7.2.1两个变体。使用其他Python版本时安装器会悄悄退回到CUDA wheel，然后在AMD设备上失败。第二个障碍是量化格式。SGLang文档写明依赖Marlin或英伟达专用内核的方式在AMD上无法工作，并逐一列出awq_marlin、gptq_marlin、gguf、modelopt_fp8和modelopt_fp4。MXFP4则需要CDNA3或CDNA4世代。移植失败的原因通常不在模型结构，而在Python wheel、内核库和量化格式这三行。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/deepseek_v4_flash_single_gpu_2026.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/deepseek_v4_flash_single_gpu_2026.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/deepseek_v4_flash_single_gpu_2026.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/deepseek_v4_flash_single_gpu_2026.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/deepseek_v4_flash_single_gpu_2026.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="把大型MoE装进单张GPU - 从内存算术到卡住的地方">
+                <meta itemprop="datePublished" content="2026-08-05">
+                <meta itemprop="dateModified" content="2026-08-05">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="DeepSeek V4 Flash, MI300X, 单卡GPU大模型, MoE 激活参数, KV缓存计算, 显存估算, ROCm, vLLM">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/deepseek_v4_flash_single_gpu_2026.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">把大型MoE装进单张GPU - 从内存算术到卡住的地方</h1>
+                    <h2 class="post-subtitle">284B能装进192GB不是因为模型小</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-08-05">2026年8月5日</span>
+                        <span class="post-category" itemprop="articleSection">开发/基础设施</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <nav class="post-toc">
+                        <h3>本文涵盖的内容</h3>
+                        <ol>
+                            <li><a href="#sec-1">权重容量由字节数而非参数个数决定</a></li>
+                            <li><a href="#sec-2">总参数与激活参数消耗的是不同资源</a></li>
+                            <li><a href="#sec-3">MI300X为什么会出现在这个话题里</a></li>
+                            <li><a href="#sec-4">装进单卡后显存实际怎么分配</a></li>
+                            <li><a href="#sec-5">KV缓存和权重是两笔账</a></li>
+                            <li><a href="#sec-6">ROCm上能用的与还不能用的</a></li>
+                            <li><a href="#sec-7">并发上升后崩掉的临界点</a></li>
+                            <li><a href="#sec-8">单卡有意义的场景与无意义的场景</a></li>
+                            <li><a href="#sec-9">在自己环境里测量的步骤</a></li>
+                            <li><a href="#sec-10">没能确认的部分</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-0">引言：看到「单卡就能跑」之后打开预算表的人</h2>
+                    <p>某个模型能在单张GPU上运行，这句话总会引出同样的反应：那我们也行。可是这句话里省略了大约六个条件，而其中一个条件的差别就是一张卡和三张卡的差别。</p>
+                    <p>先写结论。<strong>284B的MoE能装进一张192GB的卡，不是因为模型小，而是因为官方权重文件本来就以约四比特的形式发布。</strong>再叠上KV缓存和激活值，剩下的余量只有几个GB；在这个状态下加入并发请求，个人体感速度立刻崩掉。区分可行与不可行的不是卡的性能，而是<strong>一次到达多少个请求</strong>。</p>
+                    <p>本文按顺序展开这套算术。从权重字节开始，讲MoE里总参数和激活参数各自决定什么，KV缓存在哪里另占一块，ROCm栈上真正卡住的地方在哪，最后给出读者在自己设备上做同样计算并找到显存溢出临界点的步骤。</p>
+                    <p>范围先收窄。这里说的是<strong>一张数据中心加速卡和一个大型MoE</strong>。用消费级硬件跑本地模型的话题，无论是用旧CPU带动小模型还是在Mac上开启GPU加速，都放在<a href="old_xeon_run_gemma_4_local_llm_2026.html">用十年前的至强跑Gemma 4</a>和<a href="local_llm_mac_mps_speedup_2026.html">Mac上本地大模型慢的真正原因</a>里。GGUF量化等级选择和消费级GPU显存要求的通论则在<a href="local_llm_running_guide_2026.html">本地大模型运行指南</a>那边。</p>
+
+                    <h2 id="sec-1">1. 权重容量由字节数而非参数个数决定</h2>
+                    <p>第一步计算很简单，一个乘法而已。</p>
+                    <pre><code>权重字节数 = 参数个数 × 每参数字节数
+
+FP32  = 4 字节
+BF16 / FP16 = 2 字节
+FP8   = 1 字节
+FP4   = 0.5 字节</code></pre>
+                    <p>不做这个乘法、只看参数个数，整个方案就会跑偏。同样是284B，按不同精度存放所需的卡数相差四倍。</p>
+
+                    <h3>1.1 各精度实际占多少</h3>
+                    <p><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash" target="_blank" rel="noopener">DeepSeek-V4-Flash模型卡</a>标注总参数284B，每token激活13B。把这284B按精度存放，结果如下。卡数按每张192GB计算，且只算权重，实际部署需要更多。</p>
+                    <table>
+                        <thead>
+                            <tr><th>存放精度</th><th>每参数</th><th>284B权重容量</th><th>192GB卡最少张数(仅权重)</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>FP32</td><td>4 字节</td><td>约 1,136 GB</td><td>6张</td></tr>
+                            <tr><td>BF16 / FP16</td><td>2 字节</td><td>约 568 GB</td><td>3张</td></tr>
+                            <tr><td>FP8</td><td>1 字节</td><td>约 284 GB</td><td>2张</td></tr>
+                            <tr><td>FP4</td><td>0.5 字节</td><td>约 142 GB</td><td>1张</td></tr>
+                            <tr><td><strong>出厂状态(FP4专家 + FP8其余)</strong></td><td>平均不足1字节</td><td><strong>权重文件约 160~167 GB</strong></td><td><strong>1张，几乎没有余量</strong></td></tr>
+                        </tbody>
+                    </table>
+                    <p>最后一行是全文的起点。<a href="https://recipes.vllm.ai/deepseek-ai/DeepSeek-V4-Flash" target="_blank" rel="noopener">vLLM配方文档</a>把该模型的权重文件大小记为预览版约160GB、融合变体约167GB。模型卡说明其格式是混合的：MoE专家参数用FP4，注意力、归一化和路由参数用FP8。</p>
+
+                    <h3>1.2 与事后量化有什么不同</h3>
+                    <p>这里容易产生一个混淆。我们处理本地模型时熟悉的顺序是：拿到BF16原版，压成Q4，再看质量损失了多少。这个模型顺序相反。<strong>发布版本本身一开始就是低精度。</strong></p>
+                    <ul>
+                        <li>用户不做任何额外量化，每参数平均字节数已经低于一</li>
+                        <li>因此「再量化一下应该还能缩」的空间几乎不剩</li>
+                        <li>承担质量代价的一方从用户变成了模型作者，意味着训练阶段可以以该精度为前提做调整，这比事后压缩更有利</li>
+                        <li>换句话说，<strong>这个模型上「靠量化省下一张卡」这张牌已经打完了</strong></li>
+                    </ul>
+                    <p>事后量化等级降到哪一档、Q4与Q8之间如何取舍，是性质不同的问题，另行整理在<a href="local_llm_running_guide_2026.html">本地大模型运行指南</a>里。</p>
+
+                    <h2 id="sec-2">2. 总参数与激活参数消耗的是不同资源</h2>
+                    <p>在MoE话题里最常毁掉方案的一句话是：激活只有13B，那有13B的显存就够了。不对。这一点不纠正，后面的计算全是错的。</p>
+
+                    <h3>2.1 路由器每个token都重新选一次</h3>
+                    <p>DeepSeek-V4-Flash的MoE层有1个共享专家和256个路由专家，每个token触发6个路由专家。专家的中间维度为2048，前三个MoE层使用哈希路由。</p>
+                    <p>关键在于<strong>无法预知哪6个会被选中</strong>。路由器根据下一个token当场决定。所以全部256个专家都必须待在显存里。不在的话，需要的那一刻就得从磁盘或主机内存拉过来，那一次往返的延迟和GPU计算时间不在一个数量级。</p>
+
+                    <h3>2.2 什么决定什么</h3>
+                    <table>
+                        <thead>
+                            <tr><th>这个值</th><th>决定这项资源</th><th>调大后会发生什么</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>总参数(284B)</td><td>权重常驻显存</td><td>需要的卡数增加</td></tr>
+                            <tr><td>激活参数(13B)</td><td>每token计算量</td><td>token生成变慢</td></tr>
+                            <tr><td>上下文长度</td><td>KV缓存</td><td>与权重无关地额外吃显存</td></tr>
+                            <tr><td>并发序列数</td><td>KV缓存 + 激活值</td><td>显存与每流速度同时恶化</td></tr>
+                            <tr><td>批大小</td><td>激活值与工作区</td><td>吞吐上升，单个延迟变长</td></tr>
+                        </tbody>
+                    </table>
+                    <p>MoE的商业价值就在于前两行的错位。<strong>用13B级的算力成本拿到284B级的表达力。</strong>代价是内存账单按284B开。这是设计意图而非缺陷，规划时唯一要守的纪律就是不把这两行混在一起。</p>
+                    <p>补充一点：正因为这种错位，MoE在<strong>显存充裕而算力吃紧的机器</strong>上相对有利。反过来，显存紧张而算力有余的机器上，同等质量的稠密模型可能是更好的选择。27B级稠密模型在单卡上为什么舒服，写在<a href="qwen_3_6_27b_local_2026.html">Qwen 3.6 27B，本地开发的最佳点</a>里；那篇的甜点区逻辑和本文的算术，是从相反方向看着同一堵墙。</p>
+
+                    <h2 id="sec-3">3. MI300X为什么会出现在这个话题里</h2>
+                    <p>AMD加速卡出现在单卡讨论中只有一个理由：<strong>单张能装下多少</strong>。这是算术问题，不是跑分竞赛。</p>
+
+                    <h3>3.1 公开规格</h3>
+                    <p>按AMD资料，MI300X搭载192GB HBM3。内存位宽8,192位，数据速率5.2Gbps，峰值带宽5.325TB/s。采用CDNA 3架构、8个XCD配置，在750W等级、加速频率2,100MHz时，FP16与BF16的峰值理论性能各标为1,307.4 TFLOPS。</p>
+                    <div class="callout">
+                        <p><strong>峰值理论值不是实测值。</strong>1,307.4 TFLOPS是用频率和单元数算出的上限，实际推理不会接近它。这个数字用于比较卡的世代，不用于预测吞吐。</p>
+                    </div>
+
+                    <h3>3.2 对照只用两个轴</h3>
+                    <p>与英伟达产品的比较，收窄到两个轴才准确。想排速度名次，条件一不一致比较就不成立了。</p>
+                    <ul>
+                        <li><strong>容量轴</strong> — 单张能装多少。这一轴上HBM容量更大的一方在单卡配置里占优。一旦越过卡的边界，张量并行或专家并行就要进来，互连成为新的瓶颈候选，故障点和运维复杂度同时上升。装进一张卡，这些全部消失</li>
+                        <li><strong>软件成熟度轴</strong> — 有没有内核和推理服务真正用得上那份容量。这一轴上CUDA生态仍然领先，具体差距在第6节点明</li>
+                    </ul>
+                    <p>不放速度对比不是消极。同一个模型，精度、上下文长度、批大小、内核库版本、是否开启投机解码，都会让吞吐差出几倍。把两个条件不一致的数字并排放，那不是比较而是错觉。</p>
+
+                    <h2 id="sec-4">4. 装进单卡后显存实际怎么分配</h2>
+                    <p>光算是算不出全貌的。看实际分配会发现<strong>与只算权重的估计相差40GB以上。</strong></p>
+                    <p>下面是<a href="https://github.com/ryanzhou/deepseek-v4-flash-mi300x" target="_blank" rel="noopener">公开的单张MI300X配置仓库</a>在自己那套栈上记录的数值。先写条件：对象是DeepSeek-V4-Flash-0731，硬件为单张MI300X(gfx942，304个CU，192GB HBM3)，服务端是vLLM的ROCm nightly <code>0.26.1rc1.dev229+g124154a88.rocm723</code>，内核用AITER 0.1.19，KV缓存为FP8(<code>fp8_ds_mla</code>，256 token分块)，权重<strong>保持出厂状态、未做额外量化</strong>，验证过的上下文为256K。</p>
+                    <table>
+                        <thead>
+                            <tr><th>组成部分</th><th>占用</th><th>备注</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>权重</td><td>156.67 GB</td><td>出厂精度，无额外量化</td></tr>
+                            <tr><td>GPU KV池</td><td>20 GB</td><td>FP8 KV下可容纳1,927,444个token</td></tr>
+                            <tr><td>其余(激活值、工作区、图缓冲、分配器余量)</td><td>约 28 GB</td><td>由下方最高水位倒推</td></tr>
+                            <tr><td><strong>预热后最高水位</strong></td><td><strong>204.5 GB / 共 205.8 GB</strong></td><td>余量约1.3 GB</td></tr>
+                            <tr><td>CPU卸载层</td><td>96 GiB</td><td>存放被逐出的前缀缓存，位于主机内存</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h3>4.1 这张表要读出的三点</h3>
+                    <ol>
+                        <li><strong>只数权重会偏差40GB以上。</strong>看着156.67GB就断定「192GB还剩35GB」，会在20GB的KV池和28GB的其余项上翻车</li>
+                        <li><strong>最高水位是总量的99.4%。</strong>只剩1.3GB余量说明这是调优完成后的数字，不是起点。第一次启动通常撑不到这里就挂了</li>
+                        <li><strong>「192GB」和「205.8GB」为何不同</strong> — 大部分是单位写法差异。192 GiB换成十进制约等于206.2 GB。你只需要知道规格书上的数字和分配器报告的数字不会精确对上。不要把方案算到最后一个GB</li>
+                    </ol>
+                    <div class="callout">
+                        <p><strong>这些数字的性质。</strong>上述值由仓库维护者在自己那套栈上测得，未经厂商验证。服务端是nightly构建，内核或版本一变分配也会变。不要直接照搬，<strong>应在自己的设备上重新测量</strong>。测量步骤在第9节。</p>
+                    </div>
+
+                    <h3>4.2 官方配方列出的硬件</h3>
+                    <p>有一处对照值得注意。vLLM官方配方为该模型列出的硬件清单里<strong>没有MI300X。</strong></p>
+                    <table>
+                        <thead>
+                            <tr><th>配置</th><th>GPU</th><th>备注</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>单节点(英伟达)</td><td>4张 (H200 / B200 / B300 或 GB200 NVL4)</td><td>推荐 <code>--data-parallel-size 4</code> 的DP+EP</td></tr>
+                            <tr><td>DGX Station</td><td>1张</td><td>标为最小配置</td></tr>
+                            <tr><td>MI325X</td><td>1张 × 256GB</td><td>加载后148.66 GiB，在vLLM 0.25.0上验证</td></tr>
+                            <tr><td>MI355X</td><td>4张 × 288GB</td><td>vLLM 0.25.0及以上</td></tr>
+                            <tr><td><strong>MI300X (192GB)</strong></td><td><strong>清单中没有</strong></td><td>社区配置单独存在的原因</td></tr>
+                        </tbody>
+                    </table>
+                    <p>这张表说得很清楚：AMD单卡路径上官方验证过的是256GB的MI325X，而192GB的MI300X<strong>是一个装同一个模型余量紧得多的位置</strong>。4.1里只剩1.3GB余量也正因如此。它显示出「单卡能跑」这句话对一个型号名有多敏感。</p>
+
+                    <h2 id="sec-5">5. KV缓存和权重是两笔账</h2>
+                    <p>量化讨论最常漏掉的就是这里。<strong>把权重从FP16降到FP4，KV缓存一个字节也不会少。</strong>两者是不同的轴。</p>
+
+                    <h3>5.1 传统注意力下的计算式</h3>
+                    <p>如果是MHA或GQA系模型，KV缓存大小是这样算的。从自己模型的<code>config.json</code>里取值代入即可。</p>
+                    <pre><code>KV字节 = 2 × 层数 × KV头数 × 头维度
+         × 每元素字节数 × token数 × 并发序列数
+
+# 开头的 2 表示 Key 和 Value 两份
+# 每元素字节数：FP16=2，FP8=1
+# token数 = 提示词 + 目前已生成的输出</code></pre>
+                    <p>从这个式子要读出的事实是<strong>权重精度根本没出现在里面</strong>。权重压得再狠，这个值也不变。要缩小它，只能单独降低KV精度、缩短上下文，或减少并发序列。</p>
+
+                    <h3>5.2 压缩注意力系列不适用这个式子</h3>
+                    <p>DeepSeek V4系列采用压缩稀疏注意力(CSA)与高压缩注意力(HCA)的混合设计。它缓存的是潜在表示，直接代入上式会算得偏大。模型卡写明，以V4-Pro为准，在100万token下KV缓存约为V3.2的百分之十水平。</p>
+                    <p>这类模型更准确的做法是<strong>从服务端报告的池容量倒推</strong>。以第4节的配置为例：</p>
+                    <pre><code>20 GB ÷ 1,927,444 token ≈ 每token约 10 KB
+# 条件：FP8 KV缓存、fp8_ds_mla、256 token分块、该服务端配置</code></pre>
+                    <p>这个10KB是<strong>该设置下的值，不是模型的常数。</strong>改动KV精度或分块大小它就会变。但用来做规划已经够了，因为你由此能建立一种感觉：一段128K上下文的对话大约占1.3GB，256K的约占2.6GB。</p>
+
+                    <h3>5.3 实务上因此分岔</h3>
+                    <ul>
+                        <li>宣传的上下文和可用的上下文是两回事。就算支持一百万token，KV池撑不住就用不了</li>
+                        <li>KV池是<strong>并发流共享的。</strong>哪怕是能装192万token的池，七八个256K会话也就见底了</li>
+                        <li>vLLM里单独指定KV精度的选项是<code>--kv-cache-dtype</code>，英伟达路径用<code>fp8</code>，ROCm路径用<code>fp8_e4m3</code></li>
+                        <li>使用长输出的模式要求会陡增。配方文档写明，使用最多384K输出的模式要把<code>--max-model-len</code>设到393,216以上</li>
+                        <li>开启前缀缓存的复用收益很大，但需要一层把被逐出的条目下放到主机。前述配置放置96 GiB CPU卸载层正是这个原因</li>
+                    </ul>
+
+                    <h2 id="sec-6">6. ROCm上能用的与还不能用的</h2>
+                    <p>模型能装下和整套栈能跑起来是两个问题。移植失败的原因通常不在模型结构，而在<strong>Python wheel、内核库、量化格式</strong>这三行。</p>
+
+                    <h3>6.1 vLLM这一侧</h3>
+                    <p>按vLLM安装文档整理如下。</p>
+                    <ul>
+                        <li>要求的ROCm版本是<strong>6.3以上</strong></li>
+                        <li>明确列出的GPU包括MI200s(gfx90a)、MI300(gfx942)、MI350(gfx950，需ROCm 7.0以上)、Radeon RX 7900与9000系列，以及Ryzen AI MAX与AI 300系列(需ROCm 7.0.2以上)</li>
+                        <li>预构建wheel<strong>仅限Python 3.12</strong>，且只有ROCm 7.0与7.2.1两个变体</li>
+                        <li>官方Docker镜像为<code>vllm/vllm-openai-rocm</code>，分稳定版与nightly两条线</li>
+                        <li>源码构建路径是设置<code>PYTORCH_ROCM_ARCH</code>后运行<code>python3 setup.py develop</code></li>
+                    </ul>
+                    <div class="callout">
+                        <p><strong>最安静地坑人的陷阱。</strong>文档直接给出了警告：在非Python 3.12的环境里安装，安装器会<strong>悄无声息地退回CUDA wheel。</strong>安装看起来是成功的，运行时在AMD设备上失败。原因看着像模型或内核，实际上是一个wheel。搭建ROCm机器时先确认Python版本和已安装wheel的真实身份，这个习惯能省下最多时间。</p>
+                    </div>
+
+                    <h3>6.2 SGLang这一侧</h3>
+                    <ul>
+                        <li>AMD文档里以MI300X作为代表示例</li>
+                        <li>预构建镜像是Docker Hub上的<code>lmsysorg/sglang</code>，由仓库中的<code>rocm.Dockerfile</code>构建</li>
+                        <li>加速选项给出<code>export SGLANG_USE_AITER=1</code>。RDMA配置则是<code>export NCCL_IB_GID_INDEX=3</code></li>
+                        <li>逐一列出了在AMD上<strong>无法工作的量化方式</strong>，都是依赖Marlin或英伟达专用内核的那些</li>
+                    </ul>
+                    <table>
+                        <thead>
+                            <tr><th>项目</th><th>在AMD ROCm上</th><th>依据</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>awq_marlin / gptq_marlin</td><td>无法工作</td><td>依赖Marlin内核</td></tr>
+                            <tr><td>gguf</td><td>无法工作</td><td>SGLang文档明确写出</td></tr>
+                            <tr><td>modelopt_fp8 / modelopt_fp4</td><td>无法工作</td><td>英伟达专用路径</td></tr>
+                            <tr><td>MXFP4</td><td>需要CDNA3或CDNA4</td><td>世代限制</td></tr>
+                            <tr><td>AITER加速</td><td>通过环境变量开启</td><td><code>SGLANG_USE_AITER=1</code> / <code>VLLM_ROCM_USE_AITER=1</code></td></tr>
+                        </tbody>
+                    </table>
+                    <p>vLLM配方里的AMD条目方向一致。MI325X配置下给出<code>export VLLM_ROCM_USE_AITER=1</code>和<code>--moe-backend triton_unfused</code>，在eager模式下配合使用<code>--enable-chunked-prefill</code>、<code>--max-num-batched-tokens 256</code>和<code>--kv-cache-memory-bytes 10000000000</code>。</p>
+
+                    <h3>6.3 判断</h3>
+                    <p>归纳起来：<strong>把模型装上去这件事是可行的，卡住的是它下面那层。</strong>所以正在评估ROCm的组织需要准备的不是模型知识，而是下面三件事。</p>
+                    <ol>
+                        <li>能锁定Python版本和wheel的分发方式。用Docker镜像明显更稳妥</li>
+                        <li>在<strong>选模型之前</strong>确认打算使用的量化格式在AMD路径上是否存在。以GGUF为前提的方案会在这里直接崩掉</li>
+                        <li>如果配置依赖nightly构建，就把版本整体固定并把复现步骤写成文档。复现窗口很窄</li>
+                    </ol>
+
+                    <h2 id="sec-7">7. 并发上升后崩掉的临界点</h2>
+                    <p>装进显存不等于就能做服务。单卡配置真正的极限在这里显现。</p>
+                    <p>下面的数值来自与第4节相同的那套栈。条件一致，解码阶段开启了DSpark-7投机解码。</p>
+                    <table>
+                        <thead>
+                            <tr><th>并发流</th><th>合计吞吐</th><th>每流</th><th>怎么读</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>1</td><td>168.6 tok/s</td><td>168.6 tok/s (中位数)</td><td>对人阅读来说是快的</td></tr>
+                            <tr><td>8</td><td>542 tok/s</td><td>90.3 tok/s (中位数)</td><td>合计3.2倍，个人体感不到一半</td></tr>
+                            <tr><td>64 (突发)</td><td>830 tok/s</td><td>—</td><td>流数8倍而合计1.5倍，已饱和</td></tr>
+                        </tbody>
+                    </table>
+                    <p>预填充侧的数字也一并写下：调优内核下约为每秒7.9~8.5K token，生产画像的新提示词下为每秒6,988~7,019 token。预填充快意味着在推送长提示词的作业上占优，比如文档摘要或代码库索引。</p>
+
+                    <h3>7.1 这张表决定什么</h3>
+                    <p>从1到8，合计变成3.2倍，不差。可是从8到64，流数增加八倍而合计只有1.5倍。<strong>这意味着在两者之间的某处卡已经饱和</strong>，越过该点的请求对吞吐没有贡献，只在队列里增加延迟。</p>
+                    <p>由此得出的判断很明确。</p>
+                    <ul>
+                        <li>用合计吞吐做容量规划，对不上真实的用户体验。<strong>要按每流速度来规划</strong></li>
+                        <li>把人阅读速度定在每秒15~20个token，每流速度跌破该值的位置就是这张卡实际的并发用户上限</li>
+                        <li>非交互式批处理正相反。单个延迟变长无所谓，只要合计够大，所以把流数填满更划算</li>
+                        <li>还要记住这些数字是在开启投机解码的状态下测的。投机解码在单流时收益最大，并发升高后收益会缩水</li>
+                    </ul>
+
+                    <h2 id="sec-8">8. 单卡有意义的场景与无意义的场景</h2>
+                    <p>把上面的算术直接换成判断，结果这样分。</p>
+                    <table>
+                        <thead>
+                            <tr><th>场景</th><th>单卡配置</th><th>原因</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>批量为一的实验、提示词与评测迭代</td><td>合适</td><td>并发接近1，每流速度处于最大值</td></tr>
+                            <tr><td>夜间批处理(摘要、分类、索引)</td><td>合适</td><td>只看合计吞吐，不看单个延迟</td></tr>
+                            <tr><td>数据不能外传的公司内部负载</td><td>合适</td><td>要求是边界而非速度</td></tr>
+                            <tr><td>观察模型行为本身的研究</td><td>合适</td><td>目的是可复现与可控</td></tr>
+                            <tr><td>少数人使用的内部工具(可排队)</td><td>有条件</td><td>仅在实测出并发上限并设置队列时</td></tr>
+                            <tr><td>有响应时间承诺的多用户服务</td><td>不合适</td><td>并发超过8后每流速度崩塌</td></tr>
+                            <tr><td>存在流量尖峰的公开服务</td><td>不合适</td><td>饱和之后队列只增加延迟</td></tr>
+                            <tr><td>有可用性要求的生产环境</td><td>不合适</td><td>单张卡就是单点故障</td></tr>
+                            <tr><td>需要维持大量长上下文会话的服务</td><td>不合适</td><td>并发流共享同一个KV池</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h3>8.1 换成成本再看一遍</h3>
+                    <p>再补一个判断。<strong>如果负载一天只跑几个小时，单卡自建几乎必输。</strong>卡闲着，折旧、电费、机位和运维人力照样在走，而API不用就是零。仅算一张750W等级加速卡持续运行的电费，闲置时段的成本就不容小觑。</p>
+                    <p>反过来，成立的条件相当窄。</p>
+                    <ul>
+                        <li>利用率高。一天中大部分时间队列不空</li>
+                        <li>请求模式均匀。上下文长度和输出长度可预测，KV预算能固定下来</li>
+                        <li>数据边界要求真实存在。因合同或法规不能外传的材料</li>
+                        <li>量大到自建单位成本相对token单价占优的程度</li>
+                    </ul>
+                    <p>这四条都成立，单卡配置就站得住。有一条不符，API才是对的。商用模型的价格与性能对照在<a href="ai_model_comparison_2026.html">AI模型比较中心</a>持续更新，低价API竞争如何把自建的盈亏平衡点往后推，整理在<a href="deepseek_v4_pro_75percent_permanent_2026.html">DeepSeek V4 Pro降价</a>那边。智能体负载中划分本地与API的标准，在<a href="local_llm_agentic_coding_2026.html">用本地大模型做智能体编程</a>里。</p>
+
+                    <h2 id="sec-9">9. 在自己环境里测量的步骤</h2>
+                    <p>与其照搬别人的数字，不如按顺序在自己设备上测。五步足够。</p>
+
+                    <h3>9.1 先确认可用显存</h3>
+                    <pre><code># AMD
+rocm-smi --showmeminfo vram
+
+# NVIDIA
+nvidia-smi --query-gpu=name,memory.total,memory.used --format=csv</code></pre>
+                    <p>以<strong>工具报告的数字</strong>为准，而不是规格书。顺便看清单位是GB还是GiB，以及是否已有显存被占用。</p>
+
+                    <h3>9.2 权重容量用文件大小确认</h3>
+                    <pre><code># 下载下来的权重文件到底有多少字节
+du -sh /path/to/model
+du -ah /path/to/model | grep safetensors | tail -5</code></pre>
+                    <p>这比用参数个数算出来的值更诚实。混合精度的权重文件很难靠计算猜准，分词器和索引之类的附属文件也会一起进来。</p>
+
+                    <h3>9.3 按上下文长度定KV预算</h3>
+                    <p>传统注意力的模型，就把<code>config.json</code>里的层数、KV头数、头维度代入5.1的式子。压缩注意力系列则先用较短的上下文启动一次，<strong>取服务端启动日志打印的KV池容量与可容纳token数</strong>，倒推出每token字节数。再乘以目标上下文和目标并发会话数，就得到所需池容量。</p>
+
+                    <h3>9.4 用二分法找显存溢出临界点</h3>
+                    <pre><code># 仅用于确认能否启动，逐步收窄成功与失败的边界
+vllm serve &lt;model&gt; \
+  --max-model-len 32768 \
+  --kv-cache-dtype fp8_e4m3 \
+  --gpu-memory-utilization 0.90 \
+  --enable-chunked-prefill \
+  --max-num-batched-tokens 256</code></pre>
+                    <ul>
+                        <li>把<code>--max-model-len</code>按一半的幅度往上加，找出启动成功与失败的边界。成功的最大值就是该配置真实的上下文上限</li>
+                        <li><code>--gpu-memory-utilization</code>从0.90起步慢慢往上调。贴到1.0，一次碎片化就会挂掉</li>
+                        <li>ROCm路径用<code>--kv-cache-dtype fp8_e4m3</code>，英伟达路径用<code>fp8</code></li>
+                        <li>能启动但在处理请求时崩溃，问题出在激活值一侧。调低<code>--max-num-batched-tokens</code>缩小预填充分块</li>
+                    </ul>
+
+                    <h3>9.5 实测并发极限</h3>
+                    <p>最后一步最重要。把流数依次提到1、4、8、16，记录<strong>每流每秒token数</strong>。是每流的值，不是合计。跌破你目标体感速度的那一点，就是这张卡的并发用户上限；有了这个数字，才谈得上回答「这台机器能撑多少人」。没有这项实测就买卡，方案通常会乐观出两倍。</p>
+
+                    <h2 id="sec-10">10. 没能确认的部分</h2>
+                    <p>本文中没有取得依据的项目，集中列在这里。</p>
+                    <ul>
+                        <li><strong>参数量写法不一致。</strong>官方模型卡写的是总284B、激活13B。而上面引用的单张MI300X仓库及其介绍，把对象写作<strong>DeepSeek-V4-Flash-0731，304B</strong>。我没能在官方文档中找到0731修订版的单独参数标注。因此本文在描述模型时使用284B/13B，304B仅作为仓库一侧的写法保留</li>
+                        <li><strong>层数与头配置。</strong>模型卡中无法确认，所以没有把5.1的KV公式直接代入该模型，而改用服务端报告值倒推</li>
+                        <li><strong>吞吐数字的可复现性。</strong>第7节的数字未经第三方验证，且服务端是nightly构建。无法保证同样的数字能在其他设备上出现</li>
+                        <li><strong>其他加速卡的同条件数字。</strong>没能找到精度、上下文、批大小、内核版本都对齐的公开测量值。因此本文没有速度对照表</li>
+                        <li><strong>实际功耗。</strong>除了750W等级这一标注之外，该负载下的实际功耗与发热曲线未能确认</li>
+                        <li><strong>对质量的影响。</strong>FP4专家加FP8其余这种格式相对原版在哪些任务上损失多少，超出本文范围。除模型卡公开的数值外，没能找到独立评测</li>
+                    </ul>
+
+                    <h2 id="sec-11">结论：今天就能用上的三件事</h2>
+                    <p><strong>第一，养成用字节数而不是参数量说话的习惯。</strong>把「284B的模型」改写成「出厂精度下约157GB的权重」，会议上的争论会少一半。卡的张数由字节决定，不由参数决定。</p>
+                    <p><strong>第二，MoE的方案书里永远把总参数和激活参数并排写。</strong>前者是内存账单，后者是算力账单。只写一项的方案，必定在某一侧算错。</p>
+                    <p><strong>第三，买卡之前先画出并发曲线。</strong>让单卡配置崩掉的是并发，不是显存。单流能出168个token的机器，八流时每流只有90，到六十四流连合计都不再增长。如果无法用数字回答「同时有多少人用」，就还不到买的时候。</p>
+                    <p>最后一句。单卡配置之所以有意思，不是因为它是最便宜的部署方式，而是因为<strong>不越过卡边界的那一刻所消失的复杂度相当可观</strong>。没有并行策略，没有互连调优，没有跨节点故障处理。这份简单在某些位置确实值钱，在另一些位置同样明确地不值钱。先在上面的表里指出自己组织所在的那一行，然后再开始。</p>
+
+                    <h2 id="sec-12">参考资料</h2>
+                    <ul>
+                        <li><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash" target="_blank" rel="noopener">DeepSeek-V4-Flash 模型卡 (Hugging Face)</a> — 总参数与激活参数、MoE构成、混合精度、上下文</li>
+                        <li><a href="https://recipes.vllm.ai/deepseek-ai/DeepSeek-V4-Flash" target="_blank" rel="noopener">vLLM Recipes: DeepSeek-V4-Flash</a> — 权重文件大小、验证过的硬件、KV与并行参数</li>
+                        <li><a href="https://docs.vllm.ai/en/latest/getting_started/installation/gpu.html" target="_blank" rel="noopener">vLLM GPU安装文档 (ROCm部分)</a> — ROCm版本、支持架构、wheel与Docker路径</li>
+                        <li><a href="https://docs.sglang.io/platforms/amd_gpu.html" target="_blank" rel="noopener">SGLang AMD GPU文档</a> — Docker镜像、AITER环境变量、不支持的量化清单</li>
+                        <li><a href="https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/data-sheets/amd-instinct-mi300x-data-sheet.pdf" target="_blank" rel="noopener">AMD Instinct MI300X 数据手册 (PDF)</a> — HBM容量、带宽、功率等级</li>
+                        <li><a href="https://www.amd.com/en/products/accelerators/instinct/mi300/mi300x.html" target="_blank" rel="noopener">AMD Instinct MI300X 产品页</a></li>
+                        <li><a href="https://github.com/ryanzhou/deepseek-v4-flash-mi300x" target="_blank" rel="noopener">单张MI300X配置仓库 (deepseek-v4-flash-mi300x)</a> — 第4节与第7节实测数字的出处。个人测量，非厂商验证</li>
+                        <li><a href="https://news.hada.io/topic?id=32149" target="_blank" rel="noopener">GeekNews 讨论</a></li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>分享本文</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">返回列表</a>
+                </div>
+                <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/json_formatter.html">JSON 格式化工具</a></li>
+      <li><a href="../static/regex_tester.html">正则表达式测试器</a></li>
+      <li><a href="../static/jwt_decoder.html">JWT解码生成器 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 编码器/解码器</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+            <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="diataxis_documentation_framework_2026.html">文档没人读不是因为篇幅不够 - 用 Diátaxis 分成四类的判断标准与实操 2026</a></li>
+      <li><a href="ai_coding_tool_cost_transparency_2026.html">AI编程工具里的金额消失了 - 只剩令牌时如何自己测算成本 2026</a></li>
+      <li><a href="vibe_coding_stack_myths_2026.html">AI写的Next.js + Supabase会在哪里出事 - 上线前要看的七个位置 2026</a></li>
+      <li><a href="software_longevity_small_codebase_2026.html">能活过二十年的软件有什么不同 - 区分完成与荒废的指标 2026</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制！请粘贴到Threads应用中分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制！'); });
+    });
+    </script>
+</body>
+</html>

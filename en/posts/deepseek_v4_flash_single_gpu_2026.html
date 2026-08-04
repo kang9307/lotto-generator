@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<!--
+ * Tech blog post template
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="en">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fitting a Large MoE on One GPU - From Memory Math to Where It Breaks 2026</title>
+    <meta name="description" content="Running a 284B MoE on one GPU: weight-byte math, total versus active parameters, the KV cache quantization never shrinks, and where concurrency breaks.">
+    <meta name="keywords" content="DeepSeek V4 Flash, MI300X, single GPU LLM, MoE active parameters, KV cache calculation, VRAM sizing, ROCm, vLLM, SGLang, FP8 KV cache, FP4 quantization, HBM3, inference serving, OOM, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/en/posts/deepseek_v4_flash_single_gpu_2026.html">
+
+    <meta property="og:title" content="Fitting a Large MoE on One GPU - From Memory Math to Where It Breaks">
+    <meta property="og:description" content="284B fits in 192GB not because the model is small, but because the checkpoint already ships at roughly four bits.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/en/posts/deepseek_v4_flash_single_gpu_2026.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="en_US">
+    <meta property="article:published_time" content="2026-08-05">
+    <meta property="article:section" content="Dev &amp; Infra">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Fitting a Large MoE on One GPU">
+    <meta name="twitter:description" content="Quantization shrinks weights, not the KV cache. Once it fits, what breaks first is not memory but concurrency.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "Fitting a Large MoE on One GPU - From Memory Math to Where It Breaks",
+      "alternativeHeadline": "284B fits in 192GB not because the model is small",
+      "datePublished": "2026-08-05",
+      "dateModified": "2026-08-05",
+      "inLanguage": "en-US",
+      "articleSection": "Dev & Infra",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "DeepSeek V4 Flash, MI300X, single GPU LLM, MoE active parameters, KV cache calculation, VRAM sizing, ROCm, vLLM, SGLang, FP8 KV cache",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/en/posts/deepseek_v4_flash_single_gpu_2026.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "How does a 284B parameter model fit on a single 192GB card?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Not because the model is small, but because the checkpoint already ships at low precision. What weights occupy is decided by bytes per parameter, not parameter count. Storing 284B in BF16 means two bytes per parameter, roughly 568GB. In FP8 it is roughly 284GB. Neither fits on one 192GB card. The official DeepSeek-V4-Flash weights ship as a mixed format that holds MoE expert parameters in FP4 and attention, normalization and router parameters in FP8. Once the average drops below one byte per parameter, the checkpoint lands around 160GB and a single card becomes possible. No user-side quantization is involved. The distribution is already in that state."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "For an MoE model, do I only need memory for the active parameters?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "No, and this misunderstanding wrecks more single-GPU plans than any other. DeepSeek-V4-Flash has 284B total parameters with 13B active per token. Active parameters are the ones that actually participate in multiplication for a given token, so they govern compute and speed. But which experts get selected is decided by the router on the spot, token by token. You cannot know in advance which experts the next token needs, so the full set has to stay resident. Total parameters write the memory bill and active parameters write the compute bill. The value of MoE lies exactly in that mismatch. It does not mean memory shrinks to the active size."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Does quantization shrink the KV cache too?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Weight quantization and the KV cache are separate axes. Dropping weights from FP16 to FP4 does not remove a single byte from the KV cache, because KV cache size is the product of layer count, KV head configuration, head dimension, bytes per element, context length and concurrent sequences. To shrink it you have to lower KV precision separately, shorten the context, or reduce concurrent sequences. In vLLM the KV precision is set independently through the kv-cache-dtype option, and the ROCm path uses the fp8_e4m3 value. The classic failure is sizing a card from weights alone, forgetting the KV budget, and dying with an out-of-memory error the moment the context is raised."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Can a single-GPU setup serve multiple users?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Aggregate throughput rises, but the speed each person feels falls fast. Measurements published for a single MI300X setup show single-stream decode at 168.6 tokens per second. With eight concurrent streams the aggregate is 542 tokens per second and the per-stream median drops to 90.3. In a 64-stream burst the aggregate sits at 830 tokens per second. Multiplying streams by eight yields only 1.5 times the aggregate, which is where the card saturates. So a single-card setup fits batch-one experimentation, overnight batch work and internal single-workload jobs where a queue is acceptable. It does not fit a multi-user interactive service with a response-time commitment."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "What blocks large-model serving on ROCm most often?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Not the model, but installation and the kernel layer. The vLLM documentation requires ROCm 6.3 or above and names the gfx90a, gfx942 and gfx950 families, yet prebuilt wheels exist only for Python 3.12 in ROCm 7.0 and 7.2.1 variants. On any other Python version the installer silently falls back to CUDA wheels and then fails on AMD hardware. The second blocker is quantization format. SGLang documentation states that methods depending on Marlin or NVIDIA-specific kernels do not work on AMD and names awq_marlin, gptq_marlin, gguf, modelopt_fp8 and modelopt_fp4. MXFP4 requires CDNA3 or CDNA4. Porting failures usually trace back to those three lines rather than to model architecture."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/deepseek_v4_flash_single_gpu_2026.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/deepseek_v4_flash_single_gpu_2026.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/deepseek_v4_flash_single_gpu_2026.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/deepseek_v4_flash_single_gpu_2026.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/deepseek_v4_flash_single_gpu_2026.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="Fitting a Large MoE on One GPU - From Memory Math to Where It Breaks">
+                <meta itemprop="datePublished" content="2026-08-05">
+                <meta itemprop="dateModified" content="2026-08-05">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="DeepSeek V4 Flash, MI300X, single GPU LLM, MoE active parameters, KV cache calculation, VRAM sizing, ROCm, vLLM">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/en/posts/deepseek_v4_flash_single_gpu_2026.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">Fitting a Large MoE on One GPU - From Memory Math to Where It Breaks</h1>
+                    <h2 class="post-subtitle">284B fits in 192GB not because the model is small</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-08-05">Aug 5, 2026</span>
+                        <span class="post-category" itemprop="articleSection">Dev &amp; Infra</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <nav class="post-toc">
+                        <h3>What this article covers</h3>
+                        <ol>
+                            <li><a href="#sec-1">Weight capacity is set by bytes, not parameter count</a></li>
+                            <li><a href="#sec-2">Total and active parameters consume different resources</a></li>
+                            <li><a href="#sec-3">Why the MI300X shows up in this conversation</a></li>
+                            <li><a href="#sec-4">How memory actually divides on a single card</a></li>
+                            <li><a href="#sec-5">The KV cache is a separate axis from weights</a></li>
+                            <li><a href="#sec-6">What works on ROCm today and what does not</a></li>
+                            <li><a href="#sec-7">The point where concurrency breaks it</a></li>
+                            <li><a href="#sec-8">Where a single GPU earns its place, and where it does not</a></li>
+                            <li><a href="#sec-9">How to measure this on your own hardware</a></li>
+                            <li><a href="#sec-10">What I could not confirm</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-0">Intro: You read that it runs on one GPU and opened a budget sheet</h2>
+                    <p>A sentence saying some model runs on a single GPU always produces the same reaction. Then we can do it too. But that sentence has about six conditions stripped out of it, and one missing condition is the difference between one card and three.</p>
+                    <p>Here is the conclusion first. <strong>A 284B MoE fits on one 192GB card not because the model is small, but because the official checkpoint already ships at effectively four bits.</strong> Stack the KV cache and activations on top and the headroom left is a couple of gigabytes. Add concurrent requests to that state and the speed each user feels collapses. What separates the workable case from the unworkable one is not card performance. It is <strong>how many requests arrive at once</strong>.</p>
+                    <p>This article walks that arithmetic in order. It starts at weight bytes, moves to what total and active parameters each decide in an MoE, shows where the KV cache claims its own space, marks where the ROCm stack actually stops, and ends with the procedure for running the same calculation and finding the out-of-memory point on your own hardware.</p>
+                    <p>The scope is narrow on purpose. This is about <strong>one datacenter accelerator and a large MoE</strong>. Running local models on consumer hardware, whether that means an old CPU driving a small model or turning on GPU acceleration on a Mac, lives in <a href="old_xeon_run_gemma_4_local_llm_2026.html">Running Gemma 4 on a Ten-Year-Old Xeon</a> and <a href="local_llm_mac_mps_speedup_2026.html">Why Local LLMs Are Slow on a Mac</a>. The general treatment of GGUF quantization tiers and consumer GPU VRAM requirements is in the <a href="local_llm_running_guide_2026.html">local LLM running guide</a>.</p>
+
+                    <h2 id="sec-1">1. Weight capacity is set by bytes, not parameter count</h2>
+                    <p>The first calculation is a single multiplication.</p>
+                    <pre><code>weight bytes = parameter count × bytes per parameter
+
+FP32  = 4 bytes
+BF16 / FP16 = 2 bytes
+FP8   = 1 byte
+FP4   = 0.5 bytes</code></pre>
+                    <p>Skip that multiplication, look only at the parameter count, and the whole plan drifts. The same 284B needs four times as many cards depending on the precision it is stored in.</p>
+
+                    <h3>1.1 What each precision actually costs</h3>
+                    <p>The <a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash" target="_blank" rel="noopener">DeepSeek-V4-Flash model card</a> lists 284B total parameters with 13B active per token. Storing that 284B at different precisions splits as follows. Card counts assume 192GB per card and cover weights only, so real deployments need more.</p>
+                    <table>
+                        <thead>
+                            <tr><th>Storage precision</th><th>Per parameter</th><th>284B weight capacity</th><th>Minimum 192GB cards (weights only)</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>FP32</td><td>4 bytes</td><td>about 1,136 GB</td><td>6</td></tr>
+                            <tr><td>BF16 / FP16</td><td>2 bytes</td><td>about 568 GB</td><td>3</td></tr>
+                            <tr><td>FP8</td><td>1 byte</td><td>about 284 GB</td><td>2</td></tr>
+                            <tr><td>FP4</td><td>0.5 bytes</td><td>about 142 GB</td><td>1</td></tr>
+                            <tr><td><strong>As shipped (FP4 experts + FP8 remainder)</strong></td><td>under 1 byte on average</td><td><strong>checkpoint about 160-167 GB</strong></td><td><strong>1, with almost no headroom</strong></td></tr>
+                        </tbody>
+                    </table>
+                    <p>That last row is the starting point for everything else here. The <a href="https://recipes.vllm.ai/deepseek-ai/DeepSeek-V4-Flash" target="_blank" rel="noopener">vLLM recipe documentation</a> puts the checkpoint at roughly 160GB for the preview and about 167GB for the fused variants. The model card describes the format as mixed, with MoE expert parameters in FP4 and attention, normalization and router parameters in FP8.</p>
+
+                    <h3>1.2 How this differs from post-hoc quantization</h3>
+                    <p>A common confusion sits here. The familiar order when handling local models is this: take the BF16 original, squeeze it into Q4, then check how much quality was lost. This model reverses that. <strong>The distribution itself starts at low precision.</strong></p>
+                    <ul>
+                        <li>The average bytes per parameter is already below one without any user-side quantization</li>
+                        <li>So the option of shrinking further by quantizing has largely been spent already</li>
+                        <li>Instead the party absorbing the quality cost is the model author rather than the user, which means the training process can be adjusted with that precision in mind, a better position than squeezing after the fact</li>
+                        <li>Put differently, <strong>the card labeled quantize to save a GPU has already been played</strong> for this model</li>
+                    </ul>
+                    <p>Choosing how far to drop a post-hoc quantization tier, the tradeoff between Q4 and Q8, is a different problem and is covered separately in the <a href="local_llm_running_guide_2026.html">local LLM running guide</a>.</p>
+
+                    <h2 id="sec-2">2. Total and active parameters consume different resources</h2>
+                    <p>One sentence ruins more MoE plans than any other: active is 13B so 13B of memory should do it. It does not. Leave that uncorrected and every downstream calculation is wrong.</p>
+
+                    <h3>2.1 The router picks again for every token</h3>
+                    <p>Each MoE layer in DeepSeek-V4-Flash holds one shared expert and 256 routed experts, and six routed experts fire per token. The expert intermediate dimension is 2048, and the first three MoE layers use hash routing.</p>
+                    <p>The point is that <strong>you cannot know in advance which six get picked</strong>. The router decides on the spot based on what the next token is. So all 256 experts have to be sitting in memory. If they are not, the ones you need have to be pulled from disk or host memory at that moment, and that round trip is an order of magnitude away from GPU compute time.</p>
+
+                    <h3>2.2 What decides what</h3>
+                    <table>
+                        <thead>
+                            <tr><th>This value</th><th>Decides this resource</th><th>What happens when you raise it</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Total parameters (284B)</td><td>Resident memory for weights</td><td>You need more cards</td></tr>
+                            <tr><td>Active parameters (13B)</td><td>Compute per token</td><td>Token generation slows down</td></tr>
+                            <tr><td>Context length</td><td>KV cache</td><td>More memory, independent of weights</td></tr>
+                            <tr><td>Concurrent sequences</td><td>KV cache plus activations</td><td>Both memory and per-stream speed worsen</td></tr>
+                            <tr><td>Batch size</td><td>Activations and workspace</td><td>Throughput rises, individual latency grows</td></tr>
+                        </tbody>
+                    </table>
+                    <p>The commercial value of MoE lives in the first two rows diverging. <strong>You get 284B-class expressiveness at 13B-class compute cost.</strong> The memory bill still arrives sized for 284B. That is design intent, not a defect, and the only discipline required is not mixing the two rows when planning.</p>
+                    <p>Worth adding: because of that divergence, MoE is relatively favorable on <strong>hardware with generous memory and modest compute</strong>. In the reverse case, tight memory with compute to spare, a dense model of comparable quality can be the better pick. Why a 27B dense model is comfortable on a single GPU is covered in <a href="qwen_3_6_27b_local_2026.html">Qwen 3.6 27B, the sweet spot for local development</a>, and that article's sweet-spot logic and this article's arithmetic are looking at the same wall from opposite sides.</p>
+
+                    <h2 id="sec-3">3. Why the MI300X shows up in this conversation</h2>
+                    <p>There is one reason an AMD accelerator enters a single-GPU discussion: <strong>how much fits on one card</strong>. It is an arithmetic question, not a benchmark contest.</p>
+
+                    <h3>3.1 The published specifications</h3>
+                    <p>Per AMD materials the MI300X carries 192GB of HBM3. The memory bus is 8,192 bits at a 5.2 Gbps data rate for a peak bandwidth of 5.325 TB/s. It uses the CDNA 3 architecture with eight XCDs, and at the 750W class with a 2,100 MHz boost clock the peak theoretical FP16 and BF16 figures are each listed at 1,307.4 TFLOPS.</p>
+                    <div class="callout">
+                        <p><strong>Peak theoretical is not a measurement.</strong> The 1,307.4 TFLOPS number is an upper bound computed from clock and unit count, and real inference never lands near it. That figure is for comparing card generations, not for predicting throughput.</p>
+                    </div>
+
+                    <h3>3.2 Compare on two axes only</h3>
+                    <p>Comparison against NVIDIA parts is accurate when narrowed to two axes. Try to rank raw speed and the conditions diverge until the comparison stops meaning anything.</p>
+                    <ul>
+                        <li><strong>Capacity.</strong> How much fits on one card. On this axis the part with larger HBM has the advantage for single-card setups. The moment you cross a card boundary, tensor or expert parallelism enters, the interconnect becomes a new bottleneck candidate, and failure points and operational complexity grow together. Fit on one card and all of that disappears</li>
+                        <li><strong>Software maturity.</strong> Whether the kernels and servers exist to actually use that capacity. Here the CUDA ecosystem is still ahead, and section 6 puts numbers and names on that gap</li>
+                    </ul>
+                    <p>Declining to post a speed comparison is not timidity. For the same model, throughput swings by multiples depending on precision, context length, batch size, kernel library version and whether speculative decoding is on. Placing two numbers side by side without matching conditions produces an illusion, not a comparison.</p>
+
+                    <h2 id="sec-4">4. How memory actually divides on a single card</h2>
+                    <p>Arithmetic alone misses part of it. The real allocation <strong>diverges from a weights-only estimate by more than 40GB</strong>.</p>
+                    <p>The figures below are what a <a href="https://github.com/ryanzhou/deepseek-v4-flash-mi300x" target="_blank" rel="noopener">published single-MI300X configuration repository</a> recorded on its own stack. Conditions first. The target is DeepSeek-V4-Flash-0731, the hardware is a single MI300X (gfx942, 304 CUs, 192GB HBM3), the server is a vLLM ROCm nightly at <code>0.26.1rc1.dev229+g124154a88.rocm723</code>, kernels come from AITER 0.1.19, the KV cache is FP8 (<code>fp8_ds_mla</code>, 256-token blocks), the weights are <strong>as shipped with no additional quantization</strong>, and the validated context is 256K.</p>
+                    <table>
+                        <thead>
+                            <tr><th>Component</th><th>Footprint</th><th>Note</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Weights</td><td>156.67 GB</td><td>Shipped precision, no extra quantization</td></tr>
+                            <tr><td>GPU KV pool</td><td>20 GB</td><td>1,927,444 tokens at FP8 KV</td></tr>
+                            <tr><td>Everything else (activations, workspace, graph buffers, allocator slack)</td><td>about 28 GB</td><td>Derived from the high-water mark below</td></tr>
+                            <tr><td><strong>Warmed high-water mark</strong></td><td><strong>204.5 GB of 205.8 GB total</strong></td><td>About 1.3 GB free</td></tr>
+                            <tr><td>CPU offload tier</td><td>96 GiB</td><td>Host memory for evicted prefix-cache entries</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h3>4.1 Three things to read off this table</h3>
+                    <ol>
+                        <li><strong>Counting weights alone misses by more than 40GB.</strong> Look at 156.67GB, conclude that 192GB leaves 35GB spare, and the 20GB KV pool plus 28GB of everything else will break the plan</li>
+                        <li><strong>The high-water mark is 99.4% of total.</strong> Having only 1.3GB free means this is the number after tuning finished, not the number you start from. A first launch usually dies well before reaching it</li>
+                        <li><strong>Why 192GB and 205.8GB differ.</strong> Most of it is unit convention. 192 GiB is roughly 206.2 GB in decimal. All you need to carry away is that the spec-sheet number and the allocator's number will not match exactly. Do not plan down to the last gigabyte</li>
+                    </ol>
+                    <div class="callout">
+                        <p><strong>What kind of numbers these are.</strong> The values above were measured by the repository maintainer on their own stack and have not been vendor-validated. The server is a nightly build, so a kernel or version change shifts the allocation too. Do not copy them across. <strong>Measure on your own hardware</strong> using the procedure in section 9.</p>
+                    </div>
+
+                    <h3>4.2 What hardware the official recipe lists</h3>
+                    <p>One contrast is worth noting. The hardware list vLLM's official recipe publishes for this model <strong>does not include the MI300X</strong>.</p>
+                    <table>
+                        <thead>
+                            <tr><th>Configuration</th><th>GPUs</th><th>Note</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Single node (NVIDIA)</td><td>4 (H200 / B200 / B300 or GB200 NVL4)</td><td><code>--data-parallel-size 4</code> DP+EP recommended</td></tr>
+                            <tr><td>DGX Station</td><td>1</td><td>Listed as a minimum configuration</td></tr>
+                            <tr><td>MI325X</td><td>1 × 256GB</td><td>148.66 GiB loaded model, validated on vLLM 0.25.0</td></tr>
+                            <tr><td>MI355X</td><td>4 × 288GB</td><td>vLLM 0.25.0 and above</td></tr>
+                            <tr><td><strong>MI300X (192GB)</strong></td><td><strong>Not listed</strong></td><td>Which is why a community configuration exists</td></tr>
+                        </tbody>
+                    </table>
+                    <p>The table says something clear. The officially validated AMD single-card path is the 256GB MI325X, and the 192GB MI300X is <strong>a much tighter place to hold the same model</strong>. That is also why 4.1 ended with 1.3GB of headroom. It shows how sensitive the phrase runs on a single GPU is to one card model name.</p>
+
+                    <h2 id="sec-5">5. The KV cache is a separate axis from weights</h2>
+                    <p>This is where quantization discussions leak most often. <strong>Dropping weights from FP16 to FP4 removes exactly zero bytes from the KV cache.</strong> They are different axes.</p>
+
+                    <h3>5.1 The formula for conventional attention</h3>
+                    <p>For MHA or GQA family models the KV cache size comes out like this. Pull the values from your model's <code>config.json</code> and substitute.</p>
+                    <pre><code>KV bytes = 2 × layers × KV heads × head dimension
+           × bytes per element × tokens × concurrent sequences
+
+# the leading 2 covers the Key and Value copies
+# bytes per element: FP16=2, FP8=1
+# tokens = prompt + output generated so far</code></pre>
+                    <p>What to read from the formula is that <strong>weight precision appears nowhere in it</strong>. However far you squeeze the weights, this value is unchanged. Shrinking it means lowering KV precision separately, shortening the context, or reducing concurrent sequences.</p>
+
+                    <h3>5.2 Compressed attention families break the formula</h3>
+                    <p>The DeepSeek V4 family uses a hybrid of Compressed Sparse Attention and Heavily Compressed Attention. It caches latent representations, so substituting into the formula above overestimates. The model card states that for V4-Pro the KV cache is around ten percent of V3.2 at one million tokens.</p>
+                    <p>For such models it is more accurate to <strong>work backwards from the pool size the server reports</strong>. Taking the section 4 configuration as an example:</p>
+                    <pre><code>20 GB ÷ 1,927,444 tokens ≈ about 10 KB per token
+# conditions: FP8 KV cache, fp8_ds_mla, 256-token blocks, this server build</code></pre>
+                    <p>That 10 KB is <strong>a value from this setting, not a constant of the model</strong>. Change the KV precision or the block size and it changes. It is still useful for planning, because it gives you the feel that one 128K-context conversation takes roughly 1.3GB and a 256K one roughly 2.6GB.</p>
+
+                    <h3>5.3 How this splits decisions in practice</h3>
+                    <ul>
+                        <li>Advertised context and usable context are different numbers. A million-token ceiling is unusable if the KV pool cannot carry it</li>
+                        <li>The KV pool is <strong>shared across concurrent streams</strong>. Even a pool holding 1.9 million tokens shows its floor at seven or eight 256K sessions</li>
+                        <li>In vLLM the option that sets KV precision separately is <code>--kv-cache-dtype</code>, with <code>fp8</code> on the NVIDIA path and <code>fp8_e4m3</code> on the ROCm path</li>
+                        <li>Modes that emit long outputs raise the requirement sharply. The recipe documentation tells you to set <code>--max-model-len</code> to at least 393,216 for modes using up to 384K output tokens</li>
+                        <li>Turning on prefix caching pays off in reuse but needs a tier to push evicted entries down to the host. That is why the configuration above keeps a 96 GiB CPU offload tier</li>
+                    </ul>
+
+                    <h2 id="sec-6">6. What works on ROCm today and what does not</h2>
+                    <p>Getting the model loaded and getting the stack running are different problems. Porting failures usually trace not to model architecture but to three lines: <strong>Python wheels, kernel libraries and quantization formats</strong>.</p>
+
+                    <h3>6.1 Where vLLM stands</h3>
+                    <p>From the vLLM installation documentation:</p>
+                    <ul>
+                        <li>Required ROCm version is <strong>6.3 or above</strong></li>
+                        <li>Supported GPUs named are MI200s (gfx90a), MI300 (gfx942), MI350 (gfx950, requiring ROCm 7.0+), Radeon RX 7900 and 9000 series, and Ryzen AI MAX / AI 300 series (requiring ROCm 7.0.2+)</li>
+                        <li>Prebuilt wheels are <strong>Python 3.12 only</strong>, in ROCm 7.0 and 7.2.1 variants</li>
+                        <li>Official Docker images are <code>vllm/vllm-openai-rocm</code>, in stable and nightly flavors</li>
+                        <li>The from-source path means setting <code>PYTORCH_ROCM_ARCH</code> and running <code>python3 setup.py develop</code></li>
+                    </ul>
+                    <div class="callout">
+                        <p><strong>The trap that quietly costs the most time.</strong> The documentation warns about this directly: install on anything other than Python 3.12 and the installer <strong>silently falls back to CUDA wheels</strong>. Installation looks successful and execution fails on AMD hardware. The cause looks like the model or the kernels but it is one wheel. Checking the Python version and the identity of the installed wheel first is the habit that saves the most hours when setting up ROCm machines.</p>
+                    </div>
+
+                    <h3>6.2 Where SGLang stands</h3>
+                    <ul>
+                        <li>The AMD documentation uses the MI300X as its representative example</li>
+                        <li>Prebuilt images are <code>lmsysorg/sglang</code> on Docker Hub, built from <code>rocm.Dockerfile</code> in the repository</li>
+                        <li>The acceleration switch documented is <code>export SGLANG_USE_AITER=1</code>. For RDMA configuration, <code>export NCCL_IB_GID_INDEX=3</code></li>
+                        <li>It names the <strong>quantization methods that do not work on AMD</strong>, all of them dependent on Marlin or NVIDIA-specific kernels</li>
+                    </ul>
+                    <table>
+                        <thead>
+                            <tr><th>Item</th><th>On AMD ROCm</th><th>Basis</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>awq_marlin / gptq_marlin</td><td>Does not work</td><td>Marlin kernel dependency</td></tr>
+                            <tr><td>gguf</td><td>Does not work</td><td>Stated in SGLang docs</td></tr>
+                            <tr><td>modelopt_fp8 / modelopt_fp4</td><td>Does not work</td><td>NVIDIA-only path</td></tr>
+                            <tr><td>MXFP4</td><td>Requires CDNA3 or CDNA4</td><td>Generation constraint</td></tr>
+                            <tr><td>AITER acceleration</td><td>Enabled via environment variable</td><td><code>SGLANG_USE_AITER=1</code> / <code>VLLM_ROCM_USE_AITER=1</code></td></tr>
+                        </tbody>
+                    </table>
+                    <p>The AMD section of the vLLM recipe points the same way. For the MI325X configuration it documents <code>export VLLM_ROCM_USE_AITER=1</code> and <code>--moe-backend triton_unfused</code>, and in eager mode it pairs <code>--enable-chunked-prefill</code> with <code>--max-num-batched-tokens 256</code> and <code>--kv-cache-memory-bytes 10000000000</code>.</p>
+
+                    <h3>6.3 The judgment</h3>
+                    <p>Summed up: <strong>loading the model works, and what blocks you sits underneath it.</strong> So what an organization evaluating ROCm needs is not model knowledge but these three things.</p>
+                    <ol>
+                        <li>A deployment method that pins the Python version and the wheel. Using the Docker images is decisively safer</li>
+                        <li>Confirming that the quantization format you intend to use exists on the AMD path <strong>before choosing a model</strong>. A plan built around GGUF collapses right here</li>
+                        <li>If the configuration depends on nightly builds, pinning versions wholesale and writing down a reproduction procedure. The reproduction window is narrow</li>
+                    </ol>
+
+                    <h2 id="sec-7">7. The point where concurrency breaks it</h2>
+                    <p>Fitting in memory does not make a service. The real limit of a single-card setup shows up here.</p>
+                    <p>The numbers below come from the same stack as section 4. Conditions are identical, with DSpark-7 speculative decoding enabled for decode.</p>
+                    <table>
+                        <thead>
+                            <tr><th>Concurrent streams</th><th>Aggregate throughput</th><th>Per stream</th><th>How to read it</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>1</td><td>168.6 tok/s</td><td>168.6 tok/s (median)</td><td>Fast for a human reader</td></tr>
+                            <tr><td>8</td><td>542 tok/s</td><td>90.3 tok/s (median)</td><td>3.2× aggregate, under half the felt speed</td></tr>
+                            <tr><td>64 (burst)</td><td>830 tok/s</td><td>—</td><td>8× the streams for 1.5× aggregate. Saturated</td></tr>
+                        </tbody>
+                    </table>
+                    <p>The prefill figures belong here too: roughly 7.9-8.5K tokens per second with tuned kernels, and 6,988-7,019 tokens per second on fresh prompts in the production profile. Fast prefill means an advantage on work that pushes long prompts through, such as document summarization or codebase indexing.</p>
+
+                    <h3>7.1 What this table decides</h3>
+                    <p>Going from 1 to 8 gave 3.2× aggregate. Not bad. But going from 8 to 64 multiplies streams by eight and lifts the aggregate only 1.5×. <strong>Somewhere in between the card saturated</strong>, and requests past that point contribute nothing to throughput while adding queue latency.</p>
+                    <p>The judgment that follows is clear.</p>
+                    <ul>
+                        <li>Capacity planning on aggregate throughput will not match real user experience. <strong>Plan on per-stream speed</strong></li>
+                        <li>Put human reading speed at roughly 15-20 tokens per second and the point where per-stream falls below it is the practical concurrent-user ceiling for that card</li>
+                        <li>Non-interactive batch work is the opposite. Individual latency can grow as long as the aggregate is high, so filling streams to the brim pays</li>
+                        <li>Remember these figures have speculative decoding on. Speculative decoding helps most at single-stream and gives back some of its advantage as concurrency rises</li>
+                    </ul>
+
+                    <h2 id="sec-8">8. Where a single GPU earns its place, and where it does not</h2>
+                    <p>Turning the arithmetic above into a decision splits it this way.</p>
+                    <table>
+                        <thead>
+                            <tr><th>Situation</th><th>Single-GPU setup</th><th>Why</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Batch-one experiments, prompt and eval iteration</td><td>Fits</td><td>Concurrency near 1 keeps per-stream speed at maximum</td></tr>
+                            <tr><td>Overnight batch work (summarize, classify, index)</td><td>Fits</td><td>Only aggregate throughput matters, not individual latency</td></tr>
+                            <tr><td>Internal workloads where data cannot leave</td><td>Fits</td><td>The requirement is a boundary, not speed</td></tr>
+                            <tr><td>Research observing model behavior itself</td><td>Fits</td><td>Reproducibility and control are the goal</td></tr>
+                            <tr><td>Internal tools for a small team, queue acceptable</td><td>Conditional</td><td>Only with a measured concurrency ceiling and a real queue</td></tr>
+                            <tr><td>Multi-user service with a response-time commitment</td><td>Does not fit</td><td>Past concurrency 8 the per-stream speed collapses</td></tr>
+                            <tr><td>Public service with traffic spikes</td><td>Does not fit</td><td>Beyond saturation the queue only grows latency</td></tr>
+                            <tr><td>Production with availability requirements</td><td>Does not fit</td><td>One card is a single point of failure</td></tr>
+                            <tr><td>Service holding many long-context sessions</td><td>Does not fit</td><td>Concurrent streams share the KV pool</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h3>8.1 Seen again as cost</h3>
+                    <p>One more judgment on top. <strong>For a workload that runs a few hours a day, self-hosting on one card almost always loses.</strong> Depreciation, power, rack space and operations labor keep accruing while the card idles, and an API costs zero when unused. Even counting only the electricity of a 750W-class accelerator running continuously, the cost of idle hours is not trivial.</p>
+                    <p>The conditions where it does work are narrow.</p>
+                    <ul>
+                        <li>Utilization is high. The queue is rarely empty during most of the day</li>
+                        <li>Request patterns are uniform. Context and output lengths are predictable enough to fix a KV budget</li>
+                        <li>A data boundary requirement genuinely exists. Contracts or regulation prevent sending the material outside</li>
+                        <li>Volume reaches the point where self-hosted unit cost beats token pricing</li>
+                    </ul>
+                    <p>All four hold and the single-card setup works. Break one and the API is the right answer. Commercial model pricing and performance comparisons are maintained in the <a href="ai_model_comparison_2026.html">AI model comparison hub</a>, and how aggressive API pricing pushes the self-hosting break-even further out is covered in <a href="deepseek_v4_pro_75percent_permanent_2026.html">the DeepSeek V4 Pro price cut</a>. The criteria for splitting local and API across an agent workload are in <a href="local_llm_agentic_coding_2026.html">agentic coding with local LLMs</a>.</p>
+
+                    <h2 id="sec-9">9. How to measure this on your own hardware</h2>
+                    <p>Instead of copying someone else's numbers, here is the order for producing your own. Five steps is enough.</p>
+
+                    <h3>9.1 Check available memory first</h3>
+                    <pre><code># AMD
+rocm-smi --showmeminfo vram
+
+# NVIDIA
+nvidia-smi --query-gpu=name,memory.total,memory.used --format=csv</code></pre>
+                    <p>Work from <strong>what the tool reports</strong>, not from the spec sheet. Check whether the unit is GB or GiB, and whether memory is already held by something else.</p>
+
+                    <h3>9.2 Get weight capacity from file size</h3>
+                    <pre><code># how many bytes the downloaded checkpoint actually is
+du -sh /path/to/model
+du -ah /path/to/model | grep safetensors | tail -5</code></pre>
+                    <p>This is more honest than a figure computed from parameter count. Mixed-precision checkpoints are hard to predict arithmetically, and tokenizer and index files come along for the ride.</p>
+
+                    <h3>9.3 Set a KV budget per context length</h3>
+                    <p>For a conventional attention model, substitute layer count, KV head count and head dimension from <code>config.json</code> into the formula in 5.1. For compressed attention families, bring the server up once with a short context and <strong>take the KV pool size and token capacity the startup log prints</strong>, then work back to bytes per token. Multiply that by your target context and target concurrent sessions to get the pool size you need.</p>
+
+                    <h3>9.4 Find the OOM point by bisection</h3>
+                    <pre><code># startup check only. narrow the success/failure boundary
+vllm serve &lt;model&gt; \
+  --max-model-len 32768 \
+  --kv-cache-dtype fp8_e4m3 \
+  --gpu-memory-utilization 0.90 \
+  --enable-chunked-prefill \
+  --max-num-batched-tokens 256</code></pre>
+                    <ul>
+                        <li>Raise <code>--max-model-len</code> by halves to find the boundary between successful and failed startup. The largest success is that configuration's real context ceiling</li>
+                        <li>Start <code>--gpu-memory-utilization</code> at 0.90 and creep upward. Pin it at 1.0 and one fragmentation event kills the process</li>
+                        <li>On the ROCm path use <code>--kv-cache-dtype fp8_e4m3</code>. The NVIDIA path uses <code>fp8</code></li>
+                        <li>If startup succeeds but requests kill it, the problem is activations. Lower <code>--max-num-batched-tokens</code> to shrink prefill chunks</li>
+                    </ul>
+
+                    <h3>9.5 Measure the concurrency limit</h3>
+                    <p>The last step matters most. Raise stream counts through 1, 4, 8 and 16 and record <strong>tokens per second per stream</strong>. Per stream, not aggregate. The point where it drops below your target felt speed is that card's concurrent-user ceiling, and you need that number before you can answer how many people this machine serves. Buy a card without that measurement and the plan is usually optimistic by about a factor of two.</p>
+
+                    <h2 id="sec-10">10. What I could not confirm</h2>
+                    <p>The items in this article without secured backing, gathered in one place.</p>
+                    <ul>
+                        <li><strong>A parameter-count discrepancy.</strong> The official model card lists 284B total and 13B active. The single-MI300X repository cited above and its summary describe the target as <strong>DeepSeek-V4-Flash-0731 at 304B</strong>. I could not find a separate parameter figure for the 0731 revision in official documentation. So this article uses 284B/13B when describing the model and leaves 304B as the repository's own labeling</li>
+                        <li><strong>Layer count and head configuration.</strong> Not confirmable from the model card, so the KV formula in 5.1 was not substituted directly for this model. The server-reported figure was used instead</li>
+                        <li><strong>Reproducibility of the throughput numbers.</strong> The section 7 figures have no third-party validation and the server is a nightly build. There is no guarantee the same numbers appear on other hardware</li>
+                        <li><strong>Matched-condition numbers for other accelerators.</strong> I could not find public measurements with precision, context, batch and kernel version aligned. That is why there is no speed comparison table here</li>
+                        <li><strong>Actual power draw.</strong> Beyond the 750W class rating, the consumption and thermal profile under this workload are unconfirmed</li>
+                        <li><strong>Quality impact.</strong> How much the FP4-experts-plus-FP8-remainder format costs against the original on specific tasks is outside this article's scope. Beyond what the model card publishes, I found no independent evaluation</li>
+                    </ul>
+
+                    <h2 id="sec-11">Conclusion: three things you can apply today</h2>
+                    <p><strong>First, get in the habit of speaking in bytes rather than parameter counts.</strong> Writing about weights of roughly 157GB at shipped precision instead of a 284B model cuts meeting arguments in half. Card count is decided by bytes, not parameters.</p>
+                    <p><strong>Second, always write total and active parameters side by side in an MoE plan.</strong> The first is the memory bill, the second the compute bill. A plan that lists only one is guaranteed wrong on one side or the other.</p>
+                    <p><strong>Third, draw the concurrency curve before buying a card.</strong> What breaks a single-card setup is concurrency, not memory. A machine producing 168 tokens on one stream gives 90 per stream at eight, and at sixty-four even the aggregate stops rising. If you cannot answer how many people use it at once with a number, it is not time to buy yet.</p>
+                    <p>One closing note. Single-GPU setups are interesting not because they are the cheapest way to serve. It is that <strong>the complexity which disappears the moment you stay inside one card is substantial</strong>. No parallelism strategy, no interconnect tuning, no cross-node failure handling. There are places where that simplicity is worth real money, and just as clearly places where it is not. Find your row in the table above before you start.</p>
+
+                    <h2 id="sec-12">References</h2>
+                    <ul>
+                        <li><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash" target="_blank" rel="noopener">DeepSeek-V4-Flash model card (Hugging Face)</a> — total and active parameters, MoE configuration, mixed precision, context</li>
+                        <li><a href="https://recipes.vllm.ai/deepseek-ai/DeepSeek-V4-Flash" target="_blank" rel="noopener">vLLM Recipes: DeepSeek-V4-Flash</a> — checkpoint size, validated hardware, KV and parallelism flags</li>
+                        <li><a href="https://docs.vllm.ai/en/latest/getting_started/installation/gpu.html" target="_blank" rel="noopener">vLLM GPU installation docs (ROCm section)</a> — ROCm versions, supported architectures, wheel and Docker paths</li>
+                        <li><a href="https://docs.sglang.io/platforms/amd_gpu.html" target="_blank" rel="noopener">SGLang AMD GPU documentation</a> — Docker images, AITER environment variables, unsupported quantization list</li>
+                        <li><a href="https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/data-sheets/amd-instinct-mi300x-data-sheet.pdf" target="_blank" rel="noopener">AMD Instinct MI300X data sheet (PDF)</a> — HBM capacity, bandwidth, power class</li>
+                        <li><a href="https://www.amd.com/en/products/accelerators/instinct/mi300/mi300x.html" target="_blank" rel="noopener">AMD Instinct MI300X product page</a></li>
+                        <li><a href="https://github.com/ryanzhou/deepseek-v4-flash-mi300x" target="_blank" rel="noopener">Single-MI300X configuration repository (deepseek-v4-flash-mi300x)</a> — source of the measured figures in sections 4 and 7. Individual measurement, not vendor-validated</li>
+                        <li><a href="https://news.hada.io/topic?id=32149" target="_blank" rel="noopener">GeekNews discussion</a></li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>Share this article</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">Copy Link</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">Back to list</a>
+                </div>
+                <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Free tools you may find useful</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/json_formatter.html">JSON Formatter</a></li>
+      <li><a href="../static/regex_tester.html">Regex Tester</a></li>
+      <li><a href="../static/jwt_decoder.html">JWT Decoder Generator 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 Encoder/Decoder</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">See all tools &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+            <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Related Posts</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="diataxis_documentation_framework_2026.html">Nobody Reads Your Docs Because Four Kinds of Writing Are Stuck in One Page - Applying Diataxis 2026</a></li>
+      <li><a href="ai_coding_tool_cost_transparency_2026.html">The Dollars Vanished From Your AI Coding Tool - How to Price Your Own Tokens 2026</a></li>
+      <li><a href="vibe_coding_stack_myths_2026.html">Where AI-Generated Next.js + Supabase Breaks Later - Seven Places to Check Before You Ship 2026</a></li>
+      <li><a href="software_longevity_small_codebase_2026.html">What Makes Software Survive Twenty Years - Telling Finished From Abandoned 2026</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('Link copied! Paste it in the Threads app to share.');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('Link copied!'); });
+    });
+    </script>
+</body>
+</html>

@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ko">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>대형 MoE를 GPU 한 장에 - 메모리 산수부터 막히는 지점까지 2026</title>
+    <meta name="description" content="284B MoE가 GPU 한 장에 올라간다는 말이 요구하는 것. 가중치 바이트 계산법, 총 파라미터와 활성 파라미터의 차이, 양자화로 줄지 않는 KV 캐시, ROCm에서 되는 것과 아직인 것, 동시 요청이 늘 때 무너지는 지점을 정리했다.">
+    <meta name="keywords" content="DeepSeek V4 Flash, MI300X, 단일 GPU LLM, MoE 활성 파라미터, KV 캐시 계산, VRAM 산정, ROCm, vLLM, SGLang, FP8 KV 캐시, FP4 양자화, HBM3, 추론 서빙, OOM, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/posts/deepseek_v4_flash_single_gpu_2026.html">
+
+    <meta property="og:title" content="대형 MoE를 GPU 한 장에 - 메모리 산수부터 막히는 지점까지">
+    <meta property="og:description" content="284B가 192GB에 들어가는 건 모델이 작아서가 아니다. 체크포인트가 이미 4비트로 나왔기 때문이다.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/posts/deepseek_v4_flash_single_gpu_2026.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ko_KR">
+    <meta property="article:published_time" content="2026-08-05">
+    <meta property="article:section" content="개발/인프라">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="대형 MoE를 GPU 한 장에">
+    <meta name="twitter:description" content="가중치는 양자화로 줄지만 KV 캐시는 별개다. 한 장에 올라간 뒤에 무너지는 곳은 메모리가 아니라 동시성이다.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "대형 MoE를 GPU 한 장에 - 메모리 산수부터 막히는 지점까지",
+      "alternativeHeadline": "284B가 192GB에 들어가는 건 모델이 작아서가 아니다",
+      "datePublished": "2026-08-05",
+      "dateModified": "2026-08-05",
+      "inLanguage": "ko-KR",
+      "articleSection": "개발/인프라",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "DeepSeek V4 Flash, MI300X, 단일 GPU LLM, MoE 활성 파라미터, KV 캐시 계산, VRAM 산정, ROCm, vLLM, SGLang, FP8 KV 캐시",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/posts/deepseek_v4_flash_single_gpu_2026.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "284B 파라미터 모델이 어떻게 192GB 카드 한 장에 들어가나?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "모델이 작아서가 아니라 체크포인트가 이미 낮은 정밀도로 배포되기 때문이다. 가중치가 차지하는 용량은 파라미터 수가 아니라 파라미터당 바이트 수가 정한다. 284B를 BF16으로 담으면 파라미터당 2바이트라 약 568GB, FP8이면 약 284GB다. 어느 쪽도 192GB 한 장에 들어가지 않는다. DeepSeek-V4-Flash의 공식 가중치는 MoE 전문가 파라미터를 FP4로, 어텐션과 정규화와 라우터 파라미터를 FP8로 담은 혼합 형식으로 나온다. 파라미터당 평균이 1바이트 아래로 내려가면서 체크포인트 자체가 160GB 안팎이 되고, 그래서 한 장에 얹을 여지가 생긴다. 사용자가 추가로 양자화해서 줄인 것이 아니라 배포본이 처음부터 그 상태다."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "MoE 모델은 활성 파라미터만 메모리에 올리면 되는 것 아닌가?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "아니다. 이 오해가 단일 GPU 계획을 가장 자주 망친다. DeepSeek-V4-Flash는 총 284B에 토큰당 활성 13B다. 활성 파라미터는 토큰 하나를 처리할 때 실제로 곱셈에 참여하는 양이고, 그래서 연산량과 속도를 지배한다. 하지만 어느 전문가가 뽑힐지는 토큰마다 라우터가 그 자리에서 정한다. 다음 토큰에 어떤 전문가가 필요할지 미리 알 수 없으므로 전문가 전체가 메모리에 상주해야 한다. 즉 총 파라미터가 메모리 청구서를 쓰고 활성 파라미터가 연산 청구서를 쓴다. MoE의 이득은 이 둘이 어긋난다는 점에 있지 메모리가 활성 파라미터만큼으로 줄어든다는 뜻이 아니다."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "양자화하면 KV 캐시도 같이 줄어드나?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "가중치 양자화와 KV 캐시는 별개의 축이다. 가중치를 FP16에서 FP4로 내려도 KV 캐시는 한 바이트도 줄지 않는다. KV 캐시 크기는 층 수, KV 헤드 구성, 헤드 차원, 요소당 바이트, 컨텍스트 길이, 동시 시퀀스 수의 곱으로 정해지기 때문이다. KV 캐시를 줄이려면 KV 전용 정밀도를 따로 내리거나 컨텍스트를 짧게 잡거나 동시 시퀀스를 줄여야 한다. vLLM에서는 kv-cache-dtype 옵션으로 KV 정밀도를 따로 지정하고 ROCm 환경에서는 fp8_e4m3 값이 쓰인다. 실무에서 자주 나오는 실패는 가중치만 계산해 카드를 고르고 KV 예산을 빼먹은 뒤 컨텍스트를 늘리자마자 메모리 부족으로 죽는 경우다."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "단일 GPU 구성으로 여러 사용자에게 서비스할 수 있나?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "총 처리량은 늘지만 개인이 체감하는 속도는 빠르게 떨어진다. 공개된 단일 MI300X 구성의 측정치를 보면 단일 스트림 디코드가 초당 168.6토큰인데, 동시 스트림 8개에서는 합계 초당 542토큰에 스트림당 중앙값 90.3토큰으로 내려간다. 스트림을 64개로 몰아넣은 버스트에서는 합계가 초당 830토큰에 머문다. 스트림을 8배 늘렸을 때 합계는 1.5배가 된다는 뜻이고, 이 지점에서 카드가 포화했다고 읽으면 된다. 따라서 한 장짜리 구성은 배치 1에 가까운 실험, 야간 일괄 처리, 사내 단일 워크로드처럼 큐를 세워도 되는 자리에 맞다. 응답 시간 약속이 걸린 다중 사용자 대화형 서비스에는 맞지 않는다."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "ROCm 환경에서 대형 모델을 서빙할 때 가장 자주 막히는 곳은?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "모델이 아니라 설치와 커널 계층에서 막힌다. vLLM 문서는 ROCm 6.3 이상을 요구하고 gfx90a와 gfx942와 gfx950 계열을 명시하는데, 사전 빌드 휠은 파이썬 3.12 전용이며 ROCm 7.0과 7.2.1 변종만 제공된다. 다른 파이썬 버전을 쓰면 설치기가 조용히 CUDA 휠로 넘어가 AMD 장비에서 실패한다. 두 번째는 양자화 포맷이다. SGLang 문서는 Marlin이나 엔비디아 전용 커널에 의존하는 방식이 AMD에서 동작하지 않는다고 적고 있고 awq_marlin, gptq_marlin, gguf, modelopt_fp8, modelopt_fp4를 이름으로 나열한다. MXFP4는 CDNA3 또는 CDNA4 세대가 필요하다. 그래서 이식 실패의 원인은 대개 모델 구조가 아니라 파이썬 휠, 커널 라이브러리, 양자화 포맷 세 줄에 있다."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <script src="https://t1.kakaocdn.net/kakao_js_sdk/2.4.0/kakao.min.js" crossorigin="anonymous" defer></script>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/deepseek_v4_flash_single_gpu_2026.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/deepseek_v4_flash_single_gpu_2026.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/deepseek_v4_flash_single_gpu_2026.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/deepseek_v4_flash_single_gpu_2026.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/deepseek_v4_flash_single_gpu_2026.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="대형 MoE를 GPU 한 장에 - 메모리 산수부터 막히는 지점까지">
+                <meta itemprop="datePublished" content="2026-08-05">
+                <meta itemprop="dateModified" content="2026-08-05">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="DeepSeek V4 Flash, MI300X, 단일 GPU LLM, MoE 활성 파라미터, KV 캐시 계산, VRAM 산정, ROCm, vLLM">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/posts/deepseek_v4_flash_single_gpu_2026.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">대형 MoE를 GPU 한 장에 - 메모리 산수부터 막히는 지점까지</h1>
+                    <h2 class="post-subtitle">284B가 192GB에 들어가는 건 모델이 작아서가 아니다</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-08-05">2026-08-05</span>
+                        <span class="post-category" itemprop="articleSection">개발/인프라</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <nav class="post-toc">
+                        <h3>이 글에서 다루는 것</h3>
+                        <ol>
+                            <li><a href="#sec-1">가중치 용량은 파라미터 수가 아니라 바이트 수가 정한다</a></li>
+                            <li><a href="#sec-2">총 파라미터와 활성 파라미터는 서로 다른 자원을 먹는다</a></li>
+                            <li><a href="#sec-3">MI300X가 이 이야기에 나오는 이유</a></li>
+                            <li><a href="#sec-4">한 장에 올렸을 때 메모리가 실제로 나뉘는 방식</a></li>
+                            <li><a href="#sec-5">KV 캐시는 가중치와 별개다</a></li>
+                            <li><a href="#sec-6">ROCm에서 되는 것과 아직인 것</a></li>
+                            <li><a href="#sec-7">동시 요청이 늘면 무너지는 지점</a></li>
+                            <li><a href="#sec-8">단일 GPU가 의미 있는 자리와 무의미한 자리</a></li>
+                            <li><a href="#sec-9">내 환경에서 재는 절차</a></li>
+                            <li><a href="#sec-10">확인하지 못한 것</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-0">서론: 「한 장에 올라간다」를 받아 들고 견적서를 열었다면</h2>
+                    <p>어느 모델이 GPU 한 장에서 돈다는 문장은 늘 같은 반응을 만든다. 그럼 우리도 되겠네. 그런데 그 문장에는 조건이 여섯 개쯤 생략돼 있고, 생략된 조건 하나가 카드 두 장 차이를 만든다.</p>
+                    <p>먼저 결론부터 적는다. <strong>284B짜리 MoE가 192GB 카드 한 장에 들어가는 이유는 모델이 작아서가 아니다. 공식 체크포인트가 이미 사실상 4비트로 나오기 때문이다.</strong> 여기에 KV 캐시와 활성값이 얹히면 남는 여유는 몇 기가바이트 수준이고, 그 상태에서 동시 요청을 붙이는 순간 개인 체감 속도가 무너진다. 되는 자리와 안 되는 자리를 가르는 건 카드 성능이 아니라 <strong>요청이 한 번에 몇 개 오느냐</strong>다.</p>
+                    <p>이 글은 그 산수를 순서대로 편다. 가중치 바이트부터 시작해서, MoE에서 총 파라미터와 활성 파라미터가 각각 무엇을 결정하는지, KV 캐시가 어디서 따로 자리를 먹는지, ROCm 스택에서 실제로 막히는 지점이 어디인지, 그리고 독자가 자기 장비에서 같은 계산을 하고 OOM 지점을 찾는 절차까지 간다.</p>
+                    <p>범위를 미리 좁혀 둔다. 여기서 말하는 건 <strong>데이터센터 가속기 한 장과 대형 MoE</strong>다. 소비자 하드웨어로 로컬 모델을 굴리는 이야기 — 오래된 CPU로 경량 모델을 돌리거나 맥의 GPU 가속을 켜는 쪽은 <a href="old_xeon_run_gemma_4_local_llm_2026.html">10년 된 Xeon으로 Gemma 4 돌리기</a>와 <a href="local_llm_mac_mps_speedup_2026.html">맥에서 로컬 LLM이 느린 진짜 이유</a>에서 따로 다뤘다. GGUF 양자화 등급 선택과 소비자 GPU의 VRAM 요건 일반론은 <a href="local_llm_running_guide_2026.html">로컬 LLM 실행 가이드</a> 쪽이다.</p>
+
+                    <h2 id="sec-1">1. 가중치 용량은 파라미터 수가 아니라 바이트 수가 정한다</h2>
+                    <p>첫 계산은 단순하다. 곱셈 하나다.</p>
+                    <pre><code>가중치 바이트 = 파라미터 수 × 파라미터당 바이트
+
+FP32  = 4 바이트
+BF16 / FP16 = 2 바이트
+FP8   = 1 바이트
+FP4   = 0.5 바이트</code></pre>
+                    <p>이 곱셈을 안 하고 파라미터 수만 보면 계획이 통째로 어긋난다. 같은 284B라도 어떤 정밀도로 담느냐에 따라 필요한 카드 수가 네 배 차이 난다.</p>
+
+                    <h3>1.1 정밀도별로 실제 얼마나 되나</h3>
+                    <p><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash" target="_blank" rel="noopener">DeepSeek-V4-Flash 모델 카드</a>는 총 284B 파라미터, 토큰당 활성 13B로 적고 있다. 이 284B를 정밀도별로 담아 보면 이렇게 갈린다. 카드 장수는 192GB 한 장 기준이고, 가중치만 놓고 계산한 값이라 실제로는 더 필요하다.</p>
+                    <table>
+                        <thead>
+                            <tr><th>담는 정밀도</th><th>파라미터당</th><th>284B 가중치 용량</th><th>192GB 카드 최소 장수(가중치만)</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>FP32</td><td>4 바이트</td><td>약 1,136 GB</td><td>6장</td></tr>
+                            <tr><td>BF16 / FP16</td><td>2 바이트</td><td>약 568 GB</td><td>3장</td></tr>
+                            <tr><td>FP8</td><td>1 바이트</td><td>약 284 GB</td><td>2장</td></tr>
+                            <tr><td>FP4</td><td>0.5 바이트</td><td>약 142 GB</td><td>1장</td></tr>
+                            <tr><td><strong>출하 그대로(FP4 전문가 + FP8 나머지)</strong></td><td>평균 1 바이트 미만</td><td><strong>체크포인트 약 160~167 GB</strong></td><td><strong>1장(여유 거의 없음)</strong></td></tr>
+                        </tbody>
+                    </table>
+                    <p>마지막 줄이 이 글 전체의 출발점이다. <a href="https://recipes.vllm.ai/deepseek-ai/DeepSeek-V4-Flash" target="_blank" rel="noopener">vLLM 레시피 문서</a>는 이 모델의 체크포인트 크기를 프리뷰 기준 약 160GB, 융합 변종 기준 약 167GB로 적는다. 모델 카드는 MoE 전문가 파라미터를 FP4로, 어텐션·정규화·라우터 파라미터를 FP8로 담은 혼합 형식이라고 밝힌다.</p>
+
+                    <h3>1.2 사후 양자화와 무엇이 다른가</h3>
+                    <p>여기서 흔한 혼동이 하나 걸린다. 우리가 로컬 모델을 다룰 때 익숙한 순서는 이렇다. BF16 원본을 받아서 Q4로 눌러 담고, 품질이 얼마나 깎였는지 확인한다. 이 모델은 순서가 다르다. <strong>배포본 자체가 처음부터 저정밀도다.</strong></p>
+                    <ul>
+                        <li>사용자가 추가 양자화를 하지 않아도 파라미터당 평균 바이트가 이미 1 아래다</li>
+                        <li>따라서 「양자화하면 더 줄겠지」라는 여지가 거의 남아 있지 않다</li>
+                        <li>대신 품질 손실을 만드는 주체가 사용자가 아니라 모델 제작자다. 학습 단계에서 그 정밀도를 전제하고 조정할 수 있다는 뜻이고, 사후에 눌러 담는 것보다 유리한 위치다</li>
+                        <li>바꿔 말하면 <strong>이 모델에서 「양자화로 카드를 한 장 더 줄인다」는 카드는 이미 써 버린 상태</strong>다</li>
+                    </ul>
+                    <p>사후 양자화 등급을 어디까지 내릴지 고르는 판단 — Q4와 Q8 사이의 트레이드오프는 성격이 다른 문제라 <a href="local_llm_running_guide_2026.html">로컬 LLM 실행 가이드</a>에서 따로 정리했다.</p>
+
+                    <h2 id="sec-2">2. 총 파라미터와 활성 파라미터는 서로 다른 자원을 먹는다</h2>
+                    <p>MoE 이야기에서 계획을 가장 자주 망가뜨리는 문장이 있다. 「활성이 13B니까 13B짜리 메모리면 되겠네.」 아니다. 이걸 바로잡지 않으면 뒤 계산이 전부 틀린다.</p>
+
+                    <h3>2.1 라우터는 토큰마다 다시 고른다</h3>
+                    <p>DeepSeek-V4-Flash의 MoE 층은 공유 전문가 1개와 라우팅 전문가 256개를 갖고 있고, 토큰 하나당 라우팅 전문가 6개가 발화한다. 전문가의 중간 차원은 2048이며, 앞쪽 세 개 MoE 층은 해시 라우팅을 쓴다.</p>
+                    <p>핵심은 <strong>어느 6개가 뽑힐지 미리 알 수 없다</strong>는 데 있다. 다음 토큰이 무엇이냐에 따라 라우터가 그 자리에서 정한다. 그래서 전문가 256개 전부가 메모리에 앉아 있어야 한다. 안 앉아 있으면 필요한 순간 디스크나 호스트 메모리에서 끌어와야 하고, 그 왕복 지연은 GPU 연산 시간과 자릿수가 다르다.</p>
+
+                    <h3>2.2 무엇이 무엇을 결정하나</h3>
+                    <table>
+                        <thead>
+                            <tr><th>이 값이</th><th>이 자원을 결정한다</th><th>늘리면 생기는 일</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>총 파라미터(284B)</td><td>상주 메모리(가중치)</td><td>필요한 카드 장수가 늘어난다</td></tr>
+                            <tr><td>활성 파라미터(13B)</td><td>토큰당 연산량</td><td>토큰 생성이 느려진다</td></tr>
+                            <tr><td>컨텍스트 길이</td><td>KV 캐시</td><td>가중치와 무관하게 메모리를 더 먹는다</td></tr>
+                            <tr><td>동시 시퀀스 수</td><td>KV 캐시 + 활성값</td><td>메모리와 스트림당 속도 양쪽이 나빠진다</td></tr>
+                            <tr><td>배치 크기</td><td>활성값·워크스페이스</td><td>처리량은 오르고 개별 지연은 늘어난다</td></tr>
+                        </tbody>
+                    </table>
+                    <p>MoE의 상품 가치는 첫 두 줄이 어긋난다는 데 있다. <strong>284B급 표현력을 13B급 연산비로 쓴다.</strong> 대신 메모리 청구서는 284B 기준으로 온다. 이건 결함이 아니라 설계 의도이고, 계획할 때 두 줄을 섞지 않는 것이 전부다.</p>
+                    <p>덧붙이면, 이 어긋남 때문에 MoE는 <strong>메모리는 넉넉한데 연산이 아쉬운 장비</strong>에서 상대적으로 유리하다. 반대로 메모리가 빠듯하고 연산 여유가 있는 장비에서는 같은 품질을 내는 조밀 모델(dense)이 나은 선택이 되기도 한다. 27B급 조밀 모델이 단일 GPU에서 왜 편한지는 <a href="qwen_3_6_27b_local_2026.html">Qwen 3.6 27B - 로컬 개발의 최적 지점</a>에서 다뤘는데, 그 글의 스윗스팟 논리와 이 글의 산수는 정확히 반대편에서 같은 벽을 보고 있다.</p>
+
+                    <h2 id="sec-3">3. MI300X가 이 이야기에 나오는 이유</h2>
+                    <p>단일 GPU 논의에 AMD 가속기가 등장하는 이유는 하나다. <strong>한 장에 담기는 용량</strong>이다. 벤치마크 경쟁이 아니라 산수 문제다.</p>
+
+                    <h3>3.1 공개된 사양</h3>
+                    <p>AMD 자료 기준 MI300X는 192GB HBM3를 얹고 있다. 메모리 버스는 8,192비트, 데이터 레이트 5.2Gbps로 피크 대역폭이 5.325TB/s다. CDNA 3 아키텍처에 8개의 XCD 구성이며, 750W 등급에서 부스트 2,100MHz일 때 FP16과 BF16 피크 이론 성능이 각각 1,307.4TFLOPS로 표기된다.</p>
+                    <div class="callout">
+                        <p><strong>피크 이론치는 실측이 아니다.</strong> 1,307.4TFLOPS는 클록과 유닛 수로 계산한 상한이고, 실제 추론에서 그 근처가 나오는 일은 없다. 이 숫자는 카드 간 세대 비교에나 쓰는 값이지 처리량 예측에 쓰는 값이 아니다.</p>
+                    </div>
+
+                    <h3>3.2 대조는 두 축으로만</h3>
+                    <p>엔비디아 계열과의 비교는 두 축으로 좁히는 것이 정확하다. 속도 순위를 매기려 들면 조건이 달라 비교가 성립하지 않는다.</p>
+                    <ul>
+                        <li><strong>용량 축</strong> — 카드 한 장에 얼마나 담기나. 이 축에서 HBM 용량이 큰 쪽이 단일 카드 구성에서 유리하다. 카드 경계를 넘는 순간 텐서 병렬이나 전문가 병렬이 들어오고, 인터커넥트가 새 병목 후보가 되고, 장애 지점과 운영 복잡도가 함께 늘어난다. 한 장에 들어가면 이 전부가 사라진다</li>
+                        <li><strong>소프트웨어 성숙도 축</strong> — 그 용량을 실제로 쓸 커널과 서버가 있나. 여기서는 CUDA 생태계가 여전히 앞서 있고, 그 격차는 뒤의 6절에서 구체적으로 짚는다</li>
+                    </ul>
+                    <p>속도 비교를 붙이지 않는 이유는 소극적인 태도가 아니다. 같은 모델이라도 정밀도, 컨텍스트 길이, 배치 크기, 커널 라이브러리 버전, 추측 디코딩 사용 여부에 따라 처리량이 몇 배로 갈린다. 조건을 맞추지 않은 두 숫자를 나란히 두면 그건 비교가 아니라 착시다.</p>
+
+                    <h2 id="sec-4">4. 한 장에 올렸을 때 메모리가 실제로 나뉘는 방식</h2>
+                    <p>계산만으로는 안 잡히는 부분이 있다. 실제 배분을 보면 <strong>가중치만 계산했을 때와 40GB 넘게 벌어진다.</strong></p>
+                    <p>아래는 <a href="https://github.com/ryanzhou/deepseek-v4-flash-mi300x" target="_blank" rel="noopener">공개된 단일 MI300X 구성 저장소</a>가 자기 스택에서 기록한 값이다. 조건을 먼저 적는다. 대상은 DeepSeek-V4-Flash-0731, 장비는 단일 MI300X(gfx942, 304 CU, 192GB HBM3), 서버는 vLLM ROCm 나이틀리 <code>0.26.1rc1.dev229+g124154a88.rocm723</code>, 커널은 AITER 0.1.19, KV 캐시는 FP8(<code>fp8_ds_mla</code>, 256토큰 블록), 가중치는 <strong>추가 양자화 없이 출하 상태 그대로</strong>, 검증 컨텍스트는 256K다.</p>
+                    <table>
+                        <thead>
+                            <tr><th>구성 요소</th><th>차지하는 양</th><th>메모</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>가중치</td><td>156.67 GB</td><td>출하 정밀도 그대로, 추가 양자화 없음</td></tr>
+                            <tr><td>GPU KV 풀</td><td>20 GB</td><td>FP8 KV 기준 1,927,444 토큰분</td></tr>
+                            <tr><td>그 외(활성값·워크스페이스·그래프 버퍼·할당자 여유)</td><td>약 28 GB</td><td>아래 최고수위에서 역산한 값</td></tr>
+                            <tr><td><strong>워밍 후 최고수위</strong></td><td><strong>204.5 GB / 총 205.8 GB</strong></td><td>여유 약 1.3 GB</td></tr>
+                            <tr><td>CPU 오프로드 계층</td><td>96 GiB</td><td>축출된 접두 캐시 항목용, 호스트 메모리</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h3>4.1 이 표에서 읽어야 할 세 가지</h3>
+                    <ol>
+                        <li><strong>가중치만 세면 40GB 이상 빗나간다.</strong> 156.67GB만 보고 「192GB니까 35GB 남네」로 계획하면 KV 풀 20GB와 그 외 28GB에서 무너진다</li>
+                        <li><strong>최고수위가 총량의 99.4%다.</strong> 여유가 1.3GB밖에 없다는 건 튜닝이 끝난 상태의 숫자라는 뜻이지 시작점이 아니다. 처음 기동하면 대개 여기까지 오기 전에 죽는다</li>
+                        <li><strong>「192GB」와 「205.8GB」가 다른 이유</strong> — 대부분은 단위 표기 차이다. 192GiB는 십진수로 약 206.2GB다. 스펙 시트의 숫자와 할당자가 보고하는 숫자가 정확히 안 맞는다는 것만 알고 있으면 된다. 마지막 기가바이트까지 계획을 짜지 마라</li>
+                    </ol>
+                    <div class="callout">
+                        <p><strong>이 수치의 성격.</strong> 위 값은 저장소 관리자가 자기 스택에서 잰 것이고 벤더 검증을 거친 값이 아니다. 서버가 나이틀리 빌드라 커널이나 버전이 바뀌면 배분도 바뀐다. 그대로 옮겨 쓰지 말고 <strong>자기 장비에서 다시 재는 것</strong>이 맞다. 재는 절차는 9절에 있다.</p>
+                    </div>
+
+                    <h3>4.2 공식 레시피는 어떤 하드웨어를 적고 있나</h3>
+                    <p>흥미로운 대조가 하나 있다. vLLM 공식 레시피가 이 모델에 대해 적은 하드웨어 목록에 <strong>MI300X는 없다.</strong></p>
+                    <table>
+                        <thead>
+                            <tr><th>구성</th><th>GPU</th><th>비고</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>단일 노드(엔비디아)</td><td>4장 (H200 / B200 / B300 또는 GB200 NVL4)</td><td><code>--data-parallel-size 4</code> DP+EP 권장</td></tr>
+                            <tr><td>DGX Station</td><td>1장</td><td>최소 구성으로 표기</td></tr>
+                            <tr><td>MI325X</td><td>1장 × 256GB</td><td>적재 모델 148.66 GiB, vLLM 0.25.0에서 검증</td></tr>
+                            <tr><td>MI355X</td><td>4장 × 288GB</td><td>vLLM 0.25.0 이상</td></tr>
+                            <tr><td><strong>MI300X (192GB)</strong></td><td><strong>목록에 없음</strong></td><td>커뮤니티 구성이 따로 존재하는 이유</td></tr>
+                        </tbody>
+                    </table>
+                    <p>이 표가 말하는 게 명확하다. AMD 단일 카드 경로로 공식 검증된 건 256GB짜리 MI325X이고, 192GB인 MI300X는 <strong>같은 모델을 담기에 여유가 훨씬 빠듯한 자리</strong>다. 앞의 4.1에서 여유 1.3GB가 나온 것도 그래서다. 「단일 GPU에서 돈다」는 문장이 카드 모델명 하나에 얼마나 민감한지 보여 주는 대목이다.</p>
+
+                    <h2 id="sec-5">5. KV 캐시는 가중치와 별개다</h2>
+                    <p>양자화 이야기에서 가장 자주 새는 곳이 여기다. <strong>가중치를 FP16에서 FP4로 내려도 KV 캐시는 한 바이트도 줄지 않는다.</strong> 둘은 다른 축이다.</p>
+
+                    <h3>5.1 전통적인 어텐션에서의 계산식</h3>
+                    <p>MHA나 GQA 계열 모델이라면 KV 캐시 크기는 이렇게 나온다. 자기 모델의 <code>config.json</code>에서 값을 꺼내 대입하면 된다.</p>
+                    <pre><code>KV 바이트 = 2 × 층 수 × KV 헤드 수 × 헤드 차원
+           × 요소당 바이트 × 토큰 수 × 동시 시퀀스 수
+
+# 앞의 2 는 Key 와 Value 두 벌을 뜻한다
+# 요소당 바이트: FP16=2, FP8=1
+# 토큰 수 = 프롬프트 + 지금까지 생성한 출력</code></pre>
+                    <p>이 식에서 읽을 것은 <strong>가중치 정밀도가 어디에도 안 들어간다</strong>는 사실이다. 가중치를 아무리 눌러 담아도 이 값은 그대로다. 줄이려면 KV 전용 정밀도를 따로 내리거나, 컨텍스트를 짧게 잡거나, 동시 시퀀스를 줄여야 한다.</p>
+
+                    <h3>5.2 압축 어텐션 계열은 이 식이 안 맞는다</h3>
+                    <p>DeepSeek V4 계열은 압축 희소 어텐션(CSA)과 고압축 어텐션(HCA)을 섞은 하이브리드 설계다. 잠재 표현을 캐시하는 구조라 위 식을 그대로 대입하면 실제보다 크게 나온다. 모델 카드는 V4-Pro 기준으로 1M 토큰에서 V3.2 대비 KV 캐시가 10퍼센트 수준이라고 적고 있다.</p>
+                    <p>이런 모델에서는 계산 대신 <strong>서버가 보고하는 풀 크기로 역산</strong>하는 편이 정확하다. 앞의 4절 구성을 예로 들면 이렇게 된다.</p>
+                    <pre><code>20 GB ÷ 1,927,444 토큰 ≈ 토큰당 약 10 KB
+# 조건: FP8 KV 캐시, fp8_ds_mla, 256토큰 블록, 이 서버 구성</code></pre>
+                    <p>이 10KB는 <strong>이 설정에서 나온 값이지 모델의 상수가 아니다.</strong> KV 정밀도를 바꾸거나 블록 크기를 바꾸면 달라진다. 그래도 계획에는 충분히 쓸 만하다. 128K 컨텍스트 대화 하나가 대략 1.3GB, 256K짜리면 2.6GB 정도를 차지한다는 감각이 잡히기 때문이다.</p>
+
+                    <h3>5.3 그래서 실무에서 어떻게 갈리나</h3>
+                    <ul>
+                        <li>컨텍스트 광고 수치와 실제 사용 가능 컨텍스트는 다르다. 100만 토큰을 지원해도 KV 풀이 감당 못 하면 못 쓴다</li>
+                        <li>KV 풀은 <strong>동시 스트림이 나눠 쓴다.</strong> 192만 토큰짜리 풀이라도 256K 세션 7~8개면 바닥이 보인다</li>
+                        <li>vLLM에서 KV 정밀도를 따로 지정하는 옵션이 <code>--kv-cache-dtype</code>이고, 엔비디아 경로는 <code>fp8</code>, ROCm 경로는 <code>fp8_e4m3</code> 값을 쓴다</li>
+                        <li>긴 출력을 쓰는 모드는 요구가 급격히 커진다. 레시피 문서는 최대 384K 출력을 쓰는 모드에 <code>--max-model-len</code>을 393,216 이상으로 잡으라고 적는다</li>
+                        <li>접두 캐시(prefix cache)를 켜면 재사용 이득이 크지만, 축출된 항목을 호스트로 내리는 계층이 필요해진다. 앞의 구성이 96GiB CPU 오프로드 계층을 둔 이유가 그것이다</li>
+                    </ul>
+
+                    <h2 id="sec-6">6. ROCm에서 되는 것과 아직인 것</h2>
+                    <p>모델이 올라가는 것과 스택이 도는 것은 다른 문제다. 이식 실패의 원인은 대개 모델 구조가 아니라 <strong>파이썬 휠, 커널 라이브러리, 양자화 포맷</strong> 세 줄에 있다.</p>
+
+                    <h3>6.1 vLLM 쪽 상태</h3>
+                    <p>vLLM 설치 문서 기준으로 정리하면 이렇다.</p>
+                    <ul>
+                        <li>요구 ROCm 버전은 <strong>6.3 이상</strong></li>
+                        <li>지원 GPU로 MI200s(gfx90a), MI300(gfx942), MI350(gfx950, ROCm 7.0 이상 필요), Radeon RX 7900·9000 계열, Ryzen AI MAX·AI 300 계열(ROCm 7.0.2 이상)을 명시</li>
+                        <li>사전 빌드 휠은 <strong>파이썬 3.12 전용</strong>이며 ROCm 7.0과 7.2.1 변종만 제공</li>
+                        <li>공식 도커 이미지는 <code>vllm/vllm-openai-rocm</code>, 안정판과 나이틀리 두 갈래</li>
+                        <li>소스 빌드 경로는 <code>PYTORCH_ROCM_ARCH</code>를 설정하고 <code>python3 setup.py develop</code>을 돌리는 방식</li>
+                    </ul>
+                    <div class="callout">
+                        <p><strong>가장 조용히 사람을 잡는 함정.</strong> 문서가 직접 경고하는 항목인데, 파이썬 3.12가 아닌 환경에서 설치하면 설치기가 <strong>말없이 CUDA 휠로 넘어간다.</strong> 설치는 성공한 것처럼 보이고 AMD 장비에서 실행할 때 실패한다. 원인이 모델이나 커널처럼 보이지만 실은 휠 하나다. ROCm 장비를 세팅할 때 파이썬 버전과 설치된 휠의 정체를 먼저 확인하는 습관이 시간을 가장 많이 아낀다.</p>
+                    </div>
+
+                    <h3>6.2 SGLang 쪽 상태</h3>
+                    <ul>
+                        <li>AMD 문서에서 MI300X를 대표 사례로 다루고 있다</li>
+                        <li>사전 빌드 이미지는 도커 허브의 <code>lmsysorg/sglang</code>, 저장소의 <code>rocm.Dockerfile</code>로 빌드된다</li>
+                        <li>가속 옵션으로 <code>export SGLANG_USE_AITER=1</code>을 안내한다. RDMA 구성에는 <code>export NCCL_IB_GID_INDEX=3</code></li>
+                        <li>AMD에서 <strong>동작하지 않는 양자화 방식</strong>을 이름으로 나열한다. Marlin이나 엔비디아 전용 커널에 의존하는 것들이다</li>
+                    </ul>
+                    <table>
+                        <thead>
+                            <tr><th>항목</th><th>AMD ROCm에서</th><th>근거</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>awq_marlin / gptq_marlin</td><td>동작하지 않음</td><td>Marlin 커널 의존</td></tr>
+                            <tr><td>gguf</td><td>동작하지 않음</td><td>SGLang 문서 명시</td></tr>
+                            <tr><td>modelopt_fp8 / modelopt_fp4</td><td>동작하지 않음</td><td>엔비디아 전용 경로</td></tr>
+                            <tr><td>MXFP4</td><td>CDNA3 또는 CDNA4 필요</td><td>세대 제약</td></tr>
+                            <tr><td>AITER 가속</td><td>환경변수로 활성화</td><td><code>SGLANG_USE_AITER=1</code> / <code>VLLM_ROCM_USE_AITER=1</code></td></tr>
+                        </tbody>
+                    </table>
+                    <p>vLLM 레시피의 AMD 항목도 같은 방향이다. MI325X 구성에 <code>export VLLM_ROCM_USE_AITER=1</code>과 <code>--moe-backend triton_unfused</code>를 안내하고, eager 모드에서는 <code>--enable-chunked-prefill</code>과 <code>--max-num-batched-tokens 256</code>, <code>--kv-cache-memory-bytes 10000000000</code>을 함께 쓴다.</p>
+
+                    <h3>6.3 판단</h3>
+                    <p>정리하면 이렇다. <strong>모델을 올리는 것 자체는 되고, 막히는 건 그 아래 계층이다.</strong> 그래서 ROCm 도입을 검토하는 조직에 필요한 준비는 모델 지식이 아니라 다음 세 가지다.</p>
+                    <ol>
+                        <li>파이썬 버전과 휠을 고정할 수 있는 배포 방식. 도커 이미지를 쓰는 쪽이 확실히 안전하다</li>
+                        <li>쓰려는 양자화 포맷이 AMD 경로에 존재하는지 <strong>모델을 고르기 전에</strong> 확인. GGUF를 전제한 계획은 여기서 그대로 무너진다</li>
+                        <li>나이틀리 빌드에 의존하는 구성이라면 버전을 통째로 고정(pin)하고 재현 절차를 문서로 남기는 것. 재현 창이 좁다</li>
+                    </ol>
+
+                    <h2 id="sec-7">7. 동시 요청이 늘면 무너지는 지점</h2>
+                    <p>메모리에 올라갔다고 서비스가 되는 게 아니다. 단일 카드 구성의 진짜 한계는 여기서 드러난다.</p>
+                    <p>아래는 앞의 4절과 같은 스택에서 나온 수치다. 조건은 동일하고, 디코딩에 DSpark-7 추측 디코딩이 켜져 있다.</p>
+                    <table>
+                        <thead>
+                            <tr><th>동시 스트림</th><th>합계 처리량</th><th>스트림당</th><th>읽는 법</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>1</td><td>168.6 tok/s</td><td>168.6 tok/s (중앙값)</td><td>사람이 읽기에 빠른 속도</td></tr>
+                            <tr><td>8</td><td>542 tok/s</td><td>90.3 tok/s (중앙값)</td><td>합계 3.2배, 개인 체감은 절반 아래</td></tr>
+                            <tr><td>64 (버스트)</td><td>830 tok/s</td><td>—</td><td>스트림 8배에 합계 1.5배. 포화</td></tr>
+                        </tbody>
+                    </table>
+                    <p>프리필 쪽 수치도 함께 적어 둔다. 튜닝된 커널에서 초당 약 7.9~8.5K 토큰, 프로덕션 프로파일의 신규 프롬프트에서는 초당 6,988~7,019 토큰이다. 프리필이 빠르다는 건 긴 프롬프트를 밀어 넣는 작업 — 문서 요약이나 코드베이스 인덱싱 — 에서 유리하다는 뜻이다.</p>
+
+                    <h3>7.1 이 표가 결정하는 것</h3>
+                    <p>1에서 8로 갈 때 합계가 3.2배가 됐다. 나쁘지 않다. 그런데 8에서 64로 갈 때는 스트림을 8배 늘렸는데 합계가 1.5배에 그친다. <strong>그 사이 어딘가에서 카드가 포화했다는 뜻</strong>이고, 그 지점을 넘긴 요청은 처리량에 기여하지 못한 채 대기열에서 지연만 늘린다.</p>
+                    <p>여기서 나오는 판단은 분명하다.</p>
+                    <ul>
+                        <li>합계 처리량으로 용량 계획을 세우면 실제 사용자 경험을 못 맞춘다. <strong>스트림당 속도로 세워야 한다</strong></li>
+                        <li>사람이 읽는 속도를 초당 15~20토큰 정도로 잡으면, 그 아래로 떨어지는 지점이 그 카드의 실질 동시 사용자 상한이다</li>
+                        <li>비대화형 일괄 작업은 반대다. 개별 지연이 늘어도 합계만 크면 되므로 스트림을 최대한 채우는 쪽이 이득이다</li>
+                        <li>추측 디코딩이 켜진 상태의 수치라는 점도 기억할 것. 추측 디코딩은 단일 스트림에서 특히 유리하고 동시성이 높아지면 이득이 줄어드는 성격이 있다</li>
+                    </ul>
+
+                    <h2 id="sec-8">8. 단일 GPU가 의미 있는 자리와 무의미한 자리</h2>
+                    <p>앞의 산수를 그대로 판단으로 바꾸면 이렇게 갈린다.</p>
+                    <table>
+                        <thead>
+                            <tr><th>자리</th><th>단일 GPU 구성</th><th>이유</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>배치 1 실험, 프롬프트·평가 반복</td><td>적합</td><td>동시성이 1에 가까워 스트림당 속도가 최대치</td></tr>
+                            <tr><td>야간 일괄 처리(요약·분류·색인)</td><td>적합</td><td>개별 지연이 아니라 합계 처리량만 보면 됨</td></tr>
+                            <tr><td>데이터 반출이 불가능한 사내 워크로드</td><td>적합</td><td>속도보다 경계가 요구 조건일 때</td></tr>
+                            <tr><td>모델 동작 자체를 관찰하는 연구</td><td>적합</td><td>재현성과 통제가 목적</td></tr>
+                            <tr><td>소수 인원의 사내 도구(큐 허용)</td><td>조건부</td><td>동시 요청 상한을 실측해 두고 큐를 세울 때만</td></tr>
+                            <tr><td>응답 시간 약속이 걸린 다중 사용자 서비스</td><td>부적합</td><td>동시성 8을 넘기면 스트림당 속도가 무너짐</td></tr>
+                            <tr><td>트래픽 스파이크가 있는 공개 서비스</td><td>부적합</td><td>포화 지점 이후 대기열이 지연만 키움</td></tr>
+                            <tr><td>가용성 요구가 있는 프로덕션</td><td>부적합</td><td>카드 한 장이 단일 장애점</td></tr>
+                            <tr><td>긴 컨텍스트 세션을 여럿 유지해야 하는 서비스</td><td>부적합</td><td>KV 풀을 동시 스트림이 나눠 씀</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h3>8.1 비용으로 다시 보면</h3>
+                    <p>여기에 판단을 하나 더 붙인다. <strong>하루 몇 시간만 도는 워크로드라면 한 장짜리 자가 운영은 거의 항상 진다.</strong> 카드가 놀아도 감가상각·전력·상면·운영 인건비는 계속 나가는데, API는 안 쓰면 0원이다. 750W 등급 가속기 한 장이 상시 가동될 때의 전력만 따져도 놀리는 시간의 비용이 만만치 않다.</p>
+                    <p>반대로 성립하는 조건은 이렇게 좁다.</p>
+                    <ul>
+                        <li>가동률이 높다. 하루 대부분 시간에 큐가 비지 않는다</li>
+                        <li>요청 패턴이 균질하다. 컨텍스트 길이와 출력 길이가 예측 가능해 KV 예산을 고정할 수 있다</li>
+                        <li>데이터 경계 요구가 실재한다. 계약이나 규제 때문에 외부 전송이 안 되는 자료를 다룬다</li>
+                        <li>토큰 단가 대비 자가 운영 원가가 유리한 지점까지 물량이 나온다</li>
+                    </ul>
+                    <p>이 네 가지가 다 맞으면 단일 카드 구성이 성립한다. 하나라도 어긋나면 API 쪽이 맞다. 상용 모델의 단가와 성능 대조는 <a href="ai_model_comparison_2026.html">AI 모델 비교 허브</a>에서 갱신 중이고, 저가 API 경쟁이 자가 운영 손익분기를 어떻게 밀어내는지는 <a href="deepseek_v4_pro_75percent_permanent_2026.html">DeepSeek V4 Pro 가격 인하</a> 쪽에 정리돼 있다. 에이전트 워크로드에서 로컬과 API의 3단 구성을 나누는 기준은 <a href="local_llm_agentic_coding_2026.html">로컬 LLM으로 에이전트 코딩하기</a>에 있다.</p>
+
+                    <h2 id="sec-9">9. 내 환경에서 재는 절차</h2>
+                    <p>남의 숫자를 옮겨 쓰는 대신 자기 장비에서 재는 순서다. 다섯 단계면 충분하다.</p>
+
+                    <h3>9.1 가용 메모리를 먼저 확인한다</h3>
+                    <pre><code># AMD
+rocm-smi --showmeminfo vram
+
+# NVIDIA
+nvidia-smi --query-gpu=name,memory.total,memory.used --format=csv</code></pre>
+                    <p>스펙 시트 숫자가 아니라 <strong>도구가 보고하는 숫자</strong>를 기준으로 삼는다. 단위가 GB인지 GiB인지, 이미 잡혀 있는 메모리가 있는지 같이 본다.</p>
+
+                    <h3>9.2 가중치 용량은 파일 크기로 확인한다</h3>
+                    <pre><code># 내려받은 체크포인트가 실제로 몇 바이트인지
+du -sh /path/to/model
+du -ah /path/to/model | grep safetensors | tail -5</code></pre>
+                    <p>파라미터 수로 계산한 값보다 이쪽이 정직하다. 혼합 정밀도 체크포인트는 계산으로 맞히기 어렵고, 토크나이저나 인덱스 같은 부속 파일도 함께 들어온다.</p>
+
+                    <h3>9.3 컨텍스트 길이별 KV 예산을 잡는다</h3>
+                    <p>전통적 어텐션 모델이면 5.1의 식에 <code>config.json</code>의 층 수·KV 헤드 수·헤드 차원을 넣는다. 압축 어텐션 계열이면 짧은 컨텍스트로 한 번 띄운 뒤 <strong>서버 기동 로그가 출력하는 KV 풀 크기와 수용 토큰 수</strong>를 받아 토큰당 바이트를 역산한다. 그 값에 목표 컨텍스트와 목표 동시 세션 수를 곱하면 필요한 풀 크기가 나온다.</p>
+
+                    <h3>9.4 OOM 지점을 이분 탐색으로 찾는다</h3>
+                    <pre><code># 기동만 확인하는 용도. 성공/실패 경계를 좁혀 간다
+vllm serve &lt;model&gt; \
+  --max-model-len 32768 \
+  --kv-cache-dtype fp8_e4m3 \
+  --gpu-memory-utilization 0.90 \
+  --enable-chunked-prefill \
+  --max-num-batched-tokens 256</code></pre>
+                    <ul>
+                        <li><code>--max-model-len</code>을 절반씩 올리며 기동 성공과 실패의 경계를 찾는다. 성공한 최대값이 그 구성의 실제 컨텍스트 상한이다</li>
+                        <li><code>--gpu-memory-utilization</code>을 0.90에서 시작해 조금씩 올린다. 1.0에 붙이면 단편화 한 번에 죽는다</li>
+                        <li>ROCm 경로에서는 <code>--kv-cache-dtype fp8_e4m3</code>을 쓴다. 엔비디아 경로는 <code>fp8</code></li>
+                        <li>기동은 되는데 요청 중에 죽는다면 활성값 쪽이다. <code>--max-num-batched-tokens</code>를 낮춰 프리필 청크를 줄인다</li>
+                    </ul>
+
+                    <h3>9.5 동시성 한계를 실측한다</h3>
+                    <p>마지막이 가장 중요하다. 스트림 수를 1, 4, 8, 16으로 올리며 <strong>스트림당 초당 토큰</strong>을 기록한다. 합계가 아니라 스트림당 값이다. 목표 체감 속도 아래로 떨어지는 지점이 그 카드의 동시 사용자 상한이고, 그 숫자가 나와야 「이 장비로 몇 명을 감당하나」에 답할 수 있다. 이 실측 없이 카드를 사면 대개 두 배쯤 낙관한 계획이 된다.</p>
+
+                    <h2 id="sec-10">10. 확인하지 못한 것</h2>
+                    <p>이 글에서 근거를 확보하지 못한 항목을 한자리에 모은다.</p>
+                    <ul>
+                        <li><strong>파라미터 수 표기 불일치.</strong> 공식 모델 카드는 총 284B, 활성 13B로 적는다. 반면 위에서 인용한 단일 MI300X 저장소와 그 소개 글은 대상 모델을 <strong>DeepSeek-V4-Flash-0731, 304B</strong>로 적고 있다. 공식 문서에서 0731 리비전의 별도 파라미터 표기를 찾지 못했다. 그래서 이 글은 모델을 설명할 때 284B/13B를 쓰고, 304B는 저장소 쪽 표기로만 남겼다</li>
+                        <li><strong>층 수와 헤드 구성.</strong> 모델 카드에서 확인하지 못해 5.1의 KV 공식을 이 모델에 직접 대입하지 않았다. 대신 서버 보고값 역산을 썼다</li>
+                        <li><strong>처리량 수치의 재현성.</strong> 7절 수치는 제3자 검증을 거치지 않았고 서버가 나이틀리 빌드다. 같은 숫자가 다른 장비에서 나온다는 보장이 없다</li>
+                        <li><strong>다른 가속기의 같은 조건 수치.</strong> 정밀도·컨텍스트·배치·커널 버전이 맞춰진 공개 측정치를 찾지 못했다. 그래서 이 글에 속도 대조표가 없다</li>
+                        <li><strong>실제 전력 소비.</strong> 750W 등급이라는 표기 외에 이 워크로드에서의 소비 전력과 발열 프로파일은 확인하지 못했다</li>
+                        <li><strong>품질 영향.</strong> FP4 전문가 + FP8 나머지 구성이 원본 대비 어떤 과제에서 얼마나 손실을 내는지는 이 글의 범위 밖이다. 모델 카드가 공개한 값 외에 독립 평가를 확인하지 못했다</li>
+                    </ul>
+
+                    <h2 id="sec-11">결론: 오늘 적용할 수 있는 세 가지</h2>
+                    <p><strong>첫째, 파라미터 수 대신 바이트 수로 말하는 습관을 들인다.</strong> 「284B 모델」이 아니라 「출하 정밀도로 약 157GB인 가중치」라고 적으면 회의 자리에서 논쟁이 반으로 준다. 카드 장수는 파라미터가 아니라 바이트가 정한다.</p>
+                    <p><strong>둘째, MoE 계획서에는 총 파라미터와 활성 파라미터를 항상 나란히 적는다.</strong> 앞은 메모리 청구서, 뒤는 연산 청구서다. 하나만 적힌 계획서는 반드시 어느 쪽에서든 틀린다.</p>
+                    <p><strong>셋째, 카드를 사기 전에 동시성 곡선을 먼저 그린다.</strong> 단일 카드 구성이 무너지는 곳은 메모리가 아니라 동시성이다. 스트림 1개에서 168 토큰이 나오는 장비가 8개에서는 스트림당 90으로, 64개에서는 합계마저 늘지 않는다. 「몇 명이 동시에 쓰나」에 숫자로 답할 수 없다면 아직 살 때가 아니다.</p>
+                    <p>마지막으로 하나. 단일 GPU 구성이 흥미로운 이유는 그것이 가장 저렴한 서빙 방법이어서가 아니다. <strong>카드 경계를 넘지 않는 순간 사라지는 복잡도가 크기 때문</strong>이다. 병렬 전략도, 인터커넥트 튜닝도, 노드 간 장애 처리도 없다. 그 단순함이 값어치가 있는 자리가 분명히 있고, 값어치가 없는 자리도 그만큼 분명하다. 위 표에서 자기 조직이 어느 줄에 있는지 먼저 찍고 시작하면 된다.</p>
+
+                    <h2 id="sec-12">참고 자료</h2>
+                    <ul>
+                        <li><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash" target="_blank" rel="noopener">DeepSeek-V4-Flash 모델 카드 (Hugging Face)</a> — 총·활성 파라미터, MoE 구성, 혼합 정밀도, 컨텍스트</li>
+                        <li><a href="https://recipes.vllm.ai/deepseek-ai/DeepSeek-V4-Flash" target="_blank" rel="noopener">vLLM Recipes: DeepSeek-V4-Flash</a> — 체크포인트 크기, 검증 하드웨어, KV·병렬 플래그</li>
+                        <li><a href="https://docs.vllm.ai/en/latest/getting_started/installation/gpu.html" target="_blank" rel="noopener">vLLM GPU 설치 문서 (ROCm 항목)</a> — ROCm 버전, 지원 아키텍처, 휠·도커 경로</li>
+                        <li><a href="https://docs.sglang.io/platforms/amd_gpu.html" target="_blank" rel="noopener">SGLang AMD GPU 문서</a> — 도커 이미지, AITER 환경변수, 미지원 양자화 목록</li>
+                        <li><a href="https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/data-sheets/amd-instinct-mi300x-data-sheet.pdf" target="_blank" rel="noopener">AMD Instinct MI300X 데이터시트 (PDF)</a> — HBM 용량·대역폭·전력 등급</li>
+                        <li><a href="https://www.amd.com/en/products/accelerators/instinct/mi300/mi300x.html" target="_blank" rel="noopener">AMD Instinct MI300X 제품 페이지</a></li>
+                        <li><a href="https://github.com/ryanzhou/deepseek-v4-flash-mi300x" target="_blank" rel="noopener">단일 MI300X 구성 저장소 (deepseek-v4-flash-mi300x)</a> — 4·7절 실측 수치의 출처. 벤더 검증이 아닌 개인 측정</li>
+                        <li><a href="https://news.hada.io/topic?id=32149" target="_blank" rel="noopener">GeekNews 토론</a></li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>이 글 공유하기</h3>
+                    <div class="social-share">
+                        <button id="kakao-share" class="share-btn kakao-btn"><img src="https://developers.kakao.com/assets/img/about/logos/kakaolink/kakaolink_btn_small.png" alt="카카오톡">카카오톡</button>
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(트위터)</button>
+                        <button id="threads-share" class="share-btn threads-btn">쓰레드</button>
+                        <button id="link-copy" class="share-btn link-btn">링크 복사</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">목록으로 돌아가기</a>
+                </div>
+                <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">함께 쓰면 좋은 무료 도구</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/json_formatter.html">JSON 포맷터</a></li>
+      <li><a href="../static/regex_tester.html">정규식 테스트기</a></li>
+      <li><a href="../static/jwt_decoder.html">JWT 디코더·생성기 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 인코더/디코더</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">전체 도구 보기 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+            <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">관련 글</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="diataxis_documentation_framework_2026.html">문서가 안 읽히는 건 분량 탓이 아니다 - Diátaxis로 네 갈래를 가르는 기준과 실제 적용 2026</a></li>
+      <li><a href="ai_coding_tool_cost_transparency_2026.html">AI 코딩 도구에서 금액이 사라졌다 - 토큰만 남았을 때 비용을 스스로 재는 법 2026</a></li>
+      <li><a href="vibe_coding_stack_myths_2026.html">AI가 짜준 Next.js + Supabase, 나중에 터지는 자리 - 배포 전에 봐야 할 일곱 지점 2026</a></li>
+      <li><a href="software_longevity_small_codebase_2026.html">20년 넘게 살아남는 소프트웨어는 무엇이 다른가 - 완성과 방치를 가르는 지표 2026</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const kakaoShareBtn = document.getElementById('kakao-share');
+        if (kakaoShareBtn) {
+            kakaoShareBtn.addEventListener('click', function() {
+                if (!window.Kakao) return;
+                if (!window.Kakao.isInitialized()) window.Kakao.init('e06d0ee93e450a11bc6451d46e09cd88');
+                if (window.Kakao.Share) {
+                    window.Kakao.Share.sendDefault({
+                        objectType: 'feed',
+                        content: { title: document.title, description: document.querySelector('meta[name="description"]')?.content || '', imageUrl: 'https://braindetox.kr/site_logo.png', link: { mobileWebUrl: location.href, webUrl: location.href } },
+                        buttons: [{ title: '웹으로 보기', link: { mobileWebUrl: location.href, webUrl: location.href } }]
+                    });
+                }
+            });
+        }
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('링크가 복사되었습니다. 쓰레드 앱에 붙여넣기하여 공유하세요!');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('링크가 복사되었습니다!'); });
+    });
+    </script>
+</body>
+</html>

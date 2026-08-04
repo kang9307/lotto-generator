@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<!--
+ * 技術ブログ記事テンプレート
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ja">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>大規模MoEをGPU1枚に - メモリ計算から詰まる地点まで 2026</title>
+    <meta name="description" content="284BのMoEがGPU1枚に載るという話が実際に要求するもの。重みのバイト計算、総パラメータと活性パラメータの違い、量子化では減らないKVキャッシュ、ROCmで動くものと未対応のもの、同時リクエストで崩れる地点までを整理した。">
+    <meta name="keywords" content="DeepSeek V4 Flash, MI300X, 単一GPU LLM, MoE 活性パラメータ, KVキャッシュ計算, VRAM見積もり, ROCm, vLLM, SGLang, FP8 KVキャッシュ, FP4量子化, HBM3, 推論サービング, OOM, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/ja/posts/deepseek_v4_flash_single_gpu_2026.html">
+
+    <meta property="og:title" content="大規模MoEをGPU1枚に - メモリ計算から詰まる地点まで">
+    <meta property="og:description" content="284Bが192GBに収まるのはモデルが小さいからではない。チェックポイントが最初から4ビット相当で配布されているからだ。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/ja/posts/deepseek_v4_flash_single_gpu_2026.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ja_JP">
+    <meta property="article:published_time" content="2026-08-05">
+    <meta property="article:section" content="開発・インフラ">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="大規模MoEをGPU1枚に">
+    <meta name="twitter:description" content="量子化で減るのは重みだけでKVキャッシュは別勘定。1枚に載せた後で崩れるのはメモリではなく同時実行数だ。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "大規模MoEをGPU1枚に - メモリ計算から詰まる地点まで",
+      "alternativeHeadline": "284Bが192GBに収まるのはモデルが小さいからではない",
+      "datePublished": "2026-08-05",
+      "dateModified": "2026-08-05",
+      "inLanguage": "ja-JP",
+      "articleSection": "開発・インフラ",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "DeepSeek V4 Flash, MI300X, 単一GPU LLM, MoE 活性パラメータ, KVキャッシュ計算, VRAM見積もり, ROCm, vLLM, SGLang, FP8 KVキャッシュ",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/ja/posts/deepseek_v4_flash_single_gpu_2026.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "284Bパラメータのモデルがなぜ192GBのカード1枚に収まるのか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "モデルが小さいからではなく、チェックポイントが最初から低精度で配布されているからだ。重みが占める容量を決めるのはパラメータ数ではなくパラメータ当たりのバイト数である。284BをBF16で格納すると1パラメータ2バイトで約568GB、FP8でも約284GBになる。どちらも192GB1枚には収まらない。DeepSeek-V4-Flashの公式重みは、MoEのエキスパートパラメータをFP4、アテンションと正規化とルータのパラメータをFP8で格納した混合形式で配布される。1パラメータ当たりの平均が1バイトを下回ることでチェックポイント自体が160GB前後になり、1枚に載せる余地が生まれる。利用者側が追加で量子化した結果ではなく、配布物が最初からその状態である。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "MoEモデルは活性パラメータ分だけメモリに載せればよいのか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "違う。この誤解が単一GPU計画を最も頻繁に壊す。DeepSeek-V4-Flashは総パラメータ284Bでトークン当たりの活性が13Bである。活性パラメータは1トークンを処理するときに実際に乗算へ参加する量なので、計算量と速度を支配する。しかしどのエキスパートが選ばれるかはトークンごとにルータがその場で決める。次のトークンにどのエキスパートが必要かは事前に分からないため、エキスパート全体がメモリに常駐している必要がある。つまり総パラメータがメモリの請求書を書き、活性パラメータが計算の請求書を書く。MoEの利点はこの二つがずれる点にあり、メモリが活性パラメータ分まで減るという意味ではない。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "量子化すればKVキャッシュも一緒に減るのか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "重みの量子化とKVキャッシュは別の軸である。重みをFP16からFP4に落としてもKVキャッシュは1バイトも減らない。KVキャッシュの大きさは層数、KVヘッド構成、ヘッド次元、要素当たりのバイト数、コンテキスト長、同時シーケンス数の積で決まるからだ。減らすにはKV専用の精度を別途下げるか、コンテキストを短くするか、同時シーケンスを減らすしかない。vLLMではkv-cache-dtypeオプションでKV精度を個別に指定し、ROCm経路ではfp8_e4m3という値を使う。実務でよくある失敗は、重みだけ計算してカードを選びKV予算を忘れ、コンテキストを伸ばした途端にメモリ不足で落ちるパターンである。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "単一GPU構成で複数ユーザーにサービスできるか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "合計スループットは伸びるが、個人が体感する速度は急速に落ちる。公開されている単一MI300X構成の計測値では、単一ストリームのデコードが毎秒168.6トークンである。同時ストリーム8本では合計が毎秒542トークン、ストリーム当たりの中央値は90.3トークンまで下がる。64ストリームのバーストでは合計が毎秒830トークンにとどまる。ストリームを8倍にして合計が1.5倍という意味であり、この地点でカードが飽和したと読めばよい。したがって1枚構成はバッチ1に近い実験、夜間の一括処理、キューを許容できる社内の単一ワークロードに向く。応答時間の約束がかかった複数ユーザー向け対話サービスには向かない。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "ROCm環境で大規模モデルをサービングするとき最も詰まるのはどこか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "モデルではなくインストールとカーネル層で詰まる。vLLMのドキュメントはROCm 6.3以上を要求し、gfx90a、gfx942、gfx950の系列を明記しているが、ビルド済みホイールはPython 3.12専用でROCm 7.0と7.2.1の派生のみ提供される。他のPythonバージョンを使うとインストーラが黙ってCUDAホイールに切り替わり、AMD機で失敗する。二つ目は量子化フォーマットである。SGLangのドキュメントはMarlinやNVIDIA専用カーネルに依存する方式がAMDで動作しないと記し、awq_marlin、gptq_marlin、gguf、modelopt_fp8、modelopt_fp4を名前で列挙している。MXFP4はCDNA3またはCDNA4世代を要求する。移植失敗の原因はモデル構造ではなく、Pythonホイール、カーネルライブラリ、量子化フォーマットの三行にあることが多い。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/deepseek_v4_flash_single_gpu_2026.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/deepseek_v4_flash_single_gpu_2026.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/deepseek_v4_flash_single_gpu_2026.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/deepseek_v4_flash_single_gpu_2026.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/deepseek_v4_flash_single_gpu_2026.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="大規模MoEをGPU1枚に - メモリ計算から詰まる地点まで">
+                <meta itemprop="datePublished" content="2026-08-05">
+                <meta itemprop="dateModified" content="2026-08-05">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="DeepSeek V4 Flash, MI300X, 単一GPU LLM, MoE 活性パラメータ, KVキャッシュ計算, VRAM見積もり, ROCm, vLLM">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/ja/posts/deepseek_v4_flash_single_gpu_2026.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">大規模MoEをGPU1枚に - メモリ計算から詰まる地点まで</h1>
+                    <h2 class="post-subtitle">284Bが192GBに収まるのはモデルが小さいからではない</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-08-05">2026年8月5日</span>
+                        <span class="post-category" itemprop="articleSection">開発・インフラ</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <nav class="post-toc">
+                        <h3>この記事で扱うこと</h3>
+                        <ol>
+                            <li><a href="#sec-1">重みの容量はパラメータ数ではなくバイト数が決める</a></li>
+                            <li><a href="#sec-2">総パラメータと活性パラメータは別の資源を食う</a></li>
+                            <li><a href="#sec-3">MI300Xがこの話に出てくる理由</a></li>
+                            <li><a href="#sec-4">1枚に載せたときメモリが実際に分かれる形</a></li>
+                            <li><a href="#sec-5">KVキャッシュは重みとは別勘定</a></li>
+                            <li><a href="#sec-6">ROCmで動くものとまだのもの</a></li>
+                            <li><a href="#sec-7">同時リクエストが増えると崩れる地点</a></li>
+                            <li><a href="#sec-8">単一GPUが意味を持つ場所と持たない場所</a></li>
+                            <li><a href="#sec-9">自分の環境で測る手順</a></li>
+                            <li><a href="#sec-10">確認できなかったこと</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-0">序論: 「1枚で動く」を受け取って見積書を開いたなら</h2>
+                    <p>あるモデルがGPU1枚で動くという文は、いつも同じ反応を生む。ならうちでもできる。ところがその文には条件が六つほど省かれていて、省かれた条件一つがカード2枚分の差を作る。</p>
+                    <p>先に結論を書く。<strong>284BのMoEが192GBのカード1枚に収まるのはモデルが小さいからではない。公式チェックポイントが最初から実質4ビットで配布されているからだ。</strong>ここにKVキャッシュと活性値が乗ると残る余裕は数ギガバイト程度で、その状態で同時リクエストを足した瞬間に個人の体感速度が崩れる。使える場所と使えない場所を分けるのはカードの性能ではなく、<strong>リクエストが一度に何本来るか</strong>である。</p>
+                    <p>この記事はその計算を順に広げる。重みのバイト数から始めて、MoEにおける総パラメータと活性パラメータがそれぞれ何を決めるのか、KVキャッシュがどこで別に場所を取るのか、ROCmスタックで実際に詰まる地点はどこか、そして読者が自分の機材で同じ計算をしてOOM地点を見つける手順までいく。</p>
+                    <p>範囲は先に狭めておく。ここで扱うのは<strong>データセンター向けアクセラレータ1枚と大規模MoE</strong>である。コンシューマ向けハードウェアでローカルモデルを回す話、古いCPUで軽量モデルを動かしたりMacのGPU支援を有効にする側は<a href="old_xeon_run_gemma_4_local_llm_2026.html">10年前のXeonでGemma 4を動かす</a>と<a href="local_llm_mac_mps_speedup_2026.html">MacでローカルLLMが遅い本当の理由</a>で別に扱った。GGUF量子化の等級選択やコンシューマGPUのVRAM要件の一般論は<a href="local_llm_running_guide_2026.html">ローカルLLM実行ガイド</a>のほうにある。</p>
+
+                    <h2 id="sec-1">1. 重みの容量はパラメータ数ではなくバイト数が決める</h2>
+                    <p>最初の計算は単純だ。掛け算が一つである。</p>
+                    <pre><code>重みのバイト数 = パラメータ数 × パラメータ当たりのバイト数
+
+FP32  = 4 バイト
+BF16 / FP16 = 2 バイト
+FP8   = 1 バイト
+FP4   = 0.5 バイト</code></pre>
+                    <p>この掛け算をせずパラメータ数だけを見ると計画が丸ごとずれる。同じ284Bでも、どの精度で格納するかによって必要なカード数が四倍違う。</p>
+
+                    <h3>1.1 精度ごとに実際どれくらいになるか</h3>
+                    <p><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash" target="_blank" rel="noopener">DeepSeek-V4-Flashのモデルカード</a>は総パラメータ284B、トークン当たりの活性13Bと記している。この284Bを精度別に格納すると次のように分かれる。カード数は192GB1枚基準で、重みだけを計算した値なので実際にはもっと必要になる。</p>
+                    <table>
+                        <thead>
+                            <tr><th>格納精度</th><th>パラメータ当たり</th><th>284Bの重み容量</th><th>192GBカードの最小枚数(重みのみ)</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>FP32</td><td>4 バイト</td><td>約 1,136 GB</td><td>6枚</td></tr>
+                            <tr><td>BF16 / FP16</td><td>2 バイト</td><td>約 568 GB</td><td>3枚</td></tr>
+                            <tr><td>FP8</td><td>1 バイト</td><td>約 284 GB</td><td>2枚</td></tr>
+                            <tr><td>FP4</td><td>0.5 バイト</td><td>約 142 GB</td><td>1枚</td></tr>
+                            <tr><td><strong>出荷状態(FP4エキスパート + FP8残り)</strong></td><td>平均1バイト未満</td><td><strong>チェックポイント約 160~167 GB</strong></td><td><strong>1枚(余裕はほぼない)</strong></td></tr>
+                        </tbody>
+                    </table>
+                    <p>最後の行がこの記事全体の出発点である。<a href="https://recipes.vllm.ai/deepseek-ai/DeepSeek-V4-Flash" target="_blank" rel="noopener">vLLMのレシピ文書</a>はこのモデルのチェックポイント容量をプレビュー基準で約160GB、融合バリアント基準で約167GBと記す。モデルカードはMoEのエキスパートパラメータをFP4、アテンションと正規化とルータのパラメータをFP8で格納した混合形式だと明かしている。</p>
+
+                    <h3>1.2 事後量子化と何が違うのか</h3>
+                    <p>ここでよくある混同が一つ引っかかる。ローカルモデルを扱うときに馴染んだ順序はこうだ。BF16の原本を受け取ってQ4に押し込み、品質がどれだけ削れたかを確認する。このモデルは順序が違う。<strong>配布物そのものが最初から低精度である。</strong></p>
+                    <ul>
+                        <li>利用者が追加の量子化をしなくてもパラメータ当たりの平均バイト数がすでに1を下回っている</li>
+                        <li>したがって「量子化すればもっと減るだろう」という余地がほとんど残っていない</li>
+                        <li>代わりに品質損失を負う主体が利用者ではなくモデル制作者になる。学習段階でその精度を前提に調整できるという意味であり、事後に押し込むより有利な位置だ</li>
+                        <li>言い換えると、<strong>このモデルで「量子化してカードを1枚減らす」という手札はすでに使い切られている</strong></li>
+                    </ul>
+                    <p>事後量子化の等級をどこまで下げるかという判断、Q4とQ8の間のトレードオフは性格の違う問題なので<a href="local_llm_running_guide_2026.html">ローカルLLM実行ガイド</a>で別に整理した。</p>
+
+                    <h2 id="sec-2">2. 総パラメータと活性パラメータは別の資源を食う</h2>
+                    <p>MoEの話で計画を最も頻繁に壊す文がある。「活性が13Bだから13B分のメモリがあればいい。」違う。これを正さないと後の計算が全部狂う。</p>
+
+                    <h3>2.1 ルータはトークンごとに選び直す</h3>
+                    <p>DeepSeek-V4-FlashのMoE層は共有エキスパート1個とルーティングエキスパート256個を持ち、トークン1個当たりルーティングエキスパート6個が発火する。エキスパートの中間次元は2048で、前方の三つのMoE層はハッシュルーティングを使う。</p>
+                    <p>核心は<strong>どの6個が選ばれるか事前に分からない</strong>点にある。次のトークンが何かによってルータがその場で決める。だからエキスパート256個すべてがメモリに座っていなければならない。座っていなければ必要な瞬間にディスクやホストメモリから引いてくることになり、その往復遅延はGPUの演算時間と桁が違う。</p>
+
+                    <h3>2.2 何が何を決めるのか</h3>
+                    <table>
+                        <thead>
+                            <tr><th>この値が</th><th>この資源を決める</th><th>増やすと起きること</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>総パラメータ(284B)</td><td>常駐メモリ(重み)</td><td>必要なカード枚数が増える</td></tr>
+                            <tr><td>活性パラメータ(13B)</td><td>トークン当たりの計算量</td><td>トークン生成が遅くなる</td></tr>
+                            <tr><td>コンテキスト長</td><td>KVキャッシュ</td><td>重みと無関係にメモリをさらに食う</td></tr>
+                            <tr><td>同時シーケンス数</td><td>KVキャッシュ + 活性値</td><td>メモリとストリーム当たり速度の両方が悪化</td></tr>
+                            <tr><td>バッチサイズ</td><td>活性値・ワークスペース</td><td>スループットは上がり個別遅延は伸びる</td></tr>
+                        </tbody>
+                    </table>
+                    <p>MoEの商品価値は最初の二行がずれる点にある。<strong>284B級の表現力を13B級の演算コストで使う。</strong>その代わりメモリの請求書は284B基準で来る。これは欠陥ではなく設計意図であり、計画するとき二行を混ぜないことがすべてだ。</p>
+                    <p>付け加えると、このずれのためMoEは<strong>メモリは潤沢だが演算が惜しい機材</strong>で相対的に有利になる。逆にメモリがきつく演算に余裕のある機材では、同等品質の密なモデルのほうが良い選択になることもある。27B級の密なモデルが単一GPUでなぜ楽なのかは<a href="qwen_3_6_27b_local_2026.html">Qwen 3.6 27B - ローカル開発の最適点</a>で扱ったが、あの記事のスイートスポット論とこの記事の計算は正確に反対側から同じ壁を見ている。</p>
+
+                    <h2 id="sec-3">3. MI300Xがこの話に出てくる理由</h2>
+                    <p>単一GPUの議論にAMDのアクセラレータが登場する理由は一つだ。<strong>1枚に収まる容量</strong>である。ベンチマーク競争ではなく計算の問題だ。</p>
+
+                    <h3>3.1 公開されている仕様</h3>
+                    <p>AMDの資料によるとMI300Xは192GBのHBM3を載せている。メモリバスは8,192ビット、データレート5.2Gbpsでピーク帯域幅が5.325TB/sである。CDNA 3アーキテクチャに8個のXCD構成で、750W級でブースト2,100MHzのときFP16とBF16のピーク理論性能がそれぞれ1,307.4TFLOPSと表記される。</p>
+                    <div class="callout">
+                        <p><strong>ピーク理論値は実測ではない。</strong>1,307.4TFLOPSはクロックとユニット数から計算した上限であり、実際の推論でその近くが出ることはない。この数字はカードの世代比較に使う値であって、スループット予測に使う値ではない。</p>
+                    </div>
+
+                    <h3>3.2 対照は二つの軸だけで</h3>
+                    <p>NVIDIA系との比較は二つの軸に絞ると正確になる。速度の順位をつけようとすると条件が違って比較が成立しない。</p>
+                    <ul>
+                        <li><strong>容量の軸</strong> — カード1枚にどれだけ収まるか。この軸ではHBM容量の大きいほうが単一カード構成で有利だ。カードの境界を越えた瞬間にテンソル並列やエキスパート並列が入り、インターコネクトが新たなボトルネック候補になり、障害点と運用の複雑さが一緒に増える。1枚に収まればこの全部が消える</li>
+                        <li><strong>ソフトウェア成熟度の軸</strong> — その容量を実際に使うカーネルとサーバがあるか。ここではCUDAのエコシステムが依然として先行しており、その差は後の6節で具体的に指摘する</li>
+                    </ul>
+                    <p>速度比較を載せない理由は消極的な態度ではない。同じモデルでも精度、コンテキスト長、バッチサイズ、カーネルライブラリのバージョン、投機的デコードの有無によってスループットが数倍に割れる。条件を合わせない二つの数字を並べるとそれは比較ではなく錯覚だ。</p>
+
+                    <h2 id="sec-4">4. 1枚に載せたときメモリが実際に分かれる形</h2>
+                    <p>計算だけでは掴めない部分がある。実際の配分を見ると<strong>重みだけ計算したときと40GB以上開く。</strong></p>
+                    <p>以下は<a href="https://github.com/ryanzhou/deepseek-v4-flash-mi300x" target="_blank" rel="noopener">公開された単一MI300X構成のリポジトリ</a>が自分のスタックで記録した値である。条件を先に書く。対象はDeepSeek-V4-Flash-0731、機材は単一MI300X(gfx942、304 CU、192GB HBM3)、サーバはvLLMのROCmナイトリー<code>0.26.1rc1.dev229+g124154a88.rocm723</code>、カーネルはAITER 0.1.19、KVキャッシュはFP8(<code>fp8_ds_mla</code>、256トークンブロック)、重みは<strong>追加量子化なしの出荷状態そのまま</strong>、検証コンテキストは256Kである。</p>
+                    <table>
+                        <thead>
+                            <tr><th>構成要素</th><th>占有量</th><th>メモ</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>重み</td><td>156.67 GB</td><td>出荷精度のまま、追加量子化なし</td></tr>
+                            <tr><td>GPU KVプール</td><td>20 GB</td><td>FP8 KV基準で1,927,444トークン分</td></tr>
+                            <tr><td>その他(活性値・ワークスペース・グラフバッファ・アロケータ余裕)</td><td>約 28 GB</td><td>下の最高水位からの逆算値</td></tr>
+                            <tr><td><strong>ウォームアップ後の最高水位</strong></td><td><strong>204.5 GB / 総 205.8 GB</strong></td><td>余裕は約1.3 GB</td></tr>
+                            <tr><td>CPUオフロード層</td><td>96 GiB</td><td>追い出されたプレフィックスキャッシュ用、ホストメモリ</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h3>4.1 この表から読むべき三つ</h3>
+                    <ol>
+                        <li><strong>重みだけ数えると40GB以上外れる。</strong>156.67GBだけを見て「192GBだから35GB余る」と計画すると、KVプール20GBとその他28GBで崩れる</li>
+                        <li><strong>最高水位が総量の99.4%だ。</strong>余裕が1.3GBしかないというのはチューニングが終わった状態の数字という意味であり、出発点ではない。最初に起動すると大抵ここまで来る前に落ちる</li>
+                        <li><strong>「192GB」と「205.8GB」が違う理由</strong> — 大部分は単位表記の差である。192GiBは十進で約206.2GBだ。スペックシートの数字とアロケータが報告する数字が正確には合わないということだけ分かっていればよい。最後の1ギガバイトまで計画を詰めてはいけない</li>
+                    </ol>
+                    <div class="callout">
+                        <p><strong>この数値の性格。</strong>上の値はリポジトリの管理者が自分のスタックで測ったものであり、ベンダー検証を経た値ではない。サーバがナイトリービルドなのでカーネルやバージョンが変われば配分も変わる。そのまま持ち込まず<strong>自分の機材で測り直す</strong>のが正しい。測る手順は9節にある。</p>
+                    </div>
+
+                    <h3>4.2 公式レシピはどのハードウェアを記しているか</h3>
+                    <p>興味深い対照が一つある。vLLM公式レシピがこのモデルについて記したハードウェア一覧に<strong>MI300Xはない。</strong></p>
+                    <table>
+                        <thead>
+                            <tr><th>構成</th><th>GPU</th><th>備考</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>単一ノード(NVIDIA)</td><td>4枚 (H200 / B200 / B300 または GB200 NVL4)</td><td><code>--data-parallel-size 4</code> のDP+EP推奨</td></tr>
+                            <tr><td>DGX Station</td><td>1枚</td><td>最小構成として表記</td></tr>
+                            <tr><td>MI325X</td><td>1枚 × 256GB</td><td>ロード時148.66 GiB、vLLM 0.25.0で検証</td></tr>
+                            <tr><td>MI355X</td><td>4枚 × 288GB</td><td>vLLM 0.25.0以上</td></tr>
+                            <tr><td><strong>MI300X (192GB)</strong></td><td><strong>一覧にない</strong></td><td>コミュニティ構成が別に存在する理由</td></tr>
+                        </tbody>
+                    </table>
+                    <p>この表が言うことは明確だ。AMDの単一カード経路で公式に検証されたのは256GBのMI325Xであり、192GBのMI300Xは<strong>同じモデルを収めるには余裕がはるかにきつい場所</strong>である。4.1で余裕1.3GBが出たのもそのためだ。「単一GPUで動く」という文がカードの型番一つにどれだけ敏感かを見せる箇所である。</p>
+
+                    <h2 id="sec-5">5. KVキャッシュは重みとは別勘定</h2>
+                    <p>量子化の話で最も頻繁に漏れるのがここだ。<strong>重みをFP16からFP4に落としてもKVキャッシュは1バイトも減らない。</strong>二つは別の軸である。</p>
+
+                    <h3>5.1 伝統的なアテンションでの計算式</h3>
+                    <p>MHAやGQA系のモデルならKVキャッシュの大きさはこう出る。自分のモデルの<code>config.json</code>から値を取り出して代入すればよい。</p>
+                    <pre><code>KVバイト = 2 × 層数 × KVヘッド数 × ヘッド次元
+           × 要素当たりのバイト数 × トークン数 × 同時シーケンス数
+
+# 先頭の 2 は Key と Value の二組を意味する
+# 要素当たりのバイト数: FP16=2, FP8=1
+# トークン数 = プロンプト + これまでに生成した出力</code></pre>
+                    <p>この式から読むべきは<strong>重みの精度がどこにも入らない</strong>という事実だ。重みをどれだけ押し込んでもこの値はそのままである。減らすにはKV専用の精度を別途下げるか、コンテキストを短くするか、同時シーケンスを減らすしかない。</p>
+
+                    <h3>5.2 圧縮アテンション系はこの式が合わない</h3>
+                    <p>DeepSeek V4系は圧縮スパースアテンション(CSA)と高圧縮アテンション(HCA)を混ぜたハイブリッド設計だ。潜在表現をキャッシュする構造なので上の式をそのまま代入すると実際より大きく出る。モデルカードはV4-Pro基準で100万トークンにおいてV3.2比でKVキャッシュが10パーセント水準だと記している。</p>
+                    <p>このようなモデルでは計算の代わりに<strong>サーバが報告するプール容量から逆算</strong>するほうが正確だ。4節の構成を例にするとこうなる。</p>
+                    <pre><code>20 GB ÷ 1,927,444 トークン ≈ トークン当たり約 10 KB
+# 条件: FP8 KVキャッシュ、fp8_ds_mla、256トークンブロック、このサーバ構成</code></pre>
+                    <p>この10KBは<strong>この設定で出た値であってモデルの定数ではない。</strong>KV精度を変えたりブロックサイズを変えれば変わる。それでも計画には十分使える。128Kコンテキストの会話一つがおよそ1.3GB、256Kなら2.6GB程度を占めるという感覚が掴めるからだ。</p>
+
+                    <h3>5.3 実務ではどう分かれるか</h3>
+                    <ul>
+                        <li>宣伝上のコンテキストと実際に使えるコンテキストは別物だ。100万トークンに対応していてもKVプールが支えられなければ使えない</li>
+                        <li>KVプールは<strong>同時ストリームが分け合う。</strong>192万トークン分のプールでも256Kセッション7~8本で底が見える</li>
+                        <li>vLLMでKV精度を個別に指定するオプションが<code>--kv-cache-dtype</code>で、NVIDIA経路は<code>fp8</code>、ROCm経路は<code>fp8_e4m3</code>という値を使う</li>
+                        <li>長い出力を使うモードは要求が急激に大きくなる。レシピ文書は最大384Kの出力を使うモードに<code>--max-model-len</code>を393,216以上に取るよう記している</li>
+                        <li>プレフィックスキャッシュを有効にすると再利用の利得が大きいが、追い出された項目をホストに下ろす層が必要になる。前述の構成が96GiBのCPUオフロード層を置いた理由がそれだ</li>
+                    </ul>
+
+                    <h2 id="sec-6">6. ROCmで動くものとまだのもの</h2>
+                    <p>モデルが載ることとスタックが回ることは別の問題だ。移植失敗の原因は大抵モデル構造ではなく<strong>Pythonホイール、カーネルライブラリ、量子化フォーマット</strong>の三行にある。</p>
+
+                    <h3>6.1 vLLM側の状態</h3>
+                    <p>vLLMのインストール文書を基準に整理するとこうなる。</p>
+                    <ul>
+                        <li>要求ROCmバージョンは<strong>6.3以上</strong></li>
+                        <li>対応GPUとしてMI200s(gfx90a)、MI300(gfx942)、MI350(gfx950、ROCm 7.0以上が必要)、Radeon RX 7900・9000系列、Ryzen AI MAX・AI 300系列(ROCm 7.0.2以上)を明記</li>
+                        <li>ビルド済みホイールは<strong>Python 3.12専用</strong>で、ROCm 7.0と7.2.1の派生のみ提供</li>
+                        <li>公式Dockerイメージは<code>vllm/vllm-openai-rocm</code>、安定版とナイトリーの二系統</li>
+                        <li>ソースビルド経路は<code>PYTORCH_ROCM_ARCH</code>を設定して<code>python3 setup.py develop</code>を回す方式</li>
+                    </ul>
+                    <div class="callout">
+                        <p><strong>最も静かに人を捕まえる罠。</strong>文書が直接警告している項目だが、Python 3.12でない環境でインストールするとインストーラが<strong>黙ってCUDAホイールに切り替わる。</strong>インストールは成功したように見え、AMD機で実行するときに失敗する。原因はモデルやカーネルのように見えて実はホイール一つだ。ROCm機をセットアップするときPythonのバージョンとインストールされたホイールの正体を先に確認する習慣が、最も多くの時間を節約する。</p>
+                    </div>
+
+                    <h3>6.2 SGLang側の状態</h3>
+                    <ul>
+                        <li>AMD文書でMI300Xを代表事例として扱っている</li>
+                        <li>ビルド済みイメージはDocker Hubの<code>lmsysorg/sglang</code>、リポジトリの<code>rocm.Dockerfile</code>でビルドされる</li>
+                        <li>高速化オプションとして<code>export SGLANG_USE_AITER=1</code>を案内する。RDMA構成には<code>export NCCL_IB_GID_INDEX=3</code></li>
+                        <li>AMDで<strong>動作しない量子化方式</strong>を名前で列挙している。MarlinやNVIDIA専用カーネルに依存するものだ</li>
+                    </ul>
+                    <table>
+                        <thead>
+                            <tr><th>項目</th><th>AMD ROCmでは</th><th>根拠</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>awq_marlin / gptq_marlin</td><td>動作しない</td><td>Marlinカーネル依存</td></tr>
+                            <tr><td>gguf</td><td>動作しない</td><td>SGLang文書に明記</td></tr>
+                            <tr><td>modelopt_fp8 / modelopt_fp4</td><td>動作しない</td><td>NVIDIA専用経路</td></tr>
+                            <tr><td>MXFP4</td><td>CDNA3またはCDNA4が必要</td><td>世代制約</td></tr>
+                            <tr><td>AITER高速化</td><td>環境変数で有効化</td><td><code>SGLANG_USE_AITER=1</code> / <code>VLLM_ROCM_USE_AITER=1</code></td></tr>
+                        </tbody>
+                    </table>
+                    <p>vLLMレシピのAMD項目も同じ方向だ。MI325X構成に<code>export VLLM_ROCM_USE_AITER=1</code>と<code>--moe-backend triton_unfused</code>を案内し、eagerモードでは<code>--enable-chunked-prefill</code>と<code>--max-num-batched-tokens 256</code>、<code>--kv-cache-memory-bytes 10000000000</code>を併用する。</p>
+
+                    <h3>6.3 判断</h3>
+                    <p>整理するとこうだ。<strong>モデルを載せること自体はでき、詰まるのはその下の層である。</strong>だからROCm導入を検討する組織に必要な準備はモデルの知識ではなく次の三つだ。</p>
+                    <ol>
+                        <li>Pythonのバージョンとホイールを固定できる配布方式。Dockerイメージを使うほうが確実に安全だ</li>
+                        <li>使おうとする量子化フォーマットがAMD経路に存在するかを<strong>モデルを選ぶ前に</strong>確認すること。GGUFを前提にした計画はここでそのまま崩れる</li>
+                        <li>ナイトリービルドに依存する構成なら、バージョンを丸ごと固定して再現手順を文書に残すこと。再現の窓が狭い</li>
+                    </ol>
+
+                    <h2 id="sec-7">7. 同時リクエストが増えると崩れる地点</h2>
+                    <p>メモリに載ったからサービスになるわけではない。単一カード構成の本当の限界はここで露わになる。</p>
+                    <p>以下は4節と同じスタックから出た数値である。条件は同一で、デコードにDSpark-7の投機的デコードが有効になっている。</p>
+                    <table>
+                        <thead>
+                            <tr><th>同時ストリーム</th><th>合計スループット</th><th>ストリーム当たり</th><th>読み方</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>1</td><td>168.6 tok/s</td><td>168.6 tok/s (中央値)</td><td>人が読むには速い速度</td></tr>
+                            <tr><td>8</td><td>542 tok/s</td><td>90.3 tok/s (中央値)</td><td>合計3.2倍、個人の体感は半分以下</td></tr>
+                            <tr><td>64 (バースト)</td><td>830 tok/s</td><td>—</td><td>ストリーム8倍で合計1.5倍。飽和</td></tr>
+                        </tbody>
+                    </table>
+                    <p>プリフィル側の数値も一緒に書いておく。チューニングされたカーネルで毎秒約7.9~8.5Kトークン、プロダクションプロファイルの新規プロンプトでは毎秒6,988~7,019トークンである。プリフィルが速いということは、長いプロンプトを押し込む作業、文書要約やコードベースのインデックス作成などで有利だという意味だ。</p>
+
+                    <h3>7.1 この表が決めること</h3>
+                    <p>1から8へ行くとき合計が3.2倍になった。悪くない。ところが8から64へ行くときはストリームを8倍にして合計が1.5倍にとどまる。<strong>その間のどこかでカードが飽和したという意味</strong>であり、その地点を越えたリクエストはスループットに寄与しないまま待ち行列で遅延だけを増やす。</p>
+                    <p>ここから出る判断は明確だ。</p>
+                    <ul>
+                        <li>合計スループットで容量計画を立てると実際のユーザー体験に合わない。<strong>ストリーム当たり速度で立てるべきだ</strong></li>
+                        <li>人が読む速度を毎秒15~20トークン程度と置くと、それを下回る地点がそのカードの実質的な同時ユーザー上限になる</li>
+                        <li>非対話型の一括処理は逆だ。個別遅延が伸びても合計さえ大きければよいので、ストリームを目一杯埋めるほうが得になる</li>
+                        <li>投機的デコードが有効な状態の数値である点も覚えておくこと。投機的デコードは単一ストリームで特に有利で、同時実行数が高くなると利得が減る性格がある</li>
+                    </ul>
+
+                    <h2 id="sec-8">8. 単一GPUが意味を持つ場所と持たない場所</h2>
+                    <p>これまでの計算をそのまま判断に変えるとこう分かれる。</p>
+                    <table>
+                        <thead>
+                            <tr><th>場所</th><th>単一GPU構成</th><th>理由</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>バッチ1の実験、プロンプト・評価の反復</td><td>適する</td><td>同時実行数が1に近くストリーム当たり速度が最大</td></tr>
+                            <tr><td>夜間の一括処理(要約・分類・索引)</td><td>適する</td><td>個別遅延ではなく合計スループットだけ見ればよい</td></tr>
+                            <tr><td>データの持ち出しが不可能な社内ワークロード</td><td>適する</td><td>速度より境界が要件のとき</td></tr>
+                            <tr><td>モデルの挙動自体を観察する研究</td><td>適する</td><td>再現性と統制が目的</td></tr>
+                            <tr><td>少人数の社内ツール(キュー許容)</td><td>条件付き</td><td>同時リクエスト上限を実測しキューを置く場合のみ</td></tr>
+                            <tr><td>応答時間の約束がある複数ユーザー向けサービス</td><td>適さない</td><td>同時実行数8を超えるとストリーム当たり速度が崩れる</td></tr>
+                            <tr><td>トラフィックスパイクのある公開サービス</td><td>適さない</td><td>飽和地点以降は待ち行列が遅延だけを増やす</td></tr>
+                            <tr><td>可用性要件のあるプロダクション</td><td>適さない</td><td>カード1枚が単一障害点</td></tr>
+                            <tr><td>長いコンテキストのセッションを多数維持するサービス</td><td>適さない</td><td>KVプールを同時ストリームが分け合う</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h3>8.1 コストで見直すと</h3>
+                    <p>ここに判断を一つ足す。<strong>一日数時間しか回らないワークロードなら1枚での自前運用はほぼ必ず負ける。</strong>カードが遊んでいても減価償却・電力・ラックスペース・運用の人件費は出続けるのに、APIは使わなければ0円だ。750W級アクセラレータ1枚が常時稼働するときの電力だけ数えても、遊ばせる時間のコストは馬鹿にならない。</p>
+                    <p>逆に成立する条件はこれくらい狭い。</p>
+                    <ul>
+                        <li>稼働率が高い。一日の大半でキューが空かない</li>
+                        <li>リクエストのパターンが均質だ。コンテキスト長と出力長が予測可能でKV予算を固定できる</li>
+                        <li>データ境界の要件が実在する。契約や規制のため外部送信できない資料を扱う</li>
+                        <li>トークン単価に対して自前運用の原価が有利になる地点まで物量が出る</li>
+                    </ul>
+                    <p>この四つがすべて合えば単一カード構成が成立する。一つでもずれればAPI側が正しい。商用モデルの単価と性能の対照は<a href="ai_model_comparison_2026.html">AIモデル比較ハブ</a>で更新中で、低価格API競争が自前運用の損益分岐をどう押しやるかは<a href="deepseek_v4_pro_75percent_permanent_2026.html">DeepSeek V4 Proの価格引き下げ</a>のほうに整理されている。エージェントのワークロードでローカルとAPIを分ける基準は<a href="local_llm_agentic_coding_2026.html">ローカルLLMでのエージェントコーディング</a>にある。</p>
+
+                    <h2 id="sec-9">9. 自分の環境で測る手順</h2>
+                    <p>他人の数字を移して使う代わりに、自分の機材で測る順序だ。五段階で十分である。</p>
+
+                    <h3>9.1 まず利用可能メモリを確認する</h3>
+                    <pre><code># AMD
+rocm-smi --showmeminfo vram
+
+# NVIDIA
+nvidia-smi --query-gpu=name,memory.total,memory.used --format=csv</code></pre>
+                    <p>スペックシートの数字ではなく<strong>ツールが報告する数字</strong>を基準にする。単位がGBかGiBか、すでに掴まれているメモリがあるかも一緒に見る。</p>
+
+                    <h3>9.2 重みの容量はファイルサイズで確認する</h3>
+                    <pre><code># ダウンロードしたチェックポイントが実際に何バイトか
+du -sh /path/to/model
+du -ah /path/to/model | grep safetensors | tail -5</code></pre>
+                    <p>パラメータ数から計算した値よりこちらが正直だ。混合精度のチェックポイントは計算で当てにくく、トークナイザやインデックスのような付属ファイルも一緒に入ってくる。</p>
+
+                    <h3>9.3 コンテキスト長ごとのKV予算を取る</h3>
+                    <p>伝統的なアテンションのモデルなら5.1の式に<code>config.json</code>の層数・KVヘッド数・ヘッド次元を入れる。圧縮アテンション系なら短いコンテキストで一度立ち上げたあと<strong>サーバ起動ログが出力するKVプール容量と収容トークン数</strong>を受け取ってトークン当たりのバイト数を逆算する。その値に目標コンテキストと目標同時セッション数を掛ければ必要なプール容量が出る。</p>
+
+                    <h3>9.4 OOM地点を二分探索で見つける</h3>
+                    <pre><code># 起動だけ確認する用途。成功と失敗の境界を狭めていく
+vllm serve &lt;model&gt; \
+  --max-model-len 32768 \
+  --kv-cache-dtype fp8_e4m3 \
+  --gpu-memory-utilization 0.90 \
+  --enable-chunked-prefill \
+  --max-num-batched-tokens 256</code></pre>
+                    <ul>
+                        <li><code>--max-model-len</code>を半分ずつ上げながら起動の成功と失敗の境界を探す。成功した最大値がその構成の実際のコンテキスト上限だ</li>
+                        <li><code>--gpu-memory-utilization</code>を0.90から始めて少しずつ上げる。1.0に張り付けると断片化一回で落ちる</li>
+                        <li>ROCm経路では<code>--kv-cache-dtype fp8_e4m3</code>を使う。NVIDIA経路は<code>fp8</code></li>
+                        <li>起動はできるのにリクエスト中に落ちるなら活性値側だ。<code>--max-num-batched-tokens</code>を下げてプリフィルのチャンクを小さくする</li>
+                    </ul>
+
+                    <h3>9.5 同時実行の限界を実測する</h3>
+                    <p>最後が最も重要だ。ストリーム数を1、4、8、16と上げながら<strong>ストリーム当たりの毎秒トークン</strong>を記録する。合計ではなくストリーム当たりの値だ。目標の体感速度を下回る地点がそのカードの同時ユーザー上限であり、その数字が出て初めて「この機材で何人を支えられるか」に答えられる。この実測なしにカードを買うと、大抵は二倍ほど楽観した計画になる。</p>
+
+                    <h2 id="sec-10">10. 確認できなかったこと</h2>
+                    <p>この記事で根拠を確保できなかった項目を一箇所にまとめる。</p>
+                    <ul>
+                        <li><strong>パラメータ数の表記不一致。</strong>公式モデルカードは総284B、活性13Bと記す。一方で上に引用した単一MI300Xのリポジトリとその紹介文は対象モデルを<strong>DeepSeek-V4-Flash-0731、304B</strong>と記している。公式文書で0731リビジョンの個別パラメータ表記を見つけられなかった。そのためこの記事はモデルを説明するとき284B/13Bを使い、304Bはリポジトリ側の表記としてのみ残した</li>
+                        <li><strong>層数とヘッド構成。</strong>モデルカードで確認できず、5.1のKV式をこのモデルに直接代入しなかった。代わりにサーバ報告値からの逆算を用いた</li>
+                        <li><strong>スループット数値の再現性。</strong>7節の数値は第三者検証を経ておらず、サーバがナイトリービルドである。同じ数字が他の機材で出る保証はない</li>
+                        <li><strong>他のアクセラレータの同条件数値。</strong>精度・コンテキスト・バッチ・カーネルバージョンが揃った公開計測値を見つけられなかった。そのためこの記事に速度の対照表はない</li>
+                        <li><strong>実際の消費電力。</strong>750W級という表記以外に、このワークロードでの消費電力と発熱プロファイルは確認できなかった</li>
+                        <li><strong>品質への影響。</strong>FP4エキスパート + FP8残りの構成が原本に対してどの課題でどれだけ損失を出すかはこの記事の範囲外である。モデルカードが公開した値以外に独立評価を確認できなかった</li>
+                    </ul>
+
+                    <h2 id="sec-11">結論: 今日適用できる三つ</h2>
+                    <p><strong>第一に、パラメータ数の代わりにバイト数で語る習慣をつける。</strong>「284Bのモデル」ではなく「出荷精度で約157GBの重み」と書けば会議での論争が半分に減る。カードの枚数はパラメータではなくバイトが決める。</p>
+                    <p><strong>第二に、MoEの計画書には総パラメータと活性パラメータを常に並べて書く。</strong>前者はメモリの請求書、後者は計算の請求書だ。片方しか書かれていない計画書は必ずどちらかで外れる。</p>
+                    <p><strong>第三に、カードを買う前に同時実行の曲線を先に描く。</strong>単一カード構成が崩れるのはメモリではなく同時実行数だ。ストリーム1本で168トークン出る機材が8本ではストリーム当たり90に、64本では合計すら伸びなくなる。「何人が同時に使うか」に数字で答えられないなら、まだ買うときではない。</p>
+                    <p>最後に一つ。単一GPU構成が興味深い理由は、それが最も安いサービング方法だからではない。<strong>カードの境界を越えない瞬間に消える複雑さが大きいから</strong>だ。並列戦略も、インターコネクトのチューニングも、ノード間の障害処理もない。その単純さに値打ちがある場所は確かにあり、値打ちがない場所も同じくらいはっきりしている。上の表で自分の組織がどの行にいるかを先に指してから始めればよい。</p>
+
+                    <h2 id="sec-12">参考資料</h2>
+                    <ul>
+                        <li><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash" target="_blank" rel="noopener">DeepSeek-V4-Flash モデルカード (Hugging Face)</a> — 総・活性パラメータ、MoE構成、混合精度、コンテキスト</li>
+                        <li><a href="https://recipes.vllm.ai/deepseek-ai/DeepSeek-V4-Flash" target="_blank" rel="noopener">vLLM Recipes: DeepSeek-V4-Flash</a> — チェックポイント容量、検証済みハードウェア、KV・並列フラグ</li>
+                        <li><a href="https://docs.vllm.ai/en/latest/getting_started/installation/gpu.html" target="_blank" rel="noopener">vLLM GPUインストール文書 (ROCm項目)</a> — ROCmバージョン、対応アーキテクチャ、ホイール・Docker経路</li>
+                        <li><a href="https://docs.sglang.io/platforms/amd_gpu.html" target="_blank" rel="noopener">SGLang AMD GPU文書</a> — Dockerイメージ、AITER環境変数、非対応量子化の一覧</li>
+                        <li><a href="https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/data-sheets/amd-instinct-mi300x-data-sheet.pdf" target="_blank" rel="noopener">AMD Instinct MI300X データシート (PDF)</a> — HBM容量・帯域幅・電力等級</li>
+                        <li><a href="https://www.amd.com/en/products/accelerators/instinct/mi300/mi300x.html" target="_blank" rel="noopener">AMD Instinct MI300X 製品ページ</a></li>
+                        <li><a href="https://github.com/ryanzhou/deepseek-v4-flash-mi300x" target="_blank" rel="noopener">単一MI300X構成リポジトリ (deepseek-v4-flash-mi300x)</a> — 4節・7節の実測値の出典。ベンダー検証ではない個人計測</li>
+                        <li><a href="https://news.hada.io/topic?id=32149" target="_blank" rel="noopener">GeekNews 討論</a></li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>この記事をシェア</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">スレッズ</button>
+                        <button id="link-copy" class="share-btn link-btn">リンクをコピー</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">記事一覧に戻る</a>
+                </div>
+                <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">一緒に使うと便利な無料ツール</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/json_formatter.html">JSON フォーマッター</a></li>
+      <li><a href="../static/regex_tester.html">正規表現テスター</a></li>
+      <li><a href="../static/jwt_decoder.html">JWTデコーダー・生成器 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 エンコーダー/デコーダー</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">すべてのツールを見る &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+            <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">関連記事</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="diataxis_documentation_framework_2026.html">文書が読まれないのは分量のせいではない - Diátaxisで四つに分ける基準と実際の適用 2026</a></li>
+      <li><a href="ai_coding_tool_cost_transparency_2026.html">AIコーディングツールから金額が消えた - トークンだけが残ったとき費用を自分で測る方法 2026</a></li>
+      <li><a href="vibe_coding_stack_myths_2026.html">AIが書いたNext.js + Supabase、あとで壊れる場所 - デプロイ前に見るべき7つの地点 2026</a></li>
+      <li><a href="software_longevity_small_codebase_2026.html">20年以上生き残るソフトウェアは何が違うのか - 完成と放置を分ける指標 2026</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('リンクがコピーされました。Threadsアプリに貼り付けてシェアしてください！');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('リンクがコピーされました！'); });
+    });
+    </script>
+</body>
+</html>
