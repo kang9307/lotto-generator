@@ -701,6 +701,7 @@ const RecentTools = {
         'static/json_formatter.html': { name: { ko: 'JSON 포매터', en: 'JSON Formatter', ja: 'JSONフォーマッター', zh: 'JSON格式化' }, icon: '📋', cat: 'it_dev' },
         'static/regex_tester.html': { name: { ko: '정규식 테스터', en: 'Regex Tester', ja: '正規表現テスター', zh: '正则表达式测试' }, icon: '🔍', cat: 'it_dev' },
         'static/code_image.html': { name: { ko: '코드 이미지 생성기', en: 'Code Image Generator', ja: 'コード画像ジェネレーター', zh: '代码图片生成器' }, icon: '💻', cat: 'it_dev' },
+        'static/hwp_viewer.html': { name: { ko: 'HWP 뷰어', en: 'HWP Viewer', ja: 'HWPビューア', zh: 'HWP 阅读器' }, icon: '📄', cat: 'it_dev' },
         'static/token_counter.html': { name: { ko: 'AI 토큰 카운터', en: 'AI Token Counter', ja: 'AIトークンカウンター', zh: 'AI令牌计数器' }, icon: '🤖', cat: 'it_dev' },
         'static/audio_visualizer.html': { name: { ko: '오디오 비주얼라이저', en: 'Audio Visualizer', ja: 'オーディオビジュアライザー', zh: '音频可视化器' }, icon: '🎵', cat: 'entertainment' },
         'static/electricity_bill_calculator.html': { name: { ko: '전기요금 계산기', en: 'Korea Electricity Bill Calculator', ja: '電気料金計算機(韓国)', zh: '电费计算器(韩国)' }, icon: '⚡', cat: 'utility' },
