@@ -1,0 +1,600 @@
+<!DOCTYPE html>
+<!--
+ * 技术博客文章模板
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>退出登录为何不能立刻生效 - 会话撤销在规模上崩掉的地方 2026</title>
+    <meta name="description" content="会话校验只有查询型和自包含型两种，选了自包含型就必然需要一份撤销清单。本文拆解Canva把12小时窗口切成30分钟分片、每条记录压到16字节放进S3并用条件写入控制并发的做法，并按自己服务的规模重新衡量登出传播的延迟。">
+    <meta name="keywords" content="会话管理, 会话撤销, 登出传播, JWT失效, 加密Cookie, 撤销清单, S3条件写入, If-Match, 乐观并发控制, 内存缓存, 冷启动, 部署踩踏, Canva, 网关, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/canva_session_management_scale_2026.html">
+
+    <meta property="og:title" content="退出登录为何不能立刻生效 - 会话撤销在规模上崩掉的地方">
+    <meta property="og:description" content="Canva改的不是会话校验路径，而是撤销清单的装载路径。瓶颈在启动，不在查询。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/canva_session_management_scale_2026.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-08-06">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="退出登录为何不能立刻生效">
+    <meta name="twitter:description" content="决定撤销清单大小的是令牌寿命而不是用户数。先崩掉的也不是查询，而是冷启动。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "退出登录为何不能立刻生效 - 会话撤销在规模上崩掉的地方",
+      "alternativeHeadline": "瓶颈不在会话查询，而在撤销清单的装载",
+      "datePublished": "2026-08-06",
+      "dateModified": "2026-08-06",
+      "inLanguage": "zh-CN",
+      "articleSection": "开发/基础设施",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "会话管理, 会话撤销, 登出传播, JWT失效, 加密Cookie, 撤销清单, S3条件写入, 乐观并发控制, 冷启动, Canva",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/canva_session_management_scale_2026.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "把会话信息放进Cookie后，登出无法立刻生效该怎么解决",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "只能把撤销清单作为独立的一条轴来维护。加密Cookie或签名令牌承载的是签发那一刻的事实，之后发生变化的事实不会反映进令牌里。所以网关在放行请求之前必须再确认一次：「这位用户在这个时刻开始的会话是否已被撤销。」Canva把这次确认放在网关进程内存中完成。它在内存里保留最近12小时的撤销记录，而需要刷新的令牌一律回到数据库核对。快路径是内存，慢路径是数据库。不建立这一步，登出就要等到令牌自然过期才会生效。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "撤销清单放Redis不行吗",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Canva评估过Redis并且没有采用。理由不是性能而是持久性。Redis通常不会以完全持久的配置部署，而真那样做只是把问题从一个数据存储搬到另一个数据存储，同时还要额外承担维持缓存一致性的复杂度。事实层面也很清楚：Redis默认的持久化策略 appendfsync everysec 明确允许在崩溃时丢失最多一秒的写入。对普通缓存来说丢失只是未命中，回源再读一次正确性不变。但在撤销清单里丢失意味着「看起来没有被撤销」。这是开放式失败而不是安全式失败。能分清缓存丢失和撤销丢失属于不同等级的事故，才是判断的分水岭。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "把撤销记录压到16字节真有那么重要吗",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "看单条记录确实微不足道，乘上数百万条和数百个进程就不再微不足道。Canva用位运算把一条撤销塞进16字节，每个分片就是这些16字节元素组成的扁平数组。只在内存中保留这种稠密二进制表示，使内存缓存相比旧实现缩小了87.5个百分点，也就是八分之一。旧实现是用多个Java对象来跟踪每一条撤销的。尺寸变小之后带来的连锁收益更大。数组本身有序，二分查找可以直接用；网关拿到下载下来的字节不做任何转换就直接使用。反序列化开销和对象分配带来的垃圾回收压力同时消失。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "多个工作进程更新同一个S3对象会不会互相覆盖",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "正因如此才用条件PUT实现乐观并发控制。更新分片时附带一个前置条件，断言这个对象自首次读取以来没有变化；创建新分片时也用类似的检查确认别的进程没有抢先建好同一个分片。有了这些前置条件，读取修改写入操作永远只是向撤销集合追加，交错执行也不会丢更新。系统里同时还有ZooKeeper领导者选举，但那是为了避免持续冲突给系统堆积负载的优化，并不是正确性要求。顺带一提，S3的条件写入是2024年才加入的能力，先有仅当对象不存在时写入的条件，随后才有要求ETag匹配的比较并交换。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "只有几万用户的服务需要这套结构吗",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "不需要。判断依据不是用户数，而是三个问题。第一，有效窗口内的撤销条数乘以记录大小，能不能宽裕地放进进程内存。放得下的话，启动时一次性读入的简单结构就够了。第二，实例同时重启时这次读取会不会打到数据库。数一数滚动发布和自动扩容时同时冷启动的实例数就有答案。第三，撤销丢失会不会构成安全事故。在这三问都回答「是」之前，把撤销清单放在关系型数据库里、启动时读入的结构更好。不过有一件事现在就得定下来：撤销记录以会话标识为单位，还是以主体加时间截断为单位，这个选择以后很难更改。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/canva_session_management_scale_2026.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/canva_session_management_scale_2026.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/canva_session_management_scale_2026.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/canva_session_management_scale_2026.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/canva_session_management_scale_2026.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="退出登录为何不能立刻生效 - 会话撤销在规模上崩掉的地方">
+                <meta itemprop="datePublished" content="2026-08-06">
+                <meta itemprop="dateModified" content="2026-08-06">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="会话管理, 会话撤销, 登出传播, JWT失效, 加密Cookie, 撤销清单, S3条件写入, 冷启动">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/canva_session_management_scale_2026.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">退出登录为何不能立刻生效 - 会话撤销在规模上崩掉的地方</h1>
+                    <h2 class="post-subtitle">瓶颈不在会话查询，而在撤销清单的装载</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-08-06">2026-08-06</span>
+                        <span class="post-category" itemprop="articleSection">开发/基础设施</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <nav class="post-toc">
+                        <h3>本文涵盖的内容</h3>
+                        <ol>
+                            <li><a href="#sec-1">会话校验只有两条路，选哪条决定了下一个问题</a></li>
+                            <li><a href="#sec-2">一条撤销记录到底代表什么</a></li>
+                            <li><a href="#sec-3">规模上先崩的不是查询而是启动</a></li>
+                            <li><a href="#sec-4">为什么不用Redis - 搬走问题和解决问题</a></li>
+                            <li><a href="#sec-5">16字节和30分钟 - 数据结构决定成本</a></li>
+                            <li><a href="#sec-6">多个工作进程改同一个文件时</a></li>
+                            <li><a href="#sec-7">网关如何保持最新状态</a></li>
+                            <li><a href="#sec-8">换成自己的服务会在哪里撞上同一堵墙</a></li>
+                            <li><a href="#sec-9">不同规模阶段该选什么</a></li>
+                            <li><a href="#sec-10">决定用这套结构就得一并定下的事</a></li>
+                            <li><a href="#sec-11">未能确认的内容</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-0">引言：「我明明退出了，另一个标签页还能进」</h2>
+                    <p>任何服务都会收到一次这样的反馈。而答案往往早就写好了：缓存还没清掉。这句话一出口，这套系统的性格就已经暴露了。会话校验被做成自包含式，撤销路径是后来补上去的。</p>
+                    <p>先说结论。<strong>会话校验只有两种方式。</strong>要么每个请求都去问一次数据存储，要么把答案放进令牌，只检查签名和密文就收工。前者让数据存储正面承接全部流量，后者则意味着签发之后不能反悔。所以规模长大的服务大多选了后者，然后在旁边挂上<strong>第三种数据结构，也就是撤销清单</strong>。而真正的事故出在这份清单上，不在校验上。</p>
+                    <p>Canva公开的会话撤销结构，恰好是这个位置的案例。在每秒需要回答几十万次「发出这个请求的登录用户是谁」的规模下，他们改的并不是校验路径，而是把撤销清单填进网关内存的<strong>装载路径</strong>，目的地从MySQL换成了S3。</p>
+                    <p>本文沿着这套结构走，但落点放在别处：在不是Canva规模的服务里，同样的瓶颈会以什么面孔出现；在用户数涨十倍之前需要先定下什么；以及为什么你<strong>现在不该照搬这套结构</strong>。</p>
+
+                    <h2 id="sec-1">1. 会话校验只有两条路，选哪条决定了下一个问题</h2>
+                    <p>会话校验方式归根到底是「用户是谁」这个事实放在哪里的问题。放在服务端就是查询型，交给客户端携带就是自包含型。这一个选择决定了之后遇到的所有问题。</p>
+
+                    <h3>1.1 查询型付出的代价</h3>
+                    <ul>
+                        <li>每个请求都要往会话存储走一个来回。这个来回会原封不动加到用户能感知的延迟上</li>
+                        <li>作为交换，撤销是免费的。删掉记录，下一个请求就立即生效，压根不存在传播这个概念</li>
+                        <li>会话存储变成正面承接全站流量的单点。它一晃动，所有登录用户同时晃动</li>
+                        <li>地理分布很难做。把会话存储复制到多个地域，复制延迟就直接变成认证一致性问题</li>
+                    </ul>
+
+                    <h3>1.2 自包含型付出的代价</h3>
+                    <p>Canva选了这一边。从用户标识到权限和角色，会话相关需要知道的一切都放进浏览器Cookie。而通过<strong>加密</strong>这些Cookie，网关不必在每个请求上都去跟网络数据存储对话就能信任其中的内容。</p>
+                    <ul>
+                        <li>关键在于是加密而不是签名。里面装着权限和角色，所以连客户端也不该读到。只做签名的话内容是明摆着的</li>
+                        <li>每请求一次的数据存储往返消失了。在每秒几十万次的量级上，这个差别直接改变数据存储的容量规划</li>
+                        <li>代价只有一个：<strong>签发之后发生变化的事实不会反映到令牌里。</strong>登出、权限回收、改密码、账号停用，全都卡在这里</li>
+                        <li>所以选择自包含型的那一刻，撤销清单就不再是可选项，而是必备组件</li>
+                    </ul>
+
+                    <h3>1.3 三种组合的性格对照</h3>
+                    <table>
+                        <thead>
+                            <tr><th>组合</th><th>每请求网络往返</th><th>撤销生效时点</th><th>第一个瓶颈出现的位置</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>查询型（服务端会话）</td><td>每次一趟</td><td>立即</td><td>会话存储的稳态QPS</td></tr>
+                            <tr><td>自包含型（签名或加密令牌）</td><td>没有</td><td>要等到令牌过期</td><td>没有瓶颈，换来的是一个安全缺口</td></tr>
+                            <tr><td><strong>自包含型加撤销清单</strong></td><td>没有（内存查询）</td><td>滞后一个传播延迟</td><td><strong>撤销清单的装载路径和冷启动</strong></td></tr>
+                            <tr><td>自包含型加短过期</td><td>只在刷新时</td><td>最多一个令牌寿命</td><td>刷新流量集中到认证服务</td></tr>
+                        </tbody>
+                    </table>
+                    <p>第三行是本文的主题。而最后一列才是要点。加上撤销清单并不会让瓶颈消失，只是让它<strong>换个位置</strong>：从稳态的查询负载搬到启动时刻的装载负载。而装载负载与流量无关，只与发布次数成正比，所以做容量规划时很容易看不见。</p>
+
+                    <h2 id="sec-2">2. 一条撤销记录到底代表什么</h2>
+                    <p>设计撤销清单时，最先要定的不是数据存储，而是<strong>一条记录的含义</strong>。这里定错了，后面接再好的存储也会出现表达不了的需求。</p>
+
+                    <h3>2.1 主体和截断时刻</h3>
+                    <p>Canva的撤销记录只带两项信息：它适用于谁，以及适用到哪个登录时刻为止。前者叫<strong>principal</strong>，后者通常以「撤销在某个时间点之前开始的所有会话」这种形式使用。</p>
+                    <p>这个设计带来的性质相当可观。</p>
+                    <ul>
+                        <li>单位不是会话标识，而是<strong>用户加时间截断</strong>。所以哪怕有一百台设备，撤销也只是一行</li>
+                        <li>改密码、权限变更、管理员强制登出、账号停用，全都用同一种形状表达，不必为每种事件单独造一条链路</li>
+                        <li>代价是「只登出这台设备」用这种形式表达不出来，因为时间截断会把该时刻之前的全切掉</li>
+                        <li>因此预留了几个标志位。只要保持按principal排序的原则，多种撤销类型就能共存于同一个扁平数组</li>
+                        <li>基于时刻这一点也意味着<strong>时钟偏差会变成安全问题</strong>。签发方和撤销记录方的时钟对不上，撤销就会切到新会话，或者反过来漏掉本该切的会话</li>
+                    </ul>
+
+                    <h3>2.2 12小时这个窗口究竟是什么</h3>
+                    <p>Canva在内存里保留12小时的撤销，刷新期间则依赖更慢的MySQL查询。而且<strong>需要刷新的令牌一律回到数据库核对。</strong></p>
+                    <p>这两句话必须放在一起才有意义。所有令牌都保证在12小时内至少刷新一次，而刷新时反正会看数据库，所以超过12小时的撤销不放在内存里也是安全的。换句话说，<strong>窗口长度不是随便挑的数字，而是由令牌刷新周期决定的值</strong>。</p>
+                    <div class="callout">
+                        <p><strong>这里要带走一句话。</strong>决定撤销清单大小的不是用户数，而是<strong>令牌寿命</strong>。用户涨十倍，窗口长度不变；反过来把令牌寿命拉到24小时，即使用户数不变，需要常驻内存的撤销也翻倍。会话策略会议上有人提议「把令牌寿命放长一点」时，屋里得有人知道那是一张基础设施账单。</p>
+                    </div>
+
+                    <h2 id="sec-3">3. 规模上先崩的不是查询而是启动</h2>
+                    <p>这是整个案例里最反直觉的部分。在一个每秒查询几十万次的系统里，出问题的并不是查询。</p>
+
+                    <h3>3.1 发布打垮数据库</h3>
+                    <p>原本的结构是数百个网关Pod各自在启动时从MySQL拉取超过一百万条撤销。结果<strong>发布变成了对数据库有组织的踩踏</strong>。作为临时缓解手段，他们维持着多个只读副本。</p>
+                    <p>把这个局面说准确，是这样的。</p>
+                    <ul>
+                        <li>稳态负载很低。查询全在内存里完成，数据库几乎闲着</li>
+                        <li>负载只在冷启动时产生。而冷启动不是流量制造的，是<strong>发布和扩缩容事件</strong>制造的</li>
+                        <li>于是数据库容量规划的决定变量从「用户数」变成了「同时重启的Pod数」。这是错误的耦合</li>
+                        <li>增加只读副本只是把症状往后推。Pod多了副本就得跟着多，这笔钱以部署安全的名义常年支出</li>
+                        <li>更糟的是这份负载在<strong>故障恢复时刻达到最大</strong>。最需要大规模重启的那一刻，正是数据库挨得最狠的一刻</li>
+                    </ul>
+
+                    <h3>3.2 撤销清单崩掉的四张面孔</h3>
+                    <p>与规模无关，撤销清单总是以下面四种之一崩掉。症状不同，应对也不同。</p>
+                    <table>
+                        <thead>
+                            <tr><th>崩坏方式</th><th>用户看到的症状</th><th>真正的原因</th><th>这套结构如何应对</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>传播延迟</td><td>登出之后一段时间仍能访问</td><td>各实例的缓存刷新时点不一致</td><td>条件GET每分钟数次只取变化的分片</td></tr>
+                            <tr><td>缓存不一致</td><td>每刷新一次结果就变一次</td><td>负载均衡把请求分到状态新旧不同的实例</td><td>所有网关共享同一组分片</td></tr>
+                            <tr><td>多设备</td><td>一台设备登出后其他设备仍在线</td><td>撤销单位是会话标识，有几台就要写几条</td><td>principal加时间截断，一行全撤</td></tr>
+                            <tr><td>强制登出滞后</td><td>权限已收回却仍按旧权限运行一阵</td><td>令牌里的权限是签发时刻的快照</td><td>刷新时必定与数据库核对</td></tr>
+                        </tbody>
+                    </table>
+                    <p>这张表要读的不是最后一列，而是<strong>第三列</strong>。四种症状的原因都不是「数据存储太慢」，而是同一件事：状态被复制到多个地方，而这些副本各自看着不同的时刻。</p>
+
+                    <h2 id="sec-4">4. 为什么不用Redis - 搬走问题和解决问题</h2>
+                    <p>碰到这种问题，有个答案会条件反射地冒出来：加一层缓存，前面摆个Redis。Canva也评估过这个方案，并且没有采用。</p>
+
+                    <h3>4.1 持久性的等级不同</h3>
+                    <p>否决的理由不是性能而是<strong>持久性</strong>。Redis通常不会以完全持久的配置部署；真那么做，只是把问题从一个数据存储搬到另一个数据存储，同时还要额外背上维持缓存一致性的相当大的复杂度。</p>
+                    <p>支撑这个判断的事实很清楚。Redis默认的持久化策略是<code>appendfsync everysec</code>，这个设置明确允许<strong>崩溃时丢失最多一秒的写入</strong>。作为性能与持久性的平衡点，这是个优秀的默认值，但用在撤销清单上性格不对。</p>
+                    <ul>
+                        <li>在普通缓存里，丢失就是<strong>未命中</strong>。回源再读一次，正确性照旧</li>
+                        <li>在撤销清单里，丢失意味着<strong>「看起来没有被撤销」</strong>。这是开放式失败，不是安全式失败</li>
+                        <li>也就是说，丢掉的那一秒内发生的登出和权限回收全都当没发生过。这不是性能退化，是安全事故</li>
+                        <li>分不清这个差别，整个缓存选型标准都会跑偏。选缓存层时该问的不是「快不快」，而是<strong>「在这里丢数据会变成哪一类事故」</strong></li>
+                    </ul>
+                    <p>类似的判断在别家公司也反复出现。Shopify把库存系统从Redis搬到MySQL，依据同样是一致性而不是速度，这个案例在<a href="shopify_redis_to_mysql_migration_2026.html">Shopify为何把库存系统从Redis迁到MySQL</a>里单独整理过。缓存层本身的选项如何分岔，可以看<a href="murrdb_ml_cache_redis_alternative_2026.html">murrdb与亚毫秒缓存</a>，以及<a href="memcached_appreciation_2026.html">memcached为何能活二十年</a>。</p>
+
+                    <h3>4.2 S3合适的真正原因</h3>
+                    <p>他们选的替代方案是S3，依据是它被设计成以低成本提供大体积、持久存储文件的下载。</p>
+                    <p>关键不在于S3快，而在于<strong>这个工作负载要的根本不是随机访问</strong>。每秒几十万次查询全在网关内存里结束，留给外部存储的需求只剩一个：偶尔便宜地递出一个大文件。一旦如此，存储选型标准就从延迟变成了持久性和带宽单价。</p>
+                    <p>把这个思考顺序一般化，下次做同样的决策会快得多：存储不是按「什么快」来选，而是按<strong>「访问模式是什么」</strong>来选。模式一旦确定，候选通常就收敛到一个。自建S3兼容对象存储那一侧的结构，在<a href="garage_s3_storage_complete_guide.html">用Garage看S3兼容分布式存储</a>里讲过。</p>
+
+                    <h2 id="sec-5">5. 16字节和30分钟 - 数据结构决定成本</h2>
+                    <p>定下用S3之后会冒出新问题：得把一个滑动时间窗口转换成适合对象存储的形态，因为对象存储没有部分更新。</p>
+
+                    <h3>5.1 为什么按30分钟切</h3>
+                    <p>他们把12小时窗口切成30分钟一段，每段对应S3里的一个对象。不切的话，每加一条撤销就要把整整12小时下载下来再传回去。可即便切成30分钟仍然不轻松：往里加一条撤销，可能就要下载并重新上传数十万条记录。</p>
+                    <p>于是有了第二个决定：把记录做到尽可能小。</p>
+
+                    <h3>5.2 塞进16字节</h3>
+                    <p>用位运算把一条撤销装进16字节，分片就是这些16字节元素组成的扁平数组。只把概念画出来是这样。实际的位分配没有公开，这张图只用来建立「什么占了位置」的感觉。</p>
+                    <pre><code>撤销分片 = [16字节][16字节][16字节] ... （按principal排序）
+
+一个16字节槽位里装的东西
+  - principal      : 撤销所适用的主体标识
+  - login cutoff   : 切掉此刻之前的登录
+  - flags          : 区分撤销类型的预留位
+
+分片名（S3键）里编码了该30分钟窗口的起始时间戳
+  -> 在有序键列表中取截断时刻之后的区段即可</code></pre>
+                    <p>这种形态带来的收益不止于体积缩小。</p>
+                    <ul>
+                        <li>数组按principal排序，<strong>二分查找</strong>可以直接用，不需要额外的索引结构</li>
+                        <li>网关对下载下来的<strong>字节不做任何转换</strong>直接操作，反序列化这一步整个消失</li>
+                        <li>旧实现用多个Java对象跟踪每条撤销。只把稠密二进制表示放进内存后，内存缓存缩小了<strong>87.5个百分点，也就是八分之一</strong></li>
+                        <li>对象分配没了，垃圾回收压力也跟着没了。这直接作用在延迟分布的长尾上</li>
+                        <li>分片名里带着窗口起始时刻，所以只靠一次有序键扫描就能找出需要的分片，不需要额外的元数据存储</li>
+                    </ul>
+                    <div class="callout">
+                        <p><strong>不要误读87.5这个数字。</strong>它不是压缩率，而是<strong>剥掉对象开销之后的结果</strong>。真正要管的数据是16字节，却用好几个Java对象来表示，那么对象头、指针和装箱加起来会比数据本身还大。任何把大量小记录常驻内存的系统里，几乎都在发生同一件事。如果你从没打开过堆转储，这就是打开一次的理由。</p>
+                    </div>
+
+                    <h3>5.3 数字汇总</h3>
+                    <table>
+                        <thead>
+                            <tr><th>项目</th><th>数值</th><th>这个数值意味着什么</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>内存保留窗口</td><td>12小时</td><td>所有令牌都在其中刷新，刷新时会查数据库</td></tr>
+                            <tr><td>分片粒度</td><td>30分钟</td><td>12小时窗口被分成24个对象</td></tr>
+                            <tr><td>记录大小</td><td>16字节</td><td>principal加登录截断时刻加预留标志位</td></tr>
+                            <tr><td>内存缓存缩减</td><td>87.5个百分点</td><td>相当于Java对象表示的八分之一</td></tr>
+                            <tr><td>单工作进程写入吞吐</td><td>每秒2000条以上</td><td>还是未经优化的实现</td></tr>
+                            <tr><td>30分钟内一百万条时的传输量</td><td>16MB</td><td>每分钟数次，相比网关代理的流量微不足道</td></tr>
+                            <tr><td>冷启动下载量</td><td>每个网关数十MB / 整个集群数十GB</td><td>不是常驻内存量，而是启动时的网络开销</td></tr>
+                            <tr><td>迁移后的只读副本</td><td>2个（冗余用途）</td><td>负载改为绑定写入吞吐而非发布并发</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2 id="sec-6">6. 多个工作进程改同一个文件时</h2>
+                    <p>保持分片最新由异步工作进程负责。而这里就会冒出对象存储的经典问题。</p>
+
+                    <h3>6.1 工作进程在做什么</h3>
+                    <p>多个工作进程实例持续扫描数据库，寻找尚未上传的撤销。然后取回最新分片，或者在时间已经足够久时新建一个，把新的撤销插入有序数组，再重新上传这个分片。</p>
+                    <p>问题很明显。两个工作进程同时读到同一个分片，各自插入不同内容再各自上传，后写的那个会抹掉前一个。这就是丢更新。</p>
+
+                    <h3>6.2 用条件PUT做乐观并发控制</h3>
+                    <ul>
+                        <li>更新分片时附带<strong>「自首次读取以来这个分片没有变化」</strong>的前置条件</li>
+                        <li>创建新分片时也用类似的检查，确认别的进程没有抢先建好同一个分片</li>
+                        <li>有了这些前置条件，读取修改写入操作<strong>永远只向撤销集合追加</strong>，执行交错也不会丢数据</li>
+                        <li>系统里还并用ZooKeeper领导者选举。但那是<strong>优化而非正确性要求</strong>，只是为了避免持续冲突给系统堆积负载，没有它正确性依然成立</li>
+                    </ul>
+                    <p>最后这一条区分，恰恰是设计文档里最容易被抹平的。<strong>把保证正确性的机制和为了效率的机制混在一起写</strong>，日后就没有人能判断某个机制是否可以拿掉。领导者选举被明确标注为优化，你才能在ZooKeeper短暂抖动时，心里有底地知道服务依然是正确的。</p>
+
+                    <h3>6.3 这个设计为何最近才成为可能</h3>
+                    <p>S3的条件写入并不是老功能。仅当对象不存在时才写的条件在2024年8月加入，要求ETag匹配的比较并交换在同年11月跟上。全部地域可用且不额外收费。</p>
+                    <p>也就是说，<strong>「在对象存储之上叠加并发控制」这个选项本身才刚刚打开</strong>。几年前解同样的问题，多半会做成外挂一个锁服务或协调层的设计，运维对象也随之增加。这正是架构评审需要养成一个习惯的理由：重新确认「以前做不到的事」现在是不是仍然做不到。</p>
+
+                    <h3>6.4 明知是平方复杂度还是照做的理由</h3>
+                    <p>这个结构在复杂度上并不占优。用N条撤销构建一个分片，大致需要与N平方成正比的时间，因为每加入一批固定大小的撤销都要处理整个分片。更麻烦的是，前面说的丢更新问题让它也不容易横向扩展。</p>
+                    <p>然而在实际中，每批处理几百条的话，即使是未经优化的实现也能跑出<strong>每秒2000条以上的写入吞吐</strong>。而结论更有意思：这个工作进程处理着几十万条的数组，却<strong>被网络延迟卡住，而不是被排序卡住。</strong></p>
+                    <ul>
+                        <li>渐近复杂度说的只是N变大时的<strong>斜率</strong>，它并不告诉你在你实际的N上是多少</li>
+                        <li>常数因子有时是决定性的。现代硬件处理稠密数组的速度远比直觉快</li>
+                        <li>所以在设计评审里仅凭复杂度否决一个方案之前，正确的顺序是<strong>在真实的N和真实的硬件上先量一次</strong></li>
+                        <li>反方向也成立。复杂度更漂亮的结构，如果缓存局部性差或往返次数多，实测可能糟得多</li>
+                    </ul>
+
+                    <h2 id="sec-7">7. 网关如何保持最新状态</h2>
+                    <p>写入侧理顺之后，剩下的是接收侧。这里正是最初问题的起点：冷启动。</p>
+
+                    <h3>7.1 启动的时候</h3>
+                    <p>网关只下载覆盖最近12小时的那些30分钟分片。对单个网关而言是数十MB，放到整个集群则是数十GB。跟在数据库里扫描累积的整张表相比，快得多。</p>
+                    <p>而真正的收益是负载的性质变了。数十GB由S3来接，和由关系型数据库来接，完全是两回事。前者正是那套系统被设计出来要做的事，后者则是那套系统最吃力的负载形态。</p>
+
+                    <h3>7.2 运行期间</h3>
+                    <ul>
+                        <li>用条件GET<strong>只重新下载发生变化的分片</strong>。没变就没有正文传输</li>
+                        <li>即便30分钟窗口里堆了一百万条，也不过是每分钟几次、每次16MB。相比网关代理的请求与响应数据毫无存在感</li>
+                        <li>超过12小时的分片会自动脱落。窗口按时间定义，所以不必另写过期管理逻辑</li>
+                        <li>所有网关看到同一组分片，各实例持有不同时刻状态的问题在结构上就变小了</li>
+                    </ul>
+
+                    <h3>7.3 迁移之后留下了什么</h3>
+                    <p>结果可以归成三行：发布速度改善了；会话撤销数据库的只读副本只剩下用于冗余的<strong>两个</strong>；数据库负载从与发布并发挂钩，改为<strong>与写入吞吐和整体站点流量可预测地成正比</strong>。</p>
+                    <p>第三条最有价值。负载绑定到可预测的变量上，意味着容量规划成为可能。回答「Pod开到多少数据库还扛得住」需要做一次发布演练，和只凭流量预测就能给出答案，这两种运维难度完全不同。</p>
+
+                    <h2 id="sec-8">8. 换成自己的服务会在哪里撞上同一堵墙</h2>
+                    <p>这里是本文的目的地。不需要几亿用户，同样的失败一个都不会少，只是换了张脸。</p>
+
+                    <h3>8.1 失效传播延迟 - 每个实例看到的时刻都不同</h3>
+                    <p>实例一超过两台，内存缓存看到的时刻就各不相同。用户每刷新一次看到的结果都不一样。负载均衡若是轮询，那就是字面意义上的时灵时不灵。</p>
+                    <ul>
+                        <li>首先要量的数字是<strong>撤销生效延迟的上界</strong>，等于工作进程周期加缓存轮询周期加时钟偏差余量</li>
+                        <li>这个数字没写进文档，就没法回答安全团队的提问。「基本上是即时的」不算答案</li>
+                        <li>把延迟要紧的路径和不要紧的路径分开。支付和管理功能刷新时一律回源，其余交给缓存</li>
+                    </ul>
+
+                    <h3>8.2 缓存不一致 - 只靠TTL管理的陷阱</h3>
+                    <p>不设独立的撤销轴，只靠会话缓存的TTL来管，那么<strong>撤销生效的上界就等于TTL</strong>。缩短TTL回源负载上升，拉长TTL安全暴露时间变长。跳出这个取舍只有一条路：把撤销做成与缓存过期分离的独立数据结构。</p>
+                    <ul>
+                        <li>TTL是<strong>新鲜度</strong>的旋钮，不是<strong>撤销</strong>的旋钮。用一个旋钮同时调两个目标，必然有一个会变差</li>
+                        <li>撤销分离出去之后，TTL就可以纯按性能来调，多出一个自由度</li>
+                        <li>分离之后要把撤销清单的大小提升为监控指标。这个值变大通常是事故的前兆</li>
+                    </ul>
+
+                    <h3>8.3 多设备 - 撤销单位一开始定错就改不回来</h3>
+                    <p>撤销单位取会话标识，「所有设备登出」就要写与活跃会话数相同数量的记录；取principal加时间截断则只是一行。代价是「只登出这台设备」反过来变难。</p>
+                    <ul>
+                        <li>两种需求都有的服务，正解是<strong>一开始就把标志位的位置留出来</strong>。Canva预留位就是为了这个</li>
+                        <li>这个决定属于日后最难更改的一类，因为你必须同时解释已签发的令牌和已堆积的撤销记录</li>
+                        <li>如果产品里有给用户看的设备列表页面，那么会话标识层面的信息反正也要有。请提前规划两种单位并存</li>
+                    </ul>
+
+                    <h3>8.4 强制登出与权限变更 - 需要即时性的路径</h3>
+                    <p>管理员收回了权限，却在最长一个窗口的时间里仍按旧权限运行，那不是延迟，是事故。在这套结构里，防住它的机制是刷新时刻与数据库的核对。</p>
+                    <ul>
+                        <li>不要把权限变更和登出当成同一等级。登出可以滞后一个窗口长度，权限回收通常不行</li>
+                        <li>先列出需要即时性的操作清单。账号停用、管理员权限回收、支付方式变更大体都在其中</li>
+                        <li>只对这些路径在请求时加上回源核对。它们占总流量的比例很低，数据存储的负担也就很轻</li>
+                    </ul>
+
+                    <h3>8.5 服务不止一个时，协议层也有同样的问题</h3>
+                    <p>越过单个服务，传播问题会在认证协议层再次出现。OpenID Connect的后端通道登出正是明确处理这个问题的规范。提供方维护已登录依赖方的清单，向每个依赖方的后端通道登出端点直接投递签名过的登出令牌，规范并<strong>建议并行发送</strong>这些请求。</p>
+                    <ul>
+                        <li>结构完全一样：状态被复制到多处，撤销必须传播到全部，而其中一部分可能失败</li>
+                        <li>差别在于传播对象不是自己的实例，而是<strong>别人的服务</strong>。失败后由谁负责重试，必须写进契约</li>
+                        <li>要求登出令牌带签名也是同一个脉络。没有签名，任何人都能触发登出从而制造拒绝服务</li>
+                        <li>命令行工具也进入认证路径时，令牌的存放位置和回收路径又多一处。这部分在<a href="cli_authentication_guide_2026.html">CLI认证的设计</a>里单独讲过</li>
+                    </ul>
+
+                    <h2 id="sec-9">9. 不同规模阶段该选什么</h2>
+                    <p>照搬Canva的结构，对大多数服务都是过度设计。按阶段整理是这样。</p>
+                    <table>
+                        <thead>
+                            <tr><th>状况</th><th>撤销清单放在哪</th><th>装载方式</th><th>已经脱离该阶段的信号</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>一到两个实例</td><td>进程内存加关系型数据库作源</td><td>启动时全量读入，定期轮询</td><td>缩短轮询周期也追不上传播</td></tr>
+                            <tr><td>数十个实例</td><td>共享缓存或消息广播</td><td>只推送增量，启动时全量读入</td><td>同时重启把源库延迟推高</td></tr>
+                            <tr><td>数百个实例以上</td><td>进程内存加对象存储快照</td><td>按时间分片下载，条件GET刷新</td><td>这就是Canva抵达的位置</td></tr>
+                            <tr><td>多服务联邦</td><td>上述结构加协议层传播</td><td>用后端通道登出通知各依赖方</td><td>传播失败的重试责任不在契约里</td></tr>
+                        </tbody>
+                    </table>
+                    <p>判断要不要跨阶段，三个问题就够了。</p>
+                    <ol>
+                        <li><strong>有效窗口内的撤销条数乘记录大小，能宽裕地放进进程内存吗。</strong>放得下的话，启动时读一次的简单结构就够</li>
+                        <li><strong>同时冷启动会打到源数据存储吗。</strong>数一数滚动发布和自动扩容时一起起来的实例数就有答案</li>
+                        <li><strong>撤销丢失会构成安全事故吗。</strong>会的话，没有持久性的存储直接出局</li>
+                    </ol>
+                    <p>在三问都回答「是」之前，把撤销清单放在关系型数据库里、启动时读入的结构更好：运维对象少，调试也容易。但<strong>记录的含义</strong>现在就要定，那才是日后最难改的部分。</p>
+
+                    <h2 id="sec-10">10. 决定用这套结构就得一并定下的事</h2>
+                    <p>换掉存储并不算完。有些事项不一并定下，日后必然以事故的形式回来。</p>
+                    <ul>
+                        <li><strong>令牌寿命和窗口长度是一对。</strong>窗口长度必须不短于最大刷新周期。请在文档里写明：延长令牌寿命的决定就是扩大内存预算的决定</li>
+                        <li><strong>给撤销生效延迟定一个数字目标。</strong>上界等于工作进程周期加网关轮询周期加时钟偏差余量，把这个值做成指标监控起来</li>
+                        <li><strong>把时钟同步归类为认证依赖。</strong>在以截断时刻为基准的设计里，时钟偏差是正确性问题而不是性能问题。请把时间同步失败接进认证告警</li>
+                        <li><strong>预先定好接收失败时的策略。</strong>拿不到分片的网关是继续用旧清单，还是拒绝请求？选开放式失败还是安全式失败，由服务性质决定</li>
+                        <li><strong>把撤销清单和审计日志分开。</strong>撤销清单是只在时间窗口内有效的运行数据，谁在何时撤销了什么则是有独立留存策略的记录。想用一张表兼顾，两边都会变差</li>
+                        <li><strong>留好预留位和版本字段。</strong>二进制格式一旦发布就难以更改。请按撤销类型会增加的前提提前空出位置</li>
+                        <li><strong>先在真实规模上量过再选。</strong>Canva也是把多个方案放在真实基础设施上按预期规模试过之后才定的，并且在上线前经过了大量端到端测试和人工评审。没有基准测试就选定的存储，多半只是偏好</li>
+                        <li><strong>先把回滚路径做出来。</strong>新旧装载路径要能并行一段时间并比对结果是否一致。认证层一旦出错，全体用户会同时受影响</li>
+                    </ul>
+
+                    <h2 id="sec-11">11. 未能确认的内容</h2>
+                    <p>把本文未能取得依据的项目集中在一处。</p>
+                    <ul>
+                        <li><strong>精确的规模数字。</strong>公开的只有量级表述：数亿用户、每秒数十万次会话确认。精确的用户数、QPS、网关Pod数量均未确认</li>
+                        <li><strong>撤销生效的实际延迟。</strong>工作进程的扫描周期、网关的条件GET周期，以及从撤销发生到全量生效的实测时间均未公开</li>
+                        <li><strong>Cookie的加密方式。</strong>所用算法、密钥轮换周期、密钥管理体系均未确认</li>
+                        <li><strong>令牌刷新周期的具体值。</strong>12小时窗口源自刷新周期这一关系很清楚，但刷新周期本身的数值及其安全余量未确认</li>
+                        <li><strong>迁移的步骤与周期。</strong>新旧路径并行的时长、分阶段切换比例、回滚判据均未公开</li>
+                        <li><strong>成本。</strong>S3的请求与传输费用相比原先只读副本的成本如何变化未确认，公开的只有副本数量减少这一事实</li>
+                        <li><strong>16字节的位分配。</strong>principal、截断时刻和标志位各占多少位未公开。文中的示意图只用来展示位置构成</li>
+                        <li><strong>ZooKeeper的运维细节。</strong>领导者任期、故障时的行为、工作进程实例数量均未确认</li>
+                    </ul>
+
+                    <h2 id="sec-12">12. 常见问题</h2>
+
+                    <h3>把会话信息放进Cookie后，登出无法立刻生效该怎么解决</h3>
+                    <p>只能把撤销清单作为独立的一条轴来维护。加密Cookie或签名令牌承载的是签发那一刻的事实，之后发生变化的事实不会反映进令牌里。所以网关在放行请求之前必须再确认一次：这位用户在这个时刻开始的会话是否已被撤销。Canva把这次确认放在网关进程内存中完成。它在内存里保留最近12小时的撤销记录，而需要刷新的令牌一律回到数据库核对。快路径是内存，慢路径是数据库。不建立这一步，登出就要等到令牌自然过期才会生效。</p>
+
+                    <h3>撤销清单放Redis不行吗</h3>
+                    <p>Canva评估过Redis并且没有采用。理由不是性能而是持久性。Redis通常不会以完全持久的配置部署，而真那样做只是把问题从一个数据存储搬到另一个数据存储，同时还要额外承担维持缓存一致性的复杂度。事实层面也很清楚：Redis默认的持久化策略<code>appendfsync everysec</code>明确允许在崩溃时丢失最多一秒的写入。对普通缓存来说丢失只是未命中，回源再读一次正确性不变。但在撤销清单里丢失意味着看起来没有被撤销。这是开放式失败而不是安全式失败。能分清缓存丢失和撤销丢失属于不同等级的事故，才是判断的分水岭。</p>
+
+                    <h3>把撤销记录压到16字节真有那么重要吗</h3>
+                    <p>看单条记录确实微不足道，乘上数百万条和数百个进程就不再微不足道。Canva用位运算把一条撤销塞进16字节，每个分片就是这些16字节元素组成的扁平数组。只在内存中保留这种稠密二进制表示，使内存缓存相比旧实现缩小了87.5个百分点，也就是八分之一。旧实现是用多个Java对象来跟踪每一条撤销的。尺寸变小之后带来的连锁收益更大。数组本身有序，二分查找可以直接用；网关拿到下载下来的字节不做任何转换就直接使用。反序列化开销和对象分配带来的垃圾回收压力同时消失。</p>
+
+                    <h3>多个工作进程更新同一个S3对象会不会互相覆盖</h3>
+                    <p>正因如此才用条件PUT实现乐观并发控制。更新分片时附带一个前置条件，断言这个对象自首次读取以来没有变化；创建新分片时也用类似的检查确认别的进程没有抢先建好同一个分片。有了这些前置条件，读取修改写入操作永远只是向撤销集合追加，交错执行也不会丢更新。系统里同时还有ZooKeeper领导者选举，但那是为了避免持续冲突给系统堆积负载的优化，并不是正确性要求。顺带一提，S3的条件写入是2024年才加入的能力，先有仅当对象不存在时写入的条件，随后才有要求ETag匹配的比较并交换。</p>
+
+                    <h3>只有几万用户的服务需要这套结构吗</h3>
+                    <p>不需要。判断依据不是用户数，而是三个问题。第一，有效窗口内的撤销条数乘以记录大小，能不能宽裕地放进进程内存。放得下的话，启动时一次性读入的简单结构就够了。第二，实例同时重启时这次读取会不会打到数据库。数一数滚动发布和自动扩容时同时冷启动的实例数就有答案。第三，撤销丢失会不会构成安全事故。在这三问都回答是之前，把撤销清单放在关系型数据库里的结构更好。不过有一件事现在就得定下来：撤销记录以会话标识为单位，还是以主体加时间截断为单位，这个选择以后很难更改。</p>
+
+                    <h2 id="sec-13">结论：今天就能用上的三点</h2>
+                    <p><strong>第一，用令牌寿命而不是用户数来估算撤销清单的大小。</strong>光是把这一句带进会议，会话策略讨论的质量就会改变。提议延长令牌寿命不是便利性提案，而是基础设施预算提案。寿命翻倍，需要常驻内存的撤销也翻倍。</p>
+                    <p><strong>第二，按冷启动而不是稳态来做容量规划。</strong>Canva出问题的不是每秒几十万次查询，而是发布时数百个Pod同时发起的装载。而且这份负载在故障恢复时刻达到最大。如果你没法用数字回答「全部同时重启会怎样」，那这套系统的容量规划还不存在。</p>
+                    <p><strong>第三，存储要按访问模式和失败等级来选，不是按速度。</strong>Redis被否决不是因为慢，而是因为丢失会造成开放式失败；S3被选中不是因为快，而是因为这个负载是大体积顺序下载。选缓存时该问的是：在这里丢数据会变成哪一类事故。</p>
+                    <p>最后一点。这个案例里留存最久的既不是S3也不是16字节，而是<strong>理论上的可扩展性和实际的可扩展性是两码事</strong>这句话。让单个工作进程不停地给几十万条的数组排序，这种设计在评审里多半会被否掉。可真去量了才发现，那个工作进程被卡住的是网络延迟而不是排序。在仅凭复杂度记号否决方案之前，先在真实硬件上按真实的N量一次——留下来的就是这一个习惯。</p>
+
+                    <h2 id="sec-14">参考资料</h2>
+                    <ul>
+                        <li><a href="https://www.canva.dev/blog/engineering/session-revocations-at-scale/" target="_blank" rel="noopener">Session revocations at scale (Canva Engineering Blog)</a> — 本文主要出处：加密Cookie、12小时窗口、30分钟分片、16字节记录、条件PUT、87.5个百分点的缩减、每秒2000条吞吐</li>
+                        <li><a href="https://news.hada.io/topic?id=32156" target="_blank" rel="noopener">GeekNews讨论</a></li>
+                        <li><a href="https://aws.amazon.com/about-aws/whats-new/2024/11/amazon-s3-functionality-conditional-writes" target="_blank" rel="noopener">Amazon S3 adds new functionality for conditional writes</a> — 基于ETag的比较并交换，全地域，不额外收费</li>
+                        <li><a href="https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/" target="_blank" rel="noopener">Redis persistence 文档</a> — appendfsync everysec 默认值与最多一秒的丢失窗口</li>
+                        <li><a href="https://openid.net/specs/openid-connect-backchannel-1_0.html" target="_blank" rel="noopener">OpenID Connect Back-Channel Logout 1.0</a> — 登出令牌、依赖方追踪、并行投递建议</li>
+                        <li><a href="https://aws.amazon.com/blogs/storage/building-multi-writer-applications-on-amazon-s3-using-native-controls/" target="_blank" rel="noopener">Building multi-writer applications on Amazon S3 using native controls</a> — 多写入方环境下的条件写入模式</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>分享本文</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">返回列表</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/json_formatter.html">JSON 格式化工具</a></li>
+      <li><a href="../static/regex_tester.html">正则表达式测试器</a></li>
+      <li><a href="../static/jwt_decoder.html">JWT解码生成器 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 编码器/解码器</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="rsync_trailing_slash_guide.html">rsync 末尾一个斜杠为何让结果完全不同 - 删除前的确认方法 2026</a></li>
+      <li><a href="shell_subshell_variable_scope.html">管道里的while为什么变量会消失 - 子shell 2026</a></li>
+      <li><a href="deepseek_v4_flash_single_gpu_2026.html">把大型MoE装进单张GPU - 从内存算术到卡住的地方 2026</a></li>
+      <li><a href="diataxis_documentation_framework_2026.html">文档没人读不是因为篇幅不够 - 用 Diátaxis 分成四类的判断标准与实操 2026</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制。粘贴到Threads应用即可分享！');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制！'); });
+    });
+    </script>
+</body>
+</html>

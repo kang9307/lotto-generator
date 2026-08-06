@@ -1,0 +1,600 @@
+<!DOCTYPE html>
+<!--
+ * Tech blog post template
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="en">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Why Logout Is Not Instant - Where Session Revocation Breaks at Scale 2026</title>
+    <meta name="description" content="Session checks are either a lookup or self-contained, and self-contained forces a revocation list. How Canva moved a 12-hour window into 30-minute S3 chunks.">
+    <meta name="keywords" content="session management, session revocation, logout propagation, JWT invalidation, encrypted cookies, revocation list, S3 conditional writes, If-Match, optimistic concurrency control, in-memory cache, cold start, deploy stampede, Canva, gateway, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/en/posts/canva_session_management_scale_2026.html">
+
+    <meta property="og:title" content="Why Logout Is Not Instant - Where Session Revocation Breaks at Scale">
+    <meta property="og:description" content="What Canva changed was not the session validation path but the load path for the revocation list. The bottleneck was startup, not lookup.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/en/posts/canva_session_management_scale_2026.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="en_US">
+    <meta property="article:published_time" content="2026-08-06">
+    <meta property="article:section" content="Dev &amp; Infra">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Why Logout Is Not Instant">
+    <meta name="twitter:description" content="The size of a revocation list is set by token lifetime, not user count. And what breaks first is cold start, not lookup.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "Why Logout Is Not Instant - Where Session Revocation Breaks at Scale",
+      "alternativeHeadline": "The bottleneck was not session lookup but loading the revocation list",
+      "datePublished": "2026-08-06",
+      "dateModified": "2026-08-06",
+      "inLanguage": "en-US",
+      "articleSection": "Dev & Infra",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "session management, session revocation, logout propagation, JWT invalidation, encrypted cookies, revocation list, S3 conditional writes, optimistic concurrency control, cold start, Canva",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/en/posts/canva_session_management_scale_2026.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "If session data lives in a cookie, how do you make logout take effect right away?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "The only way is to keep a revocation list as a separate axis. An encrypted cookie or a signed token carries facts as of the moment it was issued, and anything that changes afterward is not reflected inside the token. So the gateway has to answer one more question before letting a request through: 「has this user's session, started at this time, been revoked?」 Canva answers that question inside gateway process memory. It holds the last 12 hours of revocations in memory, and any token that needs refreshing is always checked against the database. The fast path is memory, the slow path is the database. Without that extra step, a logout does nothing until the token expires on its own."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Why not just put the revocation list in Redis?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Canva evaluated Redis and did not adopt it. The reason was durability, not performance. Redis is not typically deployed in a fully durable configuration, and doing so would just move the problem from one datastore to another while adding significant complexity to keep the cache consistent. That judgment is backed by how Redis actually ships: the default persistence policy, appendfsync everysec, explicitly allows losing up to one second of writes in a crash. For an ordinary cache a loss is a miss, and you simply read from the source again. In a revocation list a loss means the session 「appears not to be revoked」. That is fail-open, not fail-safe. Recognizing that cache loss and revocation loss are different classes of incident is the fork in the road."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Does packing a revocation into 16 bytes really matter that much?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "For one record it is trivial. Multiplied by millions of records and hundreds of processes it stops being trivial. Canva packs a revocation into 16 bytes with bit twiddling and keeps each chunk as a flat array of those 16-byte elements. By holding only that dense binary representation in memory, they cut the in-memory cache by 87.5 percent, a factor of eight, against the previous implementation that tracked each revocation with multiple Java objects. The knock-on benefits are larger than the size saving. Because the array is sorted, binary search works directly on it, and gateways operate on the downloaded bytes without any transformation. Deserialization cost and the garbage collection pressure that comes with object allocation both disappear."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "If several workers update the same S3 object, will one overwrite the other?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "That is exactly why conditional PUT requests are used to implement optimistic concurrency control. Every chunk update carries a precondition asserting the chunk has not changed since it was first read, and newly created chunks use similar checks to make sure another process has not already created the same chunk. Those preconditions guarantee that each read-modify-write operation only ever appends to the set of revocations, so interleaving executions never lose data. A ZooKeeper leader election is used alongside it, but that is an optimization to stop continuous conflicts from adding load to the system, not a correctness requirement. Worth noting: conditional writes on S3 are a 2024 addition. Write-if-absent came first, and the compare-and-swap form that requires a matching ETag followed later that year."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Does a service with tens of thousands of users need this architecture?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "No. The criterion is not user count but three questions. First, does the number of revocations inside the validity window, multiplied by record size, fit comfortably in process memory? If it does, loading everything once at startup is enough. Second, does that load hit the database when instances restart together? Count the simultaneous cold starts in a rolling deploy and an autoscale event and you have the answer. Third, would losing a revocation count as a security incident? Until all three answers are yes, keeping the revocation list in a relational database and reading it at startup is the better structure. One thing does need deciding now, though: whether a revocation record is keyed by session identifier or by principal plus a cutoff timestamp is very hard to change later."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/canva_session_management_scale_2026.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/canva_session_management_scale_2026.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/canva_session_management_scale_2026.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/canva_session_management_scale_2026.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/canva_session_management_scale_2026.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="Why Logout Is Not Instant - Where Session Revocation Breaks at Scale">
+                <meta itemprop="datePublished" content="2026-08-06">
+                <meta itemprop="dateModified" content="2026-08-06">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="session management, session revocation, logout propagation, JWT invalidation, encrypted cookies, revocation list, S3 conditional writes, cold start">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/en/posts/canva_session_management_scale_2026.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">Why Logout Is Not Instant - Where Session Revocation Breaks at Scale</h1>
+                    <h2 class="post-subtitle">The bottleneck was not session lookup but loading the revocation list</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-08-06">2026-08-06</span>
+                        <span class="post-category" itemprop="articleSection">Dev &amp; Infra</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <nav class="post-toc">
+                        <h3>What this article covers</h3>
+                        <ol>
+                            <li><a href="#sec-1">There are only two ways to validate a session, and the one you pick sets your next problem</a></li>
+                            <li><a href="#sec-2">What a single revocation record actually means</a></li>
+                            <li><a href="#sec-3">At scale, what breaks first is startup, not lookup</a></li>
+                            <li><a href="#sec-4">Why not Redis - moving a problem versus solving it</a></li>
+                            <li><a href="#sec-5">Sixteen bytes and thirty minutes - the data structure sets the cost</a></li>
+                            <li><a href="#sec-6">When several workers edit the same file</a></li>
+                            <li><a href="#sec-7">How gateways stay current</a></li>
+                            <li><a href="#sec-8">Where your own service hits the same wall</a></li>
+                            <li><a href="#sec-9">What to choose at each scale tier</a></li>
+                            <li><a href="#sec-10">Decisions you must make alongside this architecture</a></li>
+                            <li><a href="#sec-11">What I could not confirm</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-0">Intro: 「I logged out but the other tab still works」</h2>
+                    <p>Every service gets this report at least once. And the answer is usually already written: the cache has not cleared yet. The moment that sentence comes out, the system has revealed its shape. Session validation was built as self-contained, and the revocation path was bolted on afterward.</p>
+                    <p>Here is the conclusion first. <strong>There are only two ways to validate a session.</strong> Either you ask a datastore on every request, or you put the answer inside the token and finish by checking a signature and a cipher. The first puts a datastore in front of your entire traffic. The second means you cannot change your mind after issuing. So services that grow mostly pick the second and then bolt a <strong>third data structure called a revocation list</strong> onto the side. And the real incidents happen in that list, not in validation.</p>
+                    <p>The session revocation architecture Canva published is exactly a case study of that spot. At a scale where the question 「which logged-in user sent this request?」 has to be answered hundreds of thousands of times every second, what they changed was not the validation path. It was the <strong>load path</strong> that fills gateway memory with the revocation list, and its destination moved from MySQL to S3.</p>
+                    <p>This article follows that architecture but takes it somewhere else. What the same bottleneck looks like at a scale that is not Canva's, what you need to decide before your user count grows tenfold, and why you probably <strong>should not adopt this architecture right now</strong>.</p>
+
+                    <h2 id="sec-1">1. There are only two ways to validate a session, and the one you pick sets your next problem</h2>
+                    <p>Session validation ultimately comes down to where you keep the fact of who the user is. Keep it on the server and you have the lookup model; hand it to the client and you have the self-contained model. That single choice determines every problem you meet afterward.</p>
+
+                    <h3>1.1 What the lookup model pays</h3>
+                    <ul>
+                        <li>Every request makes one round trip to the session store. That round trip lands directly on the latency the user perceives</li>
+                        <li>In exchange, revocation is free. Delete the record and the very next request reflects it. The concept of propagation does not exist</li>
+                        <li>The session store becomes a single point that takes the full traffic of the service head-on. When it wobbles, every logged-in user wobbles at the same moment</li>
+                        <li>Geographic distribution gets hard. Replicate the session store across regions and replication lag turns straight into an authentication consistency problem</li>
+                    </ul>
+
+                    <h3>1.2 What the self-contained model pays</h3>
+                    <p>Canva picked this side. Everything they need to know about a user's session, from user ID through permissions and roles, goes into a browser cookie. And by <strong>encrypting</strong> those cookies, their gateways can trust the details without talking to a networked datastore on every request.</p>
+                    <ul>
+                        <li>Encryption rather than signing is the important part. Permissions and roles are in there, so the client must not be able to read them either. Signing alone leaves the contents in plain view</li>
+                        <li>The per-request datastore round trip disappears. At hundreds of thousands of requests per second, that difference changes datastore sizing outright</li>
+                        <li>The price is a single thing. <strong>Facts that change after issuance are not reflected in the token.</strong> Logout, permission revocation, password change, and account suspension all hang on this hook</li>
+                        <li>So the moment you pick self-contained, a revocation list stops being optional and becomes a required component</li>
+                    </ul>
+
+                    <h3>1.3 How the three arrangements compare</h3>
+                    <table>
+                        <thead>
+                            <tr><th>Arrangement</th><th>Network round trips per request</th><th>When revocation takes effect</th><th>Where the first bottleneck forms</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Lookup (server-side sessions)</td><td>One, every time</td><td>Immediately</td><td>Steady-state QPS of the session store</td></tr>
+                            <tr><td>Self-contained (signed or encrypted tokens)</td><td>None</td><td>Not until the token expires</td><td>No bottleneck, but you have a security hole instead</td></tr>
+                            <tr><td><strong>Self-contained plus a revocation list</strong></td><td>None (memory lookup)</td><td>After the propagation delay</td><td><strong>The load path of the revocation list and cold start</strong></td></tr>
+                            <tr><td>Self-contained with short expiry</td><td>Only on refresh</td><td>Within one token lifetime at worst</td><td>Refresh traffic concentrates on the auth server</td></tr>
+                        </tbody>
+                    </table>
+                    <p>The third row is the subject of this article. And the last column is the point. Adding a revocation list does not remove the bottleneck, it <strong>relocates it</strong>. It moves from steady-state lookup load to startup-time load load. And because that load scales with deployment count rather than traffic, it tends to be invisible when you plan capacity.</p>
+
+                    <h2 id="sec-2">2. What a single revocation record actually means</h2>
+                    <p>The first thing to decide when designing a revocation list is not the datastore. It is <strong>what one record means</strong>. Get that wrong and no amount of good storage underneath will let you express requirements that arrive later.</p>
+
+                    <h3>2.1 A principal and a cutoff</h3>
+                    <p>Canva's revocation record carries exactly two pieces of information: who it applies to, and the login timestamp up to which it applies. The first is called the <strong>principal</strong>, and the second is typically used in the form of revoking all sessions started before a specific timestamp.</p>
+                    <p>The consequences of that design are considerable.</p>
+                    <ul>
+                        <li>The unit is not a session identifier but a <strong>principal plus a time cutoff</strong>. So even with a hundred devices, the revocation is one row</li>
+                        <li>Password change, permission change, admin-forced logout, and account suspension all get expressed in the same shape. You do not need a separate path per event type</li>
+                        <li>In exchange, 「log out this one device」 cannot be expressed in that form. A time cutoff cuts everything before that instant</li>
+                        <li>That is why a few bits are reserved for flags. As long as the array stays sorted by principal, many types of revocation can live together in the same flat array</li>
+                        <li>Being timestamp-based also means <strong>clock skew becomes a security concern</strong>. If the issuing server and the revocation-writing server disagree on the time, a revocation either cuts sessions it should not or misses ones it should</li>
+                    </ul>
+
+                    <h3>2.2 What the 12-hour window really is</h3>
+                    <p>Canva stores 12 hours of revocations in memory and relies on slower MySQL lookups during refreshes. And <strong>tokens that need refreshing are always checked against the database.</strong></p>
+                    <p>Those two sentences only make sense together. Every token is guaranteed to refresh within 12 hours, and the database gets consulted at refresh time anyway, so revocations older than 12 hours are safe to leave out of memory. In other words, <strong>the length of the window is not an arbitrary number but a value dictated by the token refresh interval</strong>.</p>
+                    <div class="callout">
+                        <p><strong>One sentence to take away.</strong> The size of a revocation list is set by <strong>token lifetime</strong>, not user count. Tenfold user growth does not lengthen the window. Conversely, stretching token lifetime to 24 hours doubles the revocations you must hold in memory even with the same user count. When someone in a session-policy meeting proposes extending token lifetime, somebody in that room needs to know it is an infrastructure invoice.</p>
+                    </div>
+
+                    <h2 id="sec-3">3. At scale, what breaks first is startup, not lookup</h2>
+                    <p>This is the most counterintuitive part of the case. In a system doing hundreds of thousands of lookups per second, the lookups were not the problem.</p>
+
+                    <h3>3.1 Deployments hit the database</h3>
+                    <p>Hundreds of gateway pods each potentially pulled over a million revocations from MySQL at startup. As a result, <strong>deployments became a coordinated stampede on the database</strong>. Multiple read replicas were kept as a temporary mitigation.</p>
+                    <p>Stated precisely, the situation has this shape.</p>
+                    <ul>
+                        <li>Steady-state load is low. Lookups all happen in memory, so the database is nearly idle</li>
+                        <li>Load appears only at cold start. And cold starts are produced by <strong>deployments and scaling events</strong>, not by traffic</li>
+                        <li>So the deciding variable for database sizing becomes the number of pods restarting simultaneously rather than the number of users. That is the wrong coupling</li>
+                        <li>Adding read replicas defers the symptom. As pods grow, replicas must grow with them, and that cost is paid continuously in the name of deployment safety</li>
+                        <li>Worse, this load <strong>peaks during incident recovery</strong>. The moment you most need a mass restart is the moment the database takes the hardest hit</li>
+                    </ul>
+
+                    <h3>3.2 The four faces of a failing revocation list</h3>
+                    <p>Regardless of scale, a revocation list breaks in one of four ways. Each has a distinct symptom and a distinct response.</p>
+                    <table>
+                        <thead>
+                            <tr><th>Failure mode</th><th>What the user sees</th><th>Actual cause</th><th>How this architecture answers it</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Propagation delay</td><td>Access still works for a while after logout</td><td>Per-instance caches refresh at different moments</td><td>Conditional GET pulls only changed chunks, several times a minute</td></tr>
+                            <tr><td>Cache inconsistency</td><td>It works and then it does not, refresh by refresh</td><td>The load balancer spreads requests across differently aged instances</td><td>Every gateway sees the same set of chunks</td></tr>
+                            <tr><td>Multiple devices</td><td>Logging out on one device leaves others signed in</td><td>Revocation keyed by session identifier needs one write per device</td><td>Principal plus cutoff revokes all of them in one row</td></tr>
+                            <tr><td>Delayed forced logout</td><td>Permissions were revoked but old ones still apply for a while</td><td>Permission data in the token is a snapshot from issuance</td><td>The database is always consulted at refresh time</td></tr>
+                        </tbody>
+                    </table>
+                    <p>The column to read here is not the last one. It is the <strong>third</strong>. In all four symptoms the cause is not a slow datastore. It is one thing: state is replicated in many places and those replicas are looking at different moments in time.</p>
+
+                    <h2 id="sec-4">4. Why not Redis - moving a problem versus solving it</h2>
+                    <p>Faced with this problem, one answer arrives reflexively. Add a cache layer. Put Redis in front. Canva evaluated that option and did not take it.</p>
+
+                    <h3>4.1 The durability grade is different</h3>
+                    <p>The reason for rejection was <strong>durability</strong>, not performance. Redis is not typically deployed in a fully durable configuration, and doing it that way would just be moving their problems from one datastore to another while adding significant complexity to keep the cache consistent.</p>
+                    <p>The facts behind that judgment are clear. Redis ships with <code>appendfsync everysec</code> as its default persistence policy, and that setting explicitly permits <strong>losing up to one second of writes in a crash</strong>. As a balance point between performance and durability it is an excellent default, but it is the wrong shape for a revocation list.</p>
+                    <ul>
+                        <li>In an ordinary cache, a loss is a <strong>miss</strong>. Read from the source again and correctness is unchanged</li>
+                        <li>In a revocation list, a loss means <strong>the session appears not to be revoked</strong>. That is fail-open, not fail-safe</li>
+                        <li>Every logout and permission revocation inside that lost second is undone. That is not a performance regression, it is a security incident</li>
+                        <li>Miss that distinction and your entire cache selection criterion drifts. The question to ask when choosing a cache layer is not 「is it fast?」 but <strong>「what kind of incident happens if I lose data here?」</strong></li>
+                    </ul>
+                    <p>The same judgment recurs at other companies. Shopify moved its inventory system from Redis to MySQL on consistency grounds rather than speed, a case covered separately in <a href="shopify_redis_to_mysql_migration_2026.html">why Shopify moved inventory from Redis to MySQL</a>. How the cache-layer options themselves diverge is covered in <a href="murrdb_ml_cache_redis_alternative_2026.html">murrdb and sub-millisecond caching</a> and in <a href="memcached_appreciation_2026.html">why memcached survived twenty years</a>.</p>
+
+                    <h3>4.2 The real reason S3 fits</h3>
+                    <p>The alternative they chose is S3, on the grounds that it is designed to serve downloads of large, durably stored files at a low cost.</p>
+                    <p>The important part is not that S3 is fast. It is that <strong>this workload does not require random access</strong>. All those hundreds of thousands of lookups per second finish inside gateway memory. The only demand left for external storage is to hand over a large file cheaply now and then. Once that is true, the storage selection criterion stops being latency and becomes durability and bandwidth cost.</p>
+                    <p>Generalizing this order of reasoning makes the next decision much faster. You do not choose storage by <strong>what is fast</strong>, you choose it by <strong>what the access pattern is</strong>. Once the pattern is settled, the candidate list usually narrows to one. The architecture of running S3-compatible object storage yourself is covered in <a href="garage_s3_storage_complete_guide.html">Garage and S3-compatible distributed storage</a>.</p>
+
+                    <h2 id="sec-5">5. Sixteen bytes and thirty minutes - the data structure sets the cost</h2>
+                    <p>Once you commit to S3, a new problem appears. A sliding time window has to be converted into a format suitable for object storage, because object storage has no partial update.</p>
+
+                    <h3>5.1 Why cut at thirty minutes</h3>
+                    <p>The 12-hour window is partitioned into 30-minute segments, each corresponding to one object in S3. Without partitioning, adding a single revocation means downloading and re-uploading the entire 12 hours. But even with 30-minute chunks it is still heavy: adding a single revocation can require downloading and re-uploading potentially hundreds of thousands of records.</p>
+                    <p>Which produces the second decision. Make the record as small as possible.</p>
+
+                    <h3>5.2 Packing into sixteen bytes</h3>
+                    <p>With some bit twiddling a revocation fits into 16 bytes, and a chunk is just a flat array of those 16-byte elements. Sketched conceptually it looks like this. The actual bit allocation is not public, so the diagram is only for the sense of what occupies the space.</p>
+                    <pre><code>revocation chunk = [16 bytes][16 bytes][16 bytes] ... (sorted by principal)
+
+inside one 16-byte slot
+  - principal      : identifier of the subject the revocation applies to
+  - login cutoff   : logins before this instant are cut
+  - flags          : reserved bits distinguishing revocation types
+
+the chunk name (S3 key) encodes the start timestamp of its 30-minute window
+  -> scan keys in sorted order and take everything after the cutoff</code></pre>
+                    <p>The gain from this shape does not stop at size reduction.</p>
+                    <ul>
+                        <li>Because the array is sorted by principal, <strong>binary search</strong> works on it directly. No separate index structure is needed</li>
+                        <li>Gateways operate on the downloaded <strong>bytes without transformation</strong>. The entire deserialization step disappears</li>
+                        <li>The previous implementation tracked each revocation with multiple Java objects. Keeping only the dense binary representation in memory cut the in-memory cache by <strong>87.5 percent, a factor of eight</strong></li>
+                        <li>When object allocation goes away, garbage collection pressure goes with it. That has a direct effect on the tail of the latency distribution</li>
+                        <li>Because the window start timestamp is encoded in the chunk name, finding the applicable chunks is just a sorted key scan. No separate metadata store is required</li>
+                    </ul>
+                    <div class="callout">
+                        <p><strong>Do not misread the 87.5 percent.</strong> That is not a compression ratio, it is <strong>the result of stripping object overhead</strong>. When the real payload is 16 bytes and you represent it with several Java objects, headers, pointers and boxing outweigh the payload itself. In any system that keeps a large number of small records resident in memory, almost exactly the same thing is happening. If you have never opened a heap dump, this is a good reason to open one.</p>
+                    </div>
+
+                    <h3>5.3 The numbers in one place</h3>
+                    <table>
+                        <thead>
+                            <tr><th>Item</th><th>Value</th><th>What the value means</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>In-memory window</td><td>12 hours</td><td>Every token refreshes inside it, and refresh consults the database</td></tr>
+                            <tr><td>Chunk granularity</td><td>30 minutes</td><td>The 12-hour window becomes 24 objects</td></tr>
+                            <tr><td>Record size</td><td>16 bytes</td><td>Principal plus login cutoff plus reserved flags</td></tr>
+                            <tr><td>In-memory cache reduction</td><td>87.5 percent</td><td>One eighth of the Java object representation</td></tr>
+                            <tr><td>Single-worker write throughput</td><td>Over 2,000 per second</td><td>With an unoptimized implementation</td></tr>
+                            <tr><td>Transfer at 1 million per 30 minutes</td><td>16 MB</td><td>A few times per minute. Negligible against what gateways proxy</td></tr>
+                            <tr><td>Cold start download</td><td>Tens of MB per gateway / tens of GB across the fleet</td><td>Not resident memory but startup network cost</td></tr>
+                            <tr><td>Read replicas after migration</td><td>Two, for redundancy</td><td>Load now tied to write throughput, not deployment concurrency</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2 id="sec-6">6. When several workers edit the same file</h2>
+                    <p>Keeping the chunks current is the job of an async worker. And here the classic object-storage problem shows up.</p>
+
+                    <h3>6.1 What the worker does</h3>
+                    <p>Multiple worker instances continuously scan the database for revocations that have not been uploaded yet. Then the worker fetches the latest chunk, or creates a new one if enough time has passed, inserts the new revocations into the sorted array, and re-uploads the chunk.</p>
+                    <p>The problem is obvious. If two workers read the same chunk at the same time, insert different things, and each upload, whoever writes last erases the other. That is a lost update.</p>
+
+                    <h3>6.2 Optimistic concurrency control through conditional PUT</h3>
+                    <ul>
+                        <li>Every chunk update carries a precondition asserting that <strong>the chunk has not changed since it was first read</strong></li>
+                        <li>Newly created chunks use similar checks to confirm another process has not already created the same chunk</li>
+                        <li>Thanks to those preconditions, every read-modify-write operation <strong>only ever appends</strong> to the set of revocations, so interleaved executions never lose data</li>
+                        <li>A ZooKeeper leader election runs alongside. But it is an <strong>optimization, not a correctness requirement</strong>. It exists to stop continuous conflicts from adding load to the system, and correctness holds without it</li>
+                    </ul>
+                    <p>That last distinction is the one design documents most often blur. <strong>If you write correctness mechanisms and efficiency mechanisms in the same voice</strong>, nobody will later be able to judge whether a given mechanism can be removed. When leader election is explicitly labeled an optimization, you can respond to a wobbling ZooKeeper knowing the service remains correct throughout.</p>
+
+                    <h3>6.3 Why this design only recently became possible</h3>
+                    <p>Conditional writes on S3 are not an old feature. Write-if-absent arrived in August 2024, and the compare-and-swap form requiring a matching ETag followed in November of the same year. It is available in all regions at no additional charge.</p>
+                    <p>Which means <strong>the option of layering concurrency control on top of object storage is itself recent</strong>. Solving the same problem a few years earlier would have produced a design with a separate locking service or coordination layer, and correspondingly more things to operate. That is precisely why architecture reviews need the habit of re-checking whether something that was impossible before is still impossible.</p>
+
+                    <h3>6.4 Why they shipped it knowing it was quadratic</h3>
+                    <p>This structure is unfavorable on complexity. Building a chunk of N revocations takes on the order of N squared time, because the entire chunk has to be processed for each fixed-size batch added. Worse, it cannot easily scale horizontally because of the lost update problem already described.</p>
+                    <p>And yet, by processing many hundreds of revocations in each batch, even an unoptimized implementation achieves <strong>write throughput above 2,000 revocations per second</strong>. The conclusion is more interesting still. Handling arrays of hundreds of thousands of elements, the worker is <strong>bottlenecked on network latency, not on sorting</strong>.</p>
+                    <ul>
+                        <li>Asymptotic complexity describes the <strong>slope</strong> as N grows. It says nothing about the value at your actual N</li>
+                        <li>Sometimes constant factors decide everything. Modern hardware chews through dense arrays far faster than intuition suggests</li>
+                        <li>So before rejecting an option on complexity grounds in a design review, the correct order is to <strong>measure it once at the real N on the real hardware</strong></li>
+                        <li>The reverse holds too. A structure with better complexity can measure far worse if cache locality is poor or round trips are many</li>
+                    </ul>
+
+                    <h2 id="sec-7">7. How gateways stay current</h2>
+                    <p>With the write side settled, the read side remains. This is where the original problem lived: cold start.</p>
+
+                    <h3>7.1 At startup</h3>
+                    <p>A gateway downloads only the 30-minute chunks covering the past 12 hours. For one gateway that is tens of megabytes; across the full fleet it becomes tens of gigabytes. Compared with scanning the accumulated table in the database, it is dramatically faster.</p>
+                    <p>And the real win is that the character of the load changed. Tens of gigabytes absorbed by S3 and the same tens of gigabytes absorbed by a relational database are entirely different stories. The first is exactly what that system was built for; the second is the shape of load that system finds hardest.</p>
+
+                    <h3>7.2 While running</h3>
+                    <ul>
+                        <li>Conditional GET requests re-download <strong>only chunks that changed</strong>. If nothing changed, no body is transferred</li>
+                        <li>Even at a million revocations in a 30-minute window, that is 16 megabytes a few times per minute. It is invisible next to the request and response data gateways proxy</li>
+                        <li>Chunks older than 12 hours fall off automatically. Because the window is defined in time, no separate expiry logic is needed</li>
+                        <li>Every gateway sees the same set of chunks. The problem of instances holding differently aged state shrinks structurally</li>
+                    </ul>
+
+                    <h3>7.3 What remained after migration</h3>
+                    <p>The outcome comes down to three lines. Deployment speed improved, the session revocation database kept <strong>only two read replicas</strong> for redundancy, and database load now <strong>scales predictably with write throughput and overall site traffic</strong> rather than with deployment concurrency.</p>
+                    <p>The third is the valuable one. Load tied to a predictable variable means capacity planning became possible. There is a real operational difference between a system where answering 「how many pods can we run before the database gives out?」 requires a deployment rehearsal, and one where a traffic forecast answers it.</p>
+
+                    <h2 id="sec-8">8. Where your own service hits the same wall</h2>
+                    <p>This is the destination of the article. You do not need hundreds of millions of users for these failures to occur. They just wear different faces.</p>
+
+                    <h3>8.1 Propagation delay - every instance sees a different moment</h3>
+                    <p>Once you pass two instances, in-memory caches look at different moments. The user sees a different result on every refresh. With round-robin load balancing it literally alternates between working and not working.</p>
+                    <ul>
+                        <li>The first number to measure is the <strong>upper bound on revocation propagation delay</strong>. It equals worker interval plus cache polling interval plus clock skew allowance</li>
+                        <li>If that number is not written down somewhere, you cannot answer the security team. 「Almost instantly」 is not an answer</li>
+                        <li>Separate the paths where delay matters from the ones where it does not. Payments and admin functions should always consult the source at refresh; leave the rest to cache</li>
+                    </ul>
+
+                    <h3>8.2 Cache inconsistency - the trap of managing it with TTL alone</h3>
+                    <p>If you have no separate revocation axis and manage everything through session cache TTL, then <strong>your revocation bound is your TTL</strong>. Shorten the TTL and source load rises; lengthen it and the security exposure window grows. There is exactly one way out of that trade-off: make revocation a data structure separate from cache expiry.</p>
+                    <ul>
+                        <li>TTL is a <strong>freshness</strong> control, not a <strong>revocation</strong> control. Steering two goals with one knob guarantees one of them gets worse</li>
+                        <li>Once revocation is separate, TTL can be tuned purely on performance grounds. You gain a degree of freedom</li>
+                        <li>After separating, promote the size of the revocation list to a monitored metric. Growth in that number is usually a leading indicator of an incident</li>
+                    </ul>
+
+                    <h3>8.3 Multiple devices - get the revocation unit wrong and you cannot fix it</h3>
+                    <p>Key revocation by session identifier and 「log out everywhere」 means writing as many records as there are active sessions. Key it by principal plus cutoff and it is one row. But 「log out only this device」 flips the other way.</p>
+                    <ul>
+                        <li>If your service needs both, the answer is to <strong>reserve the flag bits from the start</strong>. That is exactly why Canva left spare bits</li>
+                        <li>This decision is among the hardest to change later, because you would have to interpret already-issued tokens and already-accumulated revocation records simultaneously</li>
+                        <li>If you show users a device list screen, you need session-identifier-level information anyway. Plan for both units to coexist</li>
+                    </ul>
+
+                    <h3>8.4 Forced logout and permission change - paths that need immediacy</h3>
+                    <p>If an admin revokes permissions and the old ones keep working for a full window length, that is not latency, it is an incident. In this architecture, the mechanism preventing it is the database check at refresh time.</p>
+                    <ul>
+                        <li>Do not treat permission change and logout as the same grade. Logout can lag by a window length; permission revocation usually cannot</li>
+                        <li>Write the list of actions that require immediacy first. Account suspension, admin privilege revocation, and payment method changes usually belong there</li>
+                        <li>Add a source check at request time for those paths only. Since they are a small share of total traffic, the datastore burden stays low</li>
+                    </ul>
+
+                    <h3>8.5 With several services, the protocol layer has the same problem</h3>
+                    <p>Past a single service, propagation reappears at the authentication protocol layer. OpenID Connect Back-Channel Logout is the specification that addresses it explicitly. The provider tracks the set of logged-in relying parties, posts a signed logout token directly to each party's back-channel logout endpoint, and the specification <strong>encourages sending those requests in parallel</strong>.</p>
+                    <ul>
+                        <li>The structure is identical. State is replicated in many places, revocation must reach all of them, and some of those deliveries can fail</li>
+                        <li>The difference is that the propagation targets are <strong>other people's services</strong>, not your instances. Who is responsible for retrying a failure has to be settled contractually</li>
+                        <li>Requiring a signature on the logout token belongs to the same logic. Without it, anyone could trigger logouts and manufacture a denial of service</li>
+                        <li>Once command-line tools enter the authentication path, you gain one more token storage location and one more revocation route. That part is covered in <a href="cli_authentication_guide_2026.html">designing CLI authentication</a></li>
+                    </ul>
+
+                    <h2 id="sec-9">9. What to choose at each scale tier</h2>
+                    <p>Copying Canva's architecture wholesale is overkill for most services. Broken down by tier it looks like this.</p>
+                    <table>
+                        <thead>
+                            <tr><th>Situation</th><th>Where the revocation list lives</th><th>How it is loaded</th><th>Signal you have outgrown the tier</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>One or two instances</td><td>Process memory plus a relational database as source</td><td>Full load at startup, periodic polling</td><td>Shortening the poll interval no longer keeps propagation up</td></tr>
+                            <tr><td>Tens of instances</td><td>Shared cache or message broadcast</td><td>Push deltas, full load at startup</td><td>Simultaneous restarts drive up source database latency</td></tr>
+                            <tr><td>Hundreds of instances or more</td><td>Process memory plus object storage snapshots</td><td>Download by time chunk, refresh with conditional GET</td><td>This is where Canva arrived</td></tr>
+                            <tr><td>Federation across several services</td><td>The above plus protocol-layer propagation</td><td>Notify each party through back-channel logout</td><td>No contract assigns responsibility for retrying failed propagation</td></tr>
+                        </tbody>
+                    </table>
+                    <p>Three questions are enough to decide whether to move up a tier.</p>
+                    <ol>
+                        <li><strong>Does the number of revocations inside the validity window, times record size, fit comfortably in process memory?</strong> If it does, reading everything once at startup is enough</li>
+                        <li><strong>Do simultaneous cold starts hit the source datastore?</strong> Count the instances that come up together in a rolling deploy and an autoscale event and you have your answer</li>
+                        <li><strong>Would losing a revocation count as a security incident?</strong> If so, non-durable storage drops off the candidate list</li>
+                    </ol>
+                    <p>Until all three answers are yes, keeping the revocation list in a relational database and reading it at startup is the better structure. Fewer things to operate, easier to debug. But do settle <strong>the meaning of the record</strong> now. That is the part hardest to change later.</p>
+
+                    <h2 id="sec-10">10. Decisions you must make alongside this architecture</h2>
+                    <p>Swapping the datastore does not finish the job. Some items come back as incidents later if you do not settle them at the same time.</p>
+                    <ul>
+                        <li><strong>Token lifetime and window length are a pair.</strong> The window must be at least as long as the maximum refresh interval. Write down in the design doc that extending token lifetime is a decision to extend the memory budget</li>
+                        <li><strong>Set a numeric target for revocation propagation delay.</strong> The upper bound is worker interval plus gateway polling interval plus clock skew allowance, and that value belongs on a dashboard as a monitored metric</li>
+                        <li><strong>Classify clock synchronization as an authentication dependency.</strong> In a cutoff-timestamp design, clock skew is a correctness problem, not a performance one. Wire time sync failure into authentication alerting</li>
+                        <li><strong>Decide the policy for download failure in advance.</strong> Does a gateway that cannot fetch chunks keep serving from a stale list, or reject requests? Whether you choose fail-open or fail-safe is dictated by the nature of the service</li>
+                        <li><strong>Separate the revocation list from the audit log.</strong> The revocation list is operational data valid only inside a time window; who revoked what and when is a record with its own retention policy. Serving both from one table makes both worse</li>
+                        <li><strong>Leave reserved bits and a version field.</strong> Binary formats are hard to change once deployed. Assume revocation types will multiply and leave the room now</li>
+                        <li><strong>Measure at real scale before choosing.</strong> Canva tested multiple solutions at their expected scale on real infrastructure before picking one, and shipped only after an extensive suite of end-to-end tests and careful human review. Storage chosen without benchmarks is mostly taste</li>
+                        <li><strong>Build the rollback path first.</strong> You need to run the new load path alongside the old one for a while and compare that the results agree. When the authentication layer goes wrong, every user is affected at once</li>
+                    </ul>
+
+                    <h2 id="sec-11">11. What I could not confirm</h2>
+                    <p>Collecting in one place the items for which I have no evidence.</p>
+                    <ul>
+                        <li><strong>Exact scale figures.</strong> Only magnitudes are public: hundreds of millions of users, hundreds of thousands of session checks per second. Exact user count, QPS, and gateway pod count are unconfirmed</li>
+                        <li><strong>Real propagation delay.</strong> The worker scan interval, the gateway conditional GET interval, and the measured time from revocation to full effect are not published</li>
+                        <li><strong>Cookie encryption details.</strong> The algorithm, key rotation period, and key management scheme are unconfirmed</li>
+                        <li><strong>The concrete token refresh interval.</strong> The relationship where the 12-hour window derives from the refresh interval is clear, but the interval itself and its safety margin are unconfirmed</li>
+                        <li><strong>Migration procedure and duration.</strong> How long old and new paths ran together, the staged cutover percentages, and the rollback criteria are not published</li>
+                        <li><strong>Cost.</strong> How S3 request and transfer charges compare with the previous read replica cost is unconfirmed. Only the reduction in replicas is public</li>
+                        <li><strong>The bit layout of the 16 bytes.</strong> How many bits go to principal, cutoff, and flags respectively is not published. The diagram in this article only shows what occupies the space</li>
+                        <li><strong>ZooKeeper operational details.</strong> Leader term, behavior during failure, and worker instance count are unconfirmed</li>
+                    </ul>
+
+                    <h2 id="sec-12">12. Frequently asked questions</h2>
+
+                    <h3>If session data lives in a cookie, how do you make logout take effect right away?</h3>
+                    <p>The only way is to keep a revocation list as a separate axis. An encrypted cookie or a signed token carries facts as of the moment it was issued, and anything that changes afterward is not reflected inside the token. So the gateway has to answer one more question before letting a request through: has this user's session, started at this time, been revoked? Canva answers that question inside gateway process memory. It holds the last 12 hours of revocations in memory, and any token that needs refreshing is always checked against the database. The fast path is memory, the slow path is the database. Without that extra step, a logout does nothing until the token expires on its own.</p>
+
+                    <h3>Why not just put the revocation list in Redis?</h3>
+                    <p>Canva evaluated Redis and did not adopt it. The reason was durability, not performance. Redis is not typically deployed in a fully durable configuration, and doing so would just move the problem from one datastore to another while adding significant complexity to keep the cache consistent. That judgment is backed by how Redis actually ships: the default persistence policy, <code>appendfsync everysec</code>, explicitly allows losing up to one second of writes in a crash. For an ordinary cache a loss is a miss, and you simply read from the source again. In a revocation list a loss means the session appears not to be revoked. That is fail-open, not fail-safe. Recognizing that cache loss and revocation loss are different classes of incident is the fork in the road.</p>
+
+                    <h3>Does packing a revocation into 16 bytes really matter that much?</h3>
+                    <p>For one record it is trivial. Multiplied by millions of records and hundreds of processes it stops being trivial. Canva packs a revocation into 16 bytes with bit twiddling and keeps each chunk as a flat array of those 16-byte elements. By holding only that dense binary representation in memory, they cut the in-memory cache by 87.5 percent, a factor of eight, against the previous implementation that tracked each revocation with multiple Java objects. The knock-on benefits are larger than the size saving. Because the array is sorted, binary search works directly on it, and gateways operate on the downloaded bytes without any transformation. Deserialization cost and the garbage collection pressure that comes with object allocation both disappear.</p>
+
+                    <h3>If several workers update the same S3 object, will one overwrite the other?</h3>
+                    <p>That is exactly why conditional PUT requests are used to implement optimistic concurrency control. Every chunk update carries a precondition asserting the chunk has not changed since it was first read, and newly created chunks use similar checks to make sure another process has not already created the same chunk. Those preconditions guarantee that each read-modify-write operation only ever appends to the set of revocations, so interleaving executions never lose data. A ZooKeeper leader election is used alongside it, but that is an optimization to stop continuous conflicts from adding load to the system, not a correctness requirement. Worth noting: conditional writes on S3 are a 2024 addition. Write-if-absent came first, and the compare-and-swap form that requires a matching ETag followed later that year.</p>
+
+                    <h3>Does a service with tens of thousands of users need this architecture?</h3>
+                    <p>No. The criterion is not user count but three questions. First, does the number of revocations inside the validity window, multiplied by record size, fit comfortably in process memory? If it does, loading everything once at startup is enough. Second, does that load hit the database when instances restart together? Count the simultaneous cold starts in a rolling deploy and an autoscale event and you have the answer. Third, would losing a revocation count as a security incident? Until all three answers are yes, keeping the revocation list in a relational database is the better structure. One thing does need deciding now, though: whether a revocation record is keyed by session identifier or by principal plus a cutoff timestamp is very hard to change later.</p>
+
+                    <h2 id="sec-13">Conclusion: three things you can apply today</h2>
+                    <p><strong>First, size your revocation list by token lifetime, not user count.</strong> Sharing that one line in a meeting changes the quality of session policy discussion. A proposal to extend token lifetime is not a convenience proposal, it is an infrastructure budget proposal. Double the lifetime and you double the revocations you must hold in memory.</p>
+                    <p><strong>Second, plan capacity around cold start, not steady state.</strong> What hurt at Canva was not hundreds of thousands of lookups per second but hundreds of pods loading simultaneously during a deploy. And that load peaks during incident recovery. If you cannot answer 「what happens if everything restarts at once?」 with a number, your system does not yet have a capacity plan.</p>
+                    <p><strong>Third, choose storage by access pattern and failure grade, not by speed.</strong> Redis was rejected not because it is slow but because a loss creates a fail-open condition, and S3 was chosen not because it is fast but because this workload is a bulk sequential download. The question to ask when choosing a cache is what kind of incident happens if you lose data there.</p>
+                    <p>One closing note. What lasts longest from this case is neither S3 nor 16 bytes. It is the sentence that <strong>scaling in theory and scaling in practice are different objects</strong>. A design where a single worker continually sorts arrays of hundreds of thousands of records normally gets rejected in review. Measured for real, that worker turned out to be bound by network latency rather than sorting. Measuring the real N on real hardware before rejecting an option on complexity notation alone is the habit worth keeping.</p>
+
+                    <h2 id="sec-14">References</h2>
+                    <ul>
+                        <li><a href="https://www.canva.dev/blog/engineering/session-revocations-at-scale/" target="_blank" rel="noopener">Session revocations at scale (Canva Engineering Blog)</a> — primary source for this article: encrypted cookies, the 12-hour window, 30-minute chunks, 16-byte records, conditional PUT, the 87.5 percent reduction, and 2,000 writes per second</li>
+                        <li><a href="https://news.hada.io/topic?id=32156" target="_blank" rel="noopener">GeekNews discussion</a></li>
+                        <li><a href="https://aws.amazon.com/about-aws/whats-new/2024/11/amazon-s3-functionality-conditional-writes" target="_blank" rel="noopener">Amazon S3 adds new functionality for conditional writes</a> — ETag-based compare-and-swap, all regions, no additional charge</li>
+                        <li><a href="https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/" target="_blank" rel="noopener">Redis persistence documentation</a> — the appendfsync everysec default and its one-second loss window</li>
+                        <li><a href="https://openid.net/specs/openid-connect-backchannel-1_0.html" target="_blank" rel="noopener">OpenID Connect Back-Channel Logout 1.0</a> — logout tokens, relying party tracking, parallel delivery guidance</li>
+                        <li><a href="https://aws.amazon.com/blogs/storage/building-multi-writer-applications-on-amazon-s3-using-native-controls/" target="_blank" rel="noopener">Building multi-writer applications on Amazon S3 using native controls</a> — conditional write patterns for multi-writer environments</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>Share this article</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">Copy Link</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">Back to list</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Free tools you may find useful</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/json_formatter.html">JSON Formatter</a></li>
+      <li><a href="../static/regex_tester.html">Regex Tester</a></li>
+      <li><a href="../static/jwt_decoder.html">JWT Decoder Generator 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 Encoder/Decoder</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">See all tools &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Related Posts</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="rsync_trailing_slash_guide.html">Why One Trailing Slash Changes Everything in rsync - Checking Before You Delete 2026</a></li>
+      <li><a href="shell_subshell_variable_scope.html">Why Variables Vanish Inside a Piped while Loop - Subshells 2026</a></li>
+      <li><a href="deepseek_v4_flash_single_gpu_2026.html">Fitting a Large MoE on One GPU - From Memory Math to Where It Breaks 2026</a></li>
+      <li><a href="diataxis_documentation_framework_2026.html">Nobody Reads Your Docs Because Four Kinds of Writing Are Stuck in One Page - Applying Diataxis 2026</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('Link copied! Paste it in the Threads app to share.');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('Link copied!'); });
+    });
+    </script>
+</body>
+</html>
