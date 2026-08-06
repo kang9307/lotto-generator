@@ -1,0 +1,991 @@
+<!DOCTYPE html>
+<!--
+ * 技术博客文章模板
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>用trap确保临时文件被清掉 - 中断也不留残骸 2026</title>
+    <meta name="description" content="让脚本被中途打断也不留下临时文件的做法。把trap挂到EXIT和各个信号上，逐个跑一遍正常退出、报错和中断，再讲清bash与dash的行为差异、kill -9会留下什么、清理被重复触发时怎么防，以及避免误删路径的几道护栏。">
+    <meta name="keywords" content="trap, bash trap EXIT, 临时文件清理, mktemp, 信号, SIGINT, SIGTERM, SIGKILL, cleanup, set -e, set -E, ERR陷阱, Shell脚本, POSIX sh, dash, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/shell_trap_cleanup_guide.html">
+
+    <meta property="og:title" content="用trap确保临时文件被清掉 - 中断也不留残骸">
+    <meta property="og:description" content="把清理代码放在脚本最后一行，只有走到那一行才会执行。问题恰恰出在走不到的那些情况。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/shell_trap_cleanup_guide.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-08-07">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="用trap确保临时文件被清掉">
+    <meta name="twitter:description" content="按下Ctrl+C之后脚本留下了什么。哪些会被清掉、哪些会一直留着，全部实际跑一遍确认。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "用trap确保临时文件被清掉 - 中断也不留残骸",
+      "alternativeHeadline": "什么会被清掉，什么会一直留着",
+      "datePublished": "2026-08-07",
+      "dateModified": "2026-08-07",
+      "inLanguage": "zh-CN",
+      "articleSection": "开发/基础设施",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "trap, bash trap EXIT, 临时文件清理, mktemp, SIGINT, SIGTERM, SIGKILL, cleanup, set -e, set -E, ERR陷阱",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/shell_trap_cleanup_guide.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "只把trap挂在EXIT上，Ctrl+C中断时也能清理吗",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "取决于用的是哪个shell。在bash 5.2.37 上只挂EXIT，被SIGINT、SIGTERM、SIGHUP杀掉时处理函数照样执行，临时文件被清掉了。可是同一个脚本换成dash来跑，SIGTERM下处理函数根本不执行，文件原样留着。shebang写成「/bin/sh」的脚本在部署环境里经常由dash执行，所以在开发机上清理正常这件事，并不能保证线上也会清理。因此只要涉及可移植性，就别只依赖EXIT，把INT TERM HUP一并列出来。信号处理函数里做完清理之后，要解除该陷阱并用同一个信号重新打自己一枪，调用方才能拿到正常的退出码。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "用kill -9杀掉的进程为什么清理不了",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "因为SIGKILL不会投递给进程，是内核直接把进程抹掉。shell根本没有执行任何东西的机会，所以任何陷阱都不会运行。麻烦的是bash并不会把针对SIGKILL的trap命令当成语法错误拒绝掉。实际验证会发现trap -p的清单里堂而皇之地列着SIGKILL条目，但它永远不会执行。于是只看代码会以为这一路已经覆盖到了。把装有五个64KB文件的工作目录用kill -9打断，320KB原封不动地留在磁盘上。对策要放在程序外面：创建路径时加上固定前缀，再让一个独立的清扫任务定期回收陈旧残骸。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "挂两次trap是两个都会执行吗",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "不会。对同一个信号，后挂的会覆盖先挂的，不会累加。如果两个函数各自把自己的清理挂到EXIT上，只有后调用的那个活下来，前一个清理会悄无声息地消失，而且没有任何报错，所以往往很晚才被发现。绕开的办法有两个。第一，把清理项压进数组，EXIT上只挂一个按逆序遍历该数组的函数，逆注册顺序恰好也符合资源释放的顺序。第二，用trap -p读出已有的处理函数字符串再往后拼接。不过trap -p属于bash扩展，dash会回一个Illegal option错误。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "怎样避免清理代码删掉不该删的东西",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "第一步是让变量为空时删除命令根本执行不到。在清理函数最前面写上冒号加问号展开，变量为空就地停下。陷阱可以在脚本任何位置触发，变量还没赋值就收到信号的窗口是真实存在的。第二步是把路径钉死，用case语句检查删除目标是否以事先约定的前缀开头，不匹配就只告警不删除。第三步是顺序：先挂陷阱，再创建目录；反过来做，在这两行之间死掉就会留下残骸。最后要承认删除不可撤销，真正重要的产物与其删掉，不如改名挪走。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "按了Ctrl+C为什么处理函数过好久才动",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "因为shell在等待前台子命令期间会推迟陷阱的执行。信号立刻被接收，但处理函数要等那个子进程结束之后才运行。实测差别很明显：把sleep 5放在前台并在t+1秒发送SIGINT，处理函数在t+5秒才执行，白等了4秒。把同样的sleep 5改成后台任务再用wait等待，处理函数在t+1秒立刻执行。wait会被信号中断，前台命令不会。所以带长等待的脚本，把等待改成后台任务加wait的组合，或者把一次长sleep拆成多次短sleep，响应就会变快。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/shell_trap_cleanup_guide.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/shell_trap_cleanup_guide.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/shell_trap_cleanup_guide.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/shell_trap_cleanup_guide.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/shell_trap_cleanup_guide.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="用trap确保临时文件被清掉 - 中断也不留残骸">
+                <meta itemprop="datePublished" content="2026-08-07">
+                <meta itemprop="dateModified" content="2026-08-07">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="trap, bash trap EXIT, 临时文件清理, mktemp, SIGINT, SIGTERM, SIGKILL, cleanup, set -e, ERR陷阱">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/shell_trap_cleanup_guide.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">用trap确保临时文件被清掉 - 中断也不留残骸</h1>
+                    <h2 class="post-subtitle">什么会被清掉，什么会一直留着</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-08-07">2026-08-07</span>
+                        <span class="post-category" itemprop="articleSection">开发/基础设施</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <nav class="post-toc">
+                        <h3>本文涉及的内容</h3>
+                        <ol>
+                            <li><a href="#sec-1">无论怎么结束都会清理的一行</a></li>
+                            <li><a href="#sec-2">按了Ctrl+C临时文件却还在的原因</a></li>
+                            <li><a href="#sec-3">哪些信号会触发处理函数，哪些不会</a></li>
+                            <li><a href="#sec-4">kill -9之后到底留下了什么</a></li>
+                            <li><a href="#sec-5">挂了两个清理却只跑一个的原因</a></li>
+                            <li><a href="#sec-6">子shell、后台任务和函数里陷阱能跟到哪</a></li>
+                            <li><a href="#sec-7">不让清理代码删掉不该删的东西</a></li>
+                            <li><a href="#sec-8">整个目录进，整个目录出</a></li>
+                            <li><a href="#sec-9">和set -e一起用时会错位的地方</a></li>
+                            <li><a href="#sec-10">清理途中又来一次Ctrl+C</a></li>
+                            <li><a href="#sec-11">处理函数看上去反应很慢的时候</a></li>
+                            <li><a href="#sec-12">挡住重复运行的锁，以及孤儿锁</a></li>
+                            <li><a href="#sec-13">那到底该用哪一种</a></li>
+                            <li><a href="#sec-14">没能验证的部分</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-0">引言：清理代码在最后一行，而脚本没走到那里</h2>
+                    <p>设想一个脚本：创建临时目录，把中间产物堆进去，用完了在最后一行删掉。平时一切正常，问题出在不平常的时候。输入文件缺失于是中途<code>exit 1</code>退出，发布过程中CI取消了任务，或者有人在终端按了Ctrl+C。每一种情况清理代码都不会执行，因为脚本压根没走到那一行。</p>
+                    <p>这类残骸会悄悄堆积。一个200MB的工作目录每天留下几个，几周后就变成磁盘告警。等到那时打开残留目录，也很难判断它出自哪一次运行、什么时候产生的。</p>
+                    <p><code>trap</code>正面处理这个问题。它把清理代码从<strong>「最后要执行的一行」</strong>改成<strong>「shell退出时必须执行的代码」</strong>。不过这句话后面挂着一串例外：有的结束方式能被捕获，有的不能；不同shell结果不一样；写得不当还会删掉不该删的东西。</p>
+                    <p>本文的命令和输出都是在<code>GNU bash, version 5.2.37(1)-release</code>和<code>dash</code>上原样跑出来的。所有删除动作只针对<code>/tmp</code>下由<code>mktemp</code>创建的路径。如果shell基本功还不牢，先看<a href="linux_server_guide_06_shell_basics.html">Shell脚本基础</a>和<a href="linux_server_guide_07_shell_advanced.html">Shell脚本高级</a>。</p>
+
+                    <h2 id="sec-1">1. 无论怎么结束都会清理的一行</h2>
+                    <p>基本写法很短。创建临时文件，然后把删除它的命令注册到<code>EXIT</code>上。</p>
+                    <pre><code>#!/usr/bin/env bash
+tmp=$(mktemp /tmp/work.XXXXXX)
+trap 'rm -f "$tmp"' EXIT</code></pre>
+                    <p><code>EXIT</code>不是信号，而是指代<strong>shell终止那一刻</strong>的一个假名字。所以正常结束、显式<code>exit 1</code>、以及被<code>set -e</code>捕获的失败，全都会经过这个点。三条路径分别跑过一遍，结果如下。</p>
+                    <pre><code>$ bash t1.sh ok
+created: /tmp/work.Z8kaai
+doing work
+[trap] cleaning /tmp/work.Z8kaai
+exit=0
+
+$ bash t1.sh fail            # 脚本中途的 exit 1
+created: /tmp/work.af0aeI
+about to exit 1
+[trap] cleaning /tmp/work.af0aeI
+exit=1
+
+$ bash t1.sh err             # set -e 状态下某条命令失败
+created: /tmp/work.cLzp5n
+about to run a failing command
+[trap] cleaning /tmp/work.cLzp5n
+exit=1</code></pre>
+                    <p>三种情况处理函数都执行了，退出码也保持了原值。这就是<code>trap</code>能确定给你的部分。</p>
+
+                    <h3>1.1 单引号和双引号会给出不同结果</h3>
+                    <p>陷阱主体有两次被解释的机会：<strong>注册时一次，触发时一次</strong>。变量在哪一次展开，由引号决定。</p>
+                    <pre><code>$ tmp=/tmp/first
+$ trap "echo [double] would remove $tmp" EXIT   # 双引号：此刻就展开
+$ tmp=/tmp/second
+$ echo "tmp is now $tmp"
+tmp is now /tmp/second
+[double] would remove /tmp/first
+
+$ tmp=/tmp/first
+$ trap 'echo "[single] would remove $tmp"' EXIT # 单引号：触发时才展开
+$ tmp=/tmp/second
+$ echo "tmp is now $tmp"
+tmp is now /tmp/second
+[single] would remove /tmp/second</code></pre>
+                    <p>双引号那一侧要删的是注册时刻的值<code>/tmp/first</code>。只要临时路径是后面才确定的，或者会在循环里变化，这个差别就直接变成事故。</p>
+                    <ul>
+                        <li>陷阱主体默认用<strong>单引号</strong>包起来</li>
+                        <li>主体超过一行就抽成函数，用<code>trap cleanup EXIT</code>只注册名字，引号的烦恼就消失了</li>
+                        <li>抽成函数后用<code>trap -p</code>检查时注册内容也短，读起来更轻松</li>
+                        <li>只有在调试、确实想把值冻结在注册时刻的时候，才刻意使用双引号</li>
+                    </ul>
+
+                    <h2 id="sec-2">2. 按了Ctrl+C临时文件却还在的原因</h2>
+                    <p>从这里开始才是真正会分岔的部分。只挂了<code>EXIT</code>的脚本被信号杀掉会怎样？让脚本给自己发信号来确认。</p>
+                    <pre><code>$ cat t4.sh
+tmp=$(mktemp /tmp/work.XXXXXX)
+trap 'echo "[EXIT trap] rm $tmp"; rm -f "$tmp"' EXIT
+kill -"$1" $$
+sleep 5
+echo "SURVIVED the signal"
+
+$ bash t4.sh INT
+pid=1349 tmp=/tmp/work.ZaHJMi  sending SIGINT to self
+[EXIT trap] rm /tmp/work.ZaHJMi
+exit=130 tmpfile=cleaned
+
+$ bash t4.sh TERM
+[EXIT trap] rm /tmp/work.By1Y9n
+Terminated
+exit=143 tmpfile=cleaned</code></pre>
+                    <p>在bash上只挂<code>EXIT</code>，<code>SIGINT</code>、<code>SIGTERM</code>、<code>SIGHUP</code>都会触发处理函数。退出码也准确，130和143，就是128加上信号编号。</p>
+
+                    <h3>2.1 可是在dash上不执行</h3>
+                    <p>同一个脚本换成<code>dash</code>跑，结果就翻过来了。</p>
+                    <pre><code>$ bash /tmp/d2.sh          # 只注册 EXIT 陷阱，给自己发 SIGTERM
+[EXIT] rm /tmp/work.LJpwWB
+Terminated
+  rc=143
+  cleaned
+
+$ dash /tmp/d2.sh
+Terminated
+  rc=143
+  LEFTOVER /tmp/work.skxk0l</code></pre>
+                    <p><code>dash</code>根本没执行处理函数，文件原样留下。<strong>shebang写成<code>#!/bin/sh</code>的脚本在部署环境里经常由dash执行。</strong>如果开发机上<code>/bin/sh</code>链接到bash，这个差别根本看不见，等上了线残骸才开始堆积。</p>
+
+                    <h3>2.2 把信号写明，dash也会清理</h3>
+                    <p>修法就是在<code>EXIT</code>旁边把信号列出来。</p>
+                    <pre><code>cleanup() { rm -f "$tmp"; }
+trap cleanup EXIT
+trap 'cleanup; trap - INT;  kill -INT  $$' INT
+trap 'cleanup; trap - TERM; kill -TERM $$' TERM
+trap 'cleanup; trap - HUP;  kill -HUP  $$' HUP</code></pre>
+                    <pre><code>$ dash /tmp/d3.sh
+[cleanup] rm /tmp/work.Gjy9y6
+Terminated
+  rc=143
+  cleaned</code></pre>
+                    <p>关键在于处理函数用<code>trap - INT</code>解除自己的陷阱之后，<strong>再用同一个信号把自己打死</strong>。直接用<code>exit 0</code>结束的话，调用方看到的是运行成功。</p>
+                    <pre><code>$ cat /tmp/reraise2.sh
+trap 'echo "[INT] cleaning"; exit 0' INT
+kill -INT $$
+
+$ bash /tmp/reraise2.sh
+[INT] cleaning
+rc=0        # 明明被中断，却报告成功
+
+$ bash /tmp/reraise.sh      # 清理后用同一个信号重新触发
+pid=587 tmp=/tmp/work.QAJTr9
+rc=130      # 128+2，调用方期待的值</code></pre>
+                    <p>CI运行器和上层脚本靠这个退出码区分「已取消」「失败」和「成功」。清理做得再干净，把退出码搞坏了，上层判断照样会乱。</p>
+
+                    <h2 id="sec-3">3. 哪些信号会触发处理函数，哪些不会</h2>
+                    <p>把同一个脚本用两种方式武装起来，逐个发送信号，整理成表。A只注册<code>trap ... EXIT</code>，B在<code>EXIT</code>之外再加<code>INT TERM HUP QUIT</code>。</p>
+                    <table>
+                        <thead>
+                            <tr><th>信号</th><th>编号</th><th>A：仅EXIT</th><th>B：EXIT+信号</th><th>退出码</th><th>备注</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>SIGINT</code></td><td>2</td><td>已清理</td><td>已清理</td><td>130</td><td>Ctrl+C发出的</td></tr>
+                            <tr><td><code>SIGTERM</code></td><td>15</td><td>已清理</td><td>已清理</td><td>143</td><td><code>kill</code>的默认值</td></tr>
+                            <tr><td><code>SIGHUP</code></td><td>1</td><td>已清理</td><td>已清理</td><td>129</td><td>终端断开</td></tr>
+                            <tr><td><code>SIGQUIT</code></td><td>3</td><td>脚本活了下来</td><td>处理函数执行但继续跑</td><td>0</td><td>非交互bash默认忽略</td></tr>
+                            <tr><td><code>SIGKILL</code></td><td>9</td><td>留下残骸</td><td>留下残骸</td><td>137</td><td>无法捕获</td></tr>
+                        </tbody>
+                    </table>
+                    <p>表里A和B看着一样，但<strong>这说的是bash</strong>。正如第2节所示，dash上A会垮掉。一旦考虑可移植性，B才是基本形。</p>
+
+                    <h3>3.1 SIGQUIT默认被忽略</h3>
+                    <p>这是表里唯一一个另类的行。非交互的bash脚本在没挂陷阱时会直接忽略<code>SIGQUIT</code>。</p>
+                    <pre><code>$ cat /tmp/q2.sh
+echo "no trap armed; sending QUIT to self"
+kill -QUIT $$
+echo "survived"
+
+$ bash /tmp/q2.sh
+no trap armed; sending QUIT to self
+survived
+rc=0</code></pre>
+                    <p>挂上陷阱之后处理函数本身是会执行的，只是处理函数不调用<code>exit</code>的话脚本会照常往下走。</p>
+                    <pre><code>$ bash /tmp/q1.sh
+armed; sending QUIT to self
+[QUIT handler] ran
+survived (handler did not abort the script)
+rc=0</code></pre>
+                    <p><code>dash</code>上结果相同。实际工作中直接处理<code>SIGQUIT</code>的场合不多，但它很好地说明了「既然挂了陷阱脚本就会停」这个前提可能落空。<strong>处理函数执行和脚本结束是两回事。</strong></p>
+
+                    <h2 id="sec-4">4. kill -9之后到底留下了什么</h2>
+                    <p><code>SIGKILL</code>不会投递给进程。内核直接抹掉进程，shell根本没有执行代码的机会。把装有五个64KB文件的工作目录用<code>kill -9</code>打断，数一下剩下什么。</p>
+                    <pre><code>$ bash /tmp/leftover.sh &amp;
+$ sleep 1; kill -9 $!
+$ du -sh /tmp/work.yURWz1; ls -1 /tmp/work.yURWz1
+320K    /tmp/work.yURWz1
+    chunk.1
+    chunk.2
+    chunk.3
+    chunk.4
+    chunk.5</code></pre>
+                    <p>陷阱在<code>EXIT INT TERM HUP</code>上全都挂着，一个都没执行。</p>
+
+                    <h3>4.1 bash并不阻止你给KILL挂陷阱</h3>
+                    <p>这才是真正的坑。如果能当语法错误拒掉就好了，可惜并没有。</p>
+                    <pre><code>$ bash -c 'trap "echo caught" KILL; trap -p'
+trap -- 'echo caught' SIGKILL
+rc=0</code></pre>
+                    <p><code>trap -p</code>的清单里堂而皇之地列着<code>SIGKILL</code>条目。代码评审时看到<code>trap cleanup EXIT INT TERM KILL</code>这样一行，<strong>读起来像是连KILL都堵上了，可那个位置什么也不做。</strong>它制造的是一种并不存在的安全感。</p>
+
+                    <h3>4.2 所以对策要放在进程外面</h3>
+                    <ul>
+                        <li>给临时路径加<strong>固定前缀</strong>。用<code>mktemp -d /tmp/myjob.XXXXXX</code>这样创建，事后一眼就能看出留了什么</li>
+                        <li>让一个独立的清扫任务定期回收该前缀下的陈旧条目。按最后修改时间过滤就不会碰到正在运行的</li>
+                        <li>产物确实很大就别用<code>/tmp</code>，改用容量有余的独立卷，免得残骸把别的服务拖垮</li>
+                        <li>先减少<code>SIGKILL</code>到来的途径。容器编排器和服务管理器通常在停止宽限期到点后升级为KILL，只要清理能在这个窗口内完成，就很少会见到KILL</li>
+                        <li>如果清理要花几十秒，正确做法是缩短清理，延长宽限期是第二步</li>
+                    </ul>
+
+                    <h2 id="sec-5">5. 挂了两个清理却只跑一个的原因</h2>
+                    <p>对同一个信号挂两次陷阱，<strong>后挂的会覆盖先挂的</strong>，不会累加。</p>
+                    <pre><code>$ bash -c 'trap "echo first" EXIT; trap "echo second" EXIT; echo body'
+body
+second</code></pre>
+                    <p>既没有报错也没有警告。两个函数各自把自己的临时文件注册到<code>EXIT</code>上，只有后调用的那个活下来，前一个清理悄无声息地消失。用<code>source</code>引入库性质脚本的结构里，这种情况尤其常见。</p>
+
+                    <h3>5.1 把清理项堆起来一次性执行</h3>
+                    <pre><code>_cleanups=()
+add_cleanup() { _cleanups+=("$1"); }
+_run_cleanups() {
+    for ((i=${#_cleanups[@]}-1; i&gt;=0; i--)); do eval "${_cleanups[i]}"; done
+}
+trap _run_cleanups EXIT
+
+add_cleanup "echo remove file A"
+add_cleanup "echo remove dir B"
+add_cleanup "echo release lock C"</code></pre>
+                    <pre><code>$ bash /tmp/stack.sh
+body
+release lock C
+remove dir B
+remove file A</code></pre>
+                    <p>按注册的<strong>逆序</strong>执行是关键。如果先拿锁后建目录，释放时就应该先删目录、最后解锁。</p>
+
+                    <h3>5.2 往已有处理函数后面拼接的办法</h3>
+                    <p>如果别处已经挂了陷阱，可以用<code>trap -p</code>读出来再拼接。</p>
+                    <pre><code>add_exit() {
+    local prev new
+    prev=$(trap -p EXIT)
+    prev=${prev#trap -- \'}
+    prev=${prev%\' EXIT}
+    if [ -z "$prev" ]; then new="$1"; else new="$prev; $1"; fi
+    trap "$new" EXIT
+}</code></pre>
+                    <pre><code>$ bash /tmp/a1.sh
+captured: trap -- 'echo first-handler' EXIT
+now armed as: trap -- 'echo first-handler; echo second-handler; echo third-handler' EXIT
+body
+first-handler
+second-handler
+third-handler</code></pre>
+                    <p>能跑，但要接受两点代价。第一，处理函数字符串里若含有单引号，上面的字符串截取就会错位。第二，<code>trap -p</code>是bash扩展，<code>dash</code>里用不了。</p>
+                    <pre><code>$ dash -c 'trap "echo x" EXIT; trap -p'
+dash: 1: trap: Illegal option -p</code></pre>
+                    <p>在<code>dash</code>里不带参数敲<code>trap</code>是能列出清单的，但把那份输出解析回去，引号处理更加棘手。需要可移植性的话，5.1的数组方式更合适。</p>
+                    <pre><code>$ bash -c 'trap "echo a" EXIT INT; trap'
+trap -- 'echo a' EXIT
+trap -- 'echo a' SIGINT
+
+$ dash -c 'trap "echo a" EXIT INT; trap'
+trap -- 'echo a' EXIT
+trap -- 'echo a' INT</code></pre>
+                    <p>bash写作<code>SIGINT</code>，dash写作<code>INT</code>。要是做一个机械比对这份输出的检查器，就会栽在这个差别上。</p>
+
+                    <h3>5.3 怎样撤掉陷阱</h3>
+                    <pre><code>trap - EXIT       # 恢复默认行为
+trap '' INT       # 改为忽略（与解除不同）</code></pre>
+                    <p>第二种写法有副作用。<strong>被设为忽略的信号会被子进程继承，而且子进程无法改回来。</strong></p>
+                    <pre><code>$ cat /tmp/ig.sh
+trap '' INT
+bash -c 'trap "echo child handler" INT; trap -p INT'
+
+$ bash /tmp/ig.sh
+trap -- '' SIGINT</code></pre>
+                    <p>子进程明明执行了<code>trap "echo child handler" INT</code>，清单里依然是空字符串，也就是忽略状态。父进程以忽略状态传下去的信号，子进程再也抓不回来。如果你的脚本是包着另一条命令运行的封装器，这份继承会把那条命令的Ctrl+C响应给抹掉。</p>
+
+                    <h2 id="sec-6">6. 子shell、后台任务和函数里陷阱能跟到哪</h2>
+                    <p>管道和括号会多创建一个进程这件事，在<a href="shell_subshell_variable_scope.html">管道里的while为什么变量会消失</a>里讲过。陷阱在同一条边界上的表现和变量并不一样。</p>
+
+                    <h3>6.1 子shell会继承陷阱，但不会因自身退出而触发</h3>
+                    <pre><code>$ cat /tmp/sub_t.sh
+trap 'echo "[EXIT] fired in BASHPID=$BASHPID"' EXIT
+echo "parent BASHPID=$BASHPID"
+( echo "  inside subshell BASHPID=$BASHPID"; exit 3 )
+echo "subshell rc=$?"
+
+$ bash /tmp/sub_t.sh
+parent BASHPID=340
+  inside subshell BASHPID=341
+subshell rc=3
+[EXIT] fired in BASHPID=340</code></pre>
+                    <p>子shell是独立进程（341）并且以<code>exit 3</code>结束，可处理函数只在父进程（340）里执行了一次。<strong>不必担心同一份清理被执行两遍。</strong>反过来说，只在子shell内部使用的临时文件，就得在里面单独挂一个。</p>
+                    <pre><code>$ cat /tmp/sub_t2.sh
+trap 'echo "[parent EXIT] BASHPID=$BASHPID"' EXIT
+( trap 'echo "  [subshell EXIT] BASHPID=$BASHPID"' EXIT
+  echo "  inside subshell BASHPID=$BASHPID"; exit 3 )
+echo "subshell rc=$?"
+
+$ bash /tmp/sub_t2.sh
+  inside subshell BASHPID=344
+  [subshell EXIT] BASHPID=344
+subshell rc=3
+[parent EXIT] BASHPID=343</code></pre>
+                    <p>在子shell内部注册的陷阱，会在子shell结束时于其中执行；父进程的陷阱在父进程结束时另行执行。两者互不干扰。</p>
+
+                    <h3>6.2 后台任务同理，管道内部的也出不来</h3>
+                    <pre><code>$ bash /tmp/sub_t3.sh
+parent BASHPID=346
+  bg BASHPID=347
+parent done
+[EXIT] fired in BASHPID=346</code></pre>
+                    <pre><code>$ bash /tmp/a2.sh
+echo x | { trap 'echo "[inner EXIT]"' EXIT; cat &gt; /dev/null; }
+[inner EXIT]
+parent continues
+parent trap -p EXIT output:
+(nothing between the two lines = the parent has no EXIT trap)</code></pre>
+                    <p>在管道组成部分内部挂的陷阱，会在该组成部分结束时执行，不会留在父进程里。<strong>要是脚本正文里挂了陷阱却好像不触发，先看那一行是不是在管道右侧或者括号里面。</strong></p>
+
+                    <h3>6.3 函数里挂的陷阱出了函数还活着</h3>
+                    <pre><code>$ bash -c 'f() { trap "echo [EXIT] set inside f" EXIT; echo "in f"; }; f; echo "after f"'
+in f
+after f
+[EXIT] set inside f</code></pre>
+                    <p><code>EXIT</code>陷阱是整个shell的状态，不是函数局部的。函数为了清理自己的临时文件而注册到<code>EXIT</code>，这份注册会一直留到脚本结束，并且覆盖其他函数的注册。和第5节是同一个根源。</p>
+
+                    <h3>6.4 ERR和RETURN需要开选项才能进到里层</h3>
+                    <p><code>ERR</code>陷阱在命令失败时触发，但默认配置下不会进入函数、子shell和命令替换的内部。</p>
+                    <pre><code>$ bash -c 'set -e; trap "echo [ERR] caught" ERR; h() { false; }; h; echo "NOT REACHED"'
+rc=1                       # 处理函数没有执行
+
+$ bash -c 'set -eE; trap "echo [ERR] caught" ERR; h() { false; }; h; echo "NOT REACHED"'
+[ERR] caught
+rc=1</code></pre>
+                    <p>要开<code>set -E</code>，<code>ERR</code>才会继承到函数内部。<code>RETURN</code>和<code>DEBUG</code>陷阱由<code>set -T</code>扮演同样的角色。</p>
+                    <pre><code>$ bash -c 'trap "echo [RETURN]" RETURN; g() { echo "in g"; }; g'
+in g
+
+$ bash -c 'set -T; trap "echo [RETURN]" RETURN; g() { echo "in g"; }; g'
+in g
+[RETURN]</code></pre>
+                    <p>触发顺序也确认过了。发生失败时<code>ERR</code>在前，<code>EXIT</code>在后。</p>
+                    <pre><code>$ bash -c 'trap "echo [ERR]  seen" ERR; trap "echo [EXIT] seen" EXIT; set -e; false'
+[ERR]  seen
+[EXIT] seen
+rc=1</code></pre>
+                    <p>用<code>ERR</code>记录在哪里失败，把真正的清理留在<code>EXIT</code>上，这样的分工比较自然。另外<code>ERR</code>、<code>RETURN</code>、<code>DEBUG</code><strong>全都是bash扩展</strong>。</p>
+                    <pre><code>$ dash -c 'trap "echo err" ERR; false; echo done'
+trap: ERR: bad trap
+done
+
+$ dash -c 'trap "echo ret" RETURN; f(){ :; }; f'
+trap: RETURN: bad trap</code></pre>
+
+                    <h2 id="sec-7">7. 不让清理代码删掉不该删的东西</h2>
+                    <div class="callout">
+                        <p><strong>请先读这一节。</strong>本节内容必须先于后面的示例落实。清理脚本写得不当就会<strong>删掉不该碰的东西。</strong>删除不可撤销，而且脚本删掉的文件不会进回收站。在下面三道护栏装好之前，别把含有<code>rm -rf</code>的陷阱放到有真实数据的机器上。</p>
+                    </div>
+
+                    <h3>7.1 变量为空就地停下</h3>
+                    <p>陷阱可以在<strong>脚本的任何位置</strong>触发。临时路径变量还没赋值就收到信号的情况是真实存在的。在那种状态下删除命令照跑，目标会变成什么完全无法预测。</p>
+                    <pre><code>cleanup() {
+    : "${workdir:?cleanup called with no workdir}"
+    ...
+}</code></pre>
+                    <p><code>:</code>是什么都不做的内建命令，<code>${var:?消息}</code>是<strong>变量为空就打印消息并当场停下shell</strong>的展开。两者合起来就是一行只做取值检查的断言。</p>
+                    <pre><code>$ bash -c 'cleanup() { : "${workdir:?cleanup called with no workdir}"; echo "would remove $workdir"; }
+trap cleanup EXIT
+echo body'
+body
+environment: line 2: workdir: cleanup called with no workdir</code></pre>
+                    <p>还没走到删除那一行就停住了。没有这一行会发生什么，这里<strong>只做说明，不做演示。</strong><code>rm -rf -- "$workdir"</code>在变量为空时参数变成空字符串，通常会以报错收场，但下面这些常见写法就完全不同了。</p>
+                    <ul>
+                        <li><code>rm -rf "$workdir"/*</code> — 变量为空就变成<code>/*</code>，根目录下的所有内容都成了目标</li>
+                        <li><code>rm -rf "$base/$sub"</code> — 两者之一为空，残留的斜杠会让删除落到比预期高一层的位置</li>
+                        <li><code>cd "$workdir" &amp;&amp; rm -rf .</code> — <code>cd</code>失败就会在当前目录里执行。即使有<code>&amp;&amp;</code>，只要<code>cd</code>成功进了错的地方，照样往下走</li>
+                        <li><code>rm -rf $workdir</code> — 不加引号时，含空格的路径会被拆成多个参数，前面那一截碰巧存在就会被删掉</li>
+                    </ul>
+                    <p>这四种都<strong>不是拿来试跑看看的东西。</strong>先装护栏，再写删除那一行。</p>
+
+                    <h3>7.2 把路径钉死</h3>
+                    <p>只是非空还不够，还要看值是不是<strong>预期的形状</strong>。</p>
+                    <pre><code>cleanup() {
+    : "${workdir:?}"
+    case "$workdir" in
+        /tmp/myjob.*) rm -rf -- "$workdir" &amp;&amp; echo "[cleanup] removed $workdir" ;;
+        *)            echo "[cleanup] refusing to remove unexpected path: $workdir" &gt;&amp;2 ;;
+    esac
+}</code></pre>
+                    <pre><code>$ bash /tmp/guarded.sh
+workdir=/tmp/work.nGJBt5
+removed /tmp/work.nGJBt5
+rc=0</code></pre>
+                    <p>前缀不匹配就不删，只留告警。改脚本时不小心让<code>workdir</code>装进别的值，删除也不会发生，而且日志里会留下痕迹。</p>
+
+                    <h3>7.3 先挂陷阱，再创建</h3>
+                    <p>顺序颠倒的代码很常见。</p>
+                    <pre><code># 脆弱的顺序：在这两行之间死掉，文件就留下了
+tmp=$(mktemp /tmp/work.XXXXXX)
+... 准备工作 40 行 ...
+trap 'rm -f -- "$tmp"' EXIT</code></pre>
+                    <p>中间看着再短，只要信号落在那个区间，残骸照样留下。反过来写就行了。</p>
+                    <pre><code>tmp=
+cleanup() { [ -n "$tmp" ] &amp;&amp; rm -f -- "$tmp"; echo "[cleanup] handled tmp=[$tmp]"; }
+trap cleanup EXIT
+tmp=$(mktemp /tmp/work.XXXXXX)</code></pre>
+                    <pre><code>$ bash /tmp/race2.sh
+trap armed before anything exists
+created /tmp/work.35mmxL
+[cleanup] handled tmp=[/tmp/work.35mmxL]
+
+$ bash /tmp/race3.sh        # 在 mktemp 之前退出
+[cleanup] handled tmp=[]
+rc=1</code></pre>
+                    <p>还什么都没创建就死掉的话，处理函数会安静地什么也不做然后结束。用<code>tmp=</code>预先声明，在<code>set -u</code>环境下尤其重要。</p>
+                    <pre><code>$ bash -c 'set -u; cleanup() { echo "rm -rf -- \"$workdir\""; }; trap cleanup EXIT; echo body'
+body
+environment: line 3: workdir: unbound variable</code></pre>
+
+                    <h3>7.4 不可撤销的那个点</h3>
+                    <ul>
+                        <li><strong>删除一旦开始，中断也没用。</strong><code>rm -rf</code>跑到一半按Ctrl+C，已经没了的东西不会回来</li>
+                        <li>把<strong>原件挪进</strong>临时目录的设计很危险。如果是用移动而不是复制放进去的，清理陷阱就成了删除原件的陷阱</li>
+                        <li>清理目标有可能是<strong>符号链接</strong>的结构，要确认删除会不会跟着链接走。本想删链接本身，结果删掉了链接指向的真实数据，这种事是有的</li>
+                        <li>把网络文件系统或共享卷当临时空间用，意味着<strong>别的进程可能在用同一个路径。</strong>在前缀里放上进程标识，避免撞车</li>
+                        <li>改了清理逻辑之后，<strong>把删除换成<code>echo</code>先跑一遍。</strong>用眼睛确认目标路径，再换回真正的删除</li>
+                        <li>第一次上生产机时，用<code>mv</code>挪到隔离目录而不是<code>rm</code>，这样跑几天。意料之外的路径会在这段时间里暴露出来</li>
+                    </ul>
+
+                    <h2 id="sec-8">8. 整个目录进，整个目录出</h2>
+                    <p>如果任务要创建的不止一个文件，用<code>mktemp -d</code>拿一个目录、所有处理都在里面进行会更好，清理目标就收敛成一个。</p>
+                    <pre><code>#!/usr/bin/env bash
+set -euo pipefail
+
+workdir=
+_cleaned=0
+
+cleanup() {
+    [ "$_cleaned" -eq 1 ] &amp;&amp; return
+    _cleaned=1
+    trap '' INT TERM HUP
+    if [ -n "$workdir" ] &amp;&amp; [ -d "$workdir" ]; then
+        case "$workdir" in
+            /tmp/job.*) rm -rf -- "$workdir" &amp;&amp; echo "[cleanup] removed $workdir" ;;
+            *)          echo "[cleanup] refusing to remove unexpected path: $workdir" &gt;&amp;2 ;;
+        esac
+    else
+        echo "[cleanup] nothing to remove"
+    fi
+}
+
+on_signal() {
+    local sig=$1
+    echo "[signal] SIG$sig received" &gt;&amp;2
+    cleanup
+    trap - "$sig" EXIT
+    kill -"$sig" "$$"
+}
+
+trap cleanup EXIT
+for s in INT TERM HUP; do trap "on_signal $s" "$s"; done
+
+workdir=$(mktemp -d /tmp/job.XXXXXX)
+echo "workdir=$workdir"
+
+printf 'row1\nrow2\nrow3\n' &gt; "$workdir/input.txt"
+wc -l &lt; "$workdir/input.txt"</code></pre>
+                    <p>三条路径全部跑过并确认。</p>
+                    <pre><code>$ bash job.sh ok
+workdir=/tmp/job.QoSGZJ
+rows: 3
+work finished
+[cleanup] removed /tmp/job.QoSGZJ
+rc=0
+verified: /tmp/job.QoSGZJ gone
+
+$ bash job.sh fail
+workdir=/tmp/job.aHj3Nw
+rows: 3
+failing on purpose
+[cleanup] removed /tmp/job.aHj3Nw
+rc=1
+verified: /tmp/job.aHj3Nw gone
+
+$ bash job.sh signal
+workdir=/tmp/job.ipwR33
+rows: 3
+signalling myself
+[signal] SIGINT received
+[cleanup] removed /tmp/job.ipwR33
+rc=130
+verified: /tmp/job.ipwR33 gone</code></pre>
+                    <p>把这份模板里的要素逐条点出来是这样的。</p>
+                    <ul>
+                        <li>先声明<code>workdir=</code>，挂好陷阱之后再调用<code>mktemp -d</code>（7.3）</li>
+                        <li>用<code>_cleaned</code>标志避免清理跑两遍（第10节）</li>
+                        <li>清理一开始就用<code>trap '' INT TERM HUP</code>挡住后续信号</li>
+                        <li>用<code>case</code>确认路径前缀（7.2）</li>
+                        <li>信号处理函数清理完之后<strong>用同一个信号把自己再打一枪</strong>，保住退出码（2.2）</li>
+                        <li><code>local sig=$1</code>让处理函数接收自己的参数，就不用为每个信号名各写一个函数</li>
+                    </ul>
+
+                    <h3>8.1 子进程也要一起清</h3>
+                    <p>如果起了后台任务，只删目录是不够的。会留下继续想用已消失路径的孤儿进程。</p>
+                    <pre><code>cleanup() {
+    echo "[cleanup] killing $(jobs -p | wc -l) background job(s)"
+    jobs -p | while read -r p; do kill "$p" 2&gt;/dev/null; done
+    : "${workdir:?}"
+    rm -rf -- "$workdir"
+}</code></pre>
+                    <pre><code>$ bash /tmp/kids.sh
+running with 2 children
+[cleanup] killing 2 background job(s)
+[cleanup] workdir removed
+workdir gone: /tmp/work.47Wiqu</code></pre>
+                    <p>顺序很重要。<strong>先杀子进程，再删目录。</strong>反过来的话，子进程会往消失的路径里写，把日志刷满错误。</p>
+
+                    <h2 id="sec-9">9. 和set -e一起用时会错位的地方</h2>
+                    <p>在开了<code>set -e</code>的脚本里，陷阱处理函数会怎样？处理函数内部出错的话，剩下的清理又会怎样？就从这里开始确认。</p>
+                    <pre><code>$ bash -c 'trap "echo [EXIT] start; false; echo [EXIT] still running; echo [EXIT] done" EXIT; echo body'
+body
+[EXIT] start
+[EXIT] still running
+[EXIT] done
+outer rc=0</code></pre>
+                    <p>处理函数中途的失败没有挡住后面的部分，退出码也没变。可是在处理函数内部开<code>set -e</code>，情况就不一样了。</p>
+                    <pre><code>$ bash -c 'cleanup() { set -e; echo "[cleanup] step 1"; false; echo "[cleanup] step 2 - NOT REACHED"; }
+trap cleanup EXIT
+echo body'
+body
+[cleanup] step 1
+outer rc=1</code></pre>
+                    <p><strong>第二步没有执行。</strong>清理函数里第一个删除失败，第二个删除和解锁就被整体跳过。退出码也变成了1，把原来的结果覆盖掉。</p>
+                    <ul>
+                        <li>清理函数内部不要开<code>set -e</code>。清理是<strong>即使失败也要一路试到底</strong>的那类代码</li>
+                        <li>脚本开头的<code>set -e</code>在函数内部同样有效，所以在清理函数第一行写<code>set +e</code>有时是稳妥的做法</li>
+                        <li>要吸收单条命令的失败，就用<code>rm -f</code>这类目标不存在也算成功的选项，或者加上<code>|| true</code></li>
+                        <li>想忽略失败但保留记录，就换成<code>|| echo "..." &gt;&amp;2</code>的写法</li>
+                    </ul>
+
+                    <h3>9.1 处理函数里的exit会覆盖退出码</h3>
+                    <pre><code>$ bash -c 'trap "echo [EXIT] handler; exit 99" EXIT; exit 3'
+[EXIT] handler
+rc=99
+
+$ bash -c 'trap "echo [EXIT] handler" EXIT; exit 3'
+[EXIT] handler
+rc=3</code></pre>
+                    <p>处理函数不调用<code>exit</code>的话，原来的退出码原样保留。<strong>习惯性地在清理处理函数里加<code>exit 0</code>，会让失败的运行被报告成成功。</strong>在自动化流水线里，比这更糟的缺陷不多。</p>
+
+                    <h3>9.2 exec不会把陷阱带走</h3>
+                    <pre><code>$ bash -c 'trap "echo [EXIT] should not print" EXIT; echo before-exec; exec echo after-exec'
+before-exec
+after-exec</code></pre>
+                    <p><code>exec</code>会用另一个程序替换掉shell进程。替换之后那个shell已经不存在，<code>EXIT</code>陷阱也随之消失。如果容器入口脚本最后是用<code>exec</code>拉起主程序，那么在它前面挂的清理陷阱永远不会执行。</p>
+
+                    <h2 id="sec-10">10. 清理途中又来一次Ctrl+C</h2>
+                    <p>在清理需要2秒的情况下，以1秒间隔发了三次SIGINT。这是一个没有护栏的处理函数。</p>
+                    <pre><code>$ bash /tmp/reenter.sh
+start (05)
+  [cleanup] enter  (06)
+  [cleanup] enter  (08)      &lt;-- 前一次清理还没结束又进来了
+  [cleanup] leave  (10)
+  [cleanup] leave  (10)
+end (16)</code></pre>
+                    <p><code>enter</code>连着出现了两次。<strong>清理代码在自身内部被嵌套执行了。</strong>这种状态下实际会发生什么？</p>
+                    <ul>
+                        <li>会尝试删同一个目录两次。第二次因为目标不在而报错</li>
+                        <li>解锁跑两遍的话，第二次解锁可能把<strong>下一次运行刚拿到的锁</strong>给放掉</li>
+                        <li>回滚计数器或整理日志之类的代码会被应用两次，数值出现偏差</li>
+                        <li>嵌套的内层先结束并调用<code>exit</code>，外层清理就会在只做了一半的状态下随进程一起消失</li>
+                    </ul>
+
+                    <h3>10.1 标志位和信号屏蔽一起用</h3>
+                    <pre><code>_cleaned=0
+cleanup() {
+    [ "$_cleaned" -eq 1 ] &amp;&amp; { echo "  [cleanup] already done, ignoring"; return; }
+    _cleaned=1
+    trap '' INT TERM HUP      # 清理期间忽略信号
+    ...
+}</code></pre>
+                    <pre><code>$ bash /tmp/reenter2.sh
+start (17)
+  [cleanup] enter  (18)
+  [cleanup] leave  (20)
+end (26)</code></pre>
+                    <p>同样收到三次SIGINT，清理只跑了一次。用两层来挡是有理由的。</p>
+                    <ul>
+                        <li><code>_cleaned</code>标志防止<code>EXIT</code>和信号处理函数<strong>都调用同一个清理函数</strong>时的重复</li>
+                        <li><code>trap '' INT TERM HUP</code>阻止清理进行中新信号再次调用处理函数</li>
+                        <li>只有标志位的话，第二次进入确实会<code>return</code>退出，但期间第一次清理已经挨了一次中断</li>
+                        <li>只有屏蔽的话，挡不住从<code>EXIT</code>路径来的重复。<code>EXIT</code>不是信号，不在屏蔽范围内</li>
+                    </ul>
+                    <div class="callout">
+                        <p><strong>清理太长的话，屏蔽本身也有风险。</strong>忽略信号的区间一长，用户按Ctrl+C就毫无反应，最后只会走向<code>kill -9</code>，那就又回到第4节的局面了。<strong>把清理保持得足够短，才是最好的防御。</strong></p>
+                    </div>
+
+                    <h2 id="sec-11">11. 处理函数看上去反应很慢的时候</h2>
+                    <p>你大概经历过按了Ctrl+C好几秒都没动静的情况。shell在等待前台子命令期间会<strong>推迟陷阱的执行。</strong>信号是立刻接收的，但处理函数要等那个子进程结束之后才动。实测是这样。</p>
+                    <pre><code>$ bash /tmp/measure.sh 5        # sleep 5 放前台，t+1 秒发 SIGINT
+  signal will arrive at t+1s
+  [handler] ran at t+5s
+  foreground sleep 5 returned at t+5s
+
+$ bash /tmp/measure2.sh         # sleep 5 &amp; 起到后台再 wait
+  signal will arrive at t+1s
+  [handler] ran at t+1s
+  wait returned at t+1s</code></pre>
+                    <p>同样是5秒等待，一个处理函数晚了4秒，另一个立刻执行。差别在于<code>wait</code><strong>会被信号中断</strong>，而前台的<code>sleep</code>不会。</p>
+
+                    <h3>11.1 让反应变快的办法</h3>
+                    <ul>
+                        <li>长等待改写成<code>sleep 300 &amp; wait $!</code>的形式。信号一来<code>wait</code>立刻返回</li>
+                        <li>能拆就拆。用多次<code>sleep 0.5</code>的循环来验证时，处理函数在t+1秒就执行了</li>
+                        <li>把耗时的外部命令起到后台再用<code>wait</code>等待，效果相同。只是要从<code>wait "$job"</code>的返回值里取退出码</li>
+                        <li>这种延迟不是清理做不了，而是<strong>晚一点做</strong>。着急连按Ctrl+C，就转移到第10节的重入问题了</li>
+                    </ul>
+                    <pre><code>$ bash /tmp/defer5.sh
+[04:37] waiting on background sleep 4
+  &gt;&gt;&gt; [04:38] TERM handler
+rc=143</code></pre>
+
+                    <h2 id="sec-12">12. 挡住重复运行的锁，以及孤儿锁</h2>
+                    <p>清理陷阱第二常见的用途是释放锁。<code>mkdir</code>在目标已存在时会失败，而且检查与创建是一步完成的，所以能当作加锁的原语来用。</p>
+                    <pre><code>lockdir=/tmp/myjob.lock
+if ! mkdir "$lockdir" 2&gt;/dev/null; then
+    echo "another run holds $lockdir - exiting"
+    exit 1
+fi
+trap 'rmdir "$lockdir" 2&gt;/dev/null' EXIT INT TERM HUP</code></pre>
+                    <pre><code>$ bash /tmp/lock.sh &amp;          # 第一次运行
+1854 holds the lock
+$ bash /tmp/lock.sh            # 紧接着第二次运行
+another run holds /tmp/myjob.lock - exiting
+second run rc=1
+[cleanup] released /tmp/myjob.lock
+lock released</code></pre>
+
+                    <h3>12.1 SIGKILL留下的锁会永远留着</h3>
+                    <p>第4节的结论在这里再次出现。被<code>kill -9</code>打死之后锁目录原样留下，之后<strong>任何一次运行都启动不了。</strong>这比磁盘写满还要紧急。在锁里留下持有者信息，下一次运行就能做判断。</p>
+                    <pre><code>if mkdir "$lockdir" 2&gt;/dev/null; then
+    echo "$$" &gt; "$lockdir/pid"
+    trap 'rm -f "$lockdir/pid"; rmdir "$lockdir" 2&gt;/dev/null' EXIT INT TERM HUP
+else
+    owner=$(cat "$lockdir/pid" 2&gt;/dev/null)
+    if [ -n "$owner" ] &amp;&amp; kill -0 "$owner" 2&gt;/dev/null; then
+        echo "lock held by live pid $owner"
+    else
+        echo "STALE lock (owner $owner is gone) - safe to break"
+    fi
+fi</code></pre>
+                    <pre><code>$ bash /tmp/lock2.sh &amp;
+acquired by 1862
+$ bash /tmp/lock2.sh           # 持有者还活着的时候
+lock held by live pid 1862
+
+$ kill -9 1862
+$ bash /tmp/lock2.sh           # 持有者消失之后
+STALE lock (owner 1862 is gone) - safe to break</code></pre>
+                    <p><code>kill -0</code>不发送信号，只确认<strong>那个进程是否存在</strong>。不过这个判断有漏洞。</p>
+                    <ul>
+                        <li>PID会被复用。死掉的持有者编号被另一个完全无关的进程接手，就会误判成还活着</li>
+                        <li>多台服务器共用共享卷上的同一把锁时，PID检查毫无意义，必须连主机名一起记录</li>
+                        <li>自动打破孤儿锁的逻辑本身会制造竞态。两次运行可能同时判定为「已陈旧」</li>
+                        <li>安全的折中是不自动打破，<strong>只告警然后退出</strong>，让人确认后再删</li>
+                        <li>持有者信息里连启动时刻一起留下，陈旧判定会安全得多</li>
+                    </ul>
+
+                    <h2 id="sec-13">13. 那到底该用哪一种</h2>
+                    <p>把各种清理方式能抓住什么、会漏掉什么整理一下。</p>
+                    <table>
+                        <thead>
+                            <tr><th>模式</th><th>正常结束</th><th>exit 1 · 报错</th><th>INT · TERM</th><th>KILL</th><th>可移植性</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>最后一行<code>rm</code></td><td>已清理</td><td>留残骸</td><td>留残骸</td><td>留残骸</td><td>所有shell</td></tr>
+                            <tr><td><code>trap ... EXIT</code></td><td>已清理</td><td>已清理</td><td>只有bash会清理</td><td>留残骸</td><td>dash上对信号很脆弱</td></tr>
+                            <tr><td><code>trap ... EXIT INT TERM HUP</code></td><td>已清理</td><td>已清理</td><td>已清理</td><td>留残骸</td><td>bash与dash均已验证</td></tr>
+                            <tr><td>上面 + 重发信号与重入护栏</td><td>已清理</td><td>已清理</td><td>已清理 · 保住退出码</td><td>留残骸</td><td>bash为准，第8节模板</td></tr>
+                            <tr><td>固定前缀 + 外部清扫任务</td><td>—</td><td>—</td><td>—</td><td>事后清理</td><td>唯一能覆盖KILL的办法</td></tr>
+                        </tbody>
+                    </table>
+                    <p>最后一行很重要。<strong>光靠<code>trap</code>覆盖不了所有情况。</strong>第三行是脚本内部能做到的上限，再往上就得靠脚本外面的机制。两者一起放，才是真正的答案。</p>
+
+                    <h3>13.1 最小检查清单</h3>
+                    <ul>
+                        <li>清理代码抽成函数，用<code>trap cleanup EXIT</code>注册。引号问题随之消失</li>
+                        <li>在<code>EXIT</code>旁边列出<code>INT TERM HUP</code>。bash上看着多余，dash上却是必需</li>
+                        <li>信号处理函数清理完用<code>trap - SIG</code>解除，再用同一个信号把自己打死</li>
+                        <li>清理函数第一行是<code>: "${var:?}"</code>，第二行是<code>case</code>路径检查</li>
+                        <li>变量先声明成空值，挂好陷阱之后再调用<code>mktemp</code></li>
+                        <li>加上重入标志和<code>trap '' INT TERM HUP</code></li>
+                        <li>处理函数里不要调用<code>exit 0</code>。保住原来的退出码</li>
+                        <li>临时路径加固定前缀，另设一个回收陈旧残骸的任务</li>
+                        <li>有后台子进程的话，删目录之前先把它们杀掉</li>
+                        <li>长等待改成<code>&amp; wait</code>，确保响应速度</li>
+                        <li>入口脚本以<code>exec</code>结尾的话，记住它前面的陷阱不会执行</li>
+                        <li>用部署目标的shell实际跑一次。做出本文这些表格只花了几分钟</li>
+                    </ul>
+
+                    <h2 id="sec-14">14. 没能验证的部分</h2>
+                    <p>本文中没能通过实际执行验证的项目集中列在这里。</p>
+                    <ul>
+                        <li><strong>在真实终端按下的Ctrl+C。</strong>所有验证都是非交互脚本给自己或子进程发信号的方式做的。终端把SIGINT撒向整个进程组、也就是shell和子进程同时收到信号的情形没有复现。那种条件下处理函数的执行顺序有可能不同</li>
+                        <li><strong>Linux glibc环境。</strong>本文的运行环境是面向<code>x86_64-pc-msys</code>的bash 5.2.37以及同环境的dash。信号投递层未必和Linux完全一致。尤其第3节的SIGQUIT忽略行为和退出码，最好在部署目标上复现一次</li>
+                        <li><strong>zsh、ksh和busybox ash。</strong>没有可运行的环境，未能确认。这在最小容器镜像里是常见组合，对实际工作而言是个重要的空白</li>
+                        <li><strong>基于<code>flock</code>的加锁。</strong>此环境没有安装<code>flock</code>，所以第12节只用<code>mkdir</code>方式验证。文件描述符关闭时锁自动释放这一性质没能验证</li>
+                        <li><strong>服务管理器和容器编排器的停止流程。</strong>宽限期过后升级为SIGKILL这一行为在第4节被当作对策的依据提到，但没有做出实际的服务定义来复现</li>
+                        <li><strong>网络文件系统上的删除延迟。</strong>7.4提到把共享卷当临时空间的风险，但没有测量实际的延迟或部分删除</li>
+                        <li><strong>大批量删除的耗时。</strong>第10节说要把清理保持得短，但没有按文件数量测量<code>rm -rf</code>的耗时</li>
+                        <li><strong>旧版本的bash。</strong><code>trap -p</code>和<code>set -E</code>在很老的版本上行为是否一致，没有确认</li>
+                    </ul>
+
+                    <h2 id="sec-15">FAQ</h2>
+                    <h3>Q1. 一行<code>trap cleanup EXIT</code>不够吗</h3>
+                    <p>只在bash上跑的话大体够了。实际执行确认，bash 5.2.37只挂<code>EXIT</code>也会在SIGINT、SIGTERM、SIGHUP上执行处理函数。问题出在同一个脚本用<code>dash</code>跑的时候：SIGTERM下处理函数没执行，临时文件原样留下。shebang是<code>#!/bin/sh</code>就可能在部署环境里由dash执行，而开发机上<code>/bin/sh</code>指向bash的话这个差别根本看不见。把信号明确列出来的成本只有一行，那就老老实实列出来。</p>
+
+                    <h3>Q2. 清理处理函数用<code>exit 0</code>结尾不行吗</h3>
+                    <p>不行。确认过的结果是，处理函数里的<code>exit 99</code>把原来的退出码3覆盖成了99。处理函数不调用<code>exit</code>的话原值会原样保留。给清理处理函数加上<code>exit 0</code>，会让<strong>失败的运行和被中断的运行统统报告成成功。</strong>CI运行器靠这个码决定要不要重试，上层脚本靠这个码决定要不要进入下一步。清理做得再好却把退出码搞坏，前面的收益就全没了。</p>
+
+                    <h3>Q3. 陷阱处理函数里出错的话，剩下的清理会怎样</h3>
+                    <p>默认状态下会继续往下走。在处理函数中间塞一个<code>false</code>，后面的行照样全部执行，退出码也没变。不过在清理函数内部开<code>set -e</code>，就会在第一次失败处停住。实际确认时只打印了第一步，第二步没有执行，退出码变成了1。清理是即使失败也要试到底的代码，所以里面不要开<code>set -e</code>。删除命令用目标不存在也算成功的选项，需要吸收失败的位置加上<code>|| true</code>。</p>
+
+                    <h3>Q4. 每个函数各自把清理挂到<code>EXIT</code>上为什么会有问题</h3>
+                    <p>因为对同一个信号的陷阱不累加而是覆盖。函数A挂了，函数B再挂，就只剩B。而且<code>EXIT</code>陷阱是整个shell的状态，出了函数还会一直留着，不是函数局部的。绕开的办法是把清理项压进数组，<code>EXIT</code>上只挂一个按逆序遍历该数组的函数。逆注册顺序在资源释放顺序上也是对的：先拿锁后建目录的话，就先删目录、最后解锁。</p>
+
+                    <h3>Q5. 在子shell里创建的临时文件该怎么清</h3>
+                    <p>需要在那个子shell内部单独挂陷阱。实际执行确认的结果是，子shell会以清单形式继承父进程的<code>EXIT</code>陷阱，但自己终止时并不执行它，只在父进程里跑一次。反过来，在子shell内部注册的陷阱会在子shell结束时于其中执行，不会留在父进程里。在管道组成部分内部挂的陷阱也一样。所以挂了陷阱却好像不触发时，先确认那一行是不是在管道右侧或者括号里面就行了。</p>
+
+                    <h2 id="sec-16">结语：今天就改的三件事</h2>
+                    <p><strong>第一，把清理代码从最后一行搬到陷阱里。</strong>然后在<code>EXIT</code>旁边列出<code>INT TERM HUP</code>。在bash上看着可有可无，在dash上就会垮掉。信号处理函数清理完之后解除自己的陷阱，再用同一个信号把自己打死，以保住退出码。</p>
+                    <p><strong>第二，在清理函数第一行放上<code>: "${var:?}"</code>和路径检查。</strong>陷阱可以在脚本任何位置触发，变量还没赋值就收到信号的情况是真实存在的。在那种状态下执行删除，谁也不知道会删掉什么，而删掉的东西不会回来。所以这两行要写在删除那一行<strong>前面</strong>。改了逻辑之后，把删除换成<code>echo</code>跑一遍，用眼睛确认目标路径。</p>
+                    <p><strong>第三，不要相信<code>trap</code>能覆盖所有情况。</strong><code>kill -9</code>抓不住，实测下320KB的工作目录整个留了下来。因为bash不会把<code>trap ... KILL</code>当语法错误拒掉，甚至还列在清单里，只看代码就会以为已经堵上了。给临时路径加固定前缀，再设一个回收陈旧残骸的独立任务，是填上这个脚本内部永远解决不了的窟窿的唯一办法。</p>
+                    <p>最后一点。本文的表格和输出全都是用十行上下的脚本得到的。<strong>想知道清理会不会执行，别猜，用<code>mktemp</code>建一个文件然后把进程杀掉试试就行。</strong>三十秒就完事了。</p>
+
+                    <h2 id="sec-17">参考资料</h2>
+                    <ul>
+                        <li><a href="https://www.gnu.org/software/bash/manual/bash.html#Bourne-Shell-Builtins" target="_blank" rel="noopener">GNU Bash Reference Manual - Bourne Shell Builtins</a> — <code>trap</code>内建命令的参数与<code>-p</code>选项</li>
+                        <li><a href="https://www.gnu.org/software/bash/manual/bash.html#Signals" target="_blank" rel="noopener">GNU Bash Reference Manual - Signals</a> — shell何时处理信号、何时推迟</li>
+                        <li><a href="https://www.gnu.org/software/bash/manual/bash.html#The-Set-Builtin" target="_blank" rel="noopener">GNU Bash Reference Manual - The Set Builtin</a> — <code>set -E</code>与<code>set -T</code>的继承规则</li>
+                        <li><a href="https://www.gnu.org/software/bash/manual/bash.html#Shell-Parameter-Expansion" target="_blank" rel="noopener">GNU Bash Reference Manual - Shell Parameter Expansion</a> — <code>${var:?}</code>展开</li>
+                        <li><a href="https://pubs.opengroup.org/onlinepubs/9699919799/utilities/V3_chap02.html#trap" target="_blank" rel="noopener">POSIX Shell Command Language - trap</a> — 判断可移植性的基准线</li>
+                        <li><a href="https://www.gnu.org/software/coreutils/manual/html_node/mktemp-invocation.html" target="_blank" rel="noopener">GNU coreutils - mktemp invocation</a> — 模板与<code>-d</code>选项</li>
+                        <li><a href="https://mywiki.wooledge.org/SignalTrap" target="_blank" rel="noopener">Greg Wiki - Signal Traps</a></li>
+                        <li><a href="shell_subshell_variable_scope.html">管道里的while为什么变量会消失</a> — 本文第6节的前提，进程边界</li>
+                        <li><a href="linux_server_guide_06_shell_basics.html">Shell脚本基础</a> · <a href="linux_server_guide_07_shell_advanced.html">Shell脚本高级</a></li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>分享本文</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">返回列表</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/json_formatter.html">JSON 格式化工具</a></li>
+      <li><a href="../static/regex_tester.html">正则表达式测试器</a></li>
+      <li><a href="../static/jwt_decoder.html">JWT解码生成器 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 编码器/解码器</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="shell_subshell_variable_scope.html">管道里的while为什么变量会消失 - 子shell 2026</a></li>
+      <li><a href="shell_quoting_rules_guide.html">Shell 引号规则 - 哪个引号挡住了什么</a></li>
+      <li><a href="shell_exit_code_pipefail.html">Shell 退出码与 set -e - 它抓住什么又漏掉什么</a></li>
+      <li><a href="cloudflare_os_agent_platform_2026.html">Cloudflare OS - 把自己的工作负载放到智能体运行时上值不值得 2026</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制，请粘贴到 Threads 应用中分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制。'); });
+    });
+    </script>
+</body>
+</html>

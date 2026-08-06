@@ -1,0 +1,991 @@
+<!DOCTYPE html>
+<!--
+ * 技術ブログ記事テンプレート
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ja">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>trapで一時ファイルを確実に消す - 中断されても残さない 2026</title>
+    <meta name="description" content="スクリプトが途中で切れても一時ファイルを残さない方法。trapをEXITとシグナルに掛けて正常終了もエラーも中断も実際に走らせて確認し、bashとdashの差、kill -9で残るもの、消してはいけないパスを守る防御まで整理する。">
+    <meta name="keywords" content="trap, bash trap EXIT, 一時ファイル 削除, mktemp, シグナル, SIGINT, SIGTERM, SIGKILL, cleanup, set -e, set -E, ERRトラップ, シェルスクリプト, POSIX sh, dash, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/ja/posts/shell_trap_cleanup_guide.html">
+
+    <meta property="og:title" content="trapで一時ファイルを確実に消す - 中断されても残さない">
+    <meta property="og:description" content="片付けコードをスクリプトの最終行に置くと、その行まで到達したときだけ動く。問題は到達できない場合だ。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/ja/posts/shell_trap_cleanup_guide.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ja_JP">
+    <meta property="article:published_time" content="2026-08-07">
+    <meta property="article:section" content="開発・インフラ">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="trapで一時ファイルを確実に消す">
+    <meta name="twitter:description" content="Ctrl+Cで切ったスクリプトが残したもの。何が消えて何が最後まで残るかを実際に走らせて確認する。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "trapで一時ファイルを確実に消す - 中断されても残さない",
+      "alternativeHeadline": "何が消えて何が最後まで残るのか",
+      "datePublished": "2026-08-07",
+      "dateModified": "2026-08-07",
+      "inLanguage": "ja-JP",
+      "articleSection": "開発・インフラ",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "trap, bash trap EXIT, 一時ファイル 削除, mktemp, SIGINT, SIGTERM, SIGKILL, cleanup, set -e, set -E, ERRトラップ",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/ja/posts/shell_trap_cleanup_guide.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "trapをEXITだけに掛ければCtrl+Cの中断でも片付くのか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "使うシェルによって分かれる。bash 5.2.37 ではEXITひとつだけでもSIGINT・SIGTERM・SIGHUPで死ぬときにハンドラが走り、一時ファイルが消えた。ところが同じスクリプトをdashで走らせるとSIGTERMでハンドラがまったく実行されず、ファイルがそのまま残る。シバンが「/bin/sh」のスクリプトは配布先でdashとして実行されることが珍しくないので、開発機でうまく消えたという事実は本番でも消える保証にならない。だから移植性が要るならEXITだけを信じず、INT TERM HUPを並べて書く。シグナルハンドラの中では片付けを終えたあとにそのトラップを解除し、同じシグナルで自分を撃ち直さないと、呼び出した側がまともな終了コードを受け取れない。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "kill -9 で殺したプロセスはなぜ片付かないのか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "SIGKILLはプロセスに配送されず、カーネルが直接プロセスを消してしまうからだ。シェルが実行する機会そのものがないので、どのトラップも走らない。厄介なのはbashがSIGKILLに対するtrapコマンドを構文エラーとして拒否しないことだ。実際に確かめるとtrap -pの一覧にSIGKILLの項目が堂々と表示されるのに実行はされない。だからコードだけを読むと片付くように見える。64KBのファイルを5個作った作業ディレクトリをkill -9で切ると320KBがそのまま残ることを確認した。対策はプログラムの内部ではなく外側に置く。パスに固定の接頭辞を付けて作り、別の掃除ジョブが古い残骸を定期的に回収するようにする。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "trapを二回掛けたら両方とも走るのか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "走らない。同じシグナルに対しては後から掛けたものが前のものを上書きする。積み上がらない。関数が二つそれぞれ自分の片付けをEXITに掛けておくと、あとから呼ばれた側だけが生き残り、前の片付けは静かに消える。エラーメッセージが出ないので発見が遅れる。回避法は二つある。ひとつは片付け項目を配列に積んでおき、EXITにはその配列を逆順に実行する関数だけを掛けること。登録順の逆で回るのは資源解放の順序としても自然だ。もうひとつはtrap -pで既存のハンドラ文字列を読み、後ろにつなげること。ただしtrap -pはbash拡張なのでdashではIllegal optionのエラーになる。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "片付けコードが消してはいけないパスを消す事故はどう防ぐか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "変数が空のときに削除コマンドが実行されないようにするのが第一だ。片付け関数の先頭にコロンと疑問符の展開を書き、変数が空ならその場で止める。トラップはスクリプトのどの地点でも発動するので、変数に値が入る前にシグナルが来る場合が実際に存在する。第二はパスの固定だ。case文で削除対象があらかじめ決めた接頭辞で始まるかを検査し、違えば消さずに警告だけ残す。第三は順序だ。トラップを先に掛けてからディレクトリを作る。逆にすると二行の間で死んだときに残骸が残る。最後に削除は取り消せないことを認め、本当に大きな成果物なら消す代わりに別名で退避したほうがよい。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Ctrl+Cを押したのにハンドラがずっとあとで動く理由は",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "シェルがフォアグラウンドの子コマンドを待っている間はトラップの実行を先送りするからだ。シグナルは即座に受理されるがハンドラはその子が終わってから動く。測ってみると差は明らかだ。sleep 5をフォアグラウンドに置いてt+1秒にSIGINTを送ると、ハンドラはt+5秒に動いた。4秒待ったことになる。同じsleep 5をバックグラウンドに回してwaitで待つように変えると、ハンドラはt+1秒に即座に動いた。waitはシグナルで中断されるがフォアグラウンドのコマンドはそうならない。だから長い待ちがあるスクリプトは、待ちをバックグラウンドジョブとwaitの組み合わせに変えるか、長いsleepを短いsleepの繰り返しに割ると反応が速くなる。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/shell_trap_cleanup_guide.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/shell_trap_cleanup_guide.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/shell_trap_cleanup_guide.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/shell_trap_cleanup_guide.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/shell_trap_cleanup_guide.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="trapで一時ファイルを確実に消す - 中断されても残さない">
+                <meta itemprop="datePublished" content="2026-08-07">
+                <meta itemprop="dateModified" content="2026-08-07">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="trap, bash trap EXIT, 一時ファイル 削除, mktemp, SIGINT, SIGTERM, SIGKILL, cleanup, set -e, ERRトラップ">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/ja/posts/shell_trap_cleanup_guide.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">trapで一時ファイルを確実に消す - 中断されても残さない</h1>
+                    <h2 class="post-subtitle">何が消えて何が最後まで残るのか</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-08-07">2026-08-07</span>
+                        <span class="post-category" itemprop="articleSection">開発・インフラ</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <nav class="post-toc">
+                        <h3>この記事で扱うこと</h3>
+                        <ol>
+                            <li><a href="#sec-1">どう終わっても消させる一行</a></li>
+                            <li><a href="#sec-2">Ctrl+Cで切ったのに一時ファイルが残る理由</a></li>
+                            <li><a href="#sec-3">シグナルごとに何が動いて何が動かないのか</a></li>
+                            <li><a href="#sec-4">kill -9で死ぬと正確に何が残るのか</a></li>
+                            <li><a href="#sec-5">片付けを二つ掛けたのに一つしか動かない理由</a></li>
+                            <li><a href="#sec-6">サブシェル・バックグラウンド・関数でトラップはどこまで追うか</a></li>
+                            <li><a href="#sec-7">消してはいけないものを消させない防御</a></li>
+                            <li><a href="#sec-8">ディレクトリごと使ってディレクトリごと消す</a></li>
+                            <li><a href="#sec-9">set -eと一緒に使うときにずれる地点</a></li>
+                            <li><a href="#sec-10">片付けの最中にまたCtrl+Cが来たら</a></li>
+                            <li><a href="#sec-11">ハンドラが遅れて動くように見えるとき</a></li>
+                            <li><a href="#sec-12">二重実行を防ぐロックと孤児ロック</a></li>
+                            <li><a href="#sec-13">結局どれを使うのか</a></li>
+                            <li><a href="#sec-14">確認できなかったこと</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-0">はじめに: 片付けコードは最終行にあり、スクリプトはそこまで行けなかった</h2>
+                    <p>一時ディレクトリを作って中間成果物を積み、使い終わったら最終行で消すスクリプトがあるとする。普段は何の問題もない。問題は普段でないときに起きる。入力ファイルがなくて途中で<code>exit 1</code>で抜けたり、デプロイ中にCIがジョブをキャンセルしたり、誰かがターミナルでCtrl+Cを押したりする。そのたびに片付けコードは実行されない。その行まで到達していないのだから。</p>
+                    <p>こうした残骸は静かに積もる。一つ200MBの作業ディレクトリが一日に数個残れば、数週間後にはディスク警告になって返ってくる。そのとき残ったディレクトリを開いても、いつどの実行から出たものかを知るのは難しい。</p>
+                    <p><code>trap</code>はこの問題を正面から扱う道具だ。片付けコードを<strong>「最後に実行する行」ではなく「シェルが終わるときに必ず実行するコード」として登録</strong>する。ただしこの文には例外がいくつも付く。捕まる終わり方と捕まらない終わり方があり、シェルによって結果が分かれ、書き方を誤ると消してはいけないものを消す。</p>
+                    <p>この記事のコマンドと出力は<code>GNU bash, version 5.2.37(1)-release</code>と<code>dash</code>でそのまま走らせて得たものだ。消すコマンドはすべて<code>/tmp</code>配下の<code>mktemp</code>で作ったパスに対してだけ実行した。シェルの基礎が必要なら<a href="linux_server_guide_06_shell_basics.html">シェルスクリプト基礎</a>と<a href="linux_server_guide_07_shell_advanced.html">シェルスクリプト上級</a>が先だ。</p>
+
+                    <h2 id="sec-1">1. どう終わっても消させる一行</h2>
+                    <p>基本形は短い。一時ファイルを作り、そのファイルを消すコマンドを<code>EXIT</code>に登録する。</p>
+                    <pre><code>#!/usr/bin/env bash
+tmp=$(mktemp /tmp/work.XXXXXX)
+trap 'rm -f "$tmp"' EXIT</code></pre>
+                    <p><code>EXIT</code>はシグナルではなく<strong>シェルが終了する瞬間</strong>を指す仮の名前だ。だから正常終了でも<code>exit 1</code>でも<code>set -e</code>に引っかかった失敗でも、すべてこの地点を通る。三つの経路をそれぞれ走らせて確認した結果だ。</p>
+                    <pre><code>$ bash t1.sh ok
+created: /tmp/work.Z8kaai
+doing work
+[trap] cleaning /tmp/work.Z8kaai
+exit=0
+
+$ bash t1.sh fail            # スクリプト途中の exit 1
+created: /tmp/work.af0aeI
+about to exit 1
+[trap] cleaning /tmp/work.af0aeI
+exit=1
+
+$ bash t1.sh err             # set -e の状態でコマンドが一つ失敗
+created: /tmp/work.cLzp5n
+about to run a failing command
+[trap] cleaning /tmp/work.cLzp5n
+exit=1</code></pre>
+                    <p>三つとも ハンドラが動き、終了コードも元の値が保たれた。ここまでが<code>trap</code>が確実にやってくれることだ。</p>
+
+                    <h3>1.1 シングルクォートとダブルクォートで結果が変わる</h3>
+                    <p>トラップの本体は<strong>登録するときに一度、発動するときに一度</strong>解釈される機会がある。どちらで変数が展開されるかがクォートで分かれる。</p>
+                    <pre><code>$ tmp=/tmp/first
+$ trap "echo [double] would remove $tmp" EXIT   # ダブル: 今すぐ展開
+$ tmp=/tmp/second
+$ echo "tmp is now $tmp"
+tmp is now /tmp/second
+[double] would remove /tmp/first
+
+$ tmp=/tmp/first
+$ trap 'echo "[single] would remove $tmp"' EXIT # シングル: 発動時に展開
+$ tmp=/tmp/second
+$ echo "tmp is now $tmp"
+tmp is now /tmp/second
+[single] would remove /tmp/second</code></pre>
+                    <p>ダブルクォート側は登録時点の値<code>/tmp/first</code>を消そうとする。一時パスがあとで決まったりループで変わったりするスクリプトなら、この差がそのまま事故になる。</p>
+                    <ul>
+                        <li>トラップの本体は<strong>シングルクォート</strong>で囲むのを基本にする</li>
+                        <li>本体が一行を超えたら関数に出して<code>trap cleanup EXIT</code>のように名前だけ登録する。クォートの悩みが消える</li>
+                        <li>関数に出すと<code>trap -p</code>で確認するときも登録内容が短く、読みやすい</li>
+                        <li>デバッグ用に値を固定したいときだけ意図的にダブルクォートを使う</li>
+                    </ul>
+
+                    <h2 id="sec-2">2. Ctrl+Cで切ったのに一時ファイルが残る理由</h2>
+                    <p>ここからが実際に分かれる部分だ。<code>EXIT</code>だけを掛けたスクリプトをシグナルで殺すとどうなるか。スクリプトが自分自身にシグナルを送るようにして確認した。</p>
+                    <pre><code>$ cat t4.sh
+tmp=$(mktemp /tmp/work.XXXXXX)
+trap 'echo "[EXIT trap] rm $tmp"; rm -f "$tmp"' EXIT
+kill -"$1" $$
+sleep 5
+echo "SURVIVED the signal"
+
+$ bash t4.sh INT
+pid=1349 tmp=/tmp/work.ZaHJMi  sending SIGINT to self
+[EXIT trap] rm /tmp/work.ZaHJMi
+exit=130 tmpfile=cleaned
+
+$ bash t4.sh TERM
+[EXIT trap] rm /tmp/work.By1Y9n
+Terminated
+exit=143 tmpfile=cleaned</code></pre>
+                    <p>bashでは<code>EXIT</code>だけでも<code>SIGINT</code>・<code>SIGTERM</code>・<code>SIGHUP</code>でハンドラが動いた。終了コードも130と143で正確だ。128にシグナル番号を足した値である。</p>
+
+                    <h3>2.1 ところがdashでは動かない</h3>
+                    <p>同じスクリプトを<code>dash</code>で走らせると結果がひっくり返る。</p>
+                    <pre><code>$ bash /tmp/d2.sh          # EXIT トラップだけ登録、自分に SIGTERM
+[EXIT] rm /tmp/work.LJpwWB
+Terminated
+  rc=143
+  cleaned
+
+$ dash /tmp/d2.sh
+Terminated
+  rc=143
+  LEFTOVER /tmp/work.skxk0l</code></pre>
+                    <p><code>dash</code>はハンドラをまったく実行せずファイルを残した。<strong>シバンが<code>#!/bin/sh</code>のスクリプトは配布先でdashとして実行されることが珍しくない。</strong>開発機で<code>/bin/sh</code>がbashにつながっていると、この差は見えない。本番に上げてから残骸が積もり始める。</p>
+
+                    <h3>2.2 シグナルを明示すればdashも片付ける</h3>
+                    <p>直す方法は<code>EXIT</code>の隣にシグナルを並べることだ。</p>
+                    <pre><code>cleanup() { rm -f "$tmp"; }
+trap cleanup EXIT
+trap 'cleanup; trap - INT;  kill -INT  $$' INT
+trap 'cleanup; trap - TERM; kill -TERM $$' TERM
+trap 'cleanup; trap - HUP;  kill -HUP  $$' HUP</code></pre>
+                    <pre><code>$ dash /tmp/d3.sh
+[cleanup] rm /tmp/work.Gjy9y6
+Terminated
+  rc=143
+  cleaned</code></pre>
+                    <p>ハンドラが<code>trap - INT</code>で自分のトラップを解除したあと<strong>同じシグナルで自分を撃ち直す</strong>部分が重要だ。そのまま<code>exit 0</code>で終わらせると、呼び出した側からは成功したように見える。</p>
+                    <pre><code>$ cat /tmp/reraise2.sh
+trap 'echo "[INT] cleaning"; exit 0' INT
+kill -INT $$
+
+$ bash /tmp/reraise2.sh
+[INT] cleaning
+rc=0        # 中断されたのに成功として報告される
+
+$ bash /tmp/reraise.sh      # 片付け後に同じシグナルで再発生
+pid=587 tmp=/tmp/work.QAJTr9
+rc=130      # 128+2、呼び出した側が期待する値</code></pre>
+                    <p>CIランナーや上位スクリプトはこの終了コードで「キャンセル」と「失敗」と「成功」を区別する。片付けをきちんとやっておいて終了コードを壊すと、上位の判断が狂う。</p>
+
+                    <h2 id="sec-3">3. シグナルごとに何が動いて何が動かないのか</h2>
+                    <p>同じスクリプトを二通りに武装させ、シグナルを一つずつ送って表にまとめた。Aは<code>trap ... EXIT</code>だけ、Bは<code>EXIT</code>に<code>INT TERM HUP QUIT</code>を足したものだ。</p>
+                    <table>
+                        <thead>
+                            <tr><th>シグナル</th><th>番号</th><th>A: EXITのみ</th><th>B: EXIT+シグナル</th><th>終了コード</th><th>備考</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>SIGINT</code></td><td>2</td><td>片付く</td><td>片付く</td><td>130</td><td>Ctrl+Cが送るもの</td></tr>
+                            <tr><td><code>SIGTERM</code></td><td>15</td><td>片付く</td><td>片付く</td><td>143</td><td><code>kill</code>の既定値</td></tr>
+                            <tr><td><code>SIGHUP</code></td><td>1</td><td>片付く</td><td>片付く</td><td>129</td><td>端末の切断</td></tr>
+                            <tr><td><code>SIGQUIT</code></td><td>3</td><td>スクリプトが生き残る</td><td>ハンドラは動くが続行</td><td>0</td><td>非対話bashは既定で無視</td></tr>
+                            <tr><td><code>SIGKILL</code></td><td>9</td><td>残骸が残る</td><td>残骸が残る</td><td>137</td><td>捕まえられない</td></tr>
+                        </tbody>
+                    </table>
+                    <p>表ではAとBが同じに見えるが<strong>これはbashの話だ。</strong>2節で見たようにdashではAが崩れる。移植性を考えるならBが基本形になる。</p>
+
+                    <h3>3.1 SIGQUITは既定で無視される</h3>
+                    <p>表の中で一つだけ浮いている行だ。非対話のbashスクリプトはトラップを掛けていないとき<code>SIGQUIT</code>を無視する。</p>
+                    <pre><code>$ cat /tmp/q2.sh
+echo "no trap armed; sending QUIT to self"
+kill -QUIT $$
+echo "survived"
+
+$ bash /tmp/q2.sh
+no trap armed; sending QUIT to self
+survived
+rc=0</code></pre>
+                    <p>トラップを掛ければハンドラ自体は動く。ただしハンドラが<code>exit</code>をしなければスクリプトはそのまま進む。</p>
+                    <pre><code>$ bash /tmp/q1.sh
+armed; sending QUIT to self
+[QUIT handler] ran
+survived (handler did not abort the script)
+rc=0</code></pre>
+                    <p><code>dash</code>でも同じ結果が出た。実務で<code>SIGQUIT</code>を直接扱うことは少ないが、「トラップを掛けたのだからスクリプトは止まるだろう」という前提が外れうる例としては有用だ。<strong>ハンドラが動くこととスクリプトが終わることは別だ。</strong></p>
+
+                    <h2 id="sec-4">4. kill -9で死ぬと正確に何が残るのか</h2>
+                    <p><code>SIGKILL</code>はプロセスに配送されない。カーネルがプロセスを直接消すのでシェルがコードを実行する機会そのものがない。64KBのファイルを5個作った作業ディレクトリを<code>kill -9</code>で切り、残ったものを数えてみた。</p>
+                    <pre><code>$ bash /tmp/leftover.sh &amp;
+$ sleep 1; kill -9 $!
+$ du -sh /tmp/work.yURWz1; ls -1 /tmp/work.yURWz1
+320K    /tmp/work.yURWz1
+    chunk.1
+    chunk.2
+    chunk.3
+    chunk.4
+    chunk.5</code></pre>
+                    <p>トラップは<code>EXIT INT TERM HUP</code>にすべて掛かっていたが、何一つ動かなかった。</p>
+
+                    <h3>4.1 bashはKILLにトラップを掛けることを止めない</h3>
+                    <p>ここが本当の落とし穴だ。構文エラーで拒否してくれればいいのだが、そうはならない。</p>
+                    <pre><code>$ bash -c 'trap "echo caught" KILL; trap -p'
+trap -- 'echo caught' SIGKILL
+rc=0</code></pre>
+                    <p><code>trap -p</code>の一覧に<code>SIGKILL</code>の項目が堂々と表示される。コードレビューで<code>trap cleanup EXIT INT TERM KILL</code>のような行を見ると<strong>KILLまで塞いであるように読めるが、その位置は何もしない。</strong>むしろ実体のない安心感を作る。</p>
+
+                    <h3>4.2 だから対策はプロセスの外側に置く</h3>
+                    <ul>
+                        <li>一時パスに<strong>固定の接頭辞</strong>を付ける。<code>mktemp -d /tmp/myjob.XXXXXX</code>のように作れば、あとで何が残ったかが一目で分かる</li>
+                        <li>別の掃除ジョブがその接頭辞の古いものを定期的に回収するようにする。最終更新時刻で絞れば実行中のものには触らない</li>
+                        <li>本当に大きな成果物なら<code>/tmp</code>ではなく容量に余裕のある別ボリュームを使う。残骸が他のサービスを殺さないようにする</li>
+                        <li><code>SIGKILL</code>が来る経路をまず減らす。コンテナのオーケストレータやサービス管理者はたいてい停止猶予時間を超えるとKILLに上がる。片付けがその時間内に終わるようにすればKILLを見ること自体が減る</li>
+                        <li>片付けに数十秒かかる構造なら片付けを減らすほうが正しい。猶予時間を延ばすのはその次だ</li>
+                    </ul>
+
+                    <h2 id="sec-5">5. 片付けを二つ掛けたのに一つしか動かない理由</h2>
+                    <p>同じシグナルにトラップを二回掛けると<strong>後から掛けたものが前のものを上書きする。</strong>積み上がらない。</p>
+                    <pre><code>$ bash -c 'trap "echo first" EXIT; trap "echo second" EXIT; echo body'
+body
+second</code></pre>
+                    <p>エラーも警告も出ない。関数が二つそれぞれ自分の一時ファイルを<code>EXIT</code>に登録しておくと、あとから呼ばれた側だけが生き残り、前の片付けは静かに消える。ライブラリ的なスクリプトを<code>source</code>で読み込む構造で特によく起きる。</p>
+
+                    <h3>5.1 片付け項目を積んでおいて一度に実行する</h3>
+                    <pre><code>_cleanups=()
+add_cleanup() { _cleanups+=("$1"); }
+_run_cleanups() {
+    for ((i=${#_cleanups[@]}-1; i&gt;=0; i--)); do eval "${_cleanups[i]}"; done
+}
+trap _run_cleanups EXIT
+
+add_cleanup "echo remove file A"
+add_cleanup "echo remove dir B"
+add_cleanup "echo release lock C"</code></pre>
+                    <pre><code>$ bash /tmp/stack.sh
+body
+release lock C
+remove dir B
+remove file A</code></pre>
+                    <p>登録の<strong>逆順</strong>で回るのが肝だ。ロックを先に取ってディレクトリをあとで作ったなら、解放はディレクトリから消してロックを最後に外すのが正しい。</p>
+
+                    <h3>5.2 既存のハンドラの後ろにつなげる方法</h3>
+                    <p>すでに別の場所でトラップを掛けている状況なら<code>trap -p</code>で読んでつなげられる。</p>
+                    <pre><code>add_exit() {
+    local prev new
+    prev=$(trap -p EXIT)
+    prev=${prev#trap -- \'}
+    prev=${prev%\' EXIT}
+    if [ -z "$prev" ]; then new="$1"; else new="$prev; $1"; fi
+    trap "$new" EXIT
+}</code></pre>
+                    <pre><code>$ bash /tmp/a1.sh
+captured: trap -- 'echo first-handler' EXIT
+now armed as: trap -- 'echo first-handler; echo second-handler; echo third-handler' EXIT
+body
+first-handler
+second-handler
+third-handler</code></pre>
+                    <p>動きはするが二つのことを覚悟する必要がある。第一に、ハンドラ文字列にシングルクォートが入っていると上の文字列切り出しがずれる。第二に、<code>trap -p</code>はbash拡張なので<code>dash</code>では使えない。</p>
+                    <pre><code>$ dash -c 'trap "echo x" EXIT; trap -p'
+dash: 1: trap: Illegal option -p</code></pre>
+                    <p><code>dash</code>で引数なしの<code>trap</code>だけを打てば一覧は出る。ただしそれをパースして戻す方式はクォート処理がさらに厄介だ。移植性が要るなら5.1の配列方式のほうがよい。</p>
+                    <pre><code>$ bash -c 'trap "echo a" EXIT INT; trap'
+trap -- 'echo a' EXIT
+trap -- 'echo a' SIGINT
+
+$ dash -c 'trap "echo a" EXIT INT; trap'
+trap -- 'echo a' EXIT
+trap -- 'echo a' INT</code></pre>
+                    <p>bashは<code>SIGINT</code>、dashは<code>INT</code>と書く。出力を機械的に比較する検査器を作るならこの差に引っかかる。</p>
+
+                    <h3>5.3 トラップを消す方法</h3>
+                    <pre><code>trap - EXIT       # 既定の動作に戻す
+trap '' INT       # 無視させる (解除とは違う)</code></pre>
+                    <p>二つ目の形には副作用がある。<strong>無視に設定されたシグナルは子プロセスに継承され、子はそれを戻せない。</strong></p>
+                    <pre><code>$ cat /tmp/ig.sh
+trap '' INT
+bash -c 'trap "echo child handler" INT; trap -p INT'
+
+$ bash /tmp/ig.sh
+trap -- '' SIGINT</code></pre>
+                    <p>子が<code>trap "echo child handler" INT</code>を実行したのに一覧では空文字列、つまり無視のままだ。親が無視で渡したシグナルを子が捕まえ直すことはできない。スクリプトが別のコマンドを包んで実行するラッパーなら、この継承がそのコマンドのCtrl+C応答を奪う。</p>
+
+                    <h2 id="sec-6">6. サブシェル・バックグラウンド・関数でトラップはどこまで追うか</h2>
+                    <p>パイプと括弧がプロセスをもう一つ作るという話は<a href="shell_subshell_variable_scope.html">パイプの中のwhileで変数が消える理由</a>で扱った。トラップはその境界で変数とはまた違う動きをする。</p>
+
+                    <h3>6.1 サブシェルはトラップを受け継ぐが自分の終了では発動しない</h3>
+                    <pre><code>$ cat /tmp/sub_t.sh
+trap 'echo "[EXIT] fired in BASHPID=$BASHPID"' EXIT
+echo "parent BASHPID=$BASHPID"
+( echo "  inside subshell BASHPID=$BASHPID"; exit 3 )
+echo "subshell rc=$?"
+
+$ bash /tmp/sub_t.sh
+parent BASHPID=340
+  inside subshell BASHPID=341
+subshell rc=3
+[EXIT] fired in BASHPID=340</code></pre>
+                    <p>サブシェルは別プロセス(341)で<code>exit 3</code>で終わったのに、ハンドラは親(340)で一度だけ動いた。<strong>同じ片付けが二回実行されることを心配する必要はない。</strong>逆にサブシェルの中だけで使う一時ファイルがあるなら、その中で別に掛ける必要がある。</p>
+                    <pre><code>$ cat /tmp/sub_t2.sh
+trap 'echo "[parent EXIT] BASHPID=$BASHPID"' EXIT
+( trap 'echo "  [subshell EXIT] BASHPID=$BASHPID"' EXIT
+  echo "  inside subshell BASHPID=$BASHPID"; exit 3 )
+echo "subshell rc=$?"
+
+$ bash /tmp/sub_t2.sh
+  inside subshell BASHPID=344
+  [subshell EXIT] BASHPID=344
+subshell rc=3
+[parent EXIT] BASHPID=343</code></pre>
+                    <p>サブシェルの中で登録したトラップはサブシェルが終わるときにその中で動き、親のトラップは親が終わるときに別に動く。互いに干渉しない。</p>
+
+                    <h3>6.2 バックグラウンドも同様で、パイプラインの内側は外に出ない</h3>
+                    <pre><code>$ bash /tmp/sub_t3.sh
+parent BASHPID=346
+  bg BASHPID=347
+parent done
+[EXIT] fired in BASHPID=346</code></pre>
+                    <pre><code>$ bash /tmp/a2.sh
+echo x | { trap 'echo "[inner EXIT]"' EXIT; cat &gt; /dev/null; }
+[inner EXIT]
+parent continues
+parent trap -p EXIT output:
+(nothing between the two lines = the parent has no EXIT trap)</code></pre>
+                    <p>パイプライン構成要素の中で掛けたトラップはその構成要素が終わるときに動き、親には残らない。<strong>スクリプト本体でトラップを掛けたのに動かないようなら、その行がパイプの右側や括弧の中にあるかをまず見る。</strong></p>
+
+                    <h3>6.3 関数の中で掛けたトラップは関数を出ても生きている</h3>
+                    <pre><code>$ bash -c 'f() { trap "echo [EXIT] set inside f" EXIT; echo "in f"; }; f; echo "after f"'
+in f
+after f
+[EXIT] set inside f</code></pre>
+                    <p><code>EXIT</code>トラップはシェル全体の状態だ。関数ローカルではない。関数が自分の一時ファイルを片付けようと<code>EXIT</code>に登録すると、その登録はスクリプトが終わるまで残り、他の関数の登録を上書きする。5節の問題と同じ根だ。</p>
+
+                    <h3>6.4 ERRとRETURNはオプションを入れないと内側まで届かない</h3>
+                    <p><code>ERR</code>トラップはコマンドが失敗したときに動くが、既定の設定では関数・サブシェル・コマンド置換の内側には入らない。</p>
+                    <pre><code>$ bash -c 'set -e; trap "echo [ERR] caught" ERR; h() { false; }; h; echo "NOT REACHED"'
+rc=1                       # ハンドラが動かなかった
+
+$ bash -c 'set -eE; trap "echo [ERR] caught" ERR; h() { false; }; h; echo "NOT REACHED"'
+[ERR] caught
+rc=1</code></pre>
+                    <p><code>set -E</code>を入れて初めて<code>ERR</code>が関数の中まで継承される。<code>RETURN</code>と<code>DEBUG</code>トラップは<code>set -T</code>が同じ役割をする。</p>
+                    <pre><code>$ bash -c 'trap "echo [RETURN]" RETURN; g() { echo "in g"; }; g'
+in g
+
+$ bash -c 'set -T; trap "echo [RETURN]" RETURN; g() { echo "in g"; }; g'
+in g
+[RETURN]</code></pre>
+                    <p>発動の順序も確認しておいた。失敗が起きると<code>ERR</code>が先、<code>EXIT</code>があとだ。</p>
+                    <pre><code>$ bash -c 'trap "echo [ERR]  seen" ERR; trap "echo [EXIT] seen" EXIT; set -e; false'
+[ERR]  seen
+[EXIT] seen
+rc=1</code></pre>
+                    <p><code>ERR</code>はどこで失敗したかを記録するのに使い、実際の片付けは<code>EXIT</code>に置く配置が自然だ。そして<code>ERR</code>・<code>RETURN</code>・<code>DEBUG</code>は<strong>すべてbash拡張</strong>である。</p>
+                    <pre><code>$ dash -c 'trap "echo err" ERR; false; echo done'
+trap: ERR: bad trap
+done
+
+$ dash -c 'trap "echo ret" RETURN; f(){ :; }; f'
+trap: RETURN: bad trap</code></pre>
+
+                    <h2 id="sec-7">7. 消してはいけないものを消させない防御</h2>
+                    <div class="callout">
+                        <p><strong>先に読むこと。</strong>この節の内容は後の節の例より先に適用しなければならない。片付けスクリプトは書き方を誤ると<strong>消してはいけないものを消す。</strong>削除は取り消せず、スクリプトが消したファイルはゴミ箱に行かない。以下の三つの防御を付ける前に、<code>rm -rf</code>の入ったトラップを実データのある機械に上げないほうがよい。</p>
+                    </div>
+
+                    <h3>7.1 変数が空ならその場で止める</h3>
+                    <p>トラップは<strong>スクリプトのどの地点でも</strong>発動する。一時パス変数に値が入る前にシグナルが来る場合が実際にある。その状態で削除コマンドがそのまま実行されると、対象が何になるかを予測できない。</p>
+                    <pre><code>cleanup() {
+    : "${workdir:?cleanup called with no workdir}"
+    ...
+}</code></pre>
+                    <p><code>:</code>は何もしない組み込みコマンドで、<code>${var:?メッセージ}</code>は<strong>変数が空ならメッセージを出してその場でシェルを止める</strong>展開だ。二つを合わせると値の検査だけをする一行になる。</p>
+                    <pre><code>$ bash -c 'cleanup() { : "${workdir:?cleanup called with no workdir}"; echo "would remove $workdir"; }
+trap cleanup EXIT
+echo body'
+body
+environment: line 2: workdir: cleanup called with no workdir</code></pre>
+                    <p>削除の行まで行けずに止まった。この一行がないと何が起きるかは<strong>走らせずに説明だけする。</strong><code>rm -rf -- "$workdir"</code>は変数が空なら引数が空文字列になってたいていエラーで終わるが、よく使われる次の形は違う。</p>
+                    <ul>
+                        <li><code>rm -rf "$workdir"/*</code> — 変数が空だと<code>/*</code>になる。ルート直下のすべてが対象になる</li>
+                        <li><code>rm -rf "$base/$sub"</code> — どちらか一方が空でも残ったスラッシュのせいで意図より一段上が消える</li>
+                        <li><code>cd "$workdir" &amp;&amp; rm -rf .</code> — <code>cd</code>が失敗すると現在のディレクトリで実行される。<code>&amp;&amp;</code>があっても<code>cd</code>が成功してパスが見当違いならそのまま進む</li>
+                        <li><code>rm -rf $workdir</code> — クォートがないとパスに空白があるとき複数の引数に割れる。先頭の断片だけが存在するディレクトリならそれが消える</li>
+                    </ul>
+                    <p>この四つはどれも<strong>試しに走らせてみる性質のものではない。</strong>防御を先に入れて、そのあとで削除の行を書く。</p>
+
+                    <h3>7.2 パスを固定する</h3>
+                    <p>値があるだけでは足りない。値が<strong>想定した形か</strong>も見る。</p>
+                    <pre><code>cleanup() {
+    : "${workdir:?}"
+    case "$workdir" in
+        /tmp/myjob.*) rm -rf -- "$workdir" &amp;&amp; echo "[cleanup] removed $workdir" ;;
+        *)            echo "[cleanup] refusing to remove unexpected path: $workdir" &gt;&amp;2 ;;
+    esac
+}</code></pre>
+                    <pre><code>$ bash /tmp/guarded.sh
+workdir=/tmp/work.nGJBt5
+removed /tmp/work.nGJBt5
+rc=0</code></pre>
+                    <p>接頭辞が違えば消さずに警告だけ残す。スクリプトを直しているうちに<code>workdir</code>に別の値が入る失敗をしても、削除は起きずログに痕跡が残る。</p>
+
+                    <h3>7.3 トラップを先に掛けて、そのあとで作る</h3>
+                    <p>順序が逆になったコードはよくある。</p>
+                    <pre><code># 脆い順序: 二行の間で死ぬとファイルが残る
+tmp=$(mktemp /tmp/work.XXXXXX)
+... 準備作業 40行 ...
+trap 'rm -f -- "$tmp"' EXIT</code></pre>
+                    <p>間が短く見えても、その区間でシグナルが来れば残骸がそのまま残る。逆にすればよい。</p>
+                    <pre><code>tmp=
+cleanup() { [ -n "$tmp" ] &amp;&amp; rm -f -- "$tmp"; echo "[cleanup] handled tmp=[$tmp]"; }
+trap cleanup EXIT
+tmp=$(mktemp /tmp/work.XXXXXX)</code></pre>
+                    <pre><code>$ bash /tmp/race2.sh
+trap armed before anything exists
+created /tmp/work.35mmxL
+[cleanup] handled tmp=[/tmp/work.35mmxL]
+
+$ bash /tmp/race3.sh        # mktemp の前に終了
+[cleanup] handled tmp=[]
+rc=1</code></pre>
+                    <p>まだ何も作っていない状態で死んでも、ハンドラが静かに何もせずに終わる。<code>tmp=</code>であらかじめ宣言しておくことが<code>set -u</code>の環境では特に重要だ。</p>
+                    <pre><code>$ bash -c 'set -u; cleanup() { echo "rm -rf -- \"$workdir\""; }; trap cleanup EXIT; echo body'
+body
+environment: line 3: workdir: unbound variable</code></pre>
+
+                    <h3>7.4 取り消せない地点</h3>
+                    <ul>
+                        <li><strong>削除が始まったあとは中断しても無意味だ。</strong><code>rm -rf</code>が半分ほど進んだ状態でCtrl+Cを押しても、すでに消えたものは戻らない</li>
+                        <li>一時ディレクトリに<strong>原本を移しておく</strong>設計は危険だ。コピーではなく移動で入れたなら、片付けトラップが原本を消すトラップになる</li>
+                        <li>片付け対象が<strong>シンボリックリンク</strong>でありうる構造ならリンクを辿るかを確認する。リンク自体を消すつもりが、リンクの指す実データを消すことがある</li>
+                        <li>ネットワークファイルシステムや共有ボリュームを一時領域に使うと<strong>他のプロセスが同じパスを使っている可能性がある。</strong>接頭辞にプロセス識別子を入れて衝突しないようにする</li>
+                        <li>片付けのロジックを変えたら<strong>削除の行を<code>echo</code>に変えて一度走らせる。</strong>どのパスが対象になるかを目で確認してから実際の削除に戻す</li>
+                        <li>本番機に初めて上げるときは<code>rm</code>ではなく<code>mv</code>で隔離ディレクトリに移す方式で数日回す。想定外のパスが引っかかるかがその期間に見える</li>
+                    </ul>
+
+                    <h2 id="sec-8">8. ディレクトリごと使ってディレクトリごと消す</h2>
+                    <p>ファイル一つではなく複数を作る作業なら、<code>mktemp -d</code>でディレクトリを一つ取ってその中ですべて処理するほうがよい。片付け対象が一つに減る。</p>
+                    <pre><code>#!/usr/bin/env bash
+set -euo pipefail
+
+workdir=
+_cleaned=0
+
+cleanup() {
+    [ "$_cleaned" -eq 1 ] &amp;&amp; return
+    _cleaned=1
+    trap '' INT TERM HUP
+    if [ -n "$workdir" ] &amp;&amp; [ -d "$workdir" ]; then
+        case "$workdir" in
+            /tmp/job.*) rm -rf -- "$workdir" &amp;&amp; echo "[cleanup] removed $workdir" ;;
+            *)          echo "[cleanup] refusing to remove unexpected path: $workdir" &gt;&amp;2 ;;
+        esac
+    else
+        echo "[cleanup] nothing to remove"
+    fi
+}
+
+on_signal() {
+    local sig=$1
+    echo "[signal] SIG$sig received" &gt;&amp;2
+    cleanup
+    trap - "$sig" EXIT
+    kill -"$sig" "$$"
+}
+
+trap cleanup EXIT
+for s in INT TERM HUP; do trap "on_signal $s" "$s"; done
+
+workdir=$(mktemp -d /tmp/job.XXXXXX)
+echo "workdir=$workdir"
+
+printf 'row1\nrow2\nrow3\n' &gt; "$workdir/input.txt"
+wc -l &lt; "$workdir/input.txt"</code></pre>
+                    <p>三つの経路すべてを走らせて確認した。</p>
+                    <pre><code>$ bash job.sh ok
+workdir=/tmp/job.QoSGZJ
+rows: 3
+work finished
+[cleanup] removed /tmp/job.QoSGZJ
+rc=0
+verified: /tmp/job.QoSGZJ gone
+
+$ bash job.sh fail
+workdir=/tmp/job.aHj3Nw
+rows: 3
+failing on purpose
+[cleanup] removed /tmp/job.aHj3Nw
+rc=1
+verified: /tmp/job.aHj3Nw gone
+
+$ bash job.sh signal
+workdir=/tmp/job.ipwR33
+rows: 3
+signalling myself
+[signal] SIGINT received
+[cleanup] removed /tmp/job.ipwR33
+rc=130
+verified: /tmp/job.ipwR33 gone</code></pre>
+                    <p>このテンプレートに入れた要素を一つずつ挙げるとこうなる。</p>
+                    <ul>
+                        <li><code>workdir=</code>を先に宣言し、トラップを掛けてから<code>mktemp -d</code>を呼ぶ (7.3)</li>
+                        <li><code>_cleaned</code>フラグで片付けが二度回らないようにする (10節)</li>
+                        <li>片付け開始時に<code>trap '' INT TERM HUP</code>で追加のシグナルを塞ぐ</li>
+                        <li><code>case</code>でパスの接頭辞を確認する (7.2)</li>
+                        <li>シグナルハンドラは片付け後に<strong>同じシグナルで自分を撃ち直し</strong>終了コードを保つ (2.2)</li>
+                        <li><code>local sig=$1</code>でハンドラが自分の引数を受け取るようにし、シグナル名ごとに別の関数を書かずに済ませる</li>
+                    </ul>
+
+                    <h3>8.1 子プロセスも一緒に片付ける</h3>
+                    <p>バックグラウンドで上げた作業があるなら、ディレクトリを消すだけでは足りない。消えたパスを使い続けようとする孤児プロセスが残る。</p>
+                    <pre><code>cleanup() {
+    echo "[cleanup] killing $(jobs -p | wc -l) background job(s)"
+    jobs -p | while read -r p; do kill "$p" 2&gt;/dev/null; done
+    : "${workdir:?}"
+    rm -rf -- "$workdir"
+}</code></pre>
+                    <pre><code>$ bash /tmp/kids.sh
+running with 2 children
+[cleanup] killing 2 background job(s)
+[cleanup] workdir removed
+workdir gone: /tmp/work.47Wiqu</code></pre>
+                    <p>順序が重要だ。<strong>子を先に殺してディレクトリを消す。</strong>逆にすると子が消えたパスに書き込んでエラーログを吐き出す。</p>
+
+                    <h2 id="sec-9">9. set -eと一緒に使うときにずれる地点</h2>
+                    <p><code>set -e</code>が入ったスクリプトでトラップハンドラはどうなるか。ハンドラの中で失敗が起きたら残りの片付けはどうなるか。ここから確認した。</p>
+                    <pre><code>$ bash -c 'trap "echo [EXIT] start; false; echo [EXIT] still running; echo [EXIT] done" EXIT; echo body'
+body
+[EXIT] start
+[EXIT] still running
+[EXIT] done
+outer rc=0</code></pre>
+                    <p>ハンドラ途中の失敗は残りを止めず、終了コードも変わらなかった。ところがハンドラの中で<code>set -e</code>を入れると話が変わる。</p>
+                    <pre><code>$ bash -c 'cleanup() { set -e; echo "[cleanup] step 1"; false; echo "[cleanup] step 2 - NOT REACHED"; }
+trap cleanup EXIT
+echo body'
+body
+[cleanup] step 1
+outer rc=1</code></pre>
+                    <p><strong>2段目が実行されなかった。</strong>片付け関数の中で最初の削除が失敗すると、二つ目の削除とロック解除がまるごと飛ばされる。終了コードも1に変わって元の結果を上書きした。</p>
+                    <ul>
+                        <li>片付け関数の中では<code>set -e</code>を入れない。片付けは<strong>失敗しても最後まで試すべき</strong>性質のコードだ</li>
+                        <li>スクリプト冒頭の<code>set -e</code>は関数の中まで有効なので、片付け関数の一行目に<code>set +e</code>を入れるのが安全なこともある</li>
+                        <li>個別コマンドの失敗を吸収するなら<code>rm -f</code>のように無くても成功するオプションを使うか<code>|| true</code>を付ける</li>
+                        <li>失敗は無視しつつ記録は残したいなら<code>|| echo "..." &gt;&amp;2</code>の形で代える</li>
+                    </ul>
+
+                    <h3>9.1 ハンドラの中のexitが終了コードを上書きする</h3>
+                    <pre><code>$ bash -c 'trap "echo [EXIT] handler; exit 99" EXIT; exit 3'
+[EXIT] handler
+rc=99
+
+$ bash -c 'trap "echo [EXIT] handler" EXIT; exit 3'
+[EXIT] handler
+rc=3</code></pre>
+                    <p>ハンドラが<code>exit</code>を呼ばなければ元の終了コードがそのまま保たれる。<strong>片付けハンドラに<code>exit 0</code>を習慣で付けると、失敗した実行が成功として報告される。</strong>自動化パイプラインでこれより悪い欠陥は少ない。</p>
+
+                    <h3>9.2 execはトラップを連れて行かない</h3>
+                    <pre><code>$ bash -c 'trap "echo [EXIT] should not print" EXIT; echo before-exec; exec echo after-exec'
+before-exec
+after-exec</code></pre>
+                    <p><code>exec</code>はシェルのプロセスを別のプログラムで置き換える。置き換わったあとはそのシェルが存在しないので<code>EXIT</code>トラップも消える。コンテナのエントリポイントスクリプトが最後に<code>exec</code>で本体のプログラムを起動する構造なら、その手前で掛けておいた片付けトラップは決して動かない。</p>
+
+                    <h2 id="sec-10">10. 片付けの最中にまたCtrl+Cが来たら</h2>
+                    <p>片付けに2秒かかる状況で1秒間隔でSIGINTを三回送ってみた。防御のないハンドラだ。</p>
+                    <pre><code>$ bash /tmp/reenter.sh
+start (05)
+  [cleanup] enter  (06)
+  [cleanup] enter  (08)      &lt;-- 前の片付けが終わっていないのにまた入った
+  [cleanup] leave  (10)
+  [cleanup] leave  (10)
+end (16)</code></pre>
+                    <p><code>enter</code>が二回続けて出た。<strong>片付けコードが自分自身の中で入れ子に実行された。</strong>この状態で実際に何が起きるか。</p>
+                    <ul>
+                        <li>同じディレクトリを二回消そうとする。二度目は対象がなくエラーを出す</li>
+                        <li>ロック解除が二回回ると、二度目の解除が<strong>次の実行がいま取ったロック</strong>を外してしまうことがある</li>
+                        <li>カウンタを戻したりログを整理したりするコードなら二回適用されて値がずれる</li>
+                        <li>入れ子の内側が先に終わって<code>exit</code>を呼ぶと、外側の片付けが半分だけ実行された状態でプロセスが消える</li>
+                    </ul>
+
+                    <h3>10.1 フラグとシグナル遮断を一緒に使う</h3>
+                    <pre><code>_cleaned=0
+cleanup() {
+    [ "$_cleaned" -eq 1 ] &amp;&amp; { echo "  [cleanup] already done, ignoring"; return; }
+    _cleaned=1
+    trap '' INT TERM HUP      # 片付けの間はシグナルを無視する
+    ...
+}</code></pre>
+                    <pre><code>$ bash /tmp/reenter2.sh
+start (17)
+  [cleanup] enter  (18)
+  [cleanup] leave  (20)
+end (26)</code></pre>
+                    <p>同じ三回のSIGINTを受けたのに片付けは一度だけ回った。二重に塞いだ理由がある。</p>
+                    <ul>
+                        <li><code>_cleaned</code>フラグは<code>EXIT</code>とシグナルハンドラが<strong>どちらも同じ片付け関数を呼ぶ</strong>構造で重複を防ぐ</li>
+                        <li><code>trap '' INT TERM HUP</code>は片付けが回っている間に新しいシグナルがハンドラを呼び直すのを防ぐ</li>
+                        <li>フラグだけだと二度目の進入が<code>return</code>で抜けはするが、その間に一度目の片付けは割り込みを一回受けた状態になる</li>
+                        <li>遮断だけだと<code>EXIT</code>経路から来る重複は防げない。<code>EXIT</code>はシグナルではないので遮断の対象にならない</li>
+                    </ul>
+                    <div class="callout">
+                        <p><strong>片付けが長いと遮断は危険にもなる。</strong>シグナルを無視する区間が長くなると、利用者がCtrl+Cを押しても何の反応もない。結局<code>kill -9</code>につながり、そうなると4節の状況に戻る。片付けは<strong>短く保つのが最善の防御</strong>だ。</p>
+                    </div>
+
+                    <h2 id="sec-11">11. ハンドラが遅れて動くように見えるとき</h2>
+                    <p>Ctrl+Cを押したのに数秒間なにも起きない経験があるはずだ。シェルはフォアグラウンドの子コマンドを待っている間<strong>トラップの実行を先送りする。</strong>シグナルの受理は即座だがハンドラはその子が終わってから動く。測ってみるとこうなる。</p>
+                    <pre><code>$ bash /tmp/measure.sh 5        # sleep 5 をフォアグラウンドに置き t+1秒に SIGINT
+  signal will arrive at t+1s
+  [handler] ran at t+5s
+  foreground sleep 5 returned at t+5s
+
+$ bash /tmp/measure2.sh         # sleep 5 &amp; で上げて wait で待つ
+  signal will arrive at t+1s
+  [handler] ran at t+1s
+  wait returned at t+1s</code></pre>
+                    <p>同じ5秒の待ちなのに一方はハンドラが4秒遅れ、一方は即座に動いた。差は<code>wait</code>が<strong>シグナルで中断される</strong>のに対しフォアグラウンドの<code>sleep</code>はそうならない点にある。</p>
+
+                    <h3>11.1 反応を速くする方法</h3>
+                    <ul>
+                        <li>長い待ちは<code>sleep 300 &amp; wait $!</code>の形に変える。シグナルが来れば<code>wait</code>がすぐ戻る</li>
+                        <li>割れるなら割る。<code>sleep 0.5</code>を何度も回るループで確認したときハンドラはt+1秒に動いた</li>
+                        <li>時間のかかる外部コマンドをバックグラウンドに上げて<code>wait</code>で待てば同じ効果が出る。ただし終了コードを<code>wait "$job"</code>の戻り値で受け取る必要がある</li>
+                        <li>この遅延は片付けができないのではなく<strong>遅れてできる</strong>だけだ。急いでCtrl+Cを連打すると10節の再入問題に移る</li>
+                    </ul>
+                    <pre><code>$ bash /tmp/defer5.sh
+[04:37] waiting on background sleep 4
+  &gt;&gt;&gt; [04:38] TERM handler
+rc=143</code></pre>
+
+                    <h2 id="sec-12">12. 二重実行を防ぐロックと孤児ロック</h2>
+                    <p>片付けトラップのもっともよくある二つ目の用途がロック解除だ。<code>mkdir</code>はすでにあれば失敗し、その検査と生成が一度に起きるのでロックの原始操作として使える。</p>
+                    <pre><code>lockdir=/tmp/myjob.lock
+if ! mkdir "$lockdir" 2&gt;/dev/null; then
+    echo "another run holds $lockdir - exiting"
+    exit 1
+fi
+trap 'rmdir "$lockdir" 2&gt;/dev/null' EXIT INT TERM HUP</code></pre>
+                    <pre><code>$ bash /tmp/lock.sh &amp;          # 一回目の実行
+1854 holds the lock
+$ bash /tmp/lock.sh            # すぐ二回目の実行
+another run holds /tmp/myjob.lock - exiting
+second run rc=1
+[cleanup] released /tmp/myjob.lock
+lock released</code></pre>
+
+                    <h3>12.1 SIGKILLが残したロックは永遠に残る</h3>
+                    <p>4節の結論がここでまた出てくる。<code>kill -9</code>で死ぬとロックディレクトリがそのまま残り、それ以降は<strong>どの実行も始められない。</strong>ディスクが埋まるよりこちらのほうが急を要する事故だ。ロックの中に所有者情報を残せば次の実行が判定できる。</p>
+                    <pre><code>if mkdir "$lockdir" 2&gt;/dev/null; then
+    echo "$$" &gt; "$lockdir/pid"
+    trap 'rm -f "$lockdir/pid"; rmdir "$lockdir" 2&gt;/dev/null' EXIT INT TERM HUP
+else
+    owner=$(cat "$lockdir/pid" 2&gt;/dev/null)
+    if [ -n "$owner" ] &amp;&amp; kill -0 "$owner" 2&gt;/dev/null; then
+        echo "lock held by live pid $owner"
+    else
+        echo "STALE lock (owner $owner is gone) - safe to break"
+    fi
+fi</code></pre>
+                    <pre><code>$ bash /tmp/lock2.sh &amp;
+acquired by 1862
+$ bash /tmp/lock2.sh           # 所有者が生きているとき
+lock held by live pid 1862
+
+$ kill -9 1862
+$ bash /tmp/lock2.sh           # 所有者が消えたあと
+STALE lock (owner 1862 is gone) - safe to break</code></pre>
+                    <p><code>kill -0</code>はシグナルを送らず<strong>そのプロセスが存在するかだけ</strong>を確認する。ただしこの判定には穴がある。</p>
+                    <ul>
+                        <li>PIDは再利用される。死んだ所有者の番号をまったく別のプロセスが引き継いでいれば生きていると誤読する</li>
+                        <li>複数のサーバが共有ボリュームの同じロックを使うとPID検査は無意味だ。ホスト名も一緒に記録する必要がある</li>
+                        <li>孤児ロックを自動で壊すロジックはそれ自体が競合条件を作る。二つの実行が同時に「古い」と判断しうる</li>
+                        <li>安全な折衷は自動で壊さず<strong>警告だけ出して終わること</strong>だ。人が確認して消すようにする</li>
+                        <li>所有者情報に開始時刻も一緒に残せば古さの判定がはるかに安全になる</li>
+                    </ul>
+
+                    <h2 id="sec-13">13. 結局どれを使うのか</h2>
+                    <p>片付け方式ごとに何を捕まえて何を逃すかを整理するとこうなる。</p>
+                    <table>
+                        <thead>
+                            <tr><th>パターン</th><th>正常終了</th><th>exit 1 · エラー</th><th>INT · TERM</th><th>KILL</th><th>移植性</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>最終行で<code>rm</code></td><td>片付く</td><td>残る</td><td>残る</td><td>残る</td><td>すべてのシェル</td></tr>
+                            <tr><td><code>trap ... EXIT</code></td><td>片付く</td><td>片付く</td><td>bashのみ片付く</td><td>残る</td><td>dashではシグナルに弱い</td></tr>
+                            <tr><td><code>trap ... EXIT INT TERM HUP</code></td><td>片付く</td><td>片付く</td><td>片付く</td><td>残る</td><td>bash・dash両方で確認</td></tr>
+                            <tr><td>上記 + 再発生・再入防御</td><td>片付く</td><td>片付く</td><td>片付く・終了コード保持</td><td>残る</td><td>bash基準、8節のテンプレート</td></tr>
+                            <tr><td>固定接頭辞 + 外部掃除ジョブ</td><td>—</td><td>—</td><td>—</td><td>あとで片付く</td><td>KILLを覆う唯一の方法</td></tr>
+                        </tbody>
+                    </table>
+                    <p>最後の行が重要だ。<strong><code>trap</code>だけではすべての場合を覆えない。</strong>三行目までがスクリプトの中でできる最善で、その上はスクリプトの外側の仕掛けが担う。二つを一緒に置くのが実際の答えだ。</p>
+
+                    <h3>13.1 最小チェックリスト</h3>
+                    <ul>
+                        <li>片付けコードは関数に出して<code>trap cleanup EXIT</code>で登録する。クォートの問題が消える</li>
+                        <li><code>EXIT</code>の隣に<code>INT TERM HUP</code>を並べる。bashでは要らなく見えてもdashで要る</li>
+                        <li>シグナルハンドラは片付け後に<code>trap - SIG</code>で解除し、同じシグナルで自分を撃ち直す</li>
+                        <li>片付け関数の一行目は<code>: "${var:?}"</code>だ。次が<code>case</code>のパス検査になる</li>
+                        <li>変数をあらかじめ空で宣言し、トラップを掛けてから<code>mktemp</code>を呼ぶ</li>
+                        <li>再入フラグと<code>trap '' INT TERM HUP</code>を入れる</li>
+                        <li>ハンドラの中で<code>exit 0</code>を呼ばない。元の終了コードを保つ</li>
+                        <li>一時パスに固定の接頭辞を入れ、古い残骸を回収する別ジョブを置く</li>
+                        <li>バックグラウンドの子があるならディレクトリを消す前に先に殺す</li>
+                        <li>長い待ちは<code>&amp; wait</code>に変えて反応速度を確保する</li>
+                        <li>エントリポイントのスクリプトが<code>exec</code>で終わるなら、その手前のトラップは動かないことを覚えておく</li>
+                        <li>配布先のシェルで一度は実際に走らせる。この記事の表を作るのにかかった時間は数分だ</li>
+                    </ul>
+
+                    <h2 id="sec-14">14. 確認できなかったこと</h2>
+                    <p>この記事で実行によって検証できなかった項目を一箇所にまとめる。</p>
+                    <ul>
+                        <li><strong>実際の端末で押したCtrl+C。</strong>検証はすべて非対話のスクリプトが自分自身や子にシグナルを送る方式で行った。端末がプロセスグループ全体にSIGINTを撒く状況、つまりシェルと子が同時にシグナルを受ける場合は再現していない。その条件下ではハンドラの実行順序が変わる余地がある</li>
+                        <li><strong>Linux glibcの環境。</strong>この記事の実行環境は<code>x86_64-pc-msys</code>向けのbash 5.2.37と同じ環境のdashだ。シグナル配送の層がLinuxと完全に同じとは限らない。特に3節のSIGQUIT無視の挙動と終了コードは、配布先で一度再現してみるほうが確実だ</li>
+                        <li><strong>zshとkshとbusybox ash。</strong>実行できる環境ではなかったので確認できなかった。最小のコンテナイメージでよくある組み合わせなので、実務では重要な空白だ</li>
+                        <li><strong><code>flock</code>ベースのロック。</strong>この環境に<code>flock</code>が入っていないため12節は<code>mkdir</code>方式でのみ確認した。ファイルディスクリプタが閉じるときにロックが自動で外れる性質は検証できていない</li>
+                        <li><strong>サービス管理者とコンテナオーケストレータの停止手順。</strong>停止猶予時間が過ぎるとSIGKILLに上がる動作は4節で対策の根拠として触れたが、実際のサービス定義を作って再現してはいない</li>
+                        <li><strong>ネットワークファイルシステムでの削除遅延。</strong>7.4で共有ボリュームを一時領域に使う危険に触れたが、実際の遅延や部分削除を測ってはいない</li>
+                        <li><strong>大容量削除の所要時間。</strong>10節で片付けを短く保てと書いたが、ファイル数に応じた<code>rm -rf</code>の所要時間は測っていない</li>
+                        <li><strong>旧バージョンのbash。</strong><code>trap -p</code>と<code>set -E</code>の動作が古いバージョンでも同じかは確認していない</li>
+                    </ul>
+
+                    <h2 id="sec-15">FAQ</h2>
+                    <h3>Q1. <code>trap cleanup EXIT</code>の一行で十分ではないのか</h3>
+                    <p>bashだけで回すならおおむね十分だ。実行して確認した結果、bash 5.2.37は<code>EXIT</code>だけでもSIGINT・SIGTERM・SIGHUPでハンドラを走らせた。問題は同じスクリプトを<code>dash</code>で走らせたときだ。SIGTERMでハンドラが実行されず一時ファイルがそのまま残った。シバンが<code>#!/bin/sh</code>なら配布先でdashとして実行されうるし、開発機で<code>/bin/sh</code>がbashにつながっていればこの差は見えない。シグナルを明示的に並べる費用は一行なので、素直に並べるほうがよい。</p>
+
+                    <h3>Q2. 片付けハンドラを<code>exit 0</code>で終わらせてはいけないのか</h3>
+                    <p>いけない。確認した結果、ハンドラの中の<code>exit 99</code>は元の終了コード3を99で上書きした。ハンドラが<code>exit</code>を呼ばなければ元の値がそのまま保たれる。片付けハンドラに<code>exit 0</code>を付けると<strong>失敗した実行も中断された実行もすべて成功として報告される。</strong>CIランナーはそのコードで再試行の可否を決め、上位スクリプトはそのコードで次の段階に進むかを決める。片付けをきちんとやって終了コードを壊すと、前の利得がすべて消える。</p>
+
+                    <h3>Q3. トラップハンドラの中でエラーが起きたら残りの片付けはどうなるか</h3>
+                    <p>既定の状態では続行する。ハンドラの途中に<code>false</code>を入れても後ろの行がすべて実行され、終了コードも変わらなかった。ただし片付け関数の中で<code>set -e</code>を入れると最初の失敗で止まる。実際に確認すると1段目だけが出て2段目は実行されず、終了コードが1に変わる。片付けは失敗しても最後まで試すべきコードなので、その中では<code>set -e</code>を入れない。削除コマンドには対象がなくても成功するオプションを使い、失敗を吸収すべき場所には<code>|| true</code>を付ける。</p>
+
+                    <h3>Q4. 関数ごとに自分の片付けを<code>EXIT</code>に掛けるとなぜ問題になるのか</h3>
+                    <p>同じシグナルに対するトラップは積み上がらず上書きするからだ。関数Aが掛けて関数Bが掛ければBだけが残る。しかも<code>EXIT</code>トラップはシェル全体の状態なので関数を出ても残り続ける。関数ローカルではない。回避法は片付け項目を配列に積んでおき、<code>EXIT</code>にはその配列を逆順に回る関数だけを掛けることだ。登録の逆順が資源解放の順序としても合う。ロックを先に取ってディレクトリをあとで作ったならディレクトリから消してロックを最後に外す。</p>
+
+                    <h3>Q5. サブシェルの中で作った一時ファイルはどう消すのか</h3>
+                    <p>そのサブシェルの中で別にトラップを掛ける必要がある。実行して確認した結果、サブシェルは親の<code>EXIT</code>トラップを一覧としては受け継ぐが、自分が終了するときにそれを実行しない。親で一度だけ動く。逆にサブシェルの中で登録したトラップはサブシェルが終わるときにその中で動き、親には残らない。パイプライン構成要素の中で掛けたトラップも同じだ。だからトラップを掛けたのに動かないようなら、その行がパイプの右側や括弧の中にあるかをまず確認すればよい。</p>
+
+                    <h2 id="sec-16">結論: 今日変える三つのこと</h2>
+                    <p><strong>第一に、片付けコードを最終行からトラップに移す。</strong>そして<code>EXIT</code>の隣に<code>INT TERM HUP</code>を並べる。bashでは要らないように見えてもdashで崩れる。シグナルハンドラは片付け後に自分のトラップを解除し、同じシグナルで自分を撃ち直して終了コードを保つ。</p>
+                    <p><strong>第二に、片付け関数の一行目に<code>: "${var:?}"</code>とパス検査を入れる。</strong>トラップはスクリプトのどの地点でも発動するので、変数に値が入る前にシグナルが来る場合が実際にある。その状態で削除が実行されると何が消えるか分からず、消えたものは戻らない。だからこの二行は削除の行より<strong>先に</strong>書く。ロジックを変えたら削除を<code>echo</code>に変えて一度走らせ、対象のパスを目で確認する。</p>
+                    <p><strong>第三に、<code>trap</code>がすべての場合を覆うと信じない。</strong><code>kill -9</code>は捕まらず、実測で320KBの作業ディレクトリがまるごと残った。bashが<code>trap ... KILL</code>を構文エラーとして拒否せず一覧に表示までしてくれるので、コードだけを読むと塞いであるように見える。一時パスに固定の接頭辞を付けて古い残骸を回収する別ジョブを置くことが、スクリプトの中では決して解決しないこの穴を埋める唯一の方法だ。</p>
+                    <p>最後にひとつ。この記事の表と出力はすべて十行前後のスクリプトで得たものだ。<strong>片付けが動くかどうかが気になるなら推測せず、<code>mktemp</code>でファイルを一つ作って殺してみればいい。</strong>30秒で終わる。</p>
+
+                    <h2 id="sec-17">参考資料</h2>
+                    <ul>
+                        <li><a href="https://www.gnu.org/software/bash/manual/bash.html#Bourne-Shell-Builtins" target="_blank" rel="noopener">GNU Bash Reference Manual - Bourne Shell Builtins</a> — <code>trap</code>組み込みコマンドの引数と<code>-p</code>オプション</li>
+                        <li><a href="https://www.gnu.org/software/bash/manual/bash.html#Signals" target="_blank" rel="noopener">GNU Bash Reference Manual - Signals</a> — シェルがシグナルをいつ処理していつ先送りするか</li>
+                        <li><a href="https://www.gnu.org/software/bash/manual/bash.html#The-Set-Builtin" target="_blank" rel="noopener">GNU Bash Reference Manual - The Set Builtin</a> — <code>set -E</code>と<code>set -T</code>の継承規則</li>
+                        <li><a href="https://www.gnu.org/software/bash/manual/bash.html#Shell-Parameter-Expansion" target="_blank" rel="noopener">GNU Bash Reference Manual - Shell Parameter Expansion</a> — <code>${var:?}</code>展開</li>
+                        <li><a href="https://pubs.opengroup.org/onlinepubs/9699919799/utilities/V3_chap02.html#trap" target="_blank" rel="noopener">POSIX Shell Command Language - trap</a> — 移植性判断の基準線</li>
+                        <li><a href="https://www.gnu.org/software/coreutils/manual/html_node/mktemp-invocation.html" target="_blank" rel="noopener">GNU coreutils - mktemp invocation</a> — テンプレートと<code>-d</code>オプション</li>
+                        <li><a href="https://mywiki.wooledge.org/SignalTrap" target="_blank" rel="noopener">Greg Wiki - Signal Traps</a></li>
+                        <li><a href="shell_subshell_variable_scope.html">パイプの中のwhileで変数が消える理由</a> — この記事6節の前提になるプロセス境界</li>
+                        <li><a href="linux_server_guide_06_shell_basics.html">シェルスクリプト基礎</a> · <a href="linux_server_guide_07_shell_advanced.html">シェルスクリプト上級</a></li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>この記事をシェア</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">スレッズ</button>
+                        <button id="link-copy" class="share-btn link-btn">リンクをコピー</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">一覧に戻る</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">一緒に使うと便利な無料ツール</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/json_formatter.html">JSON フォーマッター</a></li>
+      <li><a href="../static/regex_tester.html">正規表現テスター</a></li>
+      <li><a href="../static/jwt_decoder.html">JWTデコーダー・生成器 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 エンコーダー/デコーダー</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">すべてのツールを見る &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">関連記事</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="shell_subshell_variable_scope.html">パイプの中のwhileで変数が消える理由 - サブシェル 2026</a></li>
+      <li><a href="shell_quoting_rules_guide.html">シェルのクォート規則 - どの引用符が何を止めるのか</a></li>
+      <li><a href="shell_exit_code_pipefail.html">シェルの終了コードと set -e - 何を捕まえ何を見逃すか</a></li>
+      <li><a href="cloudflare_os_agent_platform_2026.html">Cloudflare OS - エージェントを走らせるランタイムに自分のワークロードを置く理由はあるか 2026</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('リンクをコピーしました。スレッズアプリに貼り付けて共有してください。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('リンクをコピーしました。'); });
+    });
+    </script>
+</body>
+</html>
