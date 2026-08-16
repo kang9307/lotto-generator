@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ja">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>16年もののバグはなぜ今表に出たのか - SQLite WALリセット破損と希少欠陥の追跡法</title>
+    <meta name="description" content="SQLiteのWALリセット競合は16年を経て表面化した。チェックポイントと巻き戻しの仕組み、狭い再現条件が統計的に見えない理由、破損事例を絞り込む追跡手順、そして整合性チェックとバックアップ復元検証という防御までを整理する。">
+    <meta name="keywords" content="SQLite WAL, WALリセット, チェックポイント, データベース破損, integrity_check, 競合状態, レースコンディション, SQLite 3.51.3, SQLite 3.53.0, バックアップ復元検証, 再現しないバグ, 上流への報告, 希少欠陥, 障害追跡">
+
+    <link rel="canonical" href="https://braindetox.kr/ja/posts/sqlite_wal_reset_16year_bug.html">
+
+    <meta property="og:title" content="16年もののバグはなぜ今表に出たのか - SQLite WALリセット破損と希少欠陥の追跡法">
+    <meta property="og:description" content="チェックポイントとWAL巻き戻しが実際に何をしているのか、狭い再現条件がなぜ欠陥を長く隠すのか、静かに壊れるデータをどの順序で確保するのかを整理した。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/ja/posts/sqlite_wal_reset_16year_bug.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ja_JP">
+    <meta property="article:published_time" content="2026-08-16">
+    <meta property="article:section" content="開発・インフラ">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="16年もののバグはなぜ今表に出たのか - SQLite WALリセット破損">
+    <meta name="twitter:description" content="チェックポイントと巻き戻しの原理、希少欠陥が統計的に見えない構造、静かなデータ破損の追跡手順まで。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "16年もののバグはなぜ今表に出たのか - SQLite WALリセット破損と希少欠陥の追跡法",
+      "alternativeHeadline": "Why a 16-Year-Old SQLite WAL-Reset Bug Surfaced Now",
+      "datePublished": "2026-08-16",
+      "dateModified": "2026-08-16",
+      "inLanguage": "ja-JP",
+      "articleSection": "開発・インフラ",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "SQLite WAL, WALリセット, チェックポイント, データベース破損, integrity_check, 競合状態, SQLite 3.51.3, バックアップ復元検証, 希少欠陥の追跡",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/ja/posts/sqlite_wal_reset_16year_bug.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "SQLiteのWALモードにおけるチェックポイントと巻き戻しとは何か",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "WALモードは本体のデータベースファイルをそのままにして、変更されたページをWALファイルの末尾へ順次追記する。そこに溜まった内容を本体へ書き戻す作業がチェックポイントであり、公式文書ではWALファイルのトランザクションをデータベースへ戻すことをチェックポイントと呼ぶと説明されている。巻き戻しはその次の段階で、WAL全体がデータベースへ移されて同期が済み、そのWALを読んでいるリーダーが一つもないとき、次の書き手がWALを先頭へ巻き戻して前から書き直す動作を指す。この巻き戻しがあるからWALファイルは無限に大きくならない。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "16年間だれも見つけられなかった欠陥がなぜ今になって表に出たのか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "露出が足し算ではなく掛け算だからである。欠陥が報告に上がるには、発生確率と、そのコード経路を踏む回数と、破損を破損として認識する観測能力の三つがすべてゼロでない必要がある。多くの構成はチェックポイントを自動に任せていて巻き戻し経路をあまり踏まず、バックアップごとに整合性チェックを回す組織もまれである。三つのうち一つでもゼロに近づけば、欠陥は散らばった異常のまま残る。成熟したソフトウェアに最後まで残る欠陥は、たいていこの形をしている。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "自分の環境が影響を受けたかどうかはどう確認するのか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "まず SELECT sqlite_version() でバージョンを確認する。WALリセット破損の修正は2026年3月13日公開の3.51.3と、2026年4月9日公開の3.53.0に含まれている。次に PRAGMA journal_mode が wal かどうか、チェックポイントをアプリケーション側で制御しているかを見る。破損そのものの判定は PRAGMA integrity_check で行い、問題がなければ値が ok の一行だけが返る。quick_check は高速だがインデックスの内容とテーブルの内容が一致するかを検査しないため、この種類の判定には integrity_check を使う。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "データベース破損が疑われるとき最初にすべきことは何か",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "復旧ではなく保全である。壊れたファイルは原因を抱えた証拠なので、VACUUMやREINDEX、ダンプして再投入といった処置を先に走らせると痕跡が消える。本体ファイルだけでなく同名の -wal と -shm も一緒に控えを取り、診断は控えをもう一部複製してその上で行う。WALのデータベースを読み書きで開いた瞬間に復旧やチェックポイントが走ってファイルが変わることがあるためである。整合性チェックの出力は要約せず原文のまま残す。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "バックアップが本当に機能しているかはどう確認するのか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "復元してはじめてバックアップである。ファイルが生成されたという事実と、そのファイルからサービスを戻せるという事実は別の命題である。バックアップ世代ごとに複製へ整合性チェックを回して ok 以外は失敗として扱い、最低でも月に一度は実際に復元して標本クエリの結果が期待どおりかを確認する。破損が検知された後も書き込みを受け続けると、壊れた状態が次の世代へ伝播して戻れる地点そのものが消える。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 4px; overflow-x: auto; margin-bottom: 1.2rem; }
+        .post-content pre code { background-color: transparent; padding: 0; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/sqlite_wal_reset_16year_bug.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/sqlite_wal_reset_16year_bug.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/sqlite_wal_reset_16year_bug.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/sqlite_wal_reset_16year_bug.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/sqlite_wal_reset_16year_bug.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="16年もののバグはなぜ今表に出たのか - SQLite WALリセット破損と希少欠陥の追跡法">
+                <meta itemprop="datePublished" content="2026-08-16">
+                <meta itemprop="dateModified" content="2026-08-16">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="SQLite WAL, WALリセット, チェックポイント, データベース破損, integrity_check, 競合状態, バックアップ復元検証">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/ja/posts/sqlite_wal_reset_16year_bug.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">16年間だれも見なかったバグが表に出る条件</h1>
+                    <h2 class="post-subtitle">SQLite WALリセット破損に見る希少欠陥の追跡 - チェックポイントの仕組みから上流への報告まで</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-08-16">2026年8月16日</span>
+                        <span class="post-category" itemprop="articleSection">開発・インフラ</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+                    <h2>序論: データが静かに食い違う種類の故障</h2>
+                    <p>バックアップジョブは毎晩成功で終わり、ディスクにエラーは一つもなく、アプリケーションログもきれいだ。それなのに、昨日たしかに保存した行が今日の照会から抜けている。インデックスを使うクエリとフルスキャンが違う答えを返す。</p>
+                    <p>この種類の故障は実務でもっとも扱いにくい部類に入る。壊れる瞬間が存在しないからである。プロセスは死なず、500も出ない。食い違ったデータはそのまま次のバックアップに乗って運ばれ、数週間後に精算が合わないとか、利用者が消えた設定について問い合わせてくることでようやく表面化する。そのころには原因のあった時刻のログはローテーションで消えている。</p>
+                    <p>2026年8月13日にGeekNewsで紹介されたTailscaleの技術報告が、まさにその形の事例を扱っている。半年で19件のデータベース破損、統制された環境ではついに再現しなかった原因、そして最終的にSQLiteのWAL巻き戻し経路にあった希少な競合状態へ絞り込まれた結論である。修正のチェックインは2026年3月3日にトランクへ入った。WALがSQLiteに入ったのは3.7.0(2010-07-21)なので、その間はおよそ16年になる。</p>
+                    <p>数字だけを見ると「16年も放置された」と読みたくなる。そう読むと持ち帰るものがない。この記事が扱うのは三つである。WALとチェックポイントが実際に何をしているのか、狭い再現条件を持つ欠陥がなぜ統計的に見えないまま、ある時点で表に出るのか、そしてそうした欠陥に出会ったとき何をどの順序で確保するのか。特定の製品や組織の是非を論じる話ではない。</p>
+
+                    <h2>1. WALモードがしていること - なぜ速く、チェックポイントとは何か</h2>
+
+                    <h3>1.1 ロールバックジャーナルとの違い</h3>
+                    <p>SQLiteの既定のジャーナル方式であるロールバックジャーナルはこう動く。ページを書き換える前に元の内容を別のジャーナルファイルへ複写しておき、そのうえで本体のデータベースファイルを直接書き換える。途中でプロセスが死ねばジャーナルに残った元の内容で巻き戻す。安全だが、同じデータが実質二度書かれる。</p>
+                    <p>WALは向きが逆である。本体のデータベースファイルには触れず、変更されたページをWALファイルの末尾へ順次追記する。公式文書は利点をこう整理している。書き込みトランザクションが非常に速いのは内容を一度しか書かないから(ロールバックジャーナルは二度)であり、その書き込みがすべて順次だからである。</p>
+                    <p>実務で体感が大きいのはむしろ読み取り側だ。ロールバックジャーナルでは書き手が本体を直接書き換えるので、読み取りと書き込みが互いを塞ぐ。WALでは本体がそのまま残るのでリーダーは自分の時点のスナップショットを読み続け、その間に書き手はWALの末尾へ追記する。リーダーが最新のページをどこで見つけるかはwal-indexが教える。名前の末尾に <code>-shm</code> が付くファイルとして共有メモリに保持され、文書の表現ではリーダーが最小限のI/OでWAL内のページを素早く見つけられるようにする役目を担う。</p>
+                    <p>WALが払う代償は、データベース一つがファイル三つになることだ。<code>app.db</code>、<code>app.db-wal</code>、<code>app.db-shm</code>。この事実は後の証拠保全の節でもう一度効いてくる。</p>
+
+                    <h3>1.2 チェックポイント - WALを本体へ戻す作業</h3>
+                    <p>WALは無限には育てられない。溜まったフレームを本体のデータベースファイルへ書き写す作業がチェックポイントである。文書の表現をそのまま移せば、WALファイルのトランザクションをデータベースへ戻すことをチェックポイントと呼ぶ。</p>
+                    <p>既定は自動だ。WALが一定の大きさを超えるとコミット直後にチェックポイントが走る。必要なら <code>PRAGMA wal_checkpoint</code> で自分で回すこともでき、モードが四つある。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>モード</th><th>動作</th><th>選ぶ理由</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>PASSIVE</td><td>リーダーや書き手を待たずに移せるだけ移す</td><td>既定値。稼働中の影響がもっとも小さい</td></tr>
+                            <tr><td>FULL</td><td>書き手がおらず全リーダーが最新スナップショットを見るまで待ってから移す</td><td>WALを確実に空にしたいとき</td></tr>
+                            <tr><td>RESTART</td><td>FULLに加えて、全リーダーがログの使用を終えるまで待つ</td><td>次の書き込みをWALの先頭から始めさせたいとき</td></tr>
+                            <tr><td>TRUNCATE</td><td>RESTARTに加えてWALファイルを0バイトへ切り詰める</td><td>ディスク占有を即座に回収したいとき</td></tr>
+                            <tr><td>NOOP</td><td>フレームを一つも移さず、戻り値だけを得る</td><td>3.51.0(2025-11-04)で追加。状態観測用</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h3>1.3 巻き戻し - WALファイルを肥大させない第二の仕組み</h3>
+                    <p>チェックポイントで中身を移してもWALファイル自体が小さくなるわけではない。ここで巻き戻しが登場する。公式文書はこう説明する。書き込みが起きるたびに書き手はチェックポインタがどこまで進んだかを確認し、WAL全体がデータベースへ移されて同期され、そのWALを使っているリーダーが一つもなければ、書き手はWALを先頭へ巻き戻し、新しいトランザクションを前から積み始める。</p>
+                    <p>この一文はゆっくり読む価値がある。巻き戻しを判断する主体は<strong>書き手</strong>であり、その判断の根拠は<strong>チェックポインタが残した進捗状態</strong>である。異なる二つの主体が同じ状態をそれぞれ読み、それぞれ更新する。並行性の欠陥が住める場所は、まさにこの構造の中にできる。</p>
+                    <p>先に一つ触れておく。RESTARTとTRUNCATEは事実上巻き戻しを誘発するモードだ。チェックポイントをアプリケーションが自分で、しかも頻繁に回す構成は、自動に任せた構成よりこの経路をはるかに多く通る。後で述べる「なぜ今か」の半分はこの一行に入っている。</p>
+
+                    <h2>2. 今回の欠陥が座っていた場所</h2>
+                    <p>修正はSQLiteリポジトリのチェックイン <code>7168988acbec2d8d</code> として入った。2026年3月3日、トランクブランチ、作成者はdan。変更されたファイルは <code>src/wal.c</code> で、<code>test/walrestart.test</code> が新規に追加されている。チェックインのコメントは一文だ。</p>
+                    <blockquote>Avoid an obscure race condition between a checkpointer and a writer wrapping around to the start of the wal file.</blockquote>
+                    <p>チェックポインタと、WALファイルの先頭へ巻き戻す書き手との間の、表に出にくい競合状態を避ける、という意味である。前節で見た構造がそのまま文になっている。</p>
+                    <p>症状側の説明は原文の報告にある。チェックポイントが走っている最中の特定の時点で書き込みが起きると、チェックポイントの処理が混乱し、WALの一部のページが本体のデータベースファイルへ複写されたと判断するが実際には複写されていない、というものだ。</p>
+                    <p>その先が静かな破損へつながる。移されたと印が付いた区間は再利用してよい領域になり、巻き戻しがその上に新しいトランザクションを積む。すると本体にもWALにも存在しないページが生まれる。行が消えるか、同じデータを指すはずのテーブルとインデックスが異なる内容を持つことになる。</p>
+                    <p>この状態でSQLiteはエラーを出さない。自分では移したと信じているからである。破損は別の照合を回してはじめて見える。<code>PRAGMA integrity_check</code> が見る項目は文書に列挙されている。</p>
+                    <ul>
+                        <li>順序が狂ったテーブルまたはインデックスのエントリ</li>
+                        <li>形式の壊れたレコード</li>
+                        <li>失われたページ</li>
+                        <li>欠けた、あるいは余分なインデックスエントリ</li>
+                        <li>UNIQUE・CHECK・NOT NULL制約の違反</li>
+                        <li>フリーリストの整合性</li>
+                        <li>二度以上使われている、あるいはまったく使われていない領域</li>
+                    </ul>
+                    <p>問題がなければ値が <code>ok</code> の一行が返る。裏返して言えば、このpragmaを定期的に回さないシステムでは、上の一覧の事故は<strong>起きても何の信号も出さない。</strong></p>
+                    <p>原文が示した範囲はここまでである。どの内部状態がどの順序で食い違うのかは、チェックインのコメントと変更ファイルの一覧を超えて公開された説明がない。それ以上をもっともらしく埋めれば、それは説明ではなく推測になる。</p>
+
+                    <h2>3. 16年間表に出なかった理由 - 希少欠陥の統計構造</h2>
+
+                    <h3>3.1 露出は足し算ではなく掛け算だ</h3>
+                    <p>欠陥がだれかの報告に上がるには、三つが同時にゼロでない必要がある。</p>
+                    <ul>
+                        <li><strong>発生確率</strong> - そのコード経路を通ったときに実際に食い違う確率</li>
+                        <li><strong>経路通過回数</strong> - システムが一日にその経路を何回踏むか</li>
+                        <li><strong>観測能力</strong> - 食い違った結果を食い違いとして認識する仕掛けがあるか</li>
+                    </ul>
+                    <p>三項は足されず掛けられる。一つでもゼロに近づけば積はゼロへ収束する。だから「だれも報告しなかった」と「問題がなかった」はまったく別の命題である。</p>
+                    <p>今回に当てはめるとこうなる。発生確率はチェックポイントと巻き戻しと書き込みが特定の順序で重なる、ミリ秒単位の窓でのみ成立する。経路通過回数はチェックポイントの回し方によって桁が変わり、原文はチェックポイントの処理を直接制御し非常に積極的に回していたと述べている。観測能力は、バックアップに対して整合性チェックを常時回し、その結果を監視する体制があったからこそ確保された。</p>
+                    <p>三つめが特に効く。整合性チェックを常時回していなければ、19件は一つの事象ではなく半年に散らばった19個の別々のチケットになっていた。「たまにデータがおかしい」とまとめられるチケットは、上流へ届く信号を作れない。</p>
+
+                    <h3>3.2 テストが捕まえられる欠陥と、そうでない欠陥</h3>
+                    <p>SQLiteはテスト密度の高さでよく知られたプロジェクトだ。ところがカバレッジが答える問いは「この行が実行されたか」であって「この二行がこの順序で重なったか」ではない。コード行数が増えればカバレッジの対象は線形に増えるが、二つのスレッドが作りうる実行順序の組み合わせはそうならない。</p>
+                    <p>だから成熟したソフトウェアに最後まで残る欠陥はたいてい形が決まっている。易しいものはすでに片付き、残るのは狭い窓の中でのみ成立する順序の問題だ。この種の欠陥はコードをもっと読んでも減らない。<strong>実行量と環境の多様性が増えて、確率的に表に出る。</strong>原文は、この欠陥があまりに希少なため、SQLiteの開発陣が試験環境で条件をわざと誘発するコードを入れる必要があったと記している。</p>
+                    <p>16年という数字は放置された時間というより、必要な実行量が積み上がるのにかかった時間に近い。ソフトウェアが長く生き残り、使われる場所が多様になるほど、残っていた狭い条件が一つずつ実際に踏まれる。これは特定プロジェクトの傷ではなく、成熟曲線の正常な性質である。</p>
+
+                    <h3>3.3 では、どんな態度で始めるべきか</h3>
+                    <p>実務でこの認識が変えるのは疑う順序である。古く検証されたコンポーネントを最初から容疑者から外せば、数か月をアプリケーションコードの中でさまようことになる。逆に初日からライブラリを疑えば十中八九は外れる。</p>
+                    <p>現実的な順序は決まっている。自分のコード、次に自分の設定、次に環境(ファイルシステム・カーネル・ハードウェア)、そして上流。重要なのは順序そのものではなく、<strong>各段階を除外した根拠を文書に残すこと</strong>だ。根拠なく飛ばした段階は必ず戻ってくる。除外の根拠が積み上がっていてはじめて、上流に「ここまでは違った」と言う資格が生まれる。</p>
+
+                    <h2>4. 追跡の段階 - 何をどの順序で確保するか</h2>
+                    <p>再現しない欠陥を追跡するときに実際に使える順序を表にした。各段階で何が残れば次へ進めるのか、そしてその段階でどこが崩れやすいのかを併せて書いている。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>段階</th><th>すること</th><th>残らねばならないもの</th><th>崩れやすい箇所</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>1. 数える仕掛けを作る</td><td>破損を破損として判定する自動検査を仕込む</td><td>件数・時刻・対象インスタンス</td><td>チケットとしてのみ扱われ件数が集計されない</td></tr>
+                            <tr><td>2. 事例の正規化</td><td>すべての事例を同じ形式で記録する</td><td>整合性チェックの原文出力</td><td>要約して書き、後で照合できない</td></tr>
+                            <tr><td>3. 共通条件を絞る</td><td>バージョン・設定・ハードウェア・負荷パターンの積集合</td><td>重なる条件と重ならない条件の一覧</td><td>標本が少ないとき相関を因果と読む</td></tr>
+                            <tr><td>4. 時刻をそろえる</td><td>アプリ・DB・バックアップ・基盤のログを一本の軸へ</td><td>破損区間の上限と下限の時刻</td><td>ホストごとに時計が違い順序が反転する</td></tr>
+                            <tr><td>5. 最小再現を試みる</td><td>統制環境で条件を絞って再現する</td><td>できれば手順、できなければ試行の境界</td><td>再現失敗を原因なしと結論する</td></tr>
+                            <tr><td>6. 本番観測へ切り替える</td><td>疑う層より一段下へ追跡を差し込む</td><td>順序が見える低レベルの記録</td><td>アプリのログだけが増える</td></tr>
+                            <tr><td>7. 上流へ確認する</td><td>バージョン・設定・症状・頻度を添えて報告する</td><td>再現なしでも判断できる資料の束</td><td>再現手順がないからと報告を先送りする</td></tr>
+                            <tr><td>8. 修正後の検証</td><td>条件そのものが今も起きているかを別に数える</td><td>条件カウンタと破損カウンタの分離</td><td>症状が止まったことを原因除去と取り違える</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>1番と2番がもっとも省略されやすく、省略の代償がもっとも大きい。破損の判定を人が目で行えば事例は標準化されず、標準化されない事例は3番で積集合を作れない。追跡はそこで止まる。</p>
+                    <p>4番を独立させた理由も同じだ。原因と結果をつなぐのは結局のところ順序であり、異なる機械のログを一本の軸に置けなければ順序は見えない。経過時間を測る時計と時刻を名指す時計をなぜ分けるべきかは<a href="../posts/monotonic_vs_wall_clock.html">経過時間を壁時計で測ると負の値が出る</a>で別途整理している。</p>
+
+                    <h2>5. 再現しないバグを本番で観測する</h2>
+                    <p>統制環境での再現は良い目標だが最終目的ではない。目的は原因の特定である。再現が失敗し続けるなら方向を変える。<strong>観測点を一段下へ降ろす</strong>ことだ。</p>
+
+                    <h3>5.1 ファイル層に追跡を差し込む</h3>
+                    <p>SQLiteはファイルシステムへのアクセスをVFSというインタフェースで抽象化している。その層に薄いシムを挟めば、アプリケーションのコードを触らずに、いつどのオフセットへ何を書いたかを順序どおりに見られる。今回の追跡でSQLiteの開発陣が作ったのが <code>tmstmpvfs</code> で、ファイルアクセスに追跡情報を書き足すラッパーである。公開リポジトリの <code>ext/misc/tmstmpvfs.c</code> として残っている。</p>
+                    <p>順序が問題の欠陥では、この順序の記録が事実上唯一の証拠になる。アプリケーションのログは「何をしようとしたか」を残すが、実際にどの順序でディスクへ届いたかは残さない。</p>
+
+                    <h3>5.2 変更SQLを外へ流しておく</h3>
+                    <p>二つめに使われたのは、すべての変更SQLを外へ送り出すトランザクションログのパイプラインである。これは二役を兼ねる。破損が起きたときに最後の正常なバックアップの上でログを再生して復旧する手段であり、同時に「あるべき状態」を作って実際の状態と照合する基準にもなる。破損範囲を確定するには基準が要るが、バックアップだけでは取得時点までしか基準にならない。</p>
+
+                    <h3>5.3 修正後も条件を数え続ける警報</h3>
+                    <p>修正を出した後がむしろ重要だ。原文は、修正後も書き込みとチェックポイントの衝突そのものを検知して知らせる警報を残し、破損は防げたが条件は実際に発生していたという事実を本番で確認したと記している。</p>
+                    <p>なぜ必要か。症状が消えたことだけでは原因を除去したとは言えないからである。可能性は二つある。</p>
+                    <ul>
+                        <li>条件は今も起きているが結果が出ない → 修正が実際に効いている</li>
+                        <li>条件そのものが起きていない → 負荷パターンや構成が変わっただけかもしれない</li>
+                    </ul>
+                    <p>この二つを区別できなければ、数か月後にトラフィックが増えたとき同じ追跡を最初からやり直すことになる。条件カウンタと破損カウンタを分けておく理由はここにある。</p>
+
+                    <h3>5.4 一般化できる三行</h3>
+                    <ul>
+                        <li>観測点は疑う層より<strong>一段下</strong>に置く。同じ層でログを増やしても量が増えるだけで順序は見えない</li>
+                        <li>観測は入れた瞬間から費用である。標本抽出の比率と対象縮小の計画を、入れる前に決める</li>
+                        <li>修正後も警報を切らない。切った瞬間、次の再発は白紙から始まる</li>
+                    </ul>
+
+                    <h2>6. データ破損を扱うときの原則</h2>
+
+                    <h3>6.1 復旧より保全が先だ</h3>
+                    <p>壊れたデータベースファイルは問題のファイルではなく<strong>証拠</strong>である。ところが現場で最初にすることはたいてい復旧だ。VACUUMを回し、REINDEXをかけ、ダンプして新しいファイルへ再投入する。三つとも原因の痕跡を消す。とくにダンプして再投入は破損を正常へ洗浄してしまい、その後は何が起きたのかを辿る方法が残らない。</p>
+                    <p>控えを取る範囲にも注意が要る。WALモードでは本体ファイル一つがすべてではない。</p>
+
+                    <pre><code># 原則: 先に止め、先に複写し、それから見る
+cp app.db      evidence/app.db
+cp app.db-wal  evidence/app.db-wal   # あれば必ず一緒に
+cp app.db-shm  evidence/app.db-shm   # あれば一緒に
+
+# 診断は控えをもう一部複製し、その上で行う
+cp evidence/app.db     work/app.db
+cp evidence/app.db-wal work/app.db-wal
+sqlite3 work/app.db 'PRAGMA integrity_check;' &gt; evidence/integrity.txt</code></pre>
+
+                    <p>控えをもう一部取るのには理由がある。WALのデータベースを読み書きで開くと、その瞬間に復旧やチェックポイントが走ってファイルの内容が変わることがある。証拠として残す控えに直接 <code>sqlite3</code> をつなぐのは、証拠を触ることになる。プロセスを先に止めてから複写するのが原則だが、止めると <code>-shm</code> が消えることも知っておく必要がある。どちらを選ぶにせよ、<strong>選んだという事実そのものを記録に残す。</strong></p>
+
+                    <h3>6.2 時刻を一本の軸に置く</h3>
+                    <p>破損の時刻は「発見の時刻」ではない。正確には<strong>最後に正常が確認された時刻と発見の時刻のあいだの区間</strong>である。この区間が狭いほど良い観測体制であり、区間を狭める唯一の方法は正常確認を頻繁に行うことだ。バックアップごとに整合性チェックを回す習慣が事故対応能力へ変わる地点が、まさにここである。</p>
+                    <p>そして複数のログを一本の軸に置くには、先に時計の問題を片付ける必要がある。ホスト間の時計のずれ、タイムゾーン表記の混ざったログ、再同期による壁時計の跳びが、いずれも順序を反転させる。</p>
+
+                    <h3>6.3 判定は原文のまま残す</h3>
+                    <ul>
+                        <li>整合性チェックの出力を要約しない。「何件出た」ではなく、どの文が何個出たかが照合の材料になる</li>
+                        <li>バージョンと設定を事故記録に添える。<code>sqlite_version()</code>、<code>journal_mode</code>、チェックポイントの主体</li>
+                        <li>破損が検知されたインスタンスでは書き込みを受け続けない。原文は、破損を検知したコントロールプレーンのシャードを即座に停止させる方針を置いたと述べている</li>
+                        <li>停止方針は可用性より整合性を選んだということだ。データが台帳の性格なら概ね正しく、キャッシュの性格なら別の判断もありうる</li>
+                    </ul>
+
+                    <h2>7. 直した後に起きたこと - 修正もまた変更である</h2>
+                    <p>この事例でもっとも実用的なのは、むしろ修正の後だ。時系列で見るとこうなる。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>バージョンまたはチェックイン</th><th>日付</th><th>内容</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>SQLite 3.7.0</td><td>2010-07-21</td><td>WALモードの導入</td></tr>
+                            <tr><td>SQLite 3.51.0</td><td>2025-11-04</td><td><code>PRAGMA wal_checkpoint=NOOP</code> の追加</td></tr>
+                            <tr><td>チェックイン <code>7168988acbec2d8d</code></td><td>2026-03-03</td><td>チェックポインタと巻き戻す書き手の競合状態を回避。<code>src/wal.c</code> を修正、<code>test/walrestart.test</code> を新設</td></tr>
+                            <tr><td>SQLite 3.52.0</td><td>2026-03-06</td><td>公開後に撤回。予定されていた機能は3.53.0へ繰り延べ</td></tr>
+                            <tr><td>SQLite 3.51.3</td><td>2026-03-13</td><td>WALリセット破損の修正のみを載せて公開</td></tr>
+                            <tr><td>SQLite 3.53.0</td><td>2026-04-09</td><td>WALリセット修正に加え、式インデックスの自己修復機能(<code>REINDEX EXPRESSIONS</code>)</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>3.52.0を投入した直後、バックアップ監視が13個のデータベースに破損を報告した。原因はWALの修正ではなかった。テキストを浮動小数点へ変換するときの丸め挙動が微妙に変わったことが原因である。</p>
+                    <p>なぜそれが破損警報になったのか。高精度のタイムスタンプをテキストで保存し、VIRTUALの生成列で実数へ変換していて、その列にインデックスが張られていた。インデックスに固まっていた値と、新しいビルドが計算する値が食い違い、整合性チェックがインデックスとテーブルの不一致を破損として報告したのである。これを陳腐化した式インデックスと呼ぶ。<strong>保存されたデータ自体は無事だった。</strong></p>
+                    <p>SQLite側は3.52.0を撤回し、WALの修正だけを載せた3.51.3を出した。そして3.53.0で、陳腐化した式インデックスを自動で立て直す機能を入れた。アプリケーション側はタイムスタンプの精度を整数秒へ落とし、あいまいな変換そのものをなくしている。</p>
+                    <p>ここから持ち帰るものが二つある。</p>
+                    <ul>
+                        <li><strong>式インデックスと生成列は関数の結果を保存する構造である。</strong>関数が変われば保存しておいた結果が傷む。精度が上がる方向の変更も例外ではない</li>
+                        <li><strong>整合性警報の最初の問いは「データが傷んだか」ではなく「何と何が合わないか」である。</strong>今回の13件はインデックスとテーブルが合わなかったのであって、データが消えたのではない。二つの状況は対応がまったく違う</li>
+                    </ul>
+                    <p>この一件はバージョン固定の議論にも実際の材料を与える。固定だけすれば今回のWAL修正を受け取れない。無条件に最新を追えば3.52.0のような変更を本番が先に受ける。どちらも答えではなく、答えは昇格手順にある。後方互換と安全な既定値の緊張をSQLiteの文脈で扱った話は<a href="../posts/sqlite_editions_proposal_2026.html">SQLiteにもRust式のエディションが必要だ</a>で別途整理している。</p>
+
+                    <h2>8. 自分のシステムで取る防御 - 点検表</h2>
+                    <p>今回の欠陥一つを防ぐ対策ではなく、静かなデータ破損一般への防御である。すでにいくつ持っているかを数える用途で使えばよい。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>項目</th><th>周期</th><th>合格基準</th><th>省くと起きること</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>バックアップ複製への整合性チェック</td><td>バックアップ世代ごと</td><td><code>ok</code> の一行以外はすべて失敗扱い</td><td>破損がバックアップ世代を伝って広がる</td></tr>
+                            <tr><td>復元リハーサル</td><td>月1回以上</td><td>復元物の標本クエリ結果が期待と一致</td><td>バックアップファイルはあるのに戻せない</td></tr>
+                            <tr><td>点検pragmaの選択</td><td>設計時に1回</td><td>インデックス照合が要るなら <code>integrity_check</code></td><td><code>quick_check</code> はインデックスとテーブルの内容一致を検査せずこの種類を逃す</td></tr>
+                            <tr><td>検知時の書き込み停止</td><td>即時・自動</td><td>人の介入なしに停止と通知が動く</td><td>破損の上に書き込みが積もり戻れる地点が消える</td></tr>
+                            <tr><td>変更ログのDB外保管</td><td>常時</td><td>最後の正常バックアップ＋再生で復元できる</td><td>バックアップ時点までしか戻れない</td></tr>
+                            <tr><td>バージョン昇格手順</td><td>リリースごと</td><td>ステージングでバックアップ検証まで通してから昇格</td><td>修正と一緒に入った別の変更を本番が先に受ける</td></tr>
+                            <tr><td>チェックポイント方針の明文化</td><td>設定変更時</td><td>だれがいつチェックポイントを回すかを文書化</td><td>自分のシステムがどの経路を頻繁に踏むか分からない</td></tr>
+                            <tr><td>バージョン文字列の収集</td><td>デプロイごと</td><td><code>sqlite_version()</code> とビルド方式を記録</td><td>事故後にどのビルドだったか再構成できない</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>まずは今動いているものを確認するところから始めればよい。以下は形の例であり、実際には接続先やテーブル名を各自の環境に合わせる必要がある。</p>
+
+                    <pre><code>-- まず今何を使っているかから
+SELECT sqlite_version();      -- 3.51.3以降、または3.53.0以降か
+PRAGMA journal_mode;          -- wal かどうか
+PRAGMA wal_autocheckpoint;    -- 自動チェックポイントの閾値
+
+-- 破損の判定。正常なら ok の一行だけが返る
+PRAGMA integrity_check;</code></pre>
+
+                    <p>バックアップ検証は自動化しなければ結局やらなくなる。世代ごとに回す最小の形はこの程度だ。</p>
+
+                    <pre><code>#!/bin/sh
+# バックアップは復元してはじめてバックアップである(形の例)
+set -e
+backup="$1"
+work=$(mktemp -d)
+cp "$backup" "$work/verify.db"
+
+result=$(sqlite3 "$work/verify.db" 'PRAGMA integrity_check;')
+if [ "$result" != "ok" ]; then
+  echo "INTEGRITY FAIL: $result"
+  exit 1
+fi
+
+# 形式の点検を通っても内容が正しいかは別の問題だ
+sqlite3 "$work/verify.db" 'SELECT count(*) FROM users;'
+rm -rf "$work"</code></pre>
+
+                    <p>バックアップをWeb UIでまとめようとシェルスクリプトで回そうと、復元検証が抜ければ同じ場所で崩れる。ツール選定と3-2-1原則の話は<a href="../posts/databasement_selfhosted_db_backup_2026.html">散らばったDBバックアップをWeb UI一つでまとめるという発想</a>で扱った。</p>
+
+                    <h2>9. オープンソースの上流へ報告するとき備えるもの</h2>
+                    <p>再現手順がないからと報告を先送りする場面は多い。しかし順序が問題の欠陥は、そもそも再現手順が最後に出てくる。再現がなくても上流が判断できるようにするのは<strong>条件の密度</strong>である。</p>
+                    <ul>
+                        <li><strong>正確なバージョン</strong> - <code>SELECT sqlite_version()</code> の結果、ビルド方式(ディストリのパッケージ・同梱・自前ビルド)、コンパイルオプション</li>
+                        <li><strong>ドライバとバインディング</strong> - 名前とバージョン。ドライバが接続の寿命やチェックポイントを独自に触っていることが多い</li>
+                        <li><strong>設定の一式</strong> - <code>journal_mode</code>、<code>synchronous</code>、チェックポイントをだれがいつ回すか、同時接続数とプロセス数、ファイルシステムとマウントオプション</li>
+                        <li><strong>症状の原文</strong> - 整合性チェックの出力をそのまま。要約すると上流がパターンを読めない</li>
+                        <li><strong>頻度と期間</strong> - 何日で何件か。上流が確率を判断するほぼ唯一の材料である</li>
+                        <li><strong>再現試行の境界</strong> - 何をどんな条件で試し、どこまで駄目だったか。「再現しない」の一行は情報量がゼロだ</li>
+                        <li><strong>排除した仮説とその根拠</strong> - ハードウェア・ファイルシステム・アプリケーションコードをどう排除したか</li>
+                        <li><strong>観測データを作る用意</strong> - 上流が追跡フックを作ってくれたら本番へ入れられるか、入れるならどの範囲までか</li>
+                    </ul>
+                    <p>語り口も重要だ。上流の時間は有限で、たいてい無料でもない。原文は追跡の初期にSQLiteの開発陣と専門的な支援契約を結んだと述べている。オープンソースであることは、上流の労働が無償という意味ではない。</p>
+                    <p>そして報告は原因が特定された瞬間に終わらない。今回の追跡で作られたVFSの追跡シムがSQLiteの公開リポジトリに残ったことが、良い締めくくりの形だ。次に似た問題に出会う人の出発点が変わるからである。欠陥を一つ直すことより<strong>追跡の道具を残すこと</strong>のほうが、生態系には長く残る。</p>
+
+                    <h2>10. 確認できなかったこと</h2>
+                    <p>公開された資料では確定しない項目は以下のとおりである。この記事が断定しない理由でもある。</p>
+                    <ul>
+                        <li><strong>競合状態の内部動作の詳細</strong> - チェックインのコメントと変更ファイルの一覧(<code>src/wal.c</code>、<code>test/walrestart.test</code>)までしか公開されていない。どの内部状態がどの順序で食い違うかは原文にもリリースノートにもない</li>
+                        <li><strong>既定設定での発生率</strong> - 原文はチェックポイントを手動で積極的に制御したと述べている。自動チェックポイントのみの標準構成に対する相対的な危険度を示す公開数値はない</li>
+                        <li><strong>19件がすべて同一原因か</strong> - 原文はそう記しているが、件別の対照表は公開されていない</li>
+                        <li><strong>再現手順</strong> - 原文は統制環境で再現できなかったと述べている。この記事に載せたコマンドの例は診断と防御のための一般手順であり、この欠陥を再現する手順ではない</li>
+                        <li><strong>3.52.0撤回の公式な表現</strong> - リリースノートには予定機能が3.53.0へ繰り延べられたとだけ書かれている。誤警報との因果は原文側の記述である</li>
+                        <li><strong>他所での類似報告</strong> - 同じ症状が公に報告された事例は見つからなかった</li>
+                    </ul>
+
+                    <h2>結論</h2>
+                    <p>16という数字から読むべきものは放置ではなく構造である。狭い条件の上でのみ成立する欠陥はコードレビューやカバレッジでは減らず、実行量と環境の多様性が積み上がって確率的に表に出る。そして表に出るには三つめの条件が必ず要る。<strong>食い違ったものを食い違いとして認識する仕掛け</strong>だ。それがなければ事故は起きても報告されない。</p>
+                    <p>この事例が実務に残すのは、結局その仕掛けの一覧である。バックアップごとに回る整合性チェック、検知時の自動停止、実際に戻してみる復元リハーサル、そして修正後も条件を数え続ける警報。四つとも派手ではなく、四つとも平時には何もしない。</p>
+                    <p>今日できることを三つ挙げるとこうなる。</p>
+                    <ol>
+                        <li>今使っているSQLiteのバージョンと <code>journal_mode</code>、チェックポイントをだれが回すかを一枚にまとめる</li>
+                        <li>バックアップ世代ごとに整合性チェックを回し、結果を記録として残す仕組みにする</li>
+                        <li>今月中にバックアップを一つ実際に復元し、標本クエリまで確認する</li>
+                    </ol>
+                    <p>三つのうち最後がもっとも先送りされ、もっとも高く請求される。復元したことのないバックアップは、まだバックアップではない。</p>
+
+                    <h2>参考資料</h2>
+                    <ul>
+                        <li>原文 - Tailscaleの技術報告、SQLite WAL-Resetバグの追跡: <a href="https://tailscale.com/blog/sqlite-wal-reset-bug" target="_blank" rel="noopener">tailscale.com/blog/sqlite-wal-reset-bug</a></li>
+                        <li>GeekNewsトピック (2026-08-13): <a href="https://news.hada.io/topic?id=32442" target="_blank" rel="noopener">news.hada.io/topic?id=32442</a></li>
+                        <li>SQLiteチェックイン 7168988acbec2d8d (2026-03-03): <a href="https://sqlite.org/src/info/7168988acbec2d8d" target="_blank" rel="noopener">sqlite.org/src/info/7168988acbec2d8d</a></li>
+                        <li>SQLiteリリース履歴 (3.51.3・3.52.0・3.53.0の日付と変更): <a href="https://sqlite.org/changes.html" target="_blank" rel="noopener">sqlite.org/changes.html</a></li>
+                        <li>SQLite公式文書 - Write-Ahead Logging (チェックポイント・巻き戻し・wal-index): <a href="https://sqlite.org/wal.html" target="_blank" rel="noopener">sqlite.org/wal.html</a></li>
+                        <li>SQLite公式文書 - PRAGMA (integrity_check・quick_check・wal_checkpoint): <a href="https://sqlite.org/pragma.html" target="_blank" rel="noopener">sqlite.org/pragma.html</a></li>
+                        <li>関連記事: <a href="../posts/sqlite_editions_proposal_2026.html">SQLiteにもRust式のエディションが必要だ</a>、<a href="../posts/monotonic_vs_wall_clock.html">経過時間を壁時計で測ると負の値が出る</a>、<a href="../posts/databasement_selfhosted_db_backup_2026.html">散らばったDBバックアップをWeb UI一つでまとめる</a>、<a href="../posts/uuid_primary_key_sqlite_performance_2026.html">UUIDを主キーに使ってはいけない理由</a></li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>この記事をシェア</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">スレッズ</button>
+                        <button id="link-copy" class="share-btn link-btn">リンクをコピー</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">一覧に戻る</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">一緒に使うと便利な無料ツール</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/json_formatter.html">JSON フォーマッター</a></li>
+      <li><a href="../static/regex_tester.html">正規表現テスター</a></li>
+      <li><a href="../static/jwt_decoder.html">JWTデコーダー・生成器 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 エンコーダー/デコーダー</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">すべてのツールを見る &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">関連記事</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="ai_collaboration_leadership_skill.html">AIに仕事を任せるということ - 委任の5つの部品とチェックポイント設計 2026</a></li>
+      <li><a href="shell_readonly_idempotent_script.html">二度実行しても壊れないスクリプト - 冪等性の設計と実際に壊れる六つのパターン</a></li>
+      <li><a href="ai_disuse_reasons_debate.html">AIコーディングツールをやめるという判断 - 何が根拠になり何がならないのか 2026</a></li>
+      <li><a href="ai_software_middle_class_erosion.html">AIが消しているというソフトウェアエンジニアリングの中間層 - 減る仕事と残る仕事</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('リンクがコピーされました。Threadsアプリに貼り付けてシェアしてください！');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('リンクがコピーされました！'); });
+    });
+    </script>
+</body>
+</html>

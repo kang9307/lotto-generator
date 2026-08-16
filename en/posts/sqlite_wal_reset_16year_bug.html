@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="en">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Why a 16-Year-Old Bug Surfaced Now - SQLite WAL Reset Corruption and Tracking Rare Defects</title>
+    <meta name="description" content="A SQLite WAL reset race took 16 years to surface. How checkpoints work, why rare defects stay invisible, and how to track and defend against corruption.">
+    <meta name="keywords" content="SQLite WAL, WAL reset bug, checkpoint, database corruption, integrity_check, race condition, SQLite 3.51.3, SQLite 3.53.0, backup restore verification, unreproducible bug, upstream bug report, rare defect, incident tracking">
+
+    <link rel="canonical" href="https://braindetox.kr/en/posts/sqlite_wal_reset_16year_bug.html">
+
+    <meta property="og:title" content="Why a 16-Year-Old Bug Surfaced Now - SQLite WAL Reset Corruption and Tracking Rare Defects">
+    <meta property="og:description" content="What checkpoints and WAL rewinds actually do, why narrow reproduction conditions hide a defect for years, and the order in which to collect evidence when data goes quietly wrong.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/en/posts/sqlite_wal_reset_16year_bug.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="en_US">
+    <meta property="article:published_time" content="2026-08-16">
+    <meta property="article:section" content="Dev & Infra">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Why a 16-Year-Old Bug Surfaced Now - SQLite WAL Reset Corruption">
+    <meta name="twitter:description" content="Checkpoint and rewind mechanics, why rare defects stay statistically invisible, and how to track silent data corruption.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "Why a 16-Year-Old Bug Surfaced Now - SQLite WAL Reset Corruption and Tracking Rare Defects",
+      "alternativeHeadline": "The Conditions Under Which a 16-Year-Old Bug Finally Shows Itself",
+      "datePublished": "2026-08-16",
+      "dateModified": "2026-08-16",
+      "inLanguage": "en-US",
+      "articleSection": "Dev & Infra",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "SQLite WAL, WAL reset bug, checkpoint, database corruption, integrity_check, race condition, SQLite 3.51.3, backup restore verification, rare defect tracking",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/en/posts/sqlite_wal_reset_16year_bug.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "What are a checkpoint and a WAL rewind in SQLite WAL mode?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "In WAL mode the main database file is left untouched and changed pages are appended sequentially to the end of the WAL file. Moving that accumulated content back into the main file is a checkpoint; the official documentation calls moving WAL file transactions back into the database a checkpoint. The rewind is the step after that: when the entire WAL has been transferred and synced and no reader is using the WAL, the next writer rewinds the WAL back to the beginning and starts writing new transactions from the front. Without that rewind the WAL file would grow without limit."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Why did a defect nobody found for 16 years surface only now?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Because exposure multiplies rather than adds. For a defect to reach a bug report, the probability of it triggering, the number of times the code path is traversed, and the ability to recognise corruption as corruption all have to be non-zero. Most deployments leave checkpointing on automatic and rarely walk the rewind path, and few organisations run an integrity check on every backup. If any one of the three factors approaches zero, the defect stays scattered as unexplained anomalies. Defects that survive longest in mature software usually look exactly like this."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How do I check whether my own SQLite is affected?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Start with SELECT sqlite_version(). The WAL reset corruption fix shipped in 3.51.3 released on 2026-03-13 and in 3.53.0 released on 2026-04-09. Then check whether PRAGMA journal_mode reports wal and whether your application drives checkpoints itself. Corruption itself is judged with PRAGMA integrity_check, which returns a single row with the value ok when nothing is wrong. quick_check is faster but does not verify that index content matches table content, so use integrity_check for this class of problem."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "What should I do first when I suspect database corruption?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Preserve, do not repair. A corrupted file is the evidence that carries the cause, so running VACUUM, REINDEX or a dump-and-reload first erases the trail. Copy not only the main file but the matching -wal and -shm files, then make a second copy and diagnose on that one. Opening a WAL database read-write can trigger recovery or a checkpoint that changes the file the moment you connect. Keep the integrity check output verbatim rather than summarising it."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How do I know my backups actually work?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "A backup is only a backup once it has been restored. The fact that a file was produced and the fact that a service can be revived from it are two different claims. Run an integrity check against a copy of every backup generation and treat anything other than ok as a failure, and restore for real at least once a month while confirming that sample queries return what you expect. If writes continue after corruption is detected, the damaged state propagates into the next backup generation and the recovery point disappears."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 4px; overflow-x: auto; margin-bottom: 1.2rem; }
+        .post-content pre code { background-color: transparent; padding: 0; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/sqlite_wal_reset_16year_bug.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/sqlite_wal_reset_16year_bug.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/sqlite_wal_reset_16year_bug.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/sqlite_wal_reset_16year_bug.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/sqlite_wal_reset_16year_bug.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="Why a 16-Year-Old Bug Surfaced Now - SQLite WAL Reset Corruption and Tracking Rare Defects">
+                <meta itemprop="datePublished" content="2026-08-16">
+                <meta itemprop="dateModified" content="2026-08-16">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="SQLite WAL, WAL reset bug, checkpoint, database corruption, integrity_check, race condition, backup restore verification">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/en/posts/sqlite_wal_reset_16year_bug.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">The Conditions Under Which a 16-Year-Old Bug Finally Shows Itself</h1>
+                    <h2 class="post-subtitle">Tracking rare defects through the SQLite WAL reset corruption - from checkpoint mechanics to upstream reporting</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-08-16">Aug 16, 2026</span>
+                        <span class="post-category" itemprop="articleSection">Dev & Infra</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+                    <h2>Introduction: the kind of failure where data goes quietly wrong</h2>
+                    <p>The backup job finished successfully every night, the disks report no errors, and the application log is clean. Yet a row that was definitely saved yesterday is missing from today's query. A query that uses an index and a full scan return different answers.</p>
+                    <p>This class of failure is among the worst to deal with in practice, because there is no moment when it breaks. No process dies, no 500 goes out. The mismatched data rides straight into the next backup, and weeks later it finally surfaces when the books do not balance or one user asks about a setting that vanished. By then the logs from the hour that mattered have already been rotated away.</p>
+                    <p>A Tailscale engineering report, featured on GeekNews on 2026-08-13, describes exactly that shape of incident. Nineteen database corruption events over six months, a cause that stubbornly refused to reproduce in a controlled environment, and a conclusion that eventually narrowed to a rare race condition in SQLite's WAL rewind path. The fix landed on trunk as a check-in dated 2026-03-03. WAL first appeared in SQLite 3.7.0 (2010-07-21), so roughly sixteen years sit between the two.</p>
+                    <p>Read only the number and it becomes 'neglected for sixteen years', which teaches nothing. Three things are worth taking from it instead: what WAL and checkpointing actually do, why a defect with narrow reproduction conditions stays statistically invisible until a particular moment, and what to secure in what order when you meet one. This is not an argument about whose fault it was.</p>
+
+                    <h2>1. What WAL mode does - why it is fast, and what a checkpoint is</h2>
+
+                    <h3>1.1 How it differs from the rollback journal</h3>
+                    <p>SQLite's default journalling mode works like this. Before a page is modified, its original content is copied into a separate journal file, and only then is the main database file changed in place. If the process dies midway, the journal restores the originals. It is safe, but the same data is effectively written twice.</p>
+                    <p>WAL runs in the opposite direction. The main database file is not touched; changed pages are appended sequentially to the end of the WAL file. The official documentation summarises the benefit directly: write transactions are very fast because they only involve writing the content once, versus twice for rollback-journal transactions, and because the writes are all sequential.</p>
+                    <p>In practice the bigger win is on the read side. With a rollback journal the writer edits the main file, so readers and writers block each other. Under WAL the main file stays put, so readers keep reading their own snapshot while the writer appends. How a reader finds the newest version of a page is the job of the wal-index, kept in shared memory in the file whose name ends in <code>-shm</code>; the documentation describes it as helping readers locate pages in the WAL quickly and with a minimum of I/O.</p>
+                    <p>The price WAL pays is that one database becomes three files: <code>app.db</code>, <code>app.db-wal</code>, <code>app.db-shm</code>. That fact matters again in the evidence-preservation section below.</p>
+
+                    <h3>1.2 The checkpoint - moving the WAL back into the main file</h3>
+                    <p>A WAL cannot grow forever. The operation that copies accumulated frames back into the main database file is the checkpoint. In the documentation's own words, moving the WAL file transactions back into the database is called a checkpoint.</p>
+                    <p>The default is automatic: once the WAL passes a size threshold, a checkpoint runs right after a commit. You can also drive it yourself with <code>PRAGMA wal_checkpoint</code>, which has four modes.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Mode</th><th>Behaviour</th><th>Why you would pick it</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>PASSIVE</td><td>Checkpoints as many frames as possible without waiting for readers or writers</td><td>The default. Smallest impact on live traffic</td></tr>
+                            <tr><td>FULL</td><td>Blocks until there is no writer and every reader is on the most recent snapshot, then transfers</td><td>When you want the WAL genuinely drained</td></tr>
+                            <tr><td>RESTART</td><td>Like FULL, plus it waits until all readers are finished with the log file</td><td>To let the next write start at the front of the WAL</td></tr>
+                            <tr><td>TRUNCATE</td><td>Like RESTART, plus the WAL file is truncated to zero bytes</td><td>When disk space must be reclaimed immediately</td></tr>
+                            <tr><td>NOOP</td><td>Transfers no frames at all and only returns the status values</td><td>Added in 3.51.0 (2025-11-04). Purely for observation</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h3>1.3 The rewind - the second mechanism that keeps the WAL from growing</h3>
+                    <p>Moving content out with a checkpoint does not by itself shrink the WAL file. That is where the rewind comes in. The documentation explains it this way: whenever a write occurs, the writer checks how far the checkpointer has progressed, and if the entire WAL has been transferred into the database and synced and no readers are making use of the WAL, the writer rewinds the WAL back to the beginning and starts putting new transactions at the front.</p>
+                    <p>That sentence deserves a slow read. The party that decides to rewind is the <strong>writer</strong>, and the basis of that decision is <strong>the progress state left by the checkpointer</strong>. Two different actors read and update the same state independently. Concurrency defects live in exactly this shape of structure.</p>
+                    <p>One thing is worth flagging early. RESTART and TRUNCATE effectively induce rewinds. A deployment that drives checkpoints itself, and does so often, walks this path far more than one that leaves checkpointing on automatic. Half of the answer to 'why now' is in that single line.</p>
+
+                    <h2>2. Where this particular defect was sitting</h2>
+                    <p>The fix went in as check-in <code>7168988acbec2d8d</code> in the SQLite repository: 2026-03-03, trunk branch, authored by dan. The changed file is <code>src/wal.c</code>, and <code>test/walrestart.test</code> was added as a new file. The check-in comment is a single sentence.</p>
+                    <blockquote>Avoid an obscure race condition between a checkpointer and a writer wrapping around to the start of the wal file.</blockquote>
+                    <p>That is the structure from the previous section restated as prose: a race between the checkpointer and a writer that is wrapping back to the start of the WAL file.</p>
+                    <p>The symptom side is described in the original report. If a write occurs at a particular moment during a checkpoint, the checkpointing process gets confused and believes that some pages have been copied from the WAL into the main database file when they have not.</p>
+                    <p>What follows is the path to silent corruption. The region marked as transferred becomes reusable space, and a rewind lays new transactions over it. Pages then exist neither in the main file nor in the WAL. Rows disappear, or a table and the index that should point at the same data end up holding different content.</p>
+                    <p>SQLite raises no error in that state, because as far as it is concerned the work was done. The damage only becomes visible when you run a separate comparison. The items <code>PRAGMA integrity_check</code> inspects are listed in the documentation.</p>
+                    <ul>
+                        <li>Table or index entries that are out of sequence</li>
+                        <li>Misformatted records</li>
+                        <li>Missing pages</li>
+                        <li>Missing or surplus index entries</li>
+                        <li>UNIQUE, CHECK and NOT NULL constraint errors</li>
+                        <li>Integrity of the freelist</li>
+                        <li>Sections of the database used more than once, or not at all</li>
+                    </ul>
+                    <p>When nothing is wrong, a single row with the value <code>ok</code> comes back. Put the other way round: in a system that never runs this pragma, every failure on that list <strong>produces no signal at all when it happens.</strong></p>
+                    <p>That is as far as the published material goes. Which internal state diverges in which order is not described beyond the check-in comment and the list of changed files. Filling in the rest plausibly would not be explanation, it would be guesswork.</p>
+
+                    <h2>3. Why it stayed hidden for 16 years - the statistics of rare defects</h2>
+
+                    <h3>3.1 Exposure multiplies, it does not add</h3>
+                    <p>For a defect to reach anyone's bug report, three quantities must all be non-zero at the same time.</p>
+                    <ul>
+                        <li><strong>Trigger probability</strong> - the chance that traversing the code path actually goes wrong</li>
+                        <li><strong>Traversal count</strong> - how many times a day the system walks that path</li>
+                        <li><strong>Observability</strong> - whether anything exists that recognises a wrong result as wrong</li>
+                    </ul>
+                    <p>The three multiply rather than add, so one factor near zero drags the product to zero. Which is why 'nobody reported it' and 'nothing was wrong' are entirely different claims.</p>
+                    <p>Applied to this case: the trigger probability holds only inside a millisecond-scale window where a checkpoint, a rewind and a write overlap in a specific order. The traversal count varies by orders of magnitude depending on how checkpoints are driven, and the report states that the checkpoint process was taken under manual control and run very aggressively. Observability existed because an integrity check ran over backups continuously and something watched the result.</p>
+                    <p>The third factor is the decisive one. Without a standing integrity check, the nineteen events would not have been one incident but nineteen separate tickets scattered across six months. A ticket that reads 'data is sometimes odd' never produces a signal that can travel upstream.</p>
+
+                    <h3>3.2 Defects tests can catch, and defects they cannot</h3>
+                    <p>SQLite is well known for the density of its test suite. But the question coverage answers is 'was this line executed', not 'did these two lines overlap in this order'. As line count grows, the coverage target grows linearly; the set of interleavings two threads can produce does not.</p>
+                    <p>So the defects that survive longest in mature software tend to have a fixed shape. The easy ones are already gone, and what remains are ordering problems that hold only inside a narrow window. Reading more code does not reduce them. <strong>They surface probabilistically as execution volume and environmental diversity grow.</strong> The report notes the defect was so rare that SQLite's developers had to add code that deliberately triggers the condition in their test environments.</p>
+                    <p>Sixteen years is less a measure of neglect than of how long it took for the necessary execution volume to accumulate. The longer software survives and the more varied the places it runs, the more of its remaining narrow conditions get actually stepped on. That is a normal property of the maturity curve, not a black mark against a project.</p>
+
+                    <h3>3.3 What attitude this implies at the start</h3>
+                    <p>In practice this recognition changes the order of suspicion. Take an old, well-proven component off the suspect list at the outset and you can spend months wandering through application code. Suspect the library from the first day and you will be wrong nine times out of ten.</p>
+                    <p>The workable order is fixed: my code, then my configuration, then the environment (filesystem, kernel, hardware), then upstream. What matters is not the order itself but <strong>writing down the grounds on which each stage was ruled out</strong>. A stage skipped without evidence always comes back. Accumulated exclusion evidence is what earns you the right to tell upstream that it was not any of those.</p>
+
+                    <h2>4. Tracking stages - what to secure, in what order</h2>
+                    <p>Here is a usable order for tracking a defect that will not reproduce. Each row records what has to remain before you can move on, and where that stage typically collapses.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Stage</th><th>What you do</th><th>What must remain</th><th>Where it usually collapses</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>1. Build a counter</td><td>Attach an automatic check that judges corruption as corruption</td><td>Count, timestamp, affected instance</td><td>Handled only as tickets, so the count is never aggregated</td></tr>
+                            <tr><td>2. Normalise cases</td><td>Record every case in the same format</td><td>Verbatim integrity check output</td><td>Summarised on the way in, so later comparison is impossible</td></tr>
+                            <tr><td>3. Narrow common conditions</td><td>Intersect version, configuration, hardware, load pattern</td><td>Lists of what overlaps and what does not</td><td>Correlation read as causation on a small sample</td></tr>
+                            <tr><td>4. Align clocks</td><td>Put application, DB, backup and infrastructure logs on one axis</td><td>Upper and lower bound of the damage window</td><td>Clocks differ per host and the ordering inverts</td></tr>
+                            <tr><td>5. Attempt minimal reproduction</td><td>Narrow conditions in a controlled environment</td><td>A procedure if it works, the boundary of attempts if not</td><td>Failure to reproduce concluded as no cause</td></tr>
+                            <tr><td>6. Move observation to production</td><td>Insert tracing one layer below the suspected one</td><td>Low-level records that show ordering</td><td>Only application logging gets louder</td></tr>
+                            <tr><td>7. Confirm with upstream</td><td>Report with version, configuration, symptom and frequency attached</td><td>A bundle upstream can judge without reproducing</td><td>Reporting delayed because there is no repro procedure</td></tr>
+                            <tr><td>8. Verify after the fix</td><td>Count whether the condition itself still occurs</td><td>Separate counters for condition and for corruption</td><td>Symptoms stopping mistaken for the cause being gone</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>Stages one and two get skipped most often and the skip costs most. If a human judges corruption by eye, the cases never standardise, and non-standardised cases cannot produce an intersection at stage three. Tracking then stalls at stage three.</p>
+                    <p>Stage four is broken out for the same reason. What connects cause to effect is ordering, and ordering is invisible if logs from different machines cannot be placed on one axis. Why the clock you use to measure elapsed time must differ from the one that names an instant is covered separately in <a href="../posts/monotonic_vs_wall_clock.html">measuring elapsed time with a wall clock can return a negative number</a>.</p>
+
+                    <h2>5. Observing an unreproducible bug in production</h2>
+                    <p>Reproducing in a controlled environment is a good goal but not the ultimate one. The goal is identifying the cause. When reproduction keeps failing, the direction has to change: <strong>drop the observation point one layer down</strong>.</p>
+
+                    <h3>5.1 Wedging tracing into the file layer</h3>
+                    <p>SQLite abstracts filesystem access behind an interface called the VFS. Slip a thin shim into that layer and you can see, in order, what was written at which offset and when, without touching application code. In this investigation the SQLite developers built <code>tmstmpvfs</code>, a wrapper around the virtual filesystem that writes additional tracing information. It lives on in the public repository as <code>ext/misc/tmstmpvfs.c</code>.</p>
+                    <p>For an ordering defect that record of ordering is effectively the only evidence there is. Application logs preserve what the program intended to do; they do not preserve the order in which those intentions actually reached the disk.</p>
+
+                    <h3>5.2 Streaming modifying SQL outside the database</h3>
+                    <p>The second instrument was a transaction logging pipeline that captured every modifying statement. It plays two roles at once. It is a recovery mechanism, since the log can be replayed on top of the last known-good backup, and it is the reference for comparison, since it defines the state that ought to exist. Establishing the scope of damage requires a reference, and a backup alone only serves as a reference up to the moment it was taken.</p>
+
+                    <h3>5.3 An alert that keeps counting the condition after the fix</h3>
+                    <p>What happens after the fix ships matters more than it sounds. The report describes leaving an alert in place that detects the collision between a write and a checkpoint on its own, and confirming in production that the condition still occurred even though corruption no longer did.</p>
+                    <p>Why bother. Because symptoms disappearing is not proof that the cause is gone. Two possibilities exist.</p>
+                    <ul>
+                        <li>The condition still occurs but no bad result follows, which means the fix is genuinely working</li>
+                        <li>The condition no longer occurs at all, which may just mean the load pattern or deployment shape changed</li>
+                    </ul>
+                    <p>If you cannot tell the two apart, you will redo the entire investigation from scratch when traffic grows a few months later. That is the reason to keep the condition counter and the corruption counter separate.</p>
+
+                    <h3>5.4 Three lines worth generalising</h3>
+                    <ul>
+                        <li>Put the observation point <strong>one layer below</strong> the layer you suspect. More logging at the same layer adds volume, not ordering</li>
+                        <li>Observation costs from the instant it is switched on. Decide the sampling ratio and the scope-reduction plan before enabling it</li>
+                        <li>Do not switch the alert off after the fix. The moment it goes, the next recurrence starts from a blank page</li>
+                    </ul>
+
+                    <h2>6. Principles for handling data corruption</h2>
+
+                    <h3>6.1 Preservation comes before repair</h3>
+                    <p>A corrupted database file is not a broken file, it is <strong>evidence</strong>. Yet the first thing done in the field is usually repair: run VACUUM, run REINDEX, dump and reload into a fresh file. All three erase the traces of the cause. Dump-and-reload is the worst offender because it launders corruption into a clean state, after which there is no way left to reconstruct what happened.</p>
+                    <p>The scope of the copy matters too. Under WAL, the main file is not the whole story.</p>
+
+                    <pre><code># Rule: stop first, copy first, look afterwards
+cp app.db      evidence/app.db
+cp app.db-wal  evidence/app.db-wal   # always include it if present
+cp app.db-shm  evidence/app.db-shm   # include it too
+
+# Diagnose on a second copy, never on the evidence itself
+cp evidence/app.db     work/app.db
+cp evidence/app.db-wal work/app.db-wal
+sqlite3 work/app.db 'PRAGMA integrity_check;' &gt; evidence/integrity.txt</code></pre>
+
+                    <p>There is a reason for that second copy. Opening a WAL database read-write can trigger recovery or a checkpoint that rewrites the file at the moment you connect. Attaching <code>sqlite3</code> directly to the copy you intend to keep as evidence means altering the evidence. Stopping the process before copying is the principle, but note that stopping it also makes the <code>-shm</code> file disappear. Whichever you choose, <strong>record that you chose it.</strong></p>
+
+                    <h3>6.2 Put every clock on one axis</h3>
+                    <p>The time of corruption is not the time of discovery. Strictly it is <strong>the interval between the last confirmed-good moment and the moment of discovery</strong>. The narrower that interval, the better the observation system, and the only way to narrow it is to confirm good state more often. This is exactly where the habit of checking integrity on every backup turns into incident response capability.</p>
+                    <p>Placing several logs on one axis also means dealing with clocks first. Drift between hosts, mixed timezone notation across logs and wall-clock jumps from resynchronisation all invert ordering.</p>
+
+                    <h3>6.3 Keep the verdict verbatim</h3>
+                    <ul>
+                        <li>Do not summarise integrity check output. Which sentences appeared and how many times is the raw material for comparison, not a count</li>
+                        <li>Attach version and configuration to the incident record: <code>sqlite_version()</code>, <code>journal_mode</code>, and who drives checkpoints</li>
+                        <li>Stop accepting writes on an instance where corruption was detected. The report states that control plane shards were hard-stopped on detection</li>
+                        <li>A hard-stop policy chooses consistency over availability. For ledger-like data that is usually right; for cache-like data a different call is defensible</li>
+                    </ul>
+
+                    <h2>7. What happened after the fix - a fix is still a change</h2>
+                    <p>The most practically useful part of this case is what came after the fix. In chronological order:</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Version or check-in</th><th>Date</th><th>Content</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>SQLite 3.7.0</td><td>2010-07-21</td><td>WAL mode introduced</td></tr>
+                            <tr><td>SQLite 3.51.0</td><td>2025-11-04</td><td><code>PRAGMA wal_checkpoint=NOOP</code> added</td></tr>
+                            <tr><td>Check-in <code>7168988acbec2d8d</code></td><td>2026-03-03</td><td>Avoids the race between checkpointer and wrapping writer. <code>src/wal.c</code> modified, <code>test/walrestart.test</code> added</td></tr>
+                            <tr><td>SQLite 3.52.0</td><td>2026-03-06</td><td>Released then withdrawn. Its planned features moved forward into 3.53.0</td></tr>
+                            <tr><td>SQLite 3.51.3</td><td>2026-03-13</td><td>Shipped carrying only the WAL reset corruption fix</td></tr>
+                            <tr><td>SQLite 3.53.0</td><td>2026-04-09</td><td>WAL reset fix plus the self-healing index feature (<code>REINDEX EXPRESSIONS</code>)</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>Right after 3.52.0 went out, backup monitoring reported corruption in thirteen databases. The cause was not the WAL fix. An optimisation had subtly changed the rounding behaviour of text-to-floating-point conversion.</p>
+                    <p>Why did that become a corruption alert. High-precision timestamps were stored as text and converted to a floating point number in a VIRTUAL generated column, and that column was indexed. The values frozen into the index and the values the new build computed no longer agreed, so the integrity check reported the mismatch between index and table as corruption. That state is called a stale expression index. <strong>The stored data itself was fine.</strong></p>
+                    <p>SQLite withdrew 3.52.0 and published 3.51.3 carrying only the WAL fix, then added a feature in 3.53.0 that repairs stale expression indexes automatically. On the application side the timestamp precision was reduced to integer seconds, removing the ambiguous conversion entirely.</p>
+                    <p>Two things are worth taking from that.</p>
+                    <ul>
+                        <li><strong>Expression indexes and generated columns store the result of a function.</strong> When the function changes, the stored result spoils. A change that improves accuracy is no exception</li>
+                        <li><strong>The first question on an integrity alert is not whether data is damaged but what disagrees with what.</strong> Those thirteen cases were an index disagreeing with a table, not data disappearing. The two situations call for completely different responses</li>
+                    </ul>
+                    <p>This episode also feeds the version-pinning debate with real material. Pin only, and you never receive this WAL fix. Chase the latest unconditionally, and production meets changes like 3.52.0 first. Neither is the answer; the answer lives in the promotion procedure. The tension between backward compatibility and safer defaults in a SQLite context is covered separately in <a href="../posts/sqlite_editions_proposal_2026.html">SQLite needs Rust-style editions</a>.</p>
+
+                    <h2>8. Defences to adopt in your own system - a checklist</h2>
+                    <p>These are not countermeasures for this one defect but for silent data corruption in general. Use it to count how many of the items you already have.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Item</th><th>Cadence</th><th>Pass criterion</th><th>What happens if you skip it</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Integrity check on a backup copy</td><td>Every backup generation</td><td>Anything other than a single <code>ok</code> is a failure</td><td>Corruption propagates through backup generations</td></tr>
+                            <tr><td>Restore rehearsal</td><td>At least monthly</td><td>Sample queries on the restored copy match expectations</td><td>The backup file exists but nothing can be revived from it</td></tr>
+                            <tr><td>Choosing the right pragma</td><td>Once, at design time</td><td>Use <code>integrity_check</code> when index comparison matters</td><td><code>quick_check</code> does not verify that index content matches table content and misses this class</td></tr>
+                            <tr><td>Halting writes on detection</td><td>Immediate and automatic</td><td>Stop and alert fire without human involvement</td><td>Writes pile on top of damage and the recovery point disappears</td></tr>
+                            <tr><td>Change log kept outside the DB</td><td>Continuous</td><td>Last good backup plus replay can restore the state</td><td>You can only rewind as far as the backup</td></tr>
+                            <tr><td>Version promotion procedure</td><td>Every release</td><td>Promote only after staging passes backup verification</td><td>Production meets the other changes that shipped alongside the fix</td></tr>
+                            <tr><td>Documented checkpoint policy</td><td>On configuration change</td><td>Who runs checkpoints, and when, is written down</td><td>Nobody knows which code paths their system walks often</td></tr>
+                            <tr><td>Version string collection</td><td>Every deploy</td><td><code>sqlite_version()</code> and build method recorded</td><td>After an incident the build cannot be reconstructed</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>Start by confirming what you are actually running. The snippet below is a shape, not a script; adapt paths and table names to your environment.</p>
+
+                    <pre><code>-- Start with what you are actually running
+SELECT sqlite_version();      -- 3.51.3 or later, or 3.53.0 or later
+PRAGMA journal_mode;          -- is it wal
+PRAGMA wal_autocheckpoint;    -- automatic checkpoint threshold
+
+-- The corruption verdict. A healthy database returns one row: ok
+PRAGMA integrity_check;</code></pre>
+
+                    <p>Backup verification that is not automated eventually stops happening. The minimal form that runs per generation looks roughly like this.</p>
+
+                    <pre><code>#!/bin/sh
+# A backup is only a backup once restored (illustrative shape)
+set -e
+backup="$1"
+work=$(mktemp -d)
+cp "$backup" "$work/verify.db"
+
+result=$(sqlite3 "$work/verify.db" 'PRAGMA integrity_check;')
+if [ "$result" != "ok" ]; then
+  echo "INTEGRITY FAIL: $result"
+  exit 1
+fi
+
+# Passing a structural check says nothing about content being right
+sqlite3 "$work/verify.db" 'SELECT count(*) FROM users;'
+rm -rf "$work"</code></pre>
+
+                    <p>Whether backups are wrapped in a web UI or driven by a shell script, leaving out restore verification breaks in the same place. Tooling choices and the 3-2-1 rule are discussed in <a href="../posts/databasement_selfhosted_db_backup_2026.html">tying scattered DB backups together behind one web UI</a>.</p>
+
+                    <h2>9. What to bring when reporting upstream</h2>
+                    <p>Reports often get postponed because there is no reproduction procedure. But ordering defects are precisely the ones whose repro arrives last. What lets upstream judge without a repro is <strong>the density of conditions</strong> you supply.</p>
+                    <ul>
+                        <li><strong>The exact version</strong> - the output of <code>SELECT sqlite_version()</code>, the build method (distribution package, bundled, self-built) and compile options</li>
+                        <li><strong>Driver and bindings</strong> - name and version. Drivers frequently manage connection lifetime or checkpointing on their own</li>
+                        <li><strong>The full configuration</strong> - <code>journal_mode</code>, <code>synchronous</code>, who runs checkpoints and when, concurrent connection and process counts, filesystem and mount options</li>
+                        <li><strong>Verbatim symptoms</strong> - the integrity check output as it came out. Summarised, upstream cannot read the pattern</li>
+                        <li><strong>Frequency and duration</strong> - how many events over how many days. Almost the only material upstream has for judging probability</li>
+                        <li><strong>The boundary of your repro attempts</strong> - what was tried under which conditions and how far it failed. A bare 'cannot reproduce' carries zero information</li>
+                        <li><strong>Hypotheses you ruled out and why</strong> - how hardware, filesystem and application code were excluded</li>
+                        <li><strong>Willingness to produce observation data</strong> - whether a tracing hook built upstream could be deployed in your production, and within what scope</li>
+                    </ul>
+                    <p>Tone matters as well. Upstream time is finite and usually not free; the report notes that a professional support arrangement with the SQLite developers was in place during the investigation. Open source does not mean upstream labour costs nothing.</p>
+                    <p>Reporting also does not end when the cause is identified. The VFS tracing shim built during this investigation remaining in SQLite's public repository is a good way to finish, because the next person to hit something similar starts from a different place. <strong>Leaving behind a tracing tool</strong> outlasts fixing any single defect.</p>
+
+                    <h2>10. What could not be confirmed</h2>
+                    <p>The following are not settled by publicly available material, which is why this article does not assert them.</p>
+                    <ul>
+                        <li><strong>The internal mechanics of the race</strong> - only the check-in comment and the list of changed files (<code>src/wal.c</code>, <code>test/walrestart.test</code>) are public. Which internal state diverges in which order appears neither in the report nor in the release notes</li>
+                        <li><strong>The incidence rate under default settings</strong> - the report states that checkpointing was driven manually and aggressively. No published figure expresses the relative risk against a standard automatic configuration</li>
+                        <li><strong>Whether all nineteen events share one cause</strong> - the report describes them that way, but no per-event comparison table has been published</li>
+                        <li><strong>A reproduction procedure</strong> - the report states the team could not reproduce it in a controlled environment. The commands in this article are general diagnostic and defensive procedures, not steps that reproduce this defect</li>
+                        <li><strong>The official wording for the 3.52.0 withdrawal</strong> - the release notes say only that its planned features moved forward into 3.53.0. The causal link to the false alerts comes from the report</li>
+                        <li><strong>Similar reports elsewhere</strong> - no public account of the same symptom from other operators was found</li>
+                    </ul>
+
+                    <h2>Conclusion</h2>
+                    <p>What the number sixteen should convey is structure, not neglect. Defects that hold only on narrow conditions do not shrink under code review or coverage; they emerge probabilistically as execution volume and environmental diversity accumulate. And emerging requires a third condition without exception: <strong>something that recognises a wrong result as wrong.</strong> Without it, incidents happen and go unreported.</p>
+                    <p>What this case leaves behind in practice is a list of exactly that machinery. An integrity check on every backup, an automatic halt on detection, a restore rehearsal that actually restores, and an alert that keeps counting the condition after the fix. None of the four is glamorous and none of them does anything on an ordinary day.</p>
+                    <p>Three things worth doing today:</p>
+                    <ol>
+                        <li>Write down, on one page, your SQLite version, your <code>journal_mode</code>, and who drives checkpoints</li>
+                        <li>Make an integrity check run against every backup generation and have the result recorded</li>
+                        <li>Actually restore one backup this month and confirm sample queries against it</li>
+                    </ol>
+                    <p>The third gets postponed most and bills the most when it comes due. A backup that has never been restored is not yet a backup.</p>
+
+                    <h2>References</h2>
+                    <ul>
+                        <li>Original - Tailscale engineering report on tracing the SQLite WAL-Reset bug: <a href="https://tailscale.com/blog/sqlite-wal-reset-bug" target="_blank" rel="noopener">tailscale.com/blog/sqlite-wal-reset-bug</a></li>
+                        <li>GeekNews topic (2026-08-13): <a href="https://news.hada.io/topic?id=32442" target="_blank" rel="noopener">news.hada.io/topic?id=32442</a></li>
+                        <li>SQLite check-in 7168988acbec2d8d (2026-03-03): <a href="https://sqlite.org/src/info/7168988acbec2d8d" target="_blank" rel="noopener">sqlite.org/src/info/7168988acbec2d8d</a></li>
+                        <li>SQLite release history (dates and changes for 3.51.3, 3.52.0, 3.53.0): <a href="https://sqlite.org/changes.html" target="_blank" rel="noopener">sqlite.org/changes.html</a></li>
+                        <li>SQLite documentation - Write-Ahead Logging (checkpoint, rewind, wal-index): <a href="https://sqlite.org/wal.html" target="_blank" rel="noopener">sqlite.org/wal.html</a></li>
+                        <li>SQLite documentation - PRAGMA (integrity_check, quick_check, wal_checkpoint): <a href="https://sqlite.org/pragma.html" target="_blank" rel="noopener">sqlite.org/pragma.html</a></li>
+                        <li>Related: <a href="../posts/sqlite_editions_proposal_2026.html">SQLite needs Rust-style editions</a>, <a href="../posts/monotonic_vs_wall_clock.html">measuring elapsed time with a wall clock</a>, <a href="../posts/databasement_selfhosted_db_backup_2026.html">tying scattered DB backups behind one web UI</a>, <a href="../posts/uuid_primary_key_sqlite_performance_2026.html">why UUIDs make poor primary keys</a></li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>Share this article</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">Copy Link</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">Back to List</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Free tools you may find useful</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/json_formatter.html">JSON Formatter</a></li>
+      <li><a href="../static/regex_tester.html">Regex Tester</a></li>
+      <li><a href="../static/jwt_decoder.html">JWT Decoder Generator 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 Encoder/Decoder</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">See all tools &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Related Posts</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="ai_collaboration_leadership_skill.html">Delegating Work to AI - The Five Parts of a Handoff and How to Place Checkpoints 2026</a></li>
+      <li><a href="shell_readonly_idempotent_script.html">Idempotent Shell Scripts - Six Patterns That Break on the Second Run</a></li>
+      <li><a href="ai_disuse_reasons_debate.html">Deciding to Stop Using AI Coding Tools - What Counts as Evidence and What Does Not 2026</a></li>
+      <li><a href="ai_software_middle_class_erosion.html">Is AI Erasing the Middle Class of Software Engineering - What Shrinks and What Remains</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('Link copied! Paste it in the Threads app to share.');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('Link copied!'); });
+    });
+    </script>
+</body>
+</html>

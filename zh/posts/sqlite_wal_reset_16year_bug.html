@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>16年的老缺陷为何现在才暴露 - SQLite WAL重置损坏与稀有缺陷追踪法</title>
+    <meta name="description" content="SQLite的WAL重置竞态过了16年才浮出水面。本文梳理检查点与回绕到底在做什么、狭窄的复现条件为何在统计上长期不可见、损坏事例应当按什么顺序逐步追踪，以及完整性检查与备份还原验证这些可以今天就动手采用的防御手段。">
+    <meta name="keywords" content="SQLite WAL, WAL重置, 检查点, 数据库损坏, integrity_check, 竞态条件, SQLite 3.51.3, SQLite 3.53.0, 备份还原验证, 无法复现的缺陷, 上游报告, 稀有缺陷, 故障追踪">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/sqlite_wal_reset_16year_bug.html">
+
+    <meta property="og:title" content="16年的老缺陷为何现在才暴露 - SQLite WAL重置损坏与稀有缺陷追踪法">
+    <meta property="og:description" content="检查点与WAL回绕到底在做什么，狭窄的复现条件为何能把缺陷藏这么久，以及数据悄悄出错时应该按什么顺序保全证据。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/sqlite_wal_reset_16year_bug.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-08-16">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="16年的老缺陷为何现在才暴露 - SQLite WAL重置损坏追踪">
+    <meta name="twitter:description" content="检查点与回绕的原理、稀有缺陷在统计上不可见的结构，以及静默数据损坏的追踪顺序。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "16年的老缺陷为何现在才暴露 - SQLite WAL重置损坏与稀有缺陷追踪法",
+      "alternativeHeadline": "Why a 16-Year-Old SQLite WAL-Reset Bug Surfaced Now",
+      "datePublished": "2026-08-16",
+      "dateModified": "2026-08-16",
+      "inLanguage": "zh-CN",
+      "articleSection": "开发/基础设施",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "SQLite WAL, WAL重置, 检查点, 数据库损坏, integrity_check, 竞态条件, SQLite 3.51.3, 备份还原验证, 稀有缺陷追踪",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/sqlite_wal_reset_16year_bug.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "SQLite的WAL模式中，检查点和回绕分别是什么",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "WAL模式不改动主数据库文件，而是把变更过的页顺序追加到WAL文件末尾。把积累的内容写回主文件的操作就是检查点，官方文档把WAL文件中的事务搬回数据库这件事称为检查点。回绕是它之后的一步：当整个WAL都已经搬入数据库并完成同步、并且没有任何读者在使用这个WAL时，下一个写者会把WAL回绕到开头，从前面重新开始写入新事务。正是因为有回绕，WAL文件才不会无限增长。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "一个16年没人发现的缺陷，为什么偏偏现在暴露",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "因为暴露是乘法而不是加法。一个缺陷要出现在报告里，触发概率、走过该代码路径的次数、以及把损坏识别为损坏的观测能力，这三项必须同时不为零。多数部署把检查点交给自动机制，很少走到回绕路径，而每次备份都跑完整性检查的团队也不多。三项里只要有一项接近零，缺陷就只会停留在零散的异常里。成熟软件里最后残留的缺陷，通常就是这个形状。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "怎么确认自己用的SQLite是否受影响",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "先用 SELECT sqlite_version() 确认版本。WAL重置损坏的修复包含在2026年3月13日发布的3.51.3和2026年4月9日发布的3.53.0中。接着看 PRAGMA journal_mode 是否为 wal，以及检查点是否由应用自己驱动。损坏本身用 PRAGMA integrity_check 判定，正常时只返回值为 ok 的一行。quick_check 更快，但它不校验索引内容与表内容是否一致，所以这类问题的判定要用 integrity_check。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "怀疑数据库损坏时，第一件事应该做什么",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "是保全而不是修复。损坏的文件是承载原因的证据，先跑VACUUM、REINDEX或者导出后重新导入，都会把线索抹掉。除主文件外，同名的 -wal 与 -shm 也要一起复制，诊断则在再复制一份的副本上进行。因为以读写方式打开WAL数据库的瞬间，可能触发恢复或检查点而改变文件内容。完整性检查的输出要原样保留，不要概括。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "怎么确认备份真的有效",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "还原过才算备份。文件被生成了和能用这个文件把服务救回来，是两个不同的命题。每一代备份都在副本上跑一次完整性检查，只要不是 ok 就按失败处理；每月至少真正还原一次，并确认抽样查询的结果符合预期。如果检测到损坏之后仍继续接收写入，损坏状态会顺着备份代际扩散，可回退的时间点本身就消失了。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 4px; overflow-x: auto; margin-bottom: 1.2rem; }
+        .post-content pre code { background-color: transparent; padding: 0; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/sqlite_wal_reset_16year_bug.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/sqlite_wal_reset_16year_bug.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/sqlite_wal_reset_16year_bug.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/sqlite_wal_reset_16year_bug.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/sqlite_wal_reset_16year_bug.html">
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="16年的老缺陷为何现在才暴露 - SQLite WAL重置损坏与稀有缺陷追踪法">
+                <meta itemprop="datePublished" content="2026-08-16">
+                <meta itemprop="dateModified" content="2026-08-16">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="SQLite WAL, WAL重置, 检查点, 数据库损坏, integrity_check, 竞态条件, 备份还原验证">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/sqlite_wal_reset_16year_bug.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">一个藏了16年的缺陷，在什么条件下才会暴露</h1>
+                    <h2 class="post-subtitle">以SQLite WAL重置损坏为例看稀有缺陷追踪 - 从检查点原理到向上游报告</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-08-16">2026年8月16日</span>
+                        <span class="post-category" itemprop="articleSection">开发/基础设施</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+                    <h2>引言：数据悄悄对不上的那类故障</h2>
+                    <p>备份任务每晚都以成功结束，磁盘没有报任何错误，应用日志也很干净。可是昨天明明存进去的一行，今天查不到了。走索引的查询和全表扫描给出的答案不一样。</p>
+                    <p>这类故障在实务中属于最难处理的一档，因为它没有崩溃的那一刻。进程不会死，也不会返回500。对不上的数据就这样被装进下一次备份，几周之后账目对不平，或者某个用户来问一个消失的设置，问题才浮出水面。到那时，出问题那个时刻的日志早已被轮转清掉了。</p>
+                    <p>2026年8月13日在GeekNews上被介绍的Tailscale技术报告，讲的正是这种形状的事故。半年内19起数据库损坏，在受控环境里始终无法复现的原因，最后被收敛到SQLite的WAL回绕路径上一个稀有的竞态条件。修复的签入落在2026年3月3日的主干分支上。而WAL进入SQLite是在3.7.0（2010-07-21），两者之间大约隔了16年。</p>
+                    <p>只看数字，很容易读成「被放了16年没人管」。这样读就什么也带不走。本文要谈的是三件事：WAL和检查点实际在做什么；复现条件狭窄的缺陷为什么在统计上看不见，又为什么会在某个时点冒出来；以及遇到这类缺陷时该按什么顺序保全什么。这不是一篇评判某个产品或某个团队对错的文章。</p>
+
+                    <h2>1. WAL模式在做的事 - 为什么快，检查点又是什么</h2>
+
+                    <h3>1.1 与回滚日志的区别</h3>
+                    <p>SQLite默认的日志方式是回滚日志，它这样工作：改写某一页之前，先把原内容复制到单独的日志文件，然后直接修改主数据库文件。中途进程死掉，就用日志里的原内容回滚。安全，但同一份数据实际上写了两次。</p>
+                    <p>WAL的方向相反。它不动主数据库文件，而是把变更过的页顺序追加到WAL文件末尾。官方文档这样归纳其好处：写事务非常快，是因为内容只写一次（回滚日志要写两次），而且这些写入全部是顺序的。</p>
+                    <p>实务中感受更明显的其实是读取侧。回滚日志下写者直接改主文件，读写会互相阻塞。WAL下主文件原封不动，读者可以继续读自己那个时点的快照，写者同时往WAL末尾追加。读者到哪里去找某一页的最新版本，由wal-index负责告知；它保存在共享内存中，对应名字以 <code>-shm</code> 结尾的文件，文档的说法是让读者以最少的I/O快速定位WAL中的页。</p>
+                    <p>WAL付出的代价是一个数据库变成三个文件：<code>app.db</code>、<code>app.db-wal</code>、<code>app.db-shm</code>。这个事实在后面讲证据保全时还会再起作用。</p>
+
+                    <h3>1.2 检查点 - 把WAL搬回主文件</h3>
+                    <p>WAL不能无限增长。把积累的帧搬回主数据库文件的操作就是检查点。照搬文档的表述：把WAL文件中的事务搬回数据库这件事，称为检查点。</p>
+                    <p>默认是自动的：WAL超过一定大小之后，提交结束就会触发检查点。也可以用 <code>PRAGMA wal_checkpoint</code> 自己驱动，共有四种模式。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>模式</th><th>行为</th><th>选它的理由</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>PASSIVE</td><td>不等待读者或写者，能搬多少搬多少</td><td>默认值，对在线流量影响最小</td></tr>
+                            <tr><td>FULL</td><td>阻塞到没有写者且所有读者都在最新快照上，再搬运</td><td>希望WAL被真正清空时</td></tr>
+                            <tr><td>RESTART</td><td>在FULL基础上，再等到所有读者用完日志文件</td><td>希望下一次写入从WAL开头开始</td></tr>
+                            <tr><td>TRUNCATE</td><td>在RESTART基础上，把WAL文件截断为0字节</td><td>需要立刻回收磁盘占用时</td></tr>
+                            <tr><td>NOOP</td><td>一帧也不搬，只取回状态值</td><td>3.51.0（2025-11-04）新增，纯粹用于观测</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h3>1.3 回绕 - 不让WAL文件变胖的第二个机制</h3>
+                    <p>检查点把内容搬走，并不意味着WAL文件本身会变小。回绕就是在这里登场的。官方文档这样解释：每次发生写入时，写者会检查检查点进行到了哪里；如果整个WAL都已经搬入数据库并完成同步，而且没有读者在使用这个WAL，写者就把WAL回绕到开头，从前面开始堆放新的事务。</p>
+                    <p>这句话值得慢读。做出回绕判断的主体是<strong>写者</strong>，判断依据是<strong>检查点方留下的进度状态</strong>。两个不同的主体各自读取、各自更新同一份状态。并发缺陷能住下来的地方，正是这种结构。</p>
+                    <p>这里先埋一句。RESTART和TRUNCATE实际上是在诱发回绕。由应用自己驱动、而且驱动得很频繁的部署，走这条路径的次数远多于交给自动机制的部署。后面「为什么是现在」的答案，一半就在这一行里。</p>
+
+                    <h2>2. 这个缺陷坐在什么位置</h2>
+                    <p>修复以签入 <code>7168988acbec2d8d</code> 的形式进入SQLite仓库：2026年3月3日，主干分支，作者是dan。改动的文件是 <code>src/wal.c</code>，同时新增了 <code>test/walrestart.test</code>。签入注释只有一句。</p>
+                    <blockquote>Avoid an obscure race condition between a checkpointer and a writer wrapping around to the start of the wal file.</blockquote>
+                    <p>意思是：避免检查点方与回绕到WAL文件开头的写者之间那个不易显露的竞态条件。上一节看到的结构，被原样写成了一句话。</p>
+                    <p>症状一侧的说明在原报告里。检查点运行过程中，如果写入恰好落在特定时刻，检查点处理会产生混淆，认为WAL中的某些页已经复制进主数据库文件，而实际上并没有。</p>
+                    <p>接下来就通往静默损坏。被标记为已搬运的区间成为可以复用的空间，回绕在它之上堆放新的事务。于是出现了主文件里没有、WAL里也没有的页。行消失了，或者本该指向同一份数据的表和索引持有了不同的内容。</p>
+                    <p>在这种状态下SQLite不会报错，因为它自己相信搬运已经完成。损坏只有跑一次单独的比对才看得见。<code>PRAGMA integrity_check</code> 会检查的项目在文档里有列举。</p>
+                    <ul>
+                        <li>顺序错乱的表或索引条目</li>
+                        <li>格式损坏的记录</li>
+                        <li>丢失的页</li>
+                        <li>缺失或多余的索引条目</li>
+                        <li>UNIQUE、CHECK、NOT NULL 约束的违反</li>
+                        <li>空闲列表的完整性</li>
+                        <li>被重复使用或者完全没有被使用的区段</li>
+                    </ul>
+                    <p>没有问题时，返回值为 <code>ok</code> 的一行。反过来说，在从不跑这个pragma的系统里，上面这些事故<strong>即使发生也不会发出任何信号。</strong></p>
+                    <p>原文披露的范围到此为止。哪一处内部状态以怎样的顺序发生偏差，除签入注释和改动文件清单外没有公开的说明。再往下用似是而非的方式补全，那就不是解释而是猜测。</p>
+
+                    <h2>3. 它藏了16年的原因 - 稀有缺陷的统计结构</h2>
+
+                    <h3>3.1 暴露是乘法，不是加法</h3>
+                    <p>一个缺陷要出现在某人的报告里，需要三样东西同时不为零。</p>
+                    <ul>
+                        <li><strong>触发概率</strong> - 走过那条代码路径时真的出错的概率</li>
+                        <li><strong>路径通过次数</strong> - 系统每天要踩到那条路径多少次</li>
+                        <li><strong>观测能力</strong> - 是否存在把错误结果识别为错误的机制</li>
+                    </ul>
+                    <p>三项相乘而不是相加，只要一项接近零，乘积就趋于零。所以「没有人报告过」和「没有问题」是完全不同的两个命题。</p>
+                    <p>代入这次的情况：触发概率只在检查点、回绕与写入按特定顺序重叠的毫秒级窗口内成立。路径通过次数会因检查点的驱动方式相差几个数量级，而原文说明他们把检查点过程接管为手动控制，并且跑得非常激进。观测能力之所以存在，是因为有一套对备份持续执行完整性检查、并有人盯着结果的机制。</p>
+                    <p>第三项尤其关键。如果没有常态化的完整性检查，那19起就不会是一个事件，而是散落在半年里的19张互不相干的工单。写着「数据偶尔不对」的工单，产生不出能传到上游的信号。</p>
+
+                    <h3>3.2 测试抓得住的缺陷，和抓不住的缺陷</h3>
+                    <p>SQLite以测试密度高著称。但覆盖率回答的问题是「这一行有没有被执行」，而不是「这两行有没有按这个顺序交错」。代码行数增加，覆盖率的对象线性增加；两个线程能造出的执行顺序组合却不是这样。</p>
+                    <p>所以成熟软件里活到最后的缺陷，形状往往是固定的。容易的早就被清掉了，剩下的是只在狭窄窗口内成立的顺序问题。这类缺陷不会因为多读代码而减少，<strong>它要靠执行量和环境多样性的累积，才会以概率的方式浮现。</strong>原文提到，这个缺陷罕见到SQLite开发者不得不在测试环境里加入刻意触发该条件的代码。</p>
+                    <p>16年这个数字，与其说是被忽视的时间，不如说是必要的执行量累积所花的时间。软件活得越久、跑的地方越多样，残留的狭窄条件就会被一个个真正踩到。这是成熟曲线的正常性质，不是某个项目的污点。</p>
+
+                    <h3>3.3 那么该以什么态度开场</h3>
+                    <p>在实务上，这个认知改变的是怀疑的顺序。一上来就把老旧而久经验证的组件排除在嫌疑之外，可能会在应用代码里徘徊好几个月；反过来第一天就怀疑库，十次里有九次是错的。</p>
+                    <p>可行的顺序是固定的：自己的代码，然后自己的配置，然后环境（文件系统、内核、硬件），最后才是上游。真正重要的不是顺序本身，而是<strong>把每一步排除掉的依据写成文档</strong>。没有依据就跳过的那一步，一定会回来找你。排除依据积累起来，才有资格对上游说「这些都不是」。</p>
+
+                    <h2>4. 追踪的步骤 - 按什么顺序保全什么</h2>
+                    <p>下表整理了追踪一个无法复现的缺陷时真正能用的顺序。每一步要留下什么才能往下走，以及这一步通常在哪里塌掉，都写在一起。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>步骤</th><th>做什么</th><th>必须留下的东西</th><th>容易塌掉的地方</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>1. 建立计数装置</td><td>加一个把损坏判定为损坏的自动检查</td><td>件数、时刻、受影响的实例</td><td>只当作工单处理，件数从未被汇总</td></tr>
+                            <tr><td>2. 事例标准化</td><td>所有事例用同一格式记录</td><td>完整性检查的原文输出</td><td>写入时就概括掉，之后无法比对</td></tr>
+                            <tr><td>3. 收敛共同条件</td><td>求版本、配置、硬件、负载模式的交集</td><td>重叠条件与不重叠条件的清单</td><td>样本少时把相关当成因果</td></tr>
+                            <tr><td>4. 对齐时刻</td><td>把应用、数据库、备份、基础设施日志放到一条轴上</td><td>损坏区间的上下界时刻</td><td>各主机时钟不同导致顺序颠倒</td></tr>
+                            <tr><td>5. 尝试最小复现</td><td>在受控环境里收敛条件</td><td>成功则是步骤，失败则是尝试的边界</td><td>把复现失败当成没有原因</td></tr>
+                            <tr><td>6. 转向生产观测</td><td>在可疑层的下一层插入追踪</td><td>能看出顺序的低层记录</td><td>只是把应用日志开得更大声</td></tr>
+                            <tr><td>7. 向上游确认</td><td>附上版本、配置、症状、频率提交报告</td><td>无需复现也能判断的一整套材料</td><td>因为没有复现步骤而拖延报告</td></tr>
+                            <tr><td>8. 修复后验证</td><td>单独统计条件本身是否仍在发生</td><td>条件计数器与损坏计数器分开</td><td>把症状消失误认为原因已被清除</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>第1步和第2步最常被省略，而省略的代价也最大。如果损坏靠人眼判定，事例就不会标准化；没有标准化的事例，第3步做不出交集。追踪就在第3步停住。</p>
+                    <p>把第4步单独拎出来也是同样的道理。把原因和结果连起来的终究是顺序，而不同机器的日志放不到一条轴上，顺序就看不见。测量经过时间的时钟为什么要和标记时刻的时钟分开，在<a href="../posts/monotonic_vs_wall_clock.html">用挂钟测经过时间会得到负数</a>里另有整理。</p>
+
+                    <h2>5. 在生产环境观测无法复现的缺陷</h2>
+                    <p>受控环境复现是个好目标，但不是最终目的。目的是定位原因。当复现持续失败时就该换方向：<strong>把观测点往下降一层</strong>。</p>
+
+                    <h3>5.1 把追踪塞进文件层</h3>
+                    <p>SQLite把文件系统访问抽象成一个叫VFS的接口。在那一层夹进一个薄薄的垫片，就能在不改动应用代码的前提下，按顺序看到什么时候往哪个偏移写了什么。这次追踪中SQLite开发者做的就是 <code>tmstmpvfs</code>，一个在文件访问上追加追踪信息的包装层。它留在公开仓库的 <code>ext/misc/tmstmpvfs.c</code> 里。</p>
+                    <p>对于顺序型缺陷，这份顺序记录实际上是唯一的证据。应用日志留下的是「打算做什么」，并不留下这些意图实际以什么顺序抵达磁盘。</p>
+
+                    <h3>5.2 把变更SQL导到外面</h3>
+                    <p>第二件工具是把所有变更SQL送到外部的事务日志管道。它一身兼两职：损坏发生时可以在最后一份正常备份之上回放日志来恢复，同时也能构造出「本该是什么状态」，作为与实际状态比对的基准。要确定损坏范围就需要基准，而只有备份的话，基准只能到备份采集的那一刻为止。</p>
+
+                    <h3>5.3 修复之后仍在计数条件的告警</h3>
+                    <p>修复发布之后反而更关键。原文提到，他们在修复后保留了一个专门探测写入与检查点相撞情况的告警，并在生产环境确认到：损坏被挡住了，但条件确实还在发生。</p>
+                    <p>为什么需要这个。因为症状消失并不能证明原因已被清除。存在两种可能。</p>
+                    <ul>
+                        <li>条件仍在发生但不再产生坏结果 → 说明修复真的在起作用</li>
+                        <li>条件本身不再发生 → 也可能只是负载模式或部署形态变了</li>
+                    </ul>
+                    <p>分不清这两者，几个月后流量上来时就得把整套追踪从头再做一遍。把条件计数器和损坏计数器分开保留，理由就在这里。</p>
+
+                    <h3>5.4 可以一般化的三行</h3>
+                    <ul>
+                        <li>观测点要放在你怀疑的那一层<strong>再往下一层</strong>。在同一层加日志只会增加数量，看不出顺序</li>
+                        <li>观测从打开的那一刻起就是成本。采样比例和缩小范围的计划，要在打开之前定好</li>
+                        <li>修复之后不要关掉告警。关掉的那一刻，下一次复发就要从一张白纸开始</li>
+                    </ul>
+
+                    <h2>6. 处理数据损坏时的原则</h2>
+
+                    <h3>6.1 保全先于修复</h3>
+                    <p>损坏的数据库文件不是一个坏文件，而是<strong>证据</strong>。可现场最先做的往往是修复：跑VACUUM，做REINDEX，导出后重新导入到新文件。这三件事都会抹掉原因的痕迹。其中导出再导入最要命，它把损坏洗成了正常，之后再也没有办法回溯发生过什么。</p>
+                    <p>复制的范围也要留心。WAL模式下主文件并不是全部。</p>
+
+                    <pre><code># 原则：先停，先复制，然后再看
+cp app.db      evidence/app.db
+cp app.db-wal  evidence/app.db-wal   # 存在就一定要一起复制
+cp app.db-shm  evidence/app.db-shm   # 存在也一起复制
+
+# 诊断在再复制一份的副本上做，绝不动证据本身
+cp evidence/app.db     work/app.db
+cp evidence/app.db-wal work/app.db-wal
+sqlite3 work/app.db 'PRAGMA integrity_check;' &gt; evidence/integrity.txt</code></pre>
+
+                    <p>再复制一份是有理由的。以读写方式打开WAL数据库，可能在连接的瞬间触发恢复或检查点而改写文件。把 <code>sqlite3</code> 直接连到打算留作证据的那份副本上，等于在动证据。原则上应当先停掉进程再复制，但也要知道进程一停 <code>-shm</code> 就没了。无论选哪一边，<strong>都要把这个选择本身记录下来。</strong></p>
+
+                    <h3>6.2 把所有时刻放到一条轴上</h3>
+                    <p>损坏的时刻不是「发现的时刻」。准确地说，它是<strong>最后一次确认正常的时刻与发现时刻之间的那个区间</strong>。区间越窄，观测体系越好；而收窄区间的唯一办法，就是更频繁地确认正常。每次备份都跑完整性检查的习惯，正是在这里变成事故应对能力的。</p>
+                    <p>要把多份日志放到一条轴上，还得先处理时钟问题。主机之间的时钟偏差、时区标注混杂的日志、重新同步造成的挂钟跳变，都会把顺序颠倒过来。</p>
+
+                    <h3>6.3 判定要原样保留</h3>
+                    <ul>
+                        <li>不要概括完整性检查的输出。「出了几条」没有意义，哪句话出现了几次才是比对的原料</li>
+                        <li>把版本和配置一起附在事故记录里：<code>sqlite_version()</code>、<code>journal_mode</code>、由谁驱动检查点</li>
+                        <li>在检测到损坏的实例上不要继续接收写入。原文说明，他们对检测到损坏的控制面分片采取立即停机的策略</li>
+                        <li>停机策略是在可用性和一致性之间选择了一致性。数据如果是账本性质，这通常是对的；如果是缓存性质，另一种判断也说得通</li>
+                    </ul>
+
+                    <h2>7. 修好之后发生的事 - 修复本身也是变更</h2>
+                    <p>这个案例里最实用的部分，反而在修复之后。按时间顺序看是这样。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>版本或签入</th><th>日期</th><th>内容</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>SQLite 3.7.0</td><td>2010-07-21</td><td>引入WAL模式</td></tr>
+                            <tr><td>SQLite 3.51.0</td><td>2025-11-04</td><td>新增 <code>PRAGMA wal_checkpoint=NOOP</code></td></tr>
+                            <tr><td>签入 <code>7168988acbec2d8d</code></td><td>2026-03-03</td><td>规避检查点方与回绕写者之间的竞态。修改 <code>src/wal.c</code>，新增 <code>test/walrestart.test</code></td></tr>
+                            <tr><td>SQLite 3.52.0</td><td>2026-03-06</td><td>发布后撤回，原定功能顺延到3.53.0</td></tr>
+                            <tr><td>SQLite 3.51.3</td><td>2026-03-13</td><td>只带着WAL重置损坏的修复发布</td></tr>
+                            <tr><td>SQLite 3.53.0</td><td>2026-04-09</td><td>WAL重置修复，外加表达式索引自愈功能（<code>REINDEX EXPRESSIONS</code>）</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>3.52.0上线之后不久，备份监控在13个数据库上报告了损坏。原因并不是WAL的修复，而是一项优化微妙地改变了文本转浮点数的舍入行为。</p>
+                    <p>它为什么会变成损坏告警。高精度时间戳以文本形式存储，并在VIRTUAL生成列里被转换成浮点数，而这个列上建了索引。索引里固化的值与新版本计算出的值不再一致，完整性检查就把索引与表的不一致报告成了损坏。这种状态叫作陈旧的表达式索引。<strong>存储的数据本身完好无损。</strong></p>
+                    <p>SQLite方面撤回了3.52.0，改为发布只包含WAL修复的3.51.3，并在3.53.0里加入了自动修复陈旧表达式索引的功能。应用一侧则把时间戳精度降到整数秒，直接消除了那个有歧义的转换。</p>
+                    <p>从这里可以带走两点。</p>
+                    <ul>
+                        <li><strong>表达式索引和生成列存的是函数的结果。</strong>函数一变，存下来的结果就会坏掉。哪怕是让精度变得更好的改动，也不例外</li>
+                        <li><strong>完整性告警的第一个问题不是「数据坏了吗」，而是「什么和什么对不上」。</strong>这13起是索引与表对不上，不是数据消失。两种情况的处置方式完全不同</li>
+                    </ul>
+                    <p>这段插曲也给版本锁定之争提供了真实的材料。只锁定，就收不到这次的WAL修复；无条件追最新，生产就会先撞上3.52.0这类改动。两者都不是答案，答案在晋级流程里。向后兼容与安全默认值之间的张力，在SQLite语境下的讨论另见<a href="../posts/sqlite_editions_proposal_2026.html">SQLite也需要Rust式的版次</a>。</p>
+
+                    <h2>8. 在自己系统里采取的防御 - 检查表</h2>
+                    <p>这不是针对这一个缺陷的对策，而是针对静默数据损坏的一般性防御。可以当作清点自己已经具备几项的工具来用。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>项目</th><th>周期</th><th>通过标准</th><th>省掉会发生什么</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>对备份副本做完整性检查</td><td>每一代备份</td><td>除了 <code>ok</code> 一行之外都按失败处理</td><td>损坏顺着备份代际扩散</td></tr>
+                            <tr><td>还原演练</td><td>每月至少一次</td><td>还原件上的抽样查询结果符合预期</td><td>备份文件在，却救不回来</td></tr>
+                            <tr><td>选对检查用的pragma</td><td>设计时一次</td><td>需要比对索引就用 <code>integrity_check</code></td><td><code>quick_check</code> 不校验索引内容与表内容一致，会漏掉这一类</td></tr>
+                            <tr><td>检测到就停止写入</td><td>即时、自动</td><td>停机与告警无需人介入即可动作</td><td>写入堆在损坏之上，可回退的时间点消失</td></tr>
+                            <tr><td>变更日志存到数据库之外</td><td>常态</td><td>最后一份正常备份加回放即可还原</td><td>只能退回到备份采集的那一刻</td></tr>
+                            <tr><td>版本晋级流程</td><td>每次发布</td><td>预发布环境通过备份验证后才晋级</td><td>随修复一起进来的其他改动由生产先承受</td></tr>
+                            <tr><td>检查点策略成文</td><td>配置变更时</td><td>谁在什么时候驱动检查点，写下来</td><td>不知道自己的系统常走哪条路径</td></tr>
+                            <tr><td>收集版本字符串</td><td>每次部署</td><td>记录 <code>sqlite_version()</code> 和构建方式</td><td>事故之后无法还原当时是哪个构建</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>可以先从确认现在跑的是什么开始。下面是形态示例，实际使用时要把连接路径和表名换成自己环境的。</p>
+
+                    <pre><code>-- 先弄清现在用的是什么
+SELECT sqlite_version();      -- 是否为3.51.3以上或3.53.0以上
+PRAGMA journal_mode;          -- 是否为 wal
+PRAGMA wal_autocheckpoint;    -- 自动检查点的阈值
+
+-- 损坏判定。正常时只返回 ok 一行
+PRAGMA integrity_check;</code></pre>
+
+                    <p>备份验证不自动化，最后就一定不会做。按代际运行的最小形态大致是这样。</p>
+
+                    <pre><code>#!/bin/sh
+# 还原过才算备份（形态示例）
+set -e
+backup="$1"
+work=$(mktemp -d)
+cp "$backup" "$work/verify.db"
+
+result=$(sqlite3 "$work/verify.db" 'PRAGMA integrity_check;')
+if [ "$result" != "ok" ]; then
+  echo "INTEGRITY FAIL: $result"
+  exit 1
+fi
+
+# 通过结构检查，并不代表内容是对的
+sqlite3 "$work/verify.db" 'SELECT count(*) FROM users;'
+rm -rf "$work"</code></pre>
+
+                    <p>无论是把备份包进Web界面还是用脚本驱动，只要少了还原验证，塌的地方都一样。工具选型与3-2-1原则的讨论见<a href="../posts/databasement_selfhosted_db_backup_2026.html">把散落的数据库备份收进一个Web界面的想法</a>。</p>
+
+                    <h2>9. 向开源上游报告时该准备什么</h2>
+                    <p>因为没有复现步骤而拖延报告的情况很常见。但顺序型缺陷本来就是复现步骤最晚才出现的那一类。让上游在没有复现的情况下也能判断的，是<strong>条件的密度</strong>。</p>
+                    <ul>
+                        <li><strong>准确的版本</strong> - <code>SELECT sqlite_version()</code> 的结果、构建方式（发行版软件包、内置捆绑、自行编译）以及编译选项</li>
+                        <li><strong>驱动与绑定</strong> - 名称和版本。驱动经常自行管理连接生命周期或检查点</li>
+                        <li><strong>完整的配置</strong> - <code>journal_mode</code>、<code>synchronous</code>、谁在什么时候驱动检查点、并发连接数与进程数、文件系统与挂载选项</li>
+                        <li><strong>症状原文</strong> - 完整性检查的输出照原样贴出。概括之后上游读不出模式</li>
+                        <li><strong>频率与时间跨度</strong> - 多少天里出了多少起。这几乎是上游判断概率的唯一材料</li>
+                        <li><strong>复现尝试的边界</strong> - 在什么条件下试了什么、失败到什么程度。光写一句「无法复现」，信息量为零</li>
+                        <li><strong>已排除的假设及依据</strong> - 硬件、文件系统、应用代码是怎么被排除的</li>
+                        <li><strong>提供观测数据的准备</strong> - 如果上游做出追踪钩子，能不能放进你的生产环境，能放到什么范围</li>
+                    </ul>
+                    <p>语气同样重要。上游的时间是有限的，通常也不是免费的；原文提到，追踪初期他们与SQLite开发者签订了专业支持合约。开源并不意味着上游的劳动没有成本。</p>
+                    <p>而且报告不会在原因被定位的那一刻结束。这次追踪中做出的VFS追踪垫片留在了SQLite的公开仓库里，这是一个很好的收尾形态，因为下一个遇到类似问题的人，起点就不一样了。比起修好一个缺陷，<strong>留下一件追踪工具</strong>在生态里活得更久。</p>
+
+                    <h2>10. 没能确认的事项</h2>
+                    <p>以下内容在公开资料里无法确定，这也是本文不下断言的理由。</p>
+                    <ul>
+                        <li><strong>竞态条件的内部动作细节</strong> - 公开的只有签入注释和改动文件清单（<code>src/wal.c</code>、<code>test/walrestart.test</code>）。哪一处内部状态以怎样的顺序偏差，原文和发行说明里都没有</li>
+                        <li><strong>默认配置下的发生率</strong> - 原文说明检查点是手动且激进地驱动的。相对于仅使用自动检查点的标准配置，其相对风险没有公开数值</li>
+                        <li><strong>19起是否同一原因</strong> - 原文如此叙述，但没有公开逐起的对照表</li>
+                        <li><strong>复现步骤</strong> - 原文说明团队在受控环境中未能复现。本文给出的命令示例是诊断与防御用的一般流程，不是复现该缺陷的步骤</li>
+                        <li><strong>3.52.0撤回的官方表述</strong> - 发行说明只写了原定功能顺延到3.53.0。与误报告警之间的因果，来自原文一侧的叙述</li>
+                        <li><strong>其他地方的类似报告</strong> - 没有找到其他运营方公开报告同样症状的记录</li>
+                    </ul>
+
+                    <h2>结论</h2>
+                    <p>从16这个数字里该读出的是结构，不是疏忽。只在狭窄条件下成立的缺陷不会因为代码评审或覆盖率而减少，它要靠执行量与环境多样性的累积，以概率的方式浮现。而浮现还必须有第三个条件：<strong>一个把错误结果识别为错误的机制</strong>。没有它，事故照样发生，只是永远不会被报告。</p>
+                    <p>这个案例给实务留下的，说到底就是那套机制的清单。每次备份都跑的完整性检查、检测到就自动停机、真的动手还原的演练，以及修复之后仍在计数条件的告警。四样都不显眼，四样在平日里都什么也不做。</p>
+                    <p>今天能做的三件事：</p>
+                    <ol>
+                        <li>把现在用的SQLite版本、<code>journal_mode</code>，以及由谁驱动检查点，写在一页纸上</li>
+                        <li>让每一代备份都跑完整性检查，并把结果留成记录</li>
+                        <li>本月之内真正还原一份备份，并把抽样查询也确认一遍</li>
+                    </ol>
+                    <p>三件里最后一件最容易被拖，账单也开得最贵。从没还原过的备份，还算不上备份。</p>
+
+                    <h2>参考资料</h2>
+                    <ul>
+                        <li>原文 - Tailscale技术报告，追踪SQLite WAL-Reset缺陷：<a href="https://tailscale.com/blog/sqlite-wal-reset-bug" target="_blank" rel="noopener">tailscale.com/blog/sqlite-wal-reset-bug</a></li>
+                        <li>GeekNews话题（2026-08-13）：<a href="https://news.hada.io/topic?id=32442" target="_blank" rel="noopener">news.hada.io/topic?id=32442</a></li>
+                        <li>SQLite签入 7168988acbec2d8d（2026-03-03）：<a href="https://sqlite.org/src/info/7168988acbec2d8d" target="_blank" rel="noopener">sqlite.org/src/info/7168988acbec2d8d</a></li>
+                        <li>SQLite发布历史（3.51.3、3.52.0、3.53.0的日期与变更）：<a href="https://sqlite.org/changes.html" target="_blank" rel="noopener">sqlite.org/changes.html</a></li>
+                        <li>SQLite官方文档 - Write-Ahead Logging（检查点、回绕、wal-index）：<a href="https://sqlite.org/wal.html" target="_blank" rel="noopener">sqlite.org/wal.html</a></li>
+                        <li>SQLite官方文档 - PRAGMA（integrity_check、quick_check、wal_checkpoint）：<a href="https://sqlite.org/pragma.html" target="_blank" rel="noopener">sqlite.org/pragma.html</a></li>
+                        <li>相关文章：<a href="../posts/sqlite_editions_proposal_2026.html">SQLite也需要Rust式的版次</a>、<a href="../posts/monotonic_vs_wall_clock.html">用挂钟测经过时间会得到负数</a>、<a href="../posts/databasement_selfhosted_db_backup_2026.html">把散落的数据库备份收进一个Web界面</a>、<a href="../posts/uuid_primary_key_sqlite_performance_2026.html">为什么不该用UUID做主键</a></li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>分享本文</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">返回列表</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/json_formatter.html">JSON 格式化工具</a></li>
+      <li><a href="../static/regex_tester.html">正则表达式测试器</a></li>
+      <li><a href="../static/jwt_decoder.html">JWT解码生成器 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 编码器/解码器</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="ai_collaboration_leadership_skill.html">把工作交给AI这件事 - 委托的五个部件与检查点设计 2026</a></li>
+      <li><a href="shell_readonly_idempotent_script.html">跑两次也安全的脚本 - 幂等性设计与真正会出问题的六种模式</a></li>
+      <li><a href="ai_disuse_reasons_debate.html">停用 AI 编程工具这个决定 - 什么算依据什么不算 2026</a></li>
+      <li><a href="ai_software_middle_class_erosion.html">AI正在抹去的软件工程中间层 - 哪些活在减少，哪些活在增加</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制！请粘贴到Threads应用中分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制！');});
+    });
+    </script>
+</body>
+</html>
