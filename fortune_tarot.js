@@ -337,6 +337,39 @@ const luckyItems = {
     directions: ['동쪽', '서쪽', '남쪽', '북쪽', '동남쪽', '동북쪽', '서남쪽', '서북쪽']
 };
 
+// 암호학적 난수 정수 [min, max] (rejection sampling, 미지원 브라우저만 폴백)
+function secureRandInt(min, max) {
+    const range = max - min + 1;
+    if (window.crypto && window.crypto.getRandomValues) {
+        const maxValid = Math.floor(4294967296 / range) * range;
+        const buf = new Uint32Array(1);
+        let x;
+        do {
+            window.crypto.getRandomValues(buf);
+            x = buf[0];
+        } while (x >= maxValid);
+        return min + (x % range);
+    }
+    return min + Math.floor(Math.random() * range);
+}
+
+// 모션 축소 설정 여부
+function prefersReducedMotion() {
+    return window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+}
+
+// 타로 카드 aria-label (페이지 언어별)
+function tarotCardLabel(n) {
+    const lang = (document.documentElement.lang || 'ko').slice(0, 2);
+    const map = {
+        ko: '타로 카드 ' + n + '번',
+        en: 'Tarot card ' + n,
+        ja: 'タロットカード' + n,
+        zh: '塔罗牌' + n
+    };
+    return map[lang] || map.ko;
+}
+
 // 날짜 기반 시드 생성 함수
 function getDailySeed() {
     const today = new Date();
@@ -568,13 +601,22 @@ function initializeTarotDeck() {
         card.className = 'tarot-card';
         card.dataset.index = i;
         card.innerHTML = '🃏';
-        
+        card.setAttribute('role', 'button');
+        card.setAttribute('tabindex', '0');
+        card.setAttribute('aria-label', tarotCardLabel(i + 1));
+
         card.addEventListener('click', function() {
             if (!this.classList.contains('flipped')) {
                 selectTarotCard(i);
             }
         });
-        
+        card.addEventListener('keydown', function(e) {
+            if ((e.key === 'Enter' || e.key === ' ') && !this.classList.contains('flipped')) {
+                e.preventDefault();
+                selectTarotCard(i);
+            }
+        });
+
         deck.appendChild(card);
     }
 }
@@ -589,27 +631,30 @@ function shuffleTarotCards() {
         card.classList.remove('flipped');
         card.innerHTML = '🃏';
         card.style.pointerEvents = 'auto';
+        card.style.opacity = '1';
     });
     
     // 결과 숨기기
     result.classList.remove('active');
     
-    // 섞는 애니메이션 효과
-    cards.forEach((card, index) => {
-        setTimeout(() => {
-            card.style.transform = 'translateY(-20px)';
+    // 섞는 애니메이션 효과 (모션 축소 설정 시 생략)
+    if (!prefersReducedMotion()) {
+        cards.forEach((card, index) => {
             setTimeout(() => {
-                card.style.transform = 'translateY(0)';
-            }, 100);
-        }, index * 100);
-    });
+                card.style.transform = 'translateY(-20px)';
+                setTimeout(() => {
+                    card.style.transform = 'translateY(0)';
+                }, 100);
+            }, index * 100);
+        });
+    }
 }
 
 // 타로 카드 선택
 function selectTarotCard(index) {
     const card = document.querySelector(`[data-index="${index}"]`);
-    const seed = getDailySeed() + index;
-    const selectedTarot = getRandomFromArray(tarotCards, seed);
+    // 타로는 뽑을 때마다 암호학적 난수로 새로 선택 (별자리 운세는 날짜 시드 유지)
+    const selectedTarot = tarotCards[secureRandInt(0, tarotCards.length - 1)];
     
     // 카드 뒤집기 애니메이션
     card.classList.add('flipped');
@@ -658,9 +703,9 @@ function displayTarotResult(tarot) {
     
     resultDiv.innerHTML = resultHTML;
     resultDiv.classList.add('active');
-    
-    // 결과로 스크롤
-    resultDiv.scrollIntoView({ behavior: 'smooth' });
+
+    // 결과로 스크롤 (모션 축소 설정 시 즉시 이동)
+    resultDiv.scrollIntoView({ behavior: prefersReducedMotion() ? 'auto' : 'smooth' });
 }
 
 // 소셜 공유 기능은 HTML 파일의 인라인 스크립트에서 처리됩니다.

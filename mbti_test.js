@@ -4,6 +4,16 @@
  * All rights reserved.
  */
 
+// 결과 화면 문구 (언어판 페이지는 이 스크립트 로드 전에 window.MBTI_STRINGS 로 재정의 — 미정의 시 한국어 기본값)
+// 단정적 성격 규정 대신 「경향」 톤을 사용한다
+const MBTI_STRINGS = Object.assign({
+    strengthsTitle: '💪 강점으로 나타나기 쉬운 경향',
+    weaknessesTitle: '⚠️ 주의하면 좋은 경향',
+    careersTitle: '💼 어울리는 경우가 많은 직업 예시',
+    compatibilityTitle: '💕 잘 맞는 경우가 많은 유형',
+    resultNote: '※ 본 결과는 공식 MBTI® 검사가 아닌 재미로 해보는 자가 문항 테스트이며, 응답 경향에 따른 참고용입니다.'
+}, (typeof window !== 'undefined' && window.MBTI_STRINGS) || {});
+
 // MBTI 테스트 질문 데이터
 const mbtiQuestions = [
     {
@@ -462,30 +472,31 @@ function showResult() {
         <div class="mbti-type">${mbtiType}</div>
         <div class="mbti-title">${result.title}</div>
         <div class="mbti-description">${result.description}</div>
+        <div style="margin-top: 18px; font-size: 0.85rem; opacity: 0.85;">${MBTI_STRINGS.resultNote}</div>
     `;
-    
+
     // 상세 결과 렌더링
     document.getElementById('result-details').innerHTML = `
         <div class="detail-card">
-            <div class="detail-title">💪 주요 강점</div>
+            <div class="detail-title">${MBTI_STRINGS.strengthsTitle}</div>
             <ul class="detail-list">
                 ${result.strengths.map(strength => `<li>${strength}</li>`).join('')}
             </ul>
         </div>
         <div class="detail-card">
-            <div class="detail-title">⚠️ 주의할 점</div>
+            <div class="detail-title">${MBTI_STRINGS.weaknessesTitle}</div>
             <ul class="detail-list">
                 ${result.weaknesses.map(weakness => `<li>${weakness}</li>`).join('')}
             </ul>
         </div>
         <div class="detail-card">
-            <div class="detail-title">💼 추천 직업</div>
+            <div class="detail-title">${MBTI_STRINGS.careersTitle}</div>
             <ul class="detail-list">
                 ${result.careers.map(career => `<li>${career}</li>`).join('')}
             </ul>
         </div>
         <div class="detail-card">
-            <div class="detail-title">💕 궁합 좋은 유형</div>
+            <div class="detail-title">${MBTI_STRINGS.compatibilityTitle}</div>
             <ul class="detail-list">
                 ${result.compatibility.map(type => `<li>${type}</li>`).join('')}
             </ul>

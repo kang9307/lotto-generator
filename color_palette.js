@@ -1,5 +1,20 @@
 // 색상 팔레트 생성기 JavaScript
 
+// 표시 문자열 (언어 페이지는 window.BD_COLOR_L10N 으로 재정의 가능, 기본값은 한국어)
+function bdCpFmt(tpl, map) {
+    return String(tpl).replace(/\{(\w+)\}/g, function(m, k) { return (k in map) ? map[k] : m; });
+}
+const BD_CP_L10N = Object.assign({
+    baseLabel: '기본',
+    colorLabel: '색상 {n}',
+    copied: '{hex} 복사됨!',
+    codeCopied: '코드가 복사되었습니다!',
+    copyBtn: '복사',
+    presetApplied: '{name} 프리셋이 적용되었습니다!',
+    contrastLabel: '대비',
+    copyAria: '{hex} 색상 코드 복사'
+}, window.BD_COLOR_L10N || {});
+
 document.addEventListener('DOMContentLoaded', function() {
     // 전역 변수
     let currentPalette = [];
@@ -317,30 +332,43 @@ document.addEventListener('DOMContentLoaded', function() {
     function createColorCard(hexColor, index) {
         const rgb = hexToRgb(hexColor);
         const hsl = rgbToHsl(rgb.r, rgb.g, rgb.b);
-        
+        // WCAG 대비율 (흰색/검은색 텍스트 기준, 표준 상대휘도 공식)
+        const contrastWhite = calculateContrastRatio(hexColor, '#ffffff').toFixed(2);
+        const contrastBlack = calculateContrastRatio(hexColor, '#000000').toFixed(2);
+
         const card = document.createElement('div');
         card.className = 'color-card';
+        card.setAttribute('role', 'button');
+        card.setAttribute('tabindex', '0');
+        card.setAttribute('aria-label', bdCpFmt(BD_CP_L10N.copyAria, { hex: hexColor.toUpperCase() }));
         card.innerHTML = `
             <div class="color-swatch" style="background-color: ${hexColor};">
                 <span style="color: ${getContrastColor(hexColor)}; font-weight: bold;">
-                    ${index === 0 ? '기본' : `색상 ${index + 1}`}
+                    ${index === 0 ? BD_CP_L10N.baseLabel : bdCpFmt(BD_CP_L10N.colorLabel, { n: index + 1 })}
                 </span>
             </div>
             <div class="color-info">
                 <div class="color-hex">${hexColor.toUpperCase()}</div>
                 <div class="color-values-mini">
                     RGB: ${rgb.r}, ${rgb.g}, ${rgb.b}<br>
-                    HSL: ${Math.round(hsl.h)}, ${Math.round(hsl.s)}%, ${Math.round(hsl.l)}%
+                    HSL: ${Math.round(hsl.h)}, ${Math.round(hsl.s)}%, ${Math.round(hsl.l)}%<br>
+                    ${BD_CP_L10N.contrastLabel}: ⚪ ${contrastWhite}:1 · ⚫ ${contrastBlack}:1
                 </div>
             </div>
         `;
-        
+
         // 클릭시 클립보드 복사
         card.addEventListener('click', () => {
             copyToClipboard(hexColor);
-            showToast(`${hexColor} 복사됨!`);
+            showToast(bdCpFmt(BD_CP_L10N.copied, { hex: hexColor }));
         });
-        
+        card.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                card.click();
+            }
+        });
+
         return card;
     }
     
@@ -415,10 +443,10 @@ document.addEventListener('DOMContentLoaded', function() {
             `    "${index === 0 ? 'primary' : index === 1 ? 'secondary' : `accent${index - 1}`}": "${color}"`
         ).join(',\n')}\n  }\n}`;
         
-        document.getElementById('cssVariables').innerHTML = `<button class="copy-btn" onclick="copyCode('cssVariables')">복사</button>${cssVars}`;
-        document.getElementById('sassVariables').innerHTML = `<button class="copy-btn" onclick="copyCode('sassVariables')">복사</button>${sassVars}`;
-        document.getElementById('jsObject').innerHTML = `<button class="copy-btn" onclick="copyCode('jsObject')">복사</button>${jsObj}`;
-        document.getElementById('jsonData').innerHTML = `<button class="copy-btn" onclick="copyCode('jsonData')">복사</button>${jsonObj}`;
+        document.getElementById('cssVariables').innerHTML = `<button class="copy-btn" onclick="copyCode('cssVariables')">${BD_CP_L10N.copyBtn}</button>${cssVars}`;
+        document.getElementById('sassVariables').innerHTML = `<button class="copy-btn" onclick="copyCode('sassVariables')">${BD_CP_L10N.copyBtn}</button>${sassVars}`;
+        document.getElementById('jsObject').innerHTML = `<button class="copy-btn" onclick="copyCode('jsObject')">${BD_CP_L10N.copyBtn}</button>${jsObj}`;
+        document.getElementById('jsonData').innerHTML = `<button class="copy-btn" onclick="copyCode('jsonData')">${BD_CP_L10N.copyBtn}</button>${jsonObj}`;
     }
     
     // 프리셋 적용
@@ -472,9 +500,10 @@ document.addEventListener('DOMContentLoaded', function() {
             
             // 팔레트 생성
             generatePalette();
-            
-            // 성공 메시지 표시
-            showToast(`${presetData.name} 프리셋이 적용되었습니다!`);
+
+            // 성공 메시지 표시 (언어 페이지에서는 해당 언어의 버튼 라벨 사용)
+            const presetLabel = currentPresetBtn ? currentPresetBtn.textContent.trim() : presetData.name;
+            showToast(bdCpFmt(BD_CP_L10N.presetApplied, { name: presetLabel }));
         }
     }
     
@@ -733,7 +762,7 @@ function createColorCardGlobal(hexColor, index) {
     
     card.addEventListener('click', () => {
         navigator.clipboard.writeText(hexColor).then(() => {
-            showToastGlobal(`${hexColor} 복사됨!`);
+            showToastGlobal(bdCpFmt(BD_CP_L10N.copied, { hex: hexColor }));
         });
     });
     
@@ -848,11 +877,13 @@ function getBrightness(hex) {
 
 function copyCode(elementId) {
     const element = document.getElementById(elementId);
-    const text = element.textContent.replace('복사', '').trim();
-    
+    const clone = element.cloneNode(true);
+    clone.querySelectorAll('.copy-btn').forEach(function(btn) { btn.remove(); });
+    const text = clone.textContent.trim();
+
     if (navigator.clipboard && window.isSecureContext) {
         navigator.clipboard.writeText(text).then(() => {
-            showToastGlobal('코드가 복사되었습니다!');
+            showToastGlobal(BD_CP_L10N.codeCopied);
         });
     } else {
         const textArea = document.createElement('textarea');
@@ -861,7 +892,7 @@ function copyCode(elementId) {
         textArea.select();
         document.execCommand('copy');
         document.body.removeChild(textArea);
-        showToastGlobal('코드가 복사되었습니다!');
+        showToastGlobal(BD_CP_L10N.codeCopied);
     }
 }
 

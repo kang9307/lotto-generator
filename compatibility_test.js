@@ -1,5 +1,56 @@
 // 궁합 테스트 JavaScript
 
+// 표시 문자열 (언어 페이지는 window.BD_CT_L10N 으로 재정의 가능, 기본값은 한국어)
+const BD_CT_L10N = Object.assign({
+    fillAll: '모든 정보를 입력해주세요.',
+    selectMbti: '두 사람의 MBTI를 모두 선택해주세요.',
+    selectZodiac: '두 사람의 별자리를 모두 선택해주세요.',
+    levelExcellent: '💎 환상의 궁합',
+    levelGreat: '💖 최고의 궁합',
+    levelGood: '💕 좋은 궁합',
+    levelNormal: '💛 보통 궁합',
+    levelEffort: '💙 노력이 필요한 궁합',
+    descExcellent: '정말 완벽한 궁합입니다! 서로를 깊이 이해하고 보완해주는 최고의 관계입니다.',
+    descGreat: '매우 좋은 궁합입니다! 서로에게 큰 힘이 되어주는 특별한 관계입니다.',
+    descGood: '좋은 궁합입니다! 서로 노력한다면 더욱 발전할 수 있는 관계입니다.',
+    descNormal: '평범한 궁합입니다. 서로의 차이점을 인정하고 이해한다면 좋은 관계가 될 수 있습니다.',
+    descEffort: '조금 더 노력이 필요한 궁합입니다. 서로를 더 깊이 알아가는 시간이 필요합니다.',
+    resultTitle: '💝 궁합 테스트 결과',
+    scoreSuffix: '점',
+    nameCardTitle: '이름 궁합',
+    birthCardTitle: '생년월일 궁합',
+    nameCardDesc: '이름의 조화',
+    birthCardDesc: '생년월일의 조화',
+    firstLabel: '첫 번째',
+    secondLabel: '두 번째',
+    mbtiCardDesc: '성격 유형',
+    zodiacCardDesc: '별자리',
+    shareHeading: '🎉 결과를 친구들과 공유해보세요!',
+    kakaoLabel: '카카오톡',
+    facebookLabel: '페이스북',
+    twitterLabel: 'X(트위터)',
+    threadsLabel: 'Threads',
+    disclaimer: '※ 이 테스트는 재미를 위한 콘텐츠로, 결과에는 과학적 근거가 없습니다.',
+    shareText: '💝 궁합 테스트 - 이름, 생년월일, MBTI, 별자리로 확인하는 재미용 궁합 테스트!',
+    linkCopied: '링크가 복사되었습니다. 원하는 곳에 붙여넣어 공유하세요!',
+    kakaoTitle: '💝 궁합 테스트',
+    kakaoDesc: '이름, 생년월일, MBTI, 별자리로 확인하는 재미용 궁합 테스트! 연인, 친구, 가족과 함께 즐겨보세요.',
+    kakaoButton: '나도 궁합 테스트하기'
+}, window.BD_CT_L10N || {});
+
+// 별자리 값 정규화 (언어 페이지의 현지어 값 -> 내부 한국어 키)
+const zodiacAliases = {
+    'Aries': '양자리', 'Taurus': '황소자리', 'Gemini': '쌍둥이자리', 'Cancer': '게자리',
+    'Leo': '사자자리', 'Virgo': '처녀자리', 'Libra': '천칭자리', 'Scorpio': '전갈자리',
+    'Sagittarius': '사수자리', 'Capricorn': '염소자리', 'Aquarius': '물병자리', 'Pisces': '물고기자리',
+    '牡羊座': '양자리', '牡牛座': '황소자리', '双子座': '쌍둥이자리', '蟹座': '게자리',
+    '獅子座': '사자자리', '乙女座': '처녀자리', '天秤座': '천칭자리', '蠍座': '전갈자리',
+    '射手座': '사수자리', '山羊座': '염소자리', '水瓶座': '물병자리', '魚座': '물고기자리',
+    '白羊座': '양자리', '金牛座': '황소자리', '巨蟹座': '게자리',
+    '狮子座': '사자자리', '处女座': '처녀자리', '天蝎座': '전갈자리',
+    '摩羯座': '염소자리', '双鱼座': '물고기자리'
+};
+
 // 탭 전환 기능
 document.addEventListener('DOMContentLoaded', function() {
     const tabs = document.querySelectorAll('.compatibility-tab');
@@ -187,7 +238,7 @@ function calculateNameCompatibility() {
     const birth2 = document.getElementById('birth2').value;
     
     if (!name1 || !name2 || !birth1 || !birth2) {
-        alert('모든 정보를 입력해주세요.');
+        alert(BD_CT_L10N.fillAll);
         return;
     }
     
@@ -271,11 +322,11 @@ function calculateMBTICompatibility() {
     const mbti2 = document.getElementById('mbti2').value;
     
     if (!mbti1 || !mbti2) {
-        alert('두 사람의 MBTI를 모두 선택해주세요.');
+        alert(BD_CT_L10N.selectMbti);
         return;
     }
-    
-    const score = mbtiCompatibility[mbti1][mbti2] || 50;
+
+    const score = (mbtiCompatibility[mbti1] && mbtiCompatibility[mbti1][mbti2]) || 50;
     
     displayCompatibilityResult(score, 'mbti', {
         mbti1: mbti1,
@@ -289,11 +340,14 @@ function calculateZodiacCompatibility() {
     const zodiac2 = document.getElementById('zodiac2').value;
     
     if (!zodiac1 || !zodiac2) {
-        alert('두 사람의 별자리를 모두 선택해주세요.');
+        alert(BD_CT_L10N.selectZodiac);
         return;
     }
-    
-    const score = zodiacCompatibility[zodiac1][zodiac2] || 50;
+
+    // 현지어 별자리 값을 내부 키로 정규화 (한국어 페이지는 그대로 통과)
+    const zodiacKey1 = zodiacAliases[zodiac1] || zodiac1;
+    const zodiacKey2 = zodiacAliases[zodiac2] || zodiac2;
+    const score = (zodiacCompatibility[zodiacKey1] && zodiacCompatibility[zodiacKey1][zodiacKey2]) || 50;
     
     displayCompatibilityResult(score, 'zodiac', {
         zodiac1: zodiac1,
@@ -308,94 +362,95 @@ function displayCompatibilityResult(score, type, data) {
     let level, levelClass, description, details;
     
     if (score >= 90) {
-        level = '💎 환상의 궁합';
+        level = BD_CT_L10N.levelExcellent;
         levelClass = 'level-excellent';
-        description = '정말 완벽한 궁합입니다! 서로를 깊이 이해하고 보완해주는 최고의 관계입니다.';
+        description = BD_CT_L10N.descExcellent;
     } else if (score >= 80) {
-        level = '💖 최고의 궁합';
+        level = BD_CT_L10N.levelGreat;
         levelClass = 'level-great';
-        description = '매우 좋은 궁합입니다! 서로에게 큰 힘이 되어주는 특별한 관계입니다.';
+        description = BD_CT_L10N.descGreat;
     } else if (score >= 70) {
-        level = '💕 좋은 궁합';
+        level = BD_CT_L10N.levelGood;
         levelClass = 'level-good';
-        description = '좋은 궁합입니다! 서로 노력한다면 더욱 발전할 수 있는 관계입니다.';
+        description = BD_CT_L10N.descGood;
     } else if (score >= 60) {
-        level = '💛 보통 궁합';
+        level = BD_CT_L10N.levelNormal;
         levelClass = 'level-normal';
-        description = '평범한 궁합입니다. 서로의 차이점을 인정하고 이해한다면 좋은 관계가 될 수 있습니다.';
+        description = BD_CT_L10N.descNormal;
     } else {
-        level = '💙 노력이 필요한 궁합';
+        level = BD_CT_L10N.levelEffort;
         levelClass = 'level-effort';
-        description = '조금 더 노력이 필요한 궁합입니다. 서로를 더 깊이 알아가는 시간이 필요합니다.';
+        description = BD_CT_L10N.descEffort;
     }
-    
+
     // 세부 정보 생성
     if (type === 'name') {
         details = `
             <div class="detail-card">
-                <h4>이름 궁합</h4>
-                <div class="score">${data.nameScore}점</div>
-                <div class="description">이름의 조화</div>
+                <h4>${BD_CT_L10N.nameCardTitle}</h4>
+                <div class="score">${data.nameScore}${BD_CT_L10N.scoreSuffix}</div>
+                <div class="description">${BD_CT_L10N.nameCardDesc}</div>
             </div>
             <div class="detail-card">
-                <h4>생년월일 궁합</h4>
-                <div class="score">${data.birthScore}점</div>
-                <div class="description">생년월일의 조화</div>
+                <h4>${BD_CT_L10N.birthCardTitle}</h4>
+                <div class="score">${data.birthScore}${BD_CT_L10N.scoreSuffix}</div>
+                <div class="description">${BD_CT_L10N.birthCardDesc}</div>
             </div>
         `;
     } else if (type === 'mbti') {
         details = `
             <div class="detail-card">
                 <h4>${data.mbti1}</h4>
-                <div class="score">첫 번째</div>
-                <div class="description">성격 유형</div>
+                <div class="score">${BD_CT_L10N.firstLabel}</div>
+                <div class="description">${BD_CT_L10N.mbtiCardDesc}</div>
             </div>
             <div class="detail-card">
                 <h4>${data.mbti2}</h4>
-                <div class="score">두 번째</div>
-                <div class="description">성격 유형</div>
+                <div class="score">${BD_CT_L10N.secondLabel}</div>
+                <div class="description">${BD_CT_L10N.mbtiCardDesc}</div>
             </div>
         `;
     } else if (type === 'zodiac') {
         details = `
             <div class="detail-card">
                 <h4>${data.zodiac1}</h4>
-                <div class="score">첫 번째</div>
-                <div class="description">별자리</div>
+                <div class="score">${BD_CT_L10N.firstLabel}</div>
+                <div class="description">${BD_CT_L10N.zodiacCardDesc}</div>
             </div>
             <div class="detail-card">
                 <h4>${data.zodiac2}</h4>
-                <div class="score">두 번째</div>
-                <div class="description">별자리</div>
+                <div class="score">${BD_CT_L10N.secondLabel}</div>
+                <div class="description">${BD_CT_L10N.zodiacCardDesc}</div>
             </div>
         `;
     }
     
     resultDiv.innerHTML = `
-        <h2>💝 궁합 테스트 결과</h2>
-        <div class="compatibility-score">${score}점</div>
+        <h2>${BD_CT_L10N.resultTitle}</h2>
+        <div class="compatibility-score">${score}${BD_CT_L10N.scoreSuffix}</div>
         <div class="compatibility-level ${levelClass}">${level}</div>
         <div class="compatibility-description">${description}</div>
         <div class="compatibility-details">${details}</div>
-        
+        <p style="font-size: 0.85rem; color: #888; margin-top: 20px;">${BD_CT_L10N.disclaimer}</p>
+
         <div class="share-section">
-            <h3 style="text-align: center; margin-bottom: 20px;">🎉 결과를 친구들과 공유해보세요!</h3>
+            <h3 style="text-align: center; margin-bottom: 20px;">${BD_CT_L10N.shareHeading}</h3>
             <div class="share-buttons">
-                <button id="kakao-share" class="share-btn kakao-btn" onclick="shareKakao()">
-                    <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIj48cGF0aCBkPSJNMTIgM2M1LjggMCA5IDMuMSA5IDYuNSAwIDIuNCAxLjIgNC41LTMgNi41bDEuNSAzLjVzLjEuMyAwIC4zYy0uMSAwLS4yLS4xLS4zLS4yTDE2IDEzLjhjLTEuMi4zLTIuNi41LTQgLjUtNS44IDAtOS0zLjEtOS02LjVTNi4yIDMgMTIgM3oiIGZpbGw9IiMzQzFFMUUiLz48L3N2Zz4=" alt="카카오톡 공유">
-                    카카오톡
+                <button id="result-kakao-share" class="share-btn kakao-btn" onclick="shareKakao()">
+                    <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIj48cGF0aCBkPSJNMTIgM2M1LjggMCA5IDMuMSA5IDYuNSAwIDIuNCAxLjIgNC41LTMgNi41bDEuNSAzLjVzLjEuMyAwIC4zYy0uMSAwLS4yLS4xLS4zLS4yTDE2IDEzLjhjLTEuMi4zLTIuNi41LTQgLjUtNS44IDAtOS0zLjEtOS02LjVTNi4yIDMgMTIgM3oiIGZpbGw9IiMzQzFFMUUiLz48L3N2Zz4=" alt="${BD_CT_L10N.kakaoLabel}">
+                    ${BD_CT_L10N.kakaoLabel}
                 </button>
-                <button id="facebook-share" class="share-btn facebook-btn" onclick="shareFacebook()">
-                    <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9IndoaXRlIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCI+PHBhdGggZD0iTTE4IDJoLTNhNSA1IDAgMCAwLTUgNXYzSDd2NGgzdjhoNHYtOGgzbC0xLTRoLTJWN2EyIDIgMCAwIDEgMi0yaDN6Ii8+PC9zdmc+" alt="페이스북 공유">
-                    페이스북
+                <button id="result-facebook-share" class="share-btn facebook-btn" onclick="shareFacebook()">
+                    <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9IndoaXRlIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCI+PHBhdGggZD0iTTE4IDJoLTNhNSA1IDAgMCAwLTUgNXYzSDd2NGgzdjhoNHYtOGgzbC0xLTRoLTJWN2EyIDIgMCAwIDEgMi0yaDN6Ii8+PC9zdmc+" alt="${BD_CT_L10N.facebookLabel}">
+                    ${BD_CT_L10N.facebookLabel}
                 </button>
-                <button id="twitter-share" class="share-btn twitter-btn" onclick="shareTwitter()">
-                    <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9IndoaXRlIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCI+PHBhdGggZD0ibTIzIDNhMTAuOSAxMC45IDAgMCAxLTMuMTQgMS41MyA0LjQ4IDQuNDggMCAwIDAtNy44NiAzdjFBMTAuNjYgMTAuNjYgMCAwIDEgMyA0czQgOSA1IDEwLTMgMi0zIDJhMjIgMjIgMCAwIDAgMTEtMUE4IDE0IDAgMCAwIDIzIDN6Ii8+PC9zdmc+" alt="트위터 공유">
-                    X(트위터)
+                <button id="result-twitter-share" class="share-btn twitter-btn" onclick="shareTwitter()">
+                    <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9IndoaXRlIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCI+PHBhdGggZD0ibTIzIDNhMTAuOSAxMC45IDAgMCAxLTMuMTQgMS41MyA0LjQ4IDQuNDggMCAwIDAtNy44NiAzdjFBMTAuNjYgMTAuNjYgMCAwIDEgMyA0czQgOSA1IDEwLTMgMi0zIDJhMjIgMjIgMCAwIDAgMTEtMUE4IDE0IDAgMCAwIDIzIDN6Ii8+PC9zdmc+" alt="${BD_CT_L10N.twitterLabel}">
+                    ${BD_CT_L10N.twitterLabel}
                 </button>
-                <button id="threads-share" class="share-btn threads-btn" onclick="shareThreads()">
-                    <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9IndoaXRlIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCI+PHBhdGggZD0iTTEyIDJhOSA5IDAgMCAxIDkgOXYxYTkgOSAwIDAgMS0xOCAwdi0xYTkgOSAwIDAgMSA5LTl6Ii8+PHBhdGggZD0iTTEyIDZhMyAzIDAgMCAxIDMgM3YzYTMgMyAwIDAgMS02IDBWOWEzIDMgMCAwIDEgMy0zeiIvPjwvc3ZnPg==" alt="쓰레드 공유">
-                    Threads
+                <button id="result-threads-share" class="share-btn threads-btn" onclick="shareThreads()">
+                    <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9IndoaXRlIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCI+PHBhdGggZD0iTTEyIDJhOSA5IDAgMCAxIDkgOXYxYTkgOSAwIDAgMS0xOCAwdi0xYTkgOSAwIDAgMSA5LTl6Ii8+PHBhdGggZD0iTTEyIDZhMyAzIDAgMCAxIDMgM3YzYTMgMyAwIDAgMS02IDBWOWEzIDMgMCAwIDEgMy0zeiIvPjwvc3ZnPg==" alt="${BD_CT_L10N.threadsLabel}">
+                    ${BD_CT_L10N.threadsLabel}
                 </button>
             </div>
         </div>
@@ -414,4 +469,55 @@ function displayCompatibilityResult(score, type, data) {
     
     resultDiv.classList.add('active');
     resultDiv.scrollIntoView({ behavior: 'smooth', block: 'start' });
-} 
+}
+
+// ===== 결과 공유 함수 (결과 영역의 onclick 핸들러) =====
+function bdCtCopyUrl() {
+    const currentUrl = window.location.href;
+    if (navigator.clipboard && window.isSecureContext) {
+        return navigator.clipboard.writeText(currentUrl);
+    }
+    const tempTextArea = document.createElement('textarea');
+    tempTextArea.value = currentUrl;
+    document.body.appendChild(tempTextArea);
+    tempTextArea.select();
+    document.execCommand('copy');
+    document.body.removeChild(tempTextArea);
+    return Promise.resolve();
+}
+
+function shareKakao() {
+    try {
+        if (window.Kakao && window.Kakao.Share) {
+            if (!window.Kakao.isInitialized()) {
+                window.Kakao.init('e06d0ee93e450a11bc6451d46e09cd88');
+            }
+            window.Kakao.Share.sendDefault({
+                objectType: 'feed',
+                content: {
+                    title: BD_CT_L10N.kakaoTitle,
+                    description: BD_CT_L10N.kakaoDesc,
+                    imageUrl: 'https://braindetox.kr/images/compatibility_test_bg.png',
+                    link: { mobileWebUrl: window.location.href, webUrl: window.location.href }
+                },
+                buttons: [{ title: BD_CT_L10N.kakaoButton, link: { mobileWebUrl: window.location.href, webUrl: window.location.href } }]
+            });
+            return;
+        }
+    } catch (e) { /* fall through to link copy */ }
+    bdCtCopyUrl().then(function() { alert(BD_CT_L10N.linkCopied); });
+}
+
+function shareFacebook() {
+    const shareUrl = 'https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(window.location.href);
+    window.open(shareUrl, 'facebook-share-dialog', 'width=626,height=436');
+}
+
+function shareTwitter() {
+    const shareUrl = 'https://twitter.com/intent/tweet?text=' + encodeURIComponent(BD_CT_L10N.shareText) + '&url=' + encodeURIComponent(window.location.href);
+    window.open(shareUrl, 'twitter-share-dialog', 'width=626,height=436');
+}
+
+function shareThreads() {
+    bdCtCopyUrl().then(function() { alert(BD_CT_L10N.linkCopied); });
+}

@@ -12,6 +12,31 @@
  * Unauthorized copying or redistribution of this code is prohibited.
  */
 
+// 표시 문자열 (언어 페이지는 window.BD_DATETIME_L10N 으로 재정의 가능, 기본값은 한국어)
+function bdFmt(tpl, map) {
+    return String(tpl).replace(/\{(\w+)\}/g, function(m, k) { return (k in map) ? map[k] : m; });
+}
+const BD_DT_L10N = Object.assign({
+    invalidDate: '유효한 날짜를 입력해주세요.',
+    invalidInput: '유효한 입력값을 입력해주세요.',
+    invalidTime: '유효한 시간 값을 입력해주세요.',
+    diffDays: '일 수: {days}일',
+    diffWeeks: '주 수: {weeks}주 {rem}일',
+    diffMonths: '월 수: {months}개월 {days}일 (대략)',
+    diffYears: '년 수: {years}년 {months}개월',
+    newDate: '계산된 날짜: {date}',
+    workdays: '업무일 수: {count}일',
+    weekends: '주말 수: {count}일',
+    timeConv: '{value} {from} = {result} {to}',
+    units: { seconds: '초', minutes: '분', hours: '시간', days: '일' },
+    weekdays: ['일', '월', '화', '수', '목', '금', '토'],
+    dateFormat: '{year}년 {month}월 {day}일 ({weekday})',
+    linkCopied: '링크가 클립보드에 복사되었습니다.',
+    threadsLinkCopied: '링크가 복사되었습니다. 쓰레드 앱에 붙여넣기하여 공유하세요!',
+    kakaoSdkError: '카카오톡 SDK를 불러올 수 없습니다.',
+    kakaoShareError: '카카오톡 공유 기능을 사용할 수 없습니다. 다른 방법으로 공유해 주세요.'
+}, window.BD_DATETIME_L10N || {});
+
 document.addEventListener('DOMContentLoaded', function() {
     // DOM 요소 가져오기 - 탭 관련
     const tabs = document.querySelectorAll('.tab');
@@ -108,7 +133,7 @@ document.addEventListener('DOMContentLoaded', function() {
         
         // 입력 유효성 검사
         if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
-            alert('유효한 날짜를 입력해주세요.');
+            alert(BD_DT_L10N.invalidDate);
             return;
         }
         
@@ -132,10 +157,10 @@ document.addEventListener('DOMContentLoaded', function() {
         const years = Math.floor(months / 12);
         
         // 결과 표시
-        diffDaysDiv.textContent = `일 수: ${days}일`;
-        diffWeeksDiv.textContent = `주 수: ${weeks}주 ${days % 7}일`;
-        diffMonthsDiv.textContent = `월 수: ${Math.abs(months)}개월 ${days - Math.floor(months * 30)}일 (대략)`;
-        diffYearsDiv.textContent = `년 수: ${years}년 ${months % 12}개월`;
+        diffDaysDiv.textContent = bdFmt(BD_DT_L10N.diffDays, { days: days });
+        diffWeeksDiv.textContent = bdFmt(BD_DT_L10N.diffWeeks, { weeks: weeks, rem: days % 7 });
+        diffMonthsDiv.textContent = bdFmt(BD_DT_L10N.diffMonths, { months: Math.abs(months), days: days - Math.floor(months * 30) });
+        diffYearsDiv.textContent = bdFmt(BD_DT_L10N.diffYears, { years: years, months: months % 12 });
         
         diffResultDiv.style.display = 'block';
     }
@@ -149,7 +174,7 @@ document.addEventListener('DOMContentLoaded', function() {
         
         // 입력 유효성 검사
         if (isNaN(baseDate.getTime()) || isNaN(durationValue) || durationValue < 0) {
-            alert('유효한 입력값을 입력해주세요.');
+            alert(BD_DT_L10N.invalidInput);
             return;
         }
         
@@ -192,7 +217,7 @@ document.addEventListener('DOMContentLoaded', function() {
         
         // 결과 표시
         const formattedDate = formatDateForDisplay(newDate);
-        newDateDiv.textContent = `계산된 날짜: ${formattedDate}`;
+        newDateDiv.textContent = bdFmt(BD_DT_L10N.newDate, { date: formattedDate });
         
         addSubResultDiv.style.display = 'block';
     }
@@ -205,7 +230,7 @@ document.addEventListener('DOMContentLoaded', function() {
         
         // 입력 유효성 검사
         if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
-            alert('유효한 날짜를 입력해주세요.');
+            alert(BD_DT_L10N.invalidDate);
             return;
         }
         
@@ -228,8 +253,8 @@ document.addEventListener('DOMContentLoaded', function() {
         const workdayCount = excludeWeekends ? totalDays - weekendCount : totalDays;
         
         // 결과 표시
-        workdayCountDiv.textContent = `업무일 수: ${workdayCount}일`;
-        weekendCountDiv.textContent = `주말 수: ${weekendCount}일`;
+        workdayCountDiv.textContent = bdFmt(BD_DT_L10N.workdays, { count: workdayCount });
+        weekendCountDiv.textContent = bdFmt(BD_DT_L10N.weekends, { count: weekendCount });
         
         workdayResultDiv.style.display = 'block';
     }
@@ -242,7 +267,7 @@ document.addEventListener('DOMContentLoaded', function() {
         
         // 입력 유효성 검사
         if (isNaN(timeValue) || timeValue < 0) {
-            alert('유효한 시간 값을 입력해주세요.');
+            alert(BD_DT_L10N.invalidTime);
             return;
         }
         
@@ -281,25 +306,14 @@ document.addEventListener('DOMContentLoaded', function() {
         }
         
         // 결과 표시
-        convertedTimeDiv.textContent = `${timeValue} ${getUnitName(fromUnit)} = ${result.toFixed(2)} ${getUnitName(toUnit)}`;
+        convertedTimeDiv.textContent = bdFmt(BD_DT_L10N.timeConv, { value: timeValue, from: getUnitName(fromUnit), result: result.toFixed(2), to: getUnitName(toUnit) });
         
         timeConvResultDiv.style.display = 'block';
     }
     
     // 단위 이름 반환 함수
     function getUnitName(unit) {
-        switch (unit) {
-            case 'seconds':
-                return '초';
-            case 'minutes':
-                return '분';
-            case 'hours':
-                return '시간';
-            case 'days':
-                return '일';
-            default:
-                return unit;
-        }
+        return (BD_DT_L10N.units && BD_DT_L10N.units[unit]) || unit;
     }
     
     // 입력 필드용 날짜 형식 (YYYY-MM-DD)
@@ -315,9 +329,9 @@ document.addEventListener('DOMContentLoaded', function() {
         const year = date.getFullYear();
         const month = date.getMonth() + 1;
         const day = date.getDate();
-        const weekDay = ['일', '월', '화', '수', '목', '금', '토'][date.getDay()];
-        
-        return `${year}년 ${month}월 ${day}일 (${weekDay})`;
+        const weekDay = BD_DT_L10N.weekdays[date.getDay()];
+
+        return bdFmt(BD_DT_L10N.dateFormat, { year: year, month: month, day: day, weekday: weekDay });
     }
     
     // 공유 기능 설정
@@ -336,7 +350,7 @@ function setupShareButtons() {
     if (kakaoShareBtn) {
         kakaoShareBtn.addEventListener('click', function() {
             if (!window.Kakao) {
-                alert('카카오톡 SDK를 불러올 수 없습니다.');
+                alert(BD_DT_L10N.kakaoSdkError);
                 return;
             }
             
@@ -375,7 +389,7 @@ function setupShareButtons() {
                 }
             } catch (error) {
                 console.error('카카오톡 공유 중 오류 발생:', error);
-                alert('카카오톡 공유 기능을 사용할 수 없습니다. 다른 방법으로 공유해 주세요.');
+                alert(BD_DT_L10N.kakaoShareError);
             }
         });
     }
@@ -408,7 +422,7 @@ function setupShareButtons() {
             tempTextArea.select();
             document.execCommand('copy');
             document.body.removeChild(tempTextArea);
-            alert('링크가 복사되었습니다. 쓰레드 앱에 붙여넣기하여 공유하세요!');
+            alert(BD_DT_L10N.threadsLinkCopied);
         });
     }
     
@@ -422,7 +436,7 @@ function setupShareButtons() {
             document.execCommand('copy');
             document.body.removeChild(tempInput);
             
-            alert('링크가 클립보드에 복사되었습니다.');
+            alert(BD_DT_L10N.linkCopied);
         });
     }
 }

@@ -5,6 +5,26 @@
  * Cloudflare Speed Test 엔드포인트를 활용한 정확한 속도 측정
  */
 
+// UI 문자열 사전 (언어판 페이지는 이 스크립트 로드 전에 window.SPEED_TEST_STRINGS 로 재정의 — 미정의 시 한국어 기본값)
+const SPEED_TEST_STRINGS = Object.assign({
+    testing: '측정 중...',
+    retest: '다시 측정하기',
+    canceled: '측정이 취소되었습니다.',
+    error: '측정 중 오류가 발생했습니다. 네트워크 연결을 확인해주세요.',
+    pingTesting: '핑 측정 중...',
+    downloadTesting: '다운로드 속도 측정 중...',
+    downloadTestingSize: '다운로드 측정 중... ({size}MB)',
+    uploadEstimating: '업로드 속도 추정 중...',
+    failed: '측정 실패',
+    done: '측정 완료!',
+    ratingGiga: '매우 우수 (기가급)',
+    ratingExcellent: '우수',
+    ratingGood: '양호',
+    ratingFair: '보통',
+    ratingPoor: '개선 필요',
+    unsupported: '이 브라우저는 속도 측정을 지원하지 않습니다. 최신 브라우저를 사용해주세요.'
+}, (typeof window !== 'undefined' && window.SPEED_TEST_STRINGS) || {});
+
 // 테스트 설정
 const SPEED_TEST_CONFIG = {
     // Cloudflare 다운로드 테스트 엔드포인트
@@ -53,7 +73,7 @@ async function startSpeedTest() {
 
     // UI 초기화
     startButton.disabled = true;
-    startButton.textContent = '측정 중...';
+    startButton.textContent = SPEED_TEST_STRINGS.testing;
     resultsGrid.style.display = 'none';
     resetResults();
 
@@ -74,15 +94,15 @@ async function startSpeedTest() {
         console.error('Speed test error:', error);
 
         if (error.name === 'AbortError') {
-            statusText.textContent = '측정이 취소되었습니다.';
+            statusText.textContent = SPEED_TEST_STRINGS.canceled;
         } else {
-            statusText.textContent = '측정 중 오류가 발생했습니다. 네트워크 연결을 확인해주세요.';
+            statusText.textContent = SPEED_TEST_STRINGS.error;
         }
     } finally {
         isTestRunning = false;
         abortController = null;
         startButton.disabled = false;
-        startButton.textContent = '다시 측정하기';
+        startButton.textContent = SPEED_TEST_STRINGS.retest;
     }
 }
 
@@ -99,7 +119,7 @@ function stopSpeedTest() {
  * 핑 및 지터 측정 (Cloudflare 엔드포인트 사용)
  */
 async function runPingTest() {
-    updateStatus('핑 측정 중...', 5);
+    updateStatus(SPEED_TEST_STRINGS.pingTesting, 5);
 
     const pingTimes = [];
     const testUrl = `${SPEED_TEST_CONFIG.downloadEndpoint}?bytes=0`;
@@ -154,7 +174,7 @@ async function runPingTest() {
  * 다운로드 속도 측정 (Cloudflare CDN)
  */
 async function runDownloadTest() {
-    updateStatus('다운로드 속도 측정 중...', 20);
+    updateStatus(SPEED_TEST_STRINGS.downloadTesting, 20);
 
     const downloadSpeeds = [];
     const sizes = SPEED_TEST_CONFIG.downloadSizes;
@@ -163,7 +183,7 @@ async function runDownloadTest() {
         const bytes = sizes[i];
         const sizeMB = (bytes / (1024 * 1024)).toFixed(1);
 
-        updateStatus(`다운로드 측정 중... (${sizeMB}MB)`, 20 + (i / sizes.length) * 35);
+        updateStatus(SPEED_TEST_STRINGS.downloadTestingSize.replace('{size}', sizeMB), 20 + (i / sizes.length) * 35);
 
         try {
             const url = `${SPEED_TEST_CONFIG.downloadEndpoint}?bytes=${bytes}&cachebust=${Date.now()}`;
@@ -201,7 +221,7 @@ async function runDownloadTest() {
  * 브라우저 CORS 제한으로 실제 업로드 테스트가 어려워 다운로드 기반 추정 사용
  */
 async function runUploadTest() {
-    updateStatus('업로드 속도 추정 중...', 60);
+    updateStatus(SPEED_TEST_STRINGS.uploadEstimating, 60);
 
     if (testResults.download > 0) {
         // 다운로드 속도 기반 추정 (일반적인 비대칭 연결 비율 적용)
@@ -366,7 +386,7 @@ function updatePingDisplay() {
     const jitterValue = document.getElementById('jitterValue');
 
     if (pingValue) {
-        pingValue.textContent = testResults.ping >= 0 ? `${testResults.ping} ms` : '측정 실패';
+        pingValue.textContent = testResults.ping >= 0 ? `${testResults.ping} ms` : SPEED_TEST_STRINGS.failed;
     }
     if (jitterValue) {
         jitterValue.textContent = testResults.jitter >= 0 ? `${testResults.jitter} ms` : '-';
@@ -376,14 +396,15 @@ function updatePingDisplay() {
 function updateDownloadDisplay() {
     const downloadSpeed = document.getElementById('downloadSpeed');
     if (downloadSpeed) {
-        downloadSpeed.textContent = testResults.download >= 0 ? `${testResults.download} Mbps` : '측정 실패';
+        downloadSpeed.textContent = testResults.download >= 0 ? `${testResults.download} Mbps` : SPEED_TEST_STRINGS.failed;
     }
 }
 
 function updateUploadDisplay() {
     const uploadSpeed = document.getElementById('uploadSpeed');
     if (uploadSpeed) {
-        uploadSpeed.textContent = testResults.upload >= 0 ? `${testResults.upload} Mbps` : '측정 실패';
+        // 업로드는 실측이 아닌 추정치 — ≈ 표기로 명시
+        uploadSpeed.textContent = testResults.upload >= 0 ? `≈ ${testResults.upload} Mbps` : SPEED_TEST_STRINGS.failed;
     }
 }
 
@@ -391,7 +412,7 @@ function updateUploadDisplay() {
  * 최종 결과 표시
  */
 function displayResults() {
-    updateStatus('측정 완료!', 100);
+    updateStatus(SPEED_TEST_STRINGS.done, 100);
 
     if (testResults.download >= 0) {
         updateSpeedGauge(testResults.download);
@@ -421,28 +442,28 @@ function showSpeedRating() {
     let color = '';
 
     if (speed < 0) {
-        rating = '측정 실패';
+        rating = SPEED_TEST_STRINGS.failed;
         color = '#e74c3c';
     } else if (speed >= 500) {
-        rating = '매우 우수 (기가급)';
+        rating = SPEED_TEST_STRINGS.ratingGiga;
         color = '#27ae60';
     } else if (speed >= 100) {
-        rating = '우수';
+        rating = SPEED_TEST_STRINGS.ratingExcellent;
         color = '#27ae60';
     } else if (speed >= 50) {
-        rating = '양호';
+        rating = SPEED_TEST_STRINGS.ratingGood;
         color = '#f39c12';
     } else if (speed >= 25) {
-        rating = '보통';
+        rating = SPEED_TEST_STRINGS.ratingFair;
         color = '#f39c12';
     } else {
-        rating = '개선 필요';
+        rating = SPEED_TEST_STRINGS.ratingPoor;
         color = '#e74c3c';
     }
 
     const statusText = document.getElementById('statusText');
     if (statusText) {
-        statusText.innerHTML = `측정 완료! <span style="color: ${color}; font-weight: bold;">${rating}</span>`;
+        statusText.innerHTML = `${SPEED_TEST_STRINGS.done} <span style="color: ${color}; font-weight: bold;">${rating}</span>`;
     }
 }
 
@@ -463,7 +484,7 @@ document.addEventListener('DOMContentLoaded', function() {
         const startButton = document.getElementById('startTest');
 
         if (statusText) {
-            statusText.textContent = '이 브라우저는 속도 측정을 지원하지 않습니다. 최신 브라우저를 사용해주세요.';
+            statusText.textContent = SPEED_TEST_STRINGS.unsupported;
         }
         if (startButton) {
             startButton.disabled = true;
