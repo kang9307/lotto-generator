@@ -11,11 +11,16 @@ const MBTI_STRINGS = Object.assign({
     weaknessesTitle: '⚠️ 주의하면 좋은 경향',
     careersTitle: '💼 어울리는 경우가 많은 직업 예시',
     compatibilityTitle: '💕 잘 맞는 경우가 많은 유형',
-    resultNote: '※ 본 결과는 공식 MBTI® 검사가 아닌 재미로 해보는 자가 문항 테스트이며, 응답 경향에 따른 참고용입니다.'
+    resultNote: '※ 본 결과는 공식 MBTI® 검사가 아닌 재미로 해보는 자가 문항 테스트이며, 응답 경향에 따른 참고용입니다.',
+    prevResultTitle: '📊 이전 테스트 결과',
+    prevResultToday: '오늘 해본 테스트 결과입니다',
+    prevResultDaysAgo: '{n}일 전에 해본 테스트 결과입니다'
 }, (typeof window !== 'undefined' && window.MBTI_STRINGS) || {});
 
 // MBTI 테스트 질문 데이터
-const mbtiQuestions = [
+// 언어판 페이지는 이 스크립트 로드 전에 window.MBTI_QUESTIONS 로 재정의 — 미정의 시 한국어 기본값
+// (문항 수·선택지 수·type 키는 반드시 동일하게 유지할 것: 채점이 깨진다)
+const mbtiQuestions = (typeof window !== 'undefined' && window.MBTI_QUESTIONS) || [
     {
         id: 1,
         question: "파티나 모임에서 당신은 주로...",
@@ -179,7 +184,9 @@ const mbtiQuestions = [
 ];
 
 // MBTI 결과 데이터
-const mbtiResults = {
+// 언어판 페이지는 이 스크립트 로드 전에 window.MBTI_RESULTS 로 재정의 — 미정의 시 한국어 기본값
+// (16종 유형 키는 반드시 동일하게 유지할 것)
+const mbtiResults = (typeof window !== 'undefined' && window.MBTI_RESULTS) || {
     "ENFP": {
         title: "재기발랄한 활동가",
         nickname: "캠페이너",
@@ -549,11 +556,11 @@ window.addEventListener('load', function() {
                 const introSection = document.querySelector('#intro-section');
                 const previousResultHTML = `
                     <div style="margin-top: 20px; padding: 20px; background: linear-gradient(135deg, #e3f2fd 0%, #f3e5f5 100%); border-radius: 12px; border: 2px solid #667eea;">
-                        <h4 style="margin: 0 0 15px 0; color: #667eea; text-align: center;">📊 이전 테스트 결과</h4>
+                        <h4 style="margin: 0 0 15px 0; color: #667eea; text-align: center;">${MBTI_STRINGS.prevResultTitle}</h4>
                         <div style="text-align: center;">
                             <div style="font-size: 2rem; font-weight: bold; color: #667eea; margin-bottom: 10px;">${result.type}</div>
                             <p style="margin: 0; color: #555;">
-                                ${daysSince === 0 ? '오늘' : `${daysSince}일 전`} 테스트 결과입니다
+                                ${daysSince === 0 ? MBTI_STRINGS.prevResultToday : MBTI_STRINGS.prevResultDaysAgo.replace('{n}', daysSince)}
                             </p>
                         </div>
                     </div>

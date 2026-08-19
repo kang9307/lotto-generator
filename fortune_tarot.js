@@ -5,7 +5,8 @@
  */
 
 // 별자리 데이터
-const zodiacData = {
+// 언어판 페이지는 이 스크립트 로드 전에 window.FT_ZODIAC 로 재정의한다 (미정의 시 한국어 기본값)
+const zodiacData = (typeof window !== 'undefined' && window.FT_ZODIAC) || {
     aries: {
         name: '양자리',
         icon: '♈',
@@ -93,7 +94,8 @@ const zodiacData = {
 };
 
 // 운세 메시지 풀
-const fortuneMessages = {
+// 언어판 페이지는 이 스크립트 로드 전에 window.FT_FORTUNES 로 재정의한다 (미정의 시 한국어 기본값)
+const fortuneMessages = (typeof window !== 'undefined' && window.FT_FORTUNES) || {
     love: [
         "새로운 만남의 기회가 찾아올 수 있어요",
         "연인과의 관계가 더욱 깊어질 것 같아요",
@@ -216,7 +218,8 @@ const fortuneMessages = {
 };
 
 // 타로 카드 데이터 (메이저 아르카나 22장)
-const tarotCards = [
+// 언어판 페이지는 이 스크립트 로드 전에 window.FT_TAROT 로 재정의한다 (미정의 시 한국어 기본값)
+const tarotCards = (typeof window !== 'undefined' && window.FT_TAROT) || [
     {
         name: "The Fool (바보)",
         keywords: ["새로운 시작", "모험", "순수함", "자유"],
@@ -330,12 +333,35 @@ const tarotCards = [
 ];
 
 // 럭키 아이템 데이터
-const luckyItems = {
+// 언어판 페이지는 이 스크립트 로드 전에 window.FT_LUCKY 로 재정의한다 (미정의 시 한국어 기본값)
+const luckyItems = (typeof window !== 'undefined' && window.FT_LUCKY) || {
     colors: ['빨강', '파랑', '노랑', '초록', '보라', '주황', '분홍', '하양', '검정', '갈색', '회색', '금색', '은색'],
     numbers: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 33, 44, 55, 77, 88, 99],
     items: ['반지', '목걸이', '시계', '브로치', '가방', '신발', '모자', '스카프', '선글라스', '향수', '꽃', '보석', '동전', '열쇠'],
     directions: ['동쪽', '서쪽', '남쪽', '북쪽', '동남쪽', '동북쪽', '서남쪽', '서북쪽']
 };
+
+// 결과 화면 문구 (언어판 페이지는 이 스크립트 로드 전에 window.FT_STRINGS 로 재정의 — 미정의 시 한국어 기본값)
+const FT_STRINGS = Object.assign({
+    locale: 'ko-KR',
+    fortuneTitleSuffix: ' 오늘의 운세',
+    luckyTitle: '✨ 오늘의 럭키 아이템',
+    luckyColor: '럭키 컬러',
+    luckyNumber: '럭키 넘버',
+    luckyItem: '럭키 아이템',
+    luckyDirection: '럭키 방향',
+    categories: {
+        love: '사랑운',
+        career: '직업운',
+        money: '금전운',
+        health: '건강운',
+        relationships: '인간관계운',
+        study: '학업운',
+        overall: '전체운'
+    },
+    tarotTitle: '🃏 오늘의 타로 카드',
+    drawAgain: '🔄 다시 뽑기'
+}, (typeof window !== 'undefined' && window.FT_STRINGS) || {});
 
 // 암호학적 난수 정수 [min, max] (rejection sampling, 미지원 브라우저만 폴백)
 function secureRandInt(min, max) {
@@ -528,47 +554,39 @@ function displayFortune(zodiacKey, fortune) {
         overall: '🌟'
     };
     
-    const categoryNames = {
-        love: '사랑운',
-        career: '직업운',
-        money: '금전운',
-        health: '건강운',
-        relationships: '인간관계운',
-        study: '학업운',
-        overall: '전체운'
-    };
-    
+    const categoryNames = FT_STRINGS.categories;
+
     let fortuneHTML = `
         <div style="text-align: center; margin-bottom: 30px;">
             <h3 style="color: #667eea; font-size: 1.8rem; margin-bottom: 10px;">
-                ${zodiac.icon} ${zodiac.name} 오늘의 운세
+                ${zodiac.icon} ${zodiac.name}${FT_STRINGS.fortuneTitleSuffix}
             </h3>
             <p style="color: #666; font-size: 1rem;">
-                ${new Date().toLocaleDateString('ko-KR', { 
-                    year: 'numeric', 
-                    month: 'long', 
-                    day: 'numeric' 
+                ${new Date().toLocaleDateString(FT_STRINGS.locale, {
+                    year: 'numeric',
+                    month: 'long',
+                    day: 'numeric'
                 })}
             </p>
         </div>
-        
+
         <div class="lucky-info">
-            <h4 style="margin-bottom: 15px; font-size: 1.2rem;">✨ 오늘의 럭키 아이템</h4>
+            <h4 style="margin-bottom: 15px; font-size: 1.2rem;">${FT_STRINGS.luckyTitle}</h4>
             <div class="lucky-items">
                 <div class="lucky-item">
-                    <h5>럭키 컬러</h5>
+                    <h5>${FT_STRINGS.luckyColor}</h5>
                     <span>${fortune.lucky.color}</span>
                 </div>
                 <div class="lucky-item">
-                    <h5>럭키 넘버</h5>
+                    <h5>${FT_STRINGS.luckyNumber}</h5>
                     <span>${fortune.lucky.number}</span>
                 </div>
                 <div class="lucky-item">
-                    <h5>럭키 아이템</h5>
+                    <h5>${FT_STRINGS.luckyItem}</h5>
                     <span>${fortune.lucky.item}</span>
                 </div>
                 <div class="lucky-item">
-                    <h5>럭키 방향</h5>
+                    <h5>${FT_STRINGS.luckyDirection}</h5>
                     <span>${fortune.lucky.direction}</span>
                 </div>
             </div>
@@ -681,7 +699,7 @@ function displayTarotResult(tarot) {
     const resultHTML = `
         <div style="text-align: center; margin-bottom: 30px;">
             <h3 style="color: #667eea; font-size: 1.5rem; margin-bottom: 15px;">
-                🃏 오늘의 타로 카드
+                ${FT_STRINGS.tarotTitle}
             </h3>
         </div>
         
@@ -696,7 +714,7 @@ function displayTarotResult(tarot) {
         
         <div style="text-align: center; margin-top: 30px;">
             <button class="action-button" onclick="shuffleTarotCards()">
-                🔄 다시 뽑기
+                ${FT_STRINGS.drawAgain}
             </button>
         </div>
     `;
