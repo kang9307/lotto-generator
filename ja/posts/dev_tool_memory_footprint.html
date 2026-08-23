@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<!--
+ * 技術ブログ記事テンプレート
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ja">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>開発ツールはなぜメモリを食うのか - 言語サーバーのメモリの原理と代償</title>
+    <meta name="description" content="言語サーバーがギガバイト単位のメモリを使う理由を原理から解きます。補完が即座に返るために何をメモリへ載せるのか、索引をディスクへ逃がすと何を失うのか、RSSとPSSのどちらを見るべきか、そして削減手法それぞれの代償までを整理します。">
+    <meta name="keywords" content="言語サーバー メモリ, LSP メモリ使用量, rust-analyzer メモリ, clangd インデックス, gopls メモリ, RSS PSS 違い, 開発マシン メモリ不足, モノレポ IDE, スワップ, cgroup memory.max, PSI メモリ圧力, ワーキングセット, 増分計算, ディスクキャッシュ索引, 開発ツール選び">
+    <meta name="robots" content="index, follow">
+    <meta name="googlebot" content="index, follow">
+    <meta name="bingbot" content="index, follow">
+    <meta name="revisit-after" content="7 days">
+    <meta name="language" content="Japanese">
+    <meta name="rating" content="general">
+    <meta name="distribution" content="global">
+
+    <link rel="canonical" href="https://braindetox.kr/ja/posts/dev_tool_memory_footprint.html">
+
+    <meta property="og:title" content="開発ツールはなぜメモリを食うのか - 言語サーバーのメモリの原理と代償">
+    <meta property="og:description" content="補完や定義ジャンプが即座に返るために何をメモリへ載せるのか、そのメモリを削ると何を手放すことになるのか。計測指標とツール選びの基準までまとめます。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/ja/posts/dev_tool_memory_footprint.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ja_JP">
+    <meta property="article:published_time" content="2026-08-23">
+    <meta property="article:section" content="開発・インフラ">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="開発ツールはなぜメモリを食うのか - 言語サーバーのメモリの原理と代償">
+    <meta name="twitter:description" content="言語サーバーのメモリはどこで増え、何を壊すのか。精度とメモリの交換、計測指標、削減手法とその代償を整理します。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+    <meta name="twitter:site" content="@braindetox_kr">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "開発ツールはなぜメモリを食うのか - 言語サーバーのメモリの原理と代償",
+      "alternativeHeadline": "Why Developer Tools Eat Memory - The Mechanics and Cost of Language Server Footprint",
+      "datePublished": "2026-08-23",
+      "dateModified": "2026-08-23",
+      "inLanguage": "ja-JP",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "言語サーバー メモリ, LSP メモリ使用量, rust-analyzer メモリ, clangd インデックス, gopls メモリ, RSS PSS 違い, モノレポ IDE, cgroup memory.max, PSI メモリ圧力, ワーキングセット",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/ja/posts/dev_tool_memory_footprint.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "言語サーバーはなぜソースコードよりはるかに多くのメモリを使うのですか。",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "メモリを占めるのはソースコードそのものではなく、ソースから取り出した派生データです。rust-analyzer のアーキテクチャ文書は、入力データであるソースコードはせいぜい数十メガバイト程度なので全部メモリに置いても問題ないと説明しています。問題はその上に積み上がるものです。構文木、名前解決の結果、型推論の結果、シンボルと逆参照の索引、依存グラフ、そして同じ計算を繰り返さないために保存しておくメモ化キャッシュがすべてメモリに載ります。補完がミリ秒で出て定義ジャンプが即座に効くのは、まさにその派生データが先に用意されているからであり、ギガバイト単位の使用量はその即時性の対価です。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "メモリが少ない言語サーバーは何を手放しているのですか。",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "多くの場合、いまこの瞬間の精度を手放しています。解析結果をファイルシステムへ逃がし必要なときだけ読み込む設計は常駐メモリと再起動時間を大きく削りますが、キャッシュがいつ古くなったかを判定する規則が必要になります。保存時にのみ全体解析を回す設計であれば、まだ保存していない新しい import や構造体、トレイトが索引に存在しない状態が生まれます。遅延ロードは最初の問い合わせを遅くし、部分索引は依存ライブラリ内部への探索を浅くします。いずれにせよ、精度、遅延、運用の複雑さのいずれかをメモリと交換する取引です。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "メモリ使用量は RSS を見ればよいのですか。",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "RSS だけを見ると逼迫時に正反対の読み方をしてしまいます。ps のマニュアルは RSS をスワップされていない物理メモリと定義しているため、メモリが足りなくなってページがスワップへ追い出されるほど RSS はかえって減って見えます。したがって RSS は必ずスワップ使用量と一緒に見る必要があります。複数プロセスの合計を出すときは共有ライブラリが二重計上されないよう PSS を使うほうが正確です。コンテナ内であれば cgroup v2 の memory.current がそのグループと配下全体の実使用量を示します。ただし最初の一歩は常にシステム全体の余裕を確認することで、Linux では free 列ではなく available 列がその値です。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "開発マシンのメモリが不足すると具体的に何が起きますか。",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "まず回収とスワップが始まり、macOS ではスワップの前にメモリ圧縮が入ります。圧縮されたページは触るたびに CPU を使うため、遅延が CPU 使用率の姿で現れます。Windows はワーキングセットを削って対応しますが、削られたページに再び触れるとハードページフォールトが発生し、バッキングストアから読み直すことになります。つまり補完一回がディスク読み取りになる瞬間です。コンテナや CI では cgroup v2 の上限に当たります。memory.high を超えるとプロセスはスロットルされ強い回収圧力を受け、memory.max に達して使用量を減らせない場合はそのグループ内で OOM キラーが動きます。ノートパソコンではこれらの追加作業がすべて発熱とバッテリー消費に翻訳されます。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "メモリを100分の1に削減といった宣伝文句はどう読めばよいですか。",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "倍率そのものより、何と何を比べた値なのか、どんな条件で計測したのかを先に確認する必要があります。目標値と実測値を区別することも同じくらい重要です。目標 100MB と実測 100MB はまったく別の文です。比較対象が同じリポジトリなのか、同じマシンなのか、同じ設定なのか、インスタンス一つの値なのか複数の合計なのかが明かされていなければ、その倍率は情報というより印象に近いものです。逆に、何がいつまで索引されないのか、どの機能がまだ未対応なのかを文書に明記するプロジェクトは、信頼に足る信号を出しているといえます。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 4px; overflow-x: auto; margin: 1rem 0; }
+        .post-content pre code { background-color: transparent; padding: 0; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        .callout { background: #eef6ff; border-left: 4px solid #3498db; padding: 0.7rem 1rem; margin: 1rem 0; border-radius: 4px; font-size: 0.95em; }
+        .warn { background: #fff5f5; border-left: 4px solid #e74c3c; padding: 0.7rem 1rem; margin: 1rem 0; border-radius: 4px; font-size: 0.95em; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/dev_tool_memory_footprint.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/dev_tool_memory_footprint.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/dev_tool_memory_footprint.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/dev_tool_memory_footprint.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/dev_tool_memory_footprint.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    { "@type": "ListItem", "position": 1, "name": "ホーム", "item": "https://braindetox.kr/ja/" },
+    { "@type": "ListItem", "position": 2, "name": "開発・インフラ", "item": "https://braindetox.kr/ja/category/dev.html" },
+    { "@type": "ListItem", "position": 3, "name": "開発ツールはなぜメモリを食うのか - 言語サーバーのメモリの原理と代償", "item": "https://braindetox.kr/ja/posts/dev_tool_memory_footprint.html" }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="開発ツールはなぜメモリを食うのか - 言語サーバーのメモリの原理と代償">
+                <meta itemprop="datePublished" content="2026-08-23">
+                <meta itemprop="dateModified" content="2026-08-23">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="言語サーバー メモリ, LSP メモリ使用量, RSS PSS 違い, モノレポ IDE, cgroup memory.max, ワーキングセット">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/ja/posts/dev_tool_memory_footprint.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">開発ツールはなぜメモリを食うのか - 言語サーバーのメモリの原理と代償</h1>
+                    <h2 class="post-subtitle">補完が即座に返るために何を載せるのか、そしてそれを削ると何を失うのか</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-08-23">2026年8月23日</span>
+                        <span class="post-category" itemprop="articleSection">開発・インフラ</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+                    <h2>はじめに: 一行も打っていないのにファンが回る理由</h2>
+                    <p>エディタを開いたままコーヒーを取りに行って戻ると、ノートパソコンが熱くなっています。ビデオ会議のウィンドウをもう一つ開いた途端、さっきまで快適だった補完が一拍遅れて出るようになります。ブランチを切り替えた直後は三十秒ほどエディタごと固まります。この三つの場面はすべて同じ場所から来ています。ウィンドウの裏で動く<strong>言語サーバー</strong>が、プロジェクト全体を読み込んで自分用の地図を描き直している最中なのです。</p>
+                    <p>2026年8月、Rust 向けの代替言語サーバーが、メモリを100分の1しか使わないという見出しで開発者コミュニティに現れました。この記事はそのツールの紹介でも宣伝でもありません。その見出しが触れた本当の問いを扱います。<strong>開発ツールのメモリはなぜ増え、増えたメモリは正確に何を壊すのか。</strong>そしてそれを削ろうとするとき、私たちが静かに差し出しているものは何なのか。</p>
+                    <p>まず発表された内容を確認できた条件とともに短く押さえ、そこからは個別のツールを離れて原理に入ります。</p>
+
+                    <h2>1. 何が発表されたのか - そして100倍とは何と何の比か</h2>
+                    <p>話題になっているのは Rust Glancer という Rust 言語サーバーの実装です。プロジェクトのサイトは自らを rust-analyzer とは異なるアプローチだと紹介し、すべてをメモリに置いて動的に再計算する代わりに<em>凍結されたワークスペース</em>を用い、それをファイルシステムへ逃がせると説明しています。性能面の多少の損を認める代わりに極端なメモリ効率と即座の再起動を得るというのがプロジェクト自身の要約で、開発期間は約4か月としています。</p>
+                    <p>見出しの倍率をそのまま持ち出す前に、何を何と比べた値なのかを切り分けておく必要があります。文書で実際に確認できるのは次のとおりです。</p>
+                    <ul>
+                        <li>メモリ側の数字は<strong>目標値</strong>です。文書は妥当な規模のプロジェクトで100MB未満を目標とすると書いており、その妥当な規模が何を指すのかは明かされていません。</li>
+                        <li>比較対象側の数字は<strong>著者の逸話</strong>です。複数のプロジェクトを同じエディタ二本で同時に開いた状態で rust-analyzer が16GBを使っていたという記述で、インスタンス一つの常駐量ではなくその構成全体の合計です。</li>
+                        <li>プロジェクトが公開した<strong>並列比較の表にメモリ列はありません。</strong>表は索引の所要時間だけを載せています。</li>
+                        <li>したがって100倍は、100MBという目標と16GBという逸話を割った値に近いものです。同じリポジトリを同じマシンで両サーバーから開き常駐メモリを並べて計測した公開数値は存在しません。</li>
+                    </ul>
+                    <p>公開されている時間の比較表は次のとおりです。あくまで<strong>メモリではなく索引時間</strong>であり、二台の MacBook で計測したという条件が付きます。</p>
+                    <ul>
+                        <li>MacBook Pro M4 Max 36GB: Glancer は基本5秒・全体8秒、rust-analyzer は基本6秒・全体13秒</li>
+                        <li>MacBook Pro M1 8GB: Glancer は基本6秒・全体9秒、rust-analyzer は基本7秒・全体14秒</li>
+                    </ul>
+                    <p>代償も文書に書かれています。新しく書いた import や構造体、トレイトは<strong>ドキュメントを保存するまで索引されません。</strong>入力中は現在の本文だけを浅く見て以前の索引を再利用します。ビルドスクリプトや手続きマクロを実際に実行して得る情報、nightly 専用機能はまだ扱わないと明記しています。これらの文は欠点ではなく信号です。倍率は条件が付いて初めて意味を持ち、条件を理解するには<strong>そもそもなぜそれほどのメモリが必要だったのか</strong>を知る必要があります。</p>
+
+                    <h2>2. 言語サーバーがメモリを使う理由 - 即時性の対価</h2>
+                    <p>言語サーバープロトコルは掛け算の問題を割り算に変えるために作られました。M個の言語とN個のエディタの組み合わせごとに言語対応を実装する代わりに、言語ごとにサーバーを一つ置きエディタは標準プロトコルで会話します。補完、定義ジャンプ、参照検索、リネーム、診断がすべてサーバー側の責務になります。</p>
+                    <p>ここで誤解が一つ生まれます。メモリを食っているのはソースコードだろうという思い込みです。rust-analyzer のアーキテクチャ文書はこの点をはっきり書いています。解析器は入力データをすべてメモリに置き入出力をしないが、その入力はソースコードであり大きくてもせいぜい数十メガバイトなので全部抱えていても問題ない、と。<strong>ギガバイトを生むのはソースではなくソースから取り出したものたちです。</strong></p>
+                    <table>
+                        <thead>
+                            <tr><th>メモリに載るもの</th><th>これがあって初めてできること</th><th>ないとどうなるか</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>構文木</td><td>カーソル位置の文法的文脈の把握</td><td>補完が文字列マッチ程度に退化する</td></tr>
+                            <tr><td>名前解決の結果とモジュールスコープ表</td><td>その識別子がどの定義を指すかの決定</td><td>定義ジャンプとリネームが当て推量になる</td></tr>
+                            <tr><td>型推論の結果</td><td>ドットの後に何が来られるかの計算</td><td>メソッド候補が不正確または空になる</td></tr>
+                            <tr><td>シンボル索引と逆参照索引</td><td>参照検索、ワークスペース全体の検索</td><td>問い合わせのたびにプロジェクト全体を走査する</td></tr>
+                            <tr><td>依存グラフ</td><td>変更時に何を再計算するかの判断</td><td>一文字直しただけで全体を再解析する</td></tr>
+                            <tr><td>メモ化された中間結果</td><td>同じ問い合わせを二度計算しないこと</td><td>打鍵のたびに同じ作業を繰り返す</td></tr>
+                        </tbody>
+                    </table>
+                    <p>最後の行が特に重要です。現代の言語サーバーは増分計算エンジンです。rust-analyzer はこの目的で Salsa を使っており、その設計の中核となる不変条件は<strong>関数本体の中で入力することが大域的な派生データを無効化しない</strong>というものです。この約束を守るために、ファイルごとに関数本体の変更と無関係な要約構造を別に持ち、モジュールスコープを別の表として索引し、構文木は必要になったときだけ解析します。</p>
+                    <p>構造が細かく分かれるほど再計算の範囲は狭くなりますが、その細片と細片のキャッシュこそがメモリです。ここでこの分野の根本的な取引が姿を現します。<strong>速い再計算を買うためにメモリを支払っているのです。</strong>補完が瞬く間に出るなら、その答えの材料の大半はすでに RAM に用意されていたということです。</p>
+
+                    <h2>3. 精度とメモリの交換 - この記事の中心</h2>
+                    <p>全部載せておけば正確で速い。問題は精度と遅延とメモリの三つを同時に最大化できないことです。軽いツールは魔法を使ったのではなく三つのうち一つを手放したのであり、何を手放したかがそのツールの性格を決めます。</p>
+                    <h3>3.1 何を手放すのか</h3>
+                    <ul>
+                        <li><strong>遅延ロード</strong> — 必要になったときだけ計算します。総メモリは減りますが最初の問い合わせが遅くなります。最初の一回だけ3秒かかる現象は平均応答時間の統計にはほとんど出ませんが、人はまさにその3秒を覚えています。</li>
+                        <li><strong>部分索引</strong> — ワークスペースは精密に、依存ライブラリは要約だけ持ちます。大規模リポジトリでの削減幅は最大ですが、ライブラリ内部へ入っていく定義ジャンプがどこかの深さで途切れます。</li>
+                        <li><strong>ディスクキャッシュ</strong> — 結果をファイルに逃がし必要なときに読み込みます。再起動が劇的に速くなる代わりにキャッシュがいつ古くなったかを判定する規則が要り、その規則が保守的だと作り直してばかりになり緩いと誤った答えを返します。</li>
+                        <li><strong>スナップショット凍結</strong> — 入力中は浅く見て保存時に全体解析を回します。削減幅は最も大きい一方で<strong>いま作ったものがまだ存在しない状態</strong>が生まれます。</li>
+                    </ul>
+                    <h3>3.2 手放しているのはたいてい時間軸である</h3>
+                    <p>四つを並べると共通点が見えます。軽いツールが実際に手放しているのは機能一覧ではなく<strong>いまこの瞬間の精度</strong>である場合が多いのです。コードは保存と保存の間にも変わり続けるのに索引は最後の保存時点で止まっており、この隔たりが広がるほどツールは少しずつ過去のコードについて答えるようになります。</p>
+                    <p>構造体を新しく定義し保存しないまま別のファイルへ移ってその名前を打っても候補に出てきません。保存を押せばすぐ消えるので不具合として報告されることもありません。だからこの費用はベンチマークに現れず<strong>習慣によって体感が完全に分かれます。</strong>二、三行ごとに保存する人にはほぼ存在しない費用であり、大きく書いてから後で保存する人には毎日ぶつかる壁です。</p>
+                    <h3>3.3 現実的な答えは層を分けることである</h3>
+                    <p>C/C++ 向け言語サーバーである clangd の構造がこの折衷の良い例です。索引を一塊にせず複数の層を重ねて一つに見せます。最上層にはいま編集中のファイルを担当する動的索引があり、その下にプロジェクト全体を走査する背景索引があります。設計文書はこの構造のおかげで<strong>背景索引がまだ終わっていなくても作業中のファイルの相互参照は利用できる</strong>と説明しています。</p>
+                    <p>学ぶべきは個別の実装ではなく原則です。最新でなければならないものとそうでなくてよいものを区別した瞬間、メモリに置くものとディスクに置くものが自然に分かれます。カーソルのあるファイルはミリ秒単位で最新である必要がありますが、半年触っていないベンダーディレクトリはそうではありません。すべてを同じ鮮度で保とうとするときにメモリが破裂します。</p>
+
+                    <h2>4. 開発マシンのメモリが足りなくなると実際に起きること</h2>
+                    <p>メモリ使用量の数字が大きいこと自体は誰も傷つけません。有害なのはその数字が利用可能量を超えたときに始まる連鎖であり、それには順序があります。</p>
+                    <ul>
+                        <li><strong>回収とスワップ</strong> — カーネルが使用頻度の低いページから追い出します。ここに最初の罠があります。ps のマニュアルは RSS を<em>スワップされていない</em>物理メモリと定義するため、メモリが逼迫するほどプロセスの RSS は<strong>かえって減って見えます。</strong></li>
+                        <li><strong>圧縮</strong> — macOS はスワップの前にメモリ圧縮を使います。Activity Monitor の Compressed がより多くの RAM を確保するために圧縮した量です。圧縮されたページは触るたびに CPU を使うため、メモリの問題が CPU 使用率に化けて現れます。</li>
+                        <li><strong>ワーキングセットの縮小</strong> — Windows はプロセスのワーキングセットからページを削ります。ワーキングセットとは仮想アドレス空間のうちいま物理メモリに常駐しているページのことで、削られたページに再び触れるとハードページフォールトが起きバッキングストアから読み直します。<strong>補完一回がディスク読み取りになる地点</strong>です。</li>
+                        <li><strong>ツール同士の競合</strong> — エディタ本体と拡張ホスト、型検査器、バンドラの監視プロセス、コンテナランタイム、タブ40個のブラウザが同じ RAM を分け合います。互いに積んだページキャッシュを追い出し合うので、どれか一つを減らすと別のものが速くなります。</li>
+                        <li><strong>コンテナの上限</strong> — 開発コンテナや CI では cgroup v2 が壁を立てます。memory.high を超えるとプロセスはスロットルされ強い回収圧力を受けますが、カーネル文書はこの線を越えても<strong>OOM キラーは呼ばれない</strong>と明言しています。memory.max に達しこれ以上減らせなくなって初めて、そのグループ内で OOM キラーが動きます。</li>
+                        <li><strong>発熱とバッテリー</strong> — 圧縮、回収、再索引はすべて CPU の作業です。メモリの問題はノートパソコンでは熱の問題に翻訳され、<a href="laptop_buying_guide_2026.html">ノートパソコンを選ぶときに RAM 容量を先に見よ</a>という助言はここから出てきます。</li>
+                    </ul>
+                    <p>CI で言語サーバーや型検査器が<strong>理由もなく消える</strong>現象に遭ったなら、ログより先に見る場所があります。cgroup v2 の memory.events ファイルは low、high、max、oom、oom_kill のカウンタを持っており、oom_kill が上がっていればそれで一件落着です。</p>
+                    <p>圧力そのものを直接測る指標もあります。Linux の PSI はシステム全体では <code>/proc/pressure/memory</code>、cgroup 単位では <code>memory.pressure</code> として公開されます。some の行は少なくとも一部のタスクがその資源のせいで止まっていた時間の割合、full の行は非アイドルのタスクがすべて同時に止まっていた時間の割合です。full が上がっているならそれは遅いのではなく<strong>スラッシング</strong>です。10秒、60秒、300秒の平均が一緒に出るので、瞬間的な跳ねと持続的な傾向を一画面で見分けられます。</p>
+
+                    <h2>5. モノレポと大規模リポジトリ - 規模は線形に増えない</h2>
+                    <p>ファイルが二倍になればメモリも二倍になりそうですが、実際にはもっと急に上がります。理由はデータ構造の性質にあります。</p>
+                    <ul>
+                        <li><strong>参照関係はシンボルの組に近いものです。</strong>シンボル数はファイル数に比例しますが、参照検索と安全なリネームを即座に行うには誰が誰を使っているかの逆方向索引が必要で、この索引はファイル数より速く育ちます。</li>
+                        <li><strong>無効化の範囲が広がります。</strong>依存グラフが深くなるほど、共通の型を一つ直したときに再計算すべき下流の範囲が大きくなります。だから大きなリポジトリほどキャッシュをより大きく取りたくなります。</li>
+                        <li><strong>生成コードが割り込みます。</strong>マクロ展開、コード生成、スキーマから作られる型はソースにありません。解析対象の実際の大きさがリポジトリの見かけの大きさとずれていきます。</li>
+                        <li><strong>インスタンスが掛け算になります。</strong>rust-analyzer の文書は一つのプロセスが複数のプロジェクトを扱えると書いていますが、エディタの窓をプロジェクトごとに開くとその利点は消え、サーバーも窓の数だけ増えます。1節の16GBの逸話がまさにこの構成です。</li>
+                    </ul>
+                    <p>この規模で何が起きるかは clangd の設計文書が淡々と記しています。大規模プロジェクトの背景索引は<strong>通常数時間かかり数ギガバイトの RAM を使う</strong>とのことです。だから clangd はあらかじめ作っておいた静的索引を付ける選択肢を用意し、リモート索引機能は全体索引が招く大きなメモリ負担を別のマシンへ移すために作られました。</p>
+                    <p>ここから規模の答えが出ます。リポジトリが一定の大きさを超えると個人のマシンでのチューニングで凌ぐ段階は終わり、<strong>索引を開発マシンの外へ出すこと</strong>が残る方向になります。索引サーバー一台がメンバー全員の RAM 増設より安くなる時点が来ますが、その計算は<a href="ddr5_memory_price_surge_ai_demand_2026.html">メモリ価格が大きく上がる局面</a>で再び揺らぎます。</p>
+
+                    <h2>6. 測り方 - どの数字を見るべきか</h2>
+                    <p>メモリの話がすれ違う理由の大半は、異なる数字を同じ名前で呼んでいることにあります。定義が違えば同じ状況から違う結論が出ます。</p>
+                    <table>
+                        <thead>
+                            <tr><th>指標</th><th>定義</th><th>どこで見るか</th><th>注意点</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>RSS</td><td>スワップされていない、そのタスクが実際に使った物理メモリ</td><td>ps、top、/proc の状態ファイル</td><td>スワップした分は抜ける。共有ライブラリがプロセスごとに二重計上される</td></tr>
+                            <tr><td>VSZ</td><td>プロセスの仮想メモリサイズ、デバイスマッピングは除く</td><td>ps</td><td>予約であって使用ではない。大きなファイルをマップすると膨らんで見える</td></tr>
+                            <tr><td>PSS</td><td>そのマッピングに対するプロセスの比例配分</td><td>smaps、smaps_rollup</td><td>複数プロセスの合計に適する。単体では過小評価になる</td></tr>
+                            <tr><td>Private_Dirty</td><td>そのプロセスだけが持ち、かつ変更されたページ</td><td>smaps</td><td>終了したときに実際に戻ってくる量に近い</td></tr>
+                            <tr><td>Swap</td><td>匿名メモリだったものがスワップへ出ている量</td><td>smaps</td><td>RSS と一緒に見て初めて実使用が見える</td></tr>
+                            <tr><td>available</td><td>スワップなしで新しいプログラムを起動できるメモリの推定値</td><td>free</td><td>free 列ではなくこの列が本当の余裕である</td></tr>
+                            <tr><td>memory.current</td><td>その cgroup と配下全体が現在使っている総量</td><td>cgroup v2</td><td>コンテナと CI ではこれが基準線になる</td></tr>
+                            <tr><td>ワーキングセット</td><td>仮想アドレス空間のうち現在物理メモリに常駐するページ</td><td>Windows タスクマネージャー</td><td>共有ページがプロセスごとに数えられる</td></tr>
+                            <tr><td>Compressed</td><td>より多くの RAM を確保するために圧縮したメモリの量</td><td>macOS Activity Monitor</td><td>この値が大きければすでに逼迫している</td></tr>
+                        </tbody>
+                    </table>
+                    <p>読む順序があります。順序を守れば誤診の大半は消えます。</p>
+                    <ul>
+                        <li><strong>まずシステムの余裕から</strong> — Linux なら available、macOS ならメモリ圧力のグラフを先に見ます。ここに余裕があるなら、プロセス一つが2GBを使っていても問題ではなく設計です。</li>
+                        <li><strong>余裕がなければ持ち分を分ける</strong> — PSS の合計で誰がどれだけ占めているかを見ます。RSS を単純合計すると共有分が重複して物理メモリより大きな値になります。</li>
+                        <li><strong>指名したプロセスは RSS と Swap を一緒に</strong> — 片方だけ見ると逼迫時に正確に逆の読み方をします。</li>
+                        <li><strong>ツール自身の計測を先に探す</strong> — Go の言語サーバーである gopls は使用量が1GBを超えると一時ディレクトリへメモリのデバッグ情報を自動的に残し、デバッグサーバーを起動するとプロファイルとメモリ状況をブラウザで見られるようにしています。</li>
+                    </ul>
+                    <p>エディタが固まった時刻とシステムログの回収記録を並べる作業が残るなら、そのとき使う道具は<a href="linux_log_analysis_commands_guide.html">Linux ログ分析コマンド</a>の側とそのまま重なります。</p>
+
+                    <h2>7. 削る手法とそれぞれが払う代償</h2>
+                    <p>メモリを削る方法はすでにいくつもの筋道に整理されており、無料のものは一つもありません。すべて精度、遅延、運用の複雑さのいずれかをメモリと交換します。</p>
+                    <table>
+                        <thead>
+                            <tr><th>手法</th><th>何をするのか</th><th>得るもの</th><th>払うもの</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>ディスクへ逃がす</td><td>解析結果をファイルに置き必要なときだけ読み込む</td><td>常駐メモリの減少、再起動時間の短縮</td><td>初回アクセスの遅延、キャッシュ無効化規則の複雑さ、ディスク書き込み</td></tr>
+                            <tr><td>保存時索引</td><td>入力中は浅く、保存時に全体解析</td><td>メモリと CPU の削減幅が最も大きい</td><td>保存前の新項目がツールから見えない</td></tr>
+                            <tr><td>部分索引・遅延索引</td><td>ワークスペースは精密に、依存は要約だけ</td><td>大規模リポジトリで効果が大きい</td><td>ライブラリ内部の探索がどこかの深さで途切れる</td></tr>
+                            <tr><td>圧縮表現</td><td>インターン化、ビットパッキング、文字列プール</td><td>精度の損失がない</td><td>実装の複雑さ、アクセスごとの若干の CPU</td></tr>
+                            <tr><td>プロセス分離</td><td>索引をエディタとは別のプロセスへ隔離</td><td>エディタが軽くなり障害が波及しない</td><td>プロセス間通信の費用、管理要素の増加</td></tr>
+                            <tr><td>リモート索引</td><td>共有索引を別サーバーから提供</td><td>チーム全体が索引の費用を一度だけ払う</td><td>インフラとアクセス制御、鮮度の管理</td></tr>
+                            <tr><td>範囲除外</td><td>ビルド成果物やベンダーディレクトリを索引から外す</td><td>即効性があり追加費用なし</td><td>除外した領域はツールが何も知らない</td></tr>
+                        </tbody>
+                    </table>
+                    <p>実務で順序を付けるなら最後の行が先です。範囲除外は設定一行で終わり、たいていは <code>node_modules</code> や <code>target</code> のように<strong>そもそも解析する必要のないもの</strong>を外す作業です。次がプロセス分離と上限設定です。圧縮表現や索引構造の変更はツールを作る側の仕事であり、使う側の選択肢ではありません。</p>
+
+                    <h2>8. 反対側も正直に - そのメモリで何を買ったのか</h2>
+                    <p>軽いことが無条件に良いのなら、私たちはいまだにテキスト検索で定義を探しているはずです。この十年で開発ツールのメモリ使用量が増えたのは怠慢の結果ではなく機能が増えた結果です。</p>
+                    <ul>
+                        <li><strong>型に基づく補完</strong> — 名前の似た候補を並べるのではなく、その位置で実際に成り立つものだけを見せます。型推論の結果がメモリにあって初めて可能です。</li>
+                        <li><strong>安全なリネーム</strong> — 文字列置換はコメントやリテラルまで壊します。参照グラフに基づくリネームは逆参照索引があって成立します。</li>
+                        <li><strong>保存前の診断</strong> — ビルドを回さず入力中に誤りを見せるのは増分計算キャッシュの仕事です。</li>
+                        <li><strong>構造の探索</strong> — 参照検索、呼び出し階層、実装検索はプロジェクト全体の索引なしには存在できない機能です。</li>
+                        <li><strong>リファクタリングの自動化</strong> — メソッド抽出、インライン化、シグネチャ変更は型と参照を同時に知って初めて安全です。</li>
+                    </ul>
+                    <p>ですから判断基準は使用量の絶対値ではありません。<strong>そのメモリで何を買ったのかが見えないとき</strong>に初めて問題になります。RAM 8GB のマシンで2GBを使う言語サーバーはマシンの半分を持っていくことであり、64GB のマシンでの同じ2GBは優れた取引です。付け加えると、軽いツールが常に速いわけでもありません。キャッシュを少なく持てば繰り返しの問い合わせのたびに計算し直しディスクから読み込む時間が乗ります。索引時間と応答時間とメモリは別々の軸であり、一つを良くすると別の一つが悪くなる区間が必ずあります。</p>
+
+                    <h2>9. ツールを選ぶときに実際に見るもの</h2>
+                    <p>宣伝文句を取り除くと判断材料はさほど多く残りません。次の六つで十分です。</p>
+                    <ul>
+                        <li><strong>倍率ではなく条件</strong> — どのリポジトリを、どのマシンで、どの設定で測ったのか。条件のない倍率は情報ではなく印象です。</li>
+                        <li><strong>目標値と実測値の区別</strong> — 目標100MBと実測100MBは別の文です。文書が二つを混ぜているならそれ自体が情報です。</li>
+                        <li><strong>精度の境界が文書にあるか</strong> — 何がいつまで索引されないのかを明かすプロジェクトは信頼に足ります。隠す側のほうがはるかに危険です。</li>
+                        <li><strong>自分の作業習慣との相性</strong> — 保存時索引の体感は、頻繁に保存する人と先延ばしにする人で正反対に出ます。他人の感想より自分の習慣のほうが正確な予測変数です。</li>
+                        <li><strong>平均ではなく最悪の瞬間</strong> — 初回索引中、大量のブランチ切り替え直後、依存更新直後の山を見ます。</li>
+                        <li><strong>逃げ道があるか</strong> — 索引範囲の除外、メモリ上限、再起動の費用。上限を掛けられるツールは悪い日にもマシンを生かしておいてくれます。</li>
+                    </ul>
+                    <p>ツールを替える前に<strong>同じ RAM を使っている他のものを先に数えるほう</strong>がたいてい速いです。エディタ拡張20個、常駐する監視プロセス三つ四つ、そしてブラウザ。言語サーバーを替えて1GBを節約するより、こちらから3GB出てくることのほうが多いのです。</p>
+
+                    <h2>確認できなかったこと</h2>
+                    <p>この記事で根拠を示せなかった項目を一か所にまとめます。</p>
+                    <ul>
+                        <li>同じリポジトリを同じマシンで二つの Rust 言語サーバーから開き常駐メモリを並べて計測した公開の表。公開されている並列比較は索引の所要時間だけです。</li>
+                        <li>目標値が前提とする妥当な規模のプロジェクトが何であるか。行数、クレート数、依存数のいずれでも定義されていません。</li>
+                        <li>rust-analyzer の典型的な常駐メモリについての公式な数値。文書のトラブルシューティングのページにはメモリの項目自体がありません。</li>
+                        <li>リポジトリ規模に対するメモリ増加曲線を実際に測った公開ベンチマーク。5節の線形ではないという記述はデータ構造の性質から導いた論であって計測値ではありません。</li>
+                        <li>macOS Activity Monitor のプロセス別メモリ列がどの台帳を読んでいるのか。アップルのサポート文書はシステム単位の項目だけを定義しています。</li>
+                    </ul>
+
+                    <h2>結論: メモリは点数ではなく予算である</h2>
+                    <p>言語サーバーのメモリ使用量を、低いほうが勝つ得点表として読むと判断を誤ります。あの数字は点数ではなく<strong>予算</strong>です。予算の大きいツールはその金で即時性と精度を買い、予算の小さいツールはそのうち一部を買わないことにしたのです。どちらが正しいかは、マシンの RAM 容量、リポジトリの大きさ、そして保存ボタンを押す個人の習慣が決めます。</p>
+                    <p>今日できることは三つです。いま使っているツールがどれだけ使っているかを<strong>RSS とスワップを一緒に</strong>確認し、システムの余裕が本当に足りないかを available やメモリ圧力で判定し、足りないなら索引範囲の除外のように代償のほとんどないものから手を付けます。ツールの交換はその後の選択肢です。</p>
+                    <p>そして新しいツールが印象的な倍率を掲げて現れるたび、同じ問いを投げればよいのです。何と何の比か、どんな条件で測ったのか、その代わりに何を手放したのか。三つの問いに文書で答えるプロジェクトはおおむね信用でき、答えないプロジェクトは数字がどれほど大きくてもまだ判断する材料がない状態です。</p>
+
+                    <h2>参考資料</h2>
+                    <ul>
+                        <li><a href="https://rust-glancer.github.io/blog/hello-world/" target="_blank" rel="noopener">Rust Glancer - Hello, world!（プロジェクトブログ）</a></li>
+                        <li><a href="https://news.hada.io/topic?id=32768" target="_blank" rel="noopener">GeekNews の議論 - Rust Glancer</a></li>
+                        <li><a href="https://rust-analyzer.github.io/book/contributing/architecture.html" target="_blank" rel="noopener">rust-analyzer - Architecture</a></li>
+                        <li><a href="https://clangd.llvm.org/design/indexing" target="_blank" rel="noopener">clangd - Indexing design</a></li>
+                        <li><a href="https://github.com/golang/tools/blob/master/gopls/doc/troubleshooting.md" target="_blank" rel="noopener">gopls - Troubleshooting</a></li>
+                        <li><a href="https://man7.org/linux/man-pages/man5/proc_pid_smaps.5.html" target="_blank" rel="noopener">proc_pid_smaps(5) - PSS、Swap、Private_Dirty</a></li>
+                        <li><a href="https://docs.kernel.org/admin-guide/cgroup-v2.html" target="_blank" rel="noopener">Linux kernel - Control Group v2</a></li>
+                        <li><a href="https://docs.kernel.org/accounting/psi.html" target="_blank" rel="noopener">Linux kernel - PSI: Pressure Stall Information</a></li>
+                        <li><a href="https://learn.microsoft.com/en-us/windows/win32/memory/working-set" target="_blank" rel="noopener">Microsoft Learn - Working Set</a></li>
+                        <li><a href="https://support.apple.com/guide/activity-monitor/view-memory-usage-actmntr1004/mac" target="_blank" rel="noopener">Apple - View memory usage in Activity Monitor</a></li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>この記事をシェア</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">スレッズ</button>
+                        <button id="link-copy" class="share-btn link-btn">リンクをコピー</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">一覧に戻る</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">一緒に使うと便利な無料ツール</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/code_image.html">コード画像ジェネレーター</a></li>
+      <li><a href="../static/char_counter.html">文字数カウント</a></li>
+      <li><a href="../static/json_formatter.html">JSON フォーマッター</a></li>
+      <li><a href="../static/regex_tester.html">正規表現テスター</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">すべてのツールを見る &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">関連記事</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="tls_knowledge_expiry.html">SSLで学んだことがなぜ今は間違いなのか - 名前もプロトコルも証明書の寿命も変わった記録 2026</a></li>
+      <li><a href="typed_beam_language_gleam.html">BEAMの上に静的型を載せるという選択 - Gleamが移した境界と残した境界</a></li>
+      <li><a href="software_performance_expectations.html">遅くてもいいという合意はどう作られたか - ハードウェアが速くなっても体感が変わらない理由 2026</a></li>
+      <li><a href="observability_data_unused.html">集めた観測データがなぜ読まれないのか - ログ・メトリクス・トレースは別の問いに答える 2026</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('リンクがコピーされました。Threadsアプリに貼り付けてシェアしてください！');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('リンクがコピーされました！'); });
+    });
+    </script>
+</body>
+</html>

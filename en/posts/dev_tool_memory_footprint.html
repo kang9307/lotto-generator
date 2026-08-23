@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<!--
+ * Tech blog post template
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="en">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Why Developer Tools Eat Memory - The Mechanics and Cost of Language Server Footprint</title>
+    <meta name="description" content="Why language servers consume gigabytes, what must sit in RAM for instant completion, what you give up when an index moves to disk, and which number to read.">
+    <meta name="keywords" content="language server memory, LSP memory usage, rust-analyzer memory, clangd indexing, gopls memory, RSS vs PSS, developer machine out of memory, monorepo IDE performance, swapping, cgroup memory.max, PSI pressure stall information, working set, incremental computation, disk backed index, choosing dev tools">
+    <meta name="robots" content="index, follow">
+    <meta name="googlebot" content="index, follow">
+    <meta name="bingbot" content="index, follow">
+    <meta name="revisit-after" content="7 days">
+    <meta name="language" content="English">
+    <meta name="rating" content="general">
+    <meta name="distribution" content="global">
+
+    <link rel="canonical" href="https://braindetox.kr/en/posts/dev_tool_memory_footprint.html">
+
+    <meta property="og:title" content="Why Developer Tools Eat Memory - The Mechanics and Cost of Language Server Footprint">
+    <meta property="og:description" content="What has to sit in RAM for completion and go-to-definition to feel instant, and what a tool quietly gives up when it shrinks that footprint.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/en/posts/dev_tool_memory_footprint.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="en_US">
+    <meta property="article:published_time" content="2026-08-23">
+    <meta property="article:section" content="Dev &amp; Infra">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Why Developer Tools Eat Memory - The Mechanics and Cost of Language Server Footprint">
+    <meta name="twitter:description" content="Where language server memory comes from, what it breaks, how to measure it correctly, and what every footprint reduction actually costs.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+    <meta name="twitter:site" content="@braindetox_kr">
+
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "Why Developer Tools Eat Memory - The Mechanics and Cost of Language Server Footprint",
+      "alternativeHeadline": "Language Server Memory - Where It Goes and What It Buys",
+      "datePublished": "2026-08-23",
+      "dateModified": "2026-08-23",
+      "inLanguage": "en-US",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "language server memory, LSP memory usage, rust-analyzer memory, clangd indexing, gopls memory, RSS vs PSS, monorepo IDE performance, cgroup memory.max, PSI pressure stall information, working set",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/en/posts/dev_tool_memory_footprint.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "Why does a language server use far more memory than the source code it reads?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "What fills memory is not the source but everything derived from it. The rust-analyzer architecture document states that the analyzer keeps all input data in memory and never does IO, because the input is source code and that typically measures in tens of megabytes at most. The gigabytes come from the layer above: syntax trees, name resolution results, type inference results, symbol and reverse reference indexes, the dependency graph, and the memoized intermediate values that exist so the same query is not computed twice. Completion appearing in milliseconds and go-to-definition landing instantly are possible precisely because that derived data is already prepared, and a large footprint is the price of that immediacy."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "What does a low-memory language server give up?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Usually accuracy about the present moment. A design that offloads analysis results to the filesystem and loads them only on demand cuts resident memory and restart time sharply, but it needs rules for deciding when a cached result has gone stale. A design that runs full analysis only on save leaves a window in which newly written imports, structs and traits are simply not in the index. Lazy loading makes the first query slow, and partial indexing makes navigation into dependency internals shallower. Either way the deal is the same: something from the set of accuracy, latency and operational complexity gets traded for memory."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Is RSS the right number to watch?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "RSS alone will make you read a memory crunch backwards. The ps manual defines RSS as the non-swapped physical memory a task has used, so as pages get pushed out to swap under pressure the RSS of a process actually appears to shrink. RSS therefore has to be read together with swap usage. When summing across processes, PSS is more accurate because shared libraries are not double counted. Inside a container, cgroup v2 exposes memory.current as the total used by that group and its descendants. The first step, though, is always system-wide headroom, and on Linux that is the available column rather than the free column."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "What actually happens on a developer machine that runs low on memory?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Reclaim and swapping begin, and on macOS memory compression steps in before swap. Compressed pages cost CPU on every touch, so the latency shows up disguised as CPU usage. Windows trims the working set instead, and touching a trimmed page raises a hard page fault that must be resolved from the backing store, which is the moment a single completion request becomes a disk read. In containers and CI, cgroup v2 limits apply: crossing memory.high throttles the processes and puts them under heavy reclaim pressure, while reaching memory.max without being able to reduce usage invokes the OOM killer inside that cgroup. On a laptop all of this extra work translates into heat and battery drain."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How should I read a claim like 100x less memory?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Check what is being compared against what, and under which conditions, before you accept the multiplier. Separating a target from a measurement matters just as much, because a 100MB goal and a measured 100MB are different statements. If it is unclear whether both sides were measured on the same repository, the same machine and the same configuration, or whether one side is a single instance and the other a sum across several, the multiplier is closer to an impression than to information. Conversely, a project that documents what is not indexed until save and which features are still missing is giving you a signal worth trusting."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 4px; overflow-x: auto; margin: 1rem 0; }
+        .post-content pre code { background-color: transparent; padding: 0; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        .callout { background: #eef6ff; border-left: 4px solid #3498db; padding: 0.7rem 1rem; margin: 1rem 0; border-radius: 4px; font-size: 0.95em; }
+        .warn { background: #fff5f5; border-left: 4px solid #e74c3c; padding: 0.7rem 1rem; margin: 1rem 0; border-radius: 4px; font-size: 0.95em; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/dev_tool_memory_footprint.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/dev_tool_memory_footprint.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/dev_tool_memory_footprint.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/dev_tool_memory_footprint.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/dev_tool_memory_footprint.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    { "@type": "ListItem", "position": 1, "name": "Home", "item": "https://braindetox.kr/en/" },
+    { "@type": "ListItem", "position": 2, "name": "Dev & Infra", "item": "https://braindetox.kr/en/category/dev.html" },
+    { "@type": "ListItem", "position": 3, "name": "Why Developer Tools Eat Memory - The Mechanics and Cost of Language Server Footprint", "item": "https://braindetox.kr/en/posts/dev_tool_memory_footprint.html" }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="Why Developer Tools Eat Memory - The Mechanics and Cost of Language Server Footprint">
+                <meta itemprop="datePublished" content="2026-08-23">
+                <meta itemprop="dateModified" content="2026-08-23">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="language server memory, LSP memory usage, RSS vs PSS, monorepo IDE performance, cgroup memory.max, working set">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/en/posts/dev_tool_memory_footprint.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">Why Developer Tools Eat Memory - The Mechanics and Cost of Language Server Footprint</h1>
+                    <h2 class="post-subtitle">What has to sit in RAM for completion to feel instant, and what you lose when you shrink it</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-08-23">Aug 23, 2026</span>
+                        <span class="post-category" itemprop="articleSection">Dev &amp; Infra</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+                    <h2>Introduction: the fan spins even when you type nothing</h2>
+                    <p>You leave the editor open, walk away for coffee, and come back to a warm laptop. You open one more video call window and completion that was fine a minute ago now arrives a beat late. Right after switching branches the whole editor freezes for half a minute. All three scenes come from the same place. Behind the window, a <strong>language server</strong> is reading your project and redrawing its own map of it.</p>
+                    <p>In August 2026 an alternative Rust language server showed up in developer feeds under a headline about using 100 times less memory. This article is not an introduction to that tool and not a recommendation of it. It takes the question the headline touched: <strong>where does developer tool memory come from, and what exactly does it break when it grows.</strong> And what do we quietly hand over when we set out to shrink it.</p>
+                    <p>The announced material comes first, with its verified conditions, and then we leave the specific tool behind and work from first principles.</p>
+
+                    <h2>1. What was announced, and what is the 100x measured against</h2>
+                    <p>The project drawing attention is a Rust language server implementation called Rust Glancer. The project site describes itself as taking a different approach from rust-analyzer: instead of holding everything in memory and recomputing dynamically, it uses <em>frozen workspaces</em> that can be offloaded to the filesystem. Accepting some performance penalty in exchange for extreme memory efficiency and instant restarts is the project's own summary, and it puts development time at roughly four months.</p>
+                    <p>Before repeating the multiplier from the headline, the two sides of the comparison have to be separated. Here is what the documentation actually states.</p>
+                    <ul>
+                        <li>The memory figure is a <strong>target</strong>. The write-up aims for under 100MB on reasonably sized projects, and what counts as reasonable is never defined.</li>
+                        <li>The figure on the other side is an <strong>anecdote from the author</strong>: with several projects open across two copies of the same editor at once, rust-analyzer was consuming 16GB. That is the total for that setup, not the resident footprint of one instance.</li>
+                        <li>The <strong>side-by-side table the project published has no memory column.</strong> It reports indexing time only.</li>
+                        <li>So 100x is closer to a 100MB target divided by a 16GB anecdote. No published figure exists for opening the same repository on the same machine under both servers and measuring resident memory side by side.</li>
+                    </ul>
+                    <p>The published timing comparison looks like this. It is <strong>indexing time, not memory</strong>, and it carries the condition that it was measured on two MacBooks.</p>
+                    <ul>
+                        <li>MacBook Pro M4 Max 36GB: Glancer 5s base and 8s full, rust-analyzer 6s base and 13s full</li>
+                        <li>MacBook Pro M1 8GB: Glancer 6s base and 9s full, rust-analyzer 7s base and 14s full</li>
+                    </ul>
+                    <p>The costs are documented too. Newly written imports, structs and traits are <strong>not indexed until the document is saved.</strong> While you type, only the current body is analyzed shallowly and the previous index is reused. Information that requires actually running build scripts or procedural macros, and nightly-only features, are explicitly out of scope for now. Those sentences are a signal rather than a flaw. A multiplier only means something once conditions are attached, and to understand the conditions you have to know <strong>why that much memory was needed in the first place.</strong></p>
+
+                    <h2>2. Why a language server spends memory - the price of immediacy</h2>
+                    <p>The Language Server Protocol exists to turn a multiplication problem into a division. Instead of implementing language support for every combination of M languages and N editors, each language gets one server and editors speak a standard protocol. Completion, go-to-definition, find references, rename and diagnostics all become the server's responsibility.</p>
+                    <p>This is where one misconception starts: that the source code is what fills memory. The rust-analyzer architecture document is clear on the point. The analyzer keeps all its input data in memory and never does IO, because that input is source code and source code measures in tens of megabytes at most, so holding all of it is fine. <strong>What produces gigabytes is not the source but the things derived from it.</strong></p>
+                    <table>
+                        <thead>
+                            <tr><th>What sits in memory</th><th>What it makes possible</th><th>What happens without it</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Syntax trees</td><td>Understanding the grammatical context at the cursor</td><td>Completion degrades into string matching</td></tr>
+                            <tr><td>Name resolution and module scope maps</td><td>Deciding which definition an identifier refers to</td><td>Go-to-definition and rename become guesswork</td></tr>
+                            <tr><td>Type inference results</td><td>Computing what is valid after a dot</td><td>Method candidates are wrong or empty</td></tr>
+                            <tr><td>Symbol and reverse reference indexes</td><td>Find references and workspace-wide search</td><td>Every query rescans the whole project</td></tr>
+                            <tr><td>Dependency graph</td><td>Deciding what must be recomputed on a change</td><td>One character forces a full reanalysis</td></tr>
+                            <tr><td>Memoized intermediate results</td><td>Never computing the same query twice</td><td>The same work repeats on every keystroke</td></tr>
+                        </tbody>
+                    </table>
+                    <p>That last row matters most. A modern language server is an incremental computation engine. rust-analyzer uses Salsa for this, and the core invariant of that design is that <strong>typing inside a function body never invalidates global derived data.</strong> To keep that promise it maintains per-file summary structures independent of function body edits, indexes module scopes in a separate map, and parses syntax trees only when they are needed.</p>
+                    <p>The finer the structure, the narrower the recomputation, and those pieces plus their caches are exactly what memory holds. The fundamental bargain of the field appears here: <strong>you pay memory to buy fast recomputation.</strong> If completion appears in the blink of an eye, most of the ingredients for that answer were already sitting in RAM.</p>
+
+                    <h2>3. Trading accuracy for memory - the core of this article</h2>
+                    <p>Keeping everything loaded is accurate and fast. The problem is that accuracy, latency and memory cannot all be maximized at once. A lightweight tool has not performed magic; it has put one of the three down, and which one it put down defines its character.</p>
+                    <h3>3.1 What gets put down</h3>
+                    <ul>
+                        <li><strong>Lazy loading</strong> — compute only on demand. Total memory drops but the first query slows. A three second wait that only happens the first time barely registers in average response statistics, and it is exactly the three seconds a person remembers.</li>
+                        <li><strong>Partial indexing</strong> — the workspace is analyzed precisely while dependencies are kept as summaries. The savings are largest on big repositories, but go-to-definition into library internals stops at some depth.</li>
+                        <li><strong>Disk cache</strong> — results are written to files and loaded when needed. Restarts get dramatically faster, at the cost of needing rules for when a cached result is stale; conservative rules rebuild constantly and loose ones return wrong answers.</li>
+                        <li><strong>Frozen snapshots</strong> — type against a shallow view and run full analysis on save. The savings are the largest of all, but a state exists in which <strong>what you just wrote does not exist yet.</strong></li>
+                    </ul>
+                    <h3>3.2 What is surrendered is usually the time axis</h3>
+                    <p>Line the four up and the pattern appears. What a lightweight tool actually surrenders is often not a feature list but <strong>accuracy about the present moment</strong>. Code keeps changing between saves while the index stands still at the last one, and the wider that gap grows the more the tool answers questions about slightly older code.</p>
+                    <p>Define a new struct, jump to another file without saving, type its name, and it is not in the candidate list. Nobody files that as a bug because pressing save makes it disappear. So the cost never shows up in benchmarks and <strong>lands completely differently depending on habit.</strong> For someone who saves every few lines it barely exists; for someone who writes a large block and saves later it is a wall met daily.</p>
+                    <h3>3.3 The practical answer is to separate layers</h3>
+                    <p>The structure chosen by clangd, the C and C++ language server, is a good example of this compromise. Rather than keeping one monolithic index it layers several and presents them as one. On top sits a dynamic index covering the files being edited right now, and beneath it a background index that sweeps the whole project. The design document explains that thanks to this, <strong>cross-references for the files you are working on are available even if the background index has not finished.</strong></p>
+                    <p>The lesson is the principle, not the implementation. The moment you separate what must be current from what need not be, the split between what belongs in memory and what belongs on disk falls out naturally. The file under your cursor must be current to the millisecond; a vendor directory untouched for six months does not. Memory explodes when everything is kept at the same freshness.</p>
+
+                    <h2>4. What actually happens when a developer machine runs short</h2>
+                    <p>A large memory number harms nobody by itself. What is harmful is the chain that starts when the number exceeds what is available, and that chain has an order.</p>
+                    <ul>
+                        <li><strong>Reclaim and swapping</strong> — the kernel evicts the least used pages first. The first trap lives here. The ps manual defines RSS as <em>non-swapped</em> physical memory, so the tighter memory gets, the more a process's RSS <strong>appears to shrink.</strong></li>
+                        <li><strong>Compression</strong> — macOS compresses before it swaps. The Compressed figure in Activity Monitor is the amount compressed to make more RAM available. Compressed pages cost CPU on every touch, so a memory problem shows up disguised as CPU usage.</li>
+                        <li><strong>Working set trimming</strong> — Windows removes pages from a process working set. The working set is the set of pages in the process virtual address space currently resident in physical memory, and touching a trimmed page raises a hard page fault resolved from the backing store. <strong>That is the moment one completion request becomes a disk read.</strong></li>
+                        <li><strong>Competition between tools</strong> — the editor core, the extension host, the type checker, bundler watchers, the container runtime and a browser with forty tabs share the same RAM. They evict each other's page cache, so cutting one often speeds up another.</li>
+                        <li><strong>Container limits</strong> — dev containers and CI put up walls with cgroup v2. Crossing memory.high throttles processes and places them under heavy reclaim pressure, and the kernel documentation states plainly that going over the high limit <strong>never invokes the OOM killer.</strong> Only when memory.max is reached and usage cannot be reduced does the OOM killer run inside that cgroup.</li>
+                        <li><strong>Heat and battery</strong> — compression, reclaim and reindexing are all CPU work. On a laptop a memory problem gets translated into a thermal one, which is where the advice to <a href="laptop_buying_guide_2026.html">look at RAM capacity first when choosing a laptop</a> comes from.</li>
+                    </ul>
+                    <p>If a language server or type checker has ever <strong>vanished for no apparent reason</strong> in CI, there is a place to look before the logs. The cgroup v2 memory.events file carries low, high, max, oom and oom_kill counters, and a rising oom_kill closes the case.</p>
+                    <p>There is also a metric for pressure itself. On Linux, PSI is exposed system-wide at <code>/proc/pressure/memory</code> and per cgroup at <code>memory.pressure</code>. The some line is the share of time in which at least some tasks were stalled on that resource, and the full line is the share of time in which all non-idle tasks were stalled simultaneously. A rising full line is not slowness, it is <strong>thrashing</strong>. Ten, sixty and three hundred second averages appear together, so momentary spikes and sustained trends can be told apart on one screen.</p>
+
+                    <h2>5. Monorepos and large repositories - growth is not linear</h2>
+                    <p>Double the files and memory looks like it should double. It climbs faster than that, and the reason is in the shape of the data structures.</p>
+                    <ul>
+                        <li><strong>Reference relationships are closer to symbol pairs.</strong> Symbol count scales with file count, but instant find-references and safe rename need a reverse index of who uses whom, and that index grows faster than file count.</li>
+                        <li><strong>Invalidation reaches further.</strong> The deeper the dependency graph, the larger the downstream range that must be recomputed when one shared type changes. That is why bigger repositories tempt you into bigger caches.</li>
+                        <li><strong>Generated code intervenes.</strong> Macro expansions, code generation and schema-derived types are not in the source. The real size of the analysis target drifts away from the apparent size of the repository.</li>
+                        <li><strong>Instances multiply.</strong> The rust-analyzer documentation notes that a single process can serve many projects, but opening one editor window per project throws that away and multiplies servers by window count. The 16GB anecdote from section one is exactly this arrangement.</li>
+                    </ul>
+                    <p>The clangd design document records what happens at this scale rather plainly: background indexing a large project <strong>would typically take multiple hours and consume multiple GB of RAM.</strong> That is why clangd offers the option of attaching a prebuilt static index, and why the remote index feature was created to move the large memory overhead a global index induces onto a separate machine.</p>
+                    <p>The answer for scale follows. Past a certain repository size, tuning on a personal machine stops working and <strong>moving indexing off the development machine</strong> becomes the remaining direction. A single index server eventually costs less than upgrading RAM for everyone, and that calculation wobbles again in periods when <a href="ddr5_memory_price_surge_ai_demand_2026.html">memory prices climb sharply</a>.</p>
+
+                    <h2>6. How to measure - which number to actually read</h2>
+                    <p>Most memory conversations go wrong because different numbers are called by the same name. Different definitions produce different conclusions from the same situation.</p>
+                    <table>
+                        <thead>
+                            <tr><th>Metric</th><th>Definition</th><th>Where to read it</th><th>Watch out for</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>RSS</td><td>The non-swapped physical memory a task has used</td><td>ps, top, /proc status files</td><td>Excludes whatever went to swap; shared libraries are double counted per process</td></tr>
+                            <tr><td>VSZ</td><td>Virtual memory size of the process, device mappings excluded</td><td>ps</td><td>Reservation, not use. Mapping a large file inflates it</td></tr>
+                            <tr><td>PSS</td><td>The process's proportional share of a mapping</td><td>smaps, smaps_rollup</td><td>Right for summing across processes; understates a single process</td></tr>
+                            <tr><td>Private_Dirty</td><td>Pages this process alone holds and has modified</td><td>smaps</td><td>Closest to what actually returns when the process exits</td></tr>
+                            <tr><td>Swap</td><td>Would-be-anonymous memory that is out on swap</td><td>smaps</td><td>Only together with RSS does real usage appear</td></tr>
+                            <tr><td>available</td><td>Estimate of memory available for new programs without swapping</td><td>free</td><td>This column, not the free column, is the real headroom</td></tr>
+                            <tr><td>memory.current</td><td>Total memory used by a cgroup and its descendants</td><td>cgroup v2</td><td>In containers and CI this is the baseline</td></tr>
+                            <tr><td>Working set</td><td>Pages of the virtual address space currently resident in physical memory</td><td>Windows Task Manager</td><td>Shared pages are counted per process</td></tr>
+                            <tr><td>Compressed</td><td>Memory compressed to make more RAM available</td><td>macOS Activity Monitor</td><td>A large value already means pressure</td></tr>
+                        </tbody>
+                    </table>
+                    <p>There is an order to reading them, and keeping the order removes most misdiagnoses.</p>
+                    <ul>
+                        <li><strong>System headroom first</strong> — available on Linux, the memory pressure graph on macOS. If there is room here, one process using 2GB is design rather than a problem.</li>
+                        <li><strong>If there is no room, split the shares</strong> — use PSS totals to see who holds what. Naive RSS sums double count shared pages and can exceed physical memory.</li>
+                        <li><strong>For the process you singled out, read RSS with swap</strong> — either one alone reads exactly backwards under pressure.</li>
+                        <li><strong>Look for the tool's own instrumentation first</strong> — gopls, the Go language server, automatically writes memory debug information to the temporary directory once usage exceeds 1GB, and its debug server exposes profiles and memory state in a browser.</li>
+                    </ul>
+                    <p>If what remains is lining up the moment the editor froze with reclaim records in system logs, the tooling for that overlaps directly with <a href="linux_log_analysis_commands_guide.html">Linux log analysis commands</a>.</p>
+
+                    <h2>7. Ways to shrink it, and what each one costs</h2>
+                    <p>The approaches to reducing memory are already well catalogued, and not one of them is free. Every one trades something from accuracy, latency or operational complexity.</p>
+                    <table>
+                        <thead>
+                            <tr><th>Approach</th><th>What it does</th><th>What you gain</th><th>What you pay</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Offload to disk</td><td>Keep analysis results in files, load on demand</td><td>Lower resident memory, faster restarts</td><td>First-access latency, cache invalidation complexity, disk writes</td></tr>
+                            <tr><td>Index on save</td><td>Shallow while typing, full analysis at save</td><td>The largest memory and CPU savings</td><td>New items invisible to the tool before saving</td></tr>
+                            <tr><td>Partial or lazy indexing</td><td>Precise for the workspace, summaries for dependencies</td><td>Large effect on big repositories</td><td>Navigation into library internals stops at some depth</td></tr>
+                            <tr><td>Compact representations</td><td>Interning, bit packing and string pools</td><td>No loss of accuracy</td><td>Implementation complexity, a little CPU per access</td></tr>
+                            <tr><td>Process separation</td><td>Isolate indexing in a process apart from the editor</td><td>Lighter editor, failures do not spread</td><td>IPC cost, one more moving part</td></tr>
+                            <tr><td>Remote index</td><td>Serve a shared index from a separate server</td><td>The team pays the indexing cost once</td><td>Infrastructure, access control, freshness management</td></tr>
+                            <tr><td>Scope exclusion</td><td>Drop build outputs and vendor directories from the index</td><td>Immediate effect at no cost</td><td>The tool knows nothing about what you excluded</td></tr>
+                        </tbody>
+                    </table>
+                    <p>In practice the last row comes first. Scope exclusion is a single configuration line and usually removes things like <code>node_modules</code> or <code>target</code> that <strong>never needed analyzing</strong>. Process separation and limits come next. Compact representations and index redesign belong to whoever builds the tool, not to whoever uses it.</p>
+
+                    <h2>8. The honest other side - what that memory bought</h2>
+                    <p>If lighter were unconditionally better we would still be finding definitions with text search. Developer tool memory grew over the last decade because features grew, not because anyone got lazy.</p>
+                    <ul>
+                        <li><strong>Type-driven completion</strong> — not a list of similar-looking names but only what is actually valid at that position. Possible only with type inference results in memory.</li>
+                        <li><strong>Safe rename</strong> — string replacement damages comments and literals. Reference-graph rename requires a reverse index.</li>
+                        <li><strong>Diagnostics before saving</strong> — showing errors while you type without running a build is the work of incremental computation caches.</li>
+                        <li><strong>Structural navigation</strong> — find references, call hierarchy and find implementations cannot exist without a project-wide index.</li>
+                        <li><strong>Automated refactoring</strong> — extract method, inline and signature change are safe only when types and references are known together.</li>
+                    </ul>
+                    <p>So the criterion is not the absolute number. It becomes a problem only <strong>when you cannot see what that memory bought.</strong> A language server using 2GB on an 8GB machine is taking half the machine; the same 2GB on a 64GB machine is a fine deal. And lighter is not always faster either. Holding fewer caches means recomputing on repeated queries and paying to load from disk. Indexing time, response time and memory are separate axes, and there is always a region where improving one degrades another.</p>
+
+                    <h2>9. What to actually look at when choosing a tool</h2>
+                    <p>Strip away the marketing and not much judgment material remains. These six are enough.</p>
+                    <ul>
+                        <li><strong>Conditions, not multipliers</strong> — which repository, on which machine, with which configuration. A multiplier without conditions is an impression, not information.</li>
+                        <li><strong>Target versus measurement</strong> — a 100MB goal and a measured 100MB are different statements. If the docs blur the two, that itself is information.</li>
+                        <li><strong>Are the accuracy boundaries documented</strong> — a project that states what is not indexed and from when is worth trusting. Hiding it is far more dangerous.</li>
+                        <li><strong>Fit with your own habits</strong> — index-on-save feels opposite to someone who saves constantly and someone who puts it off. Your own habit predicts this better than someone else's review.</li>
+                        <li><strong>Worst moments, not averages</strong> — the peaks during first indexing, right after a large branch switch, and right after a dependency update.</li>
+                        <li><strong>Is there an escape hatch</strong> — scope exclusion, a memory limit, restart cost. A tool you can cap keeps the machine alive on bad days.</li>
+                    </ul>
+                    <p>Before switching tools it is usually faster to <strong>count the other things sharing that RAM</strong>. Twenty editor extensions, three or four always-on watchers, the browser. Finding 3GB there is more common than saving 1GB by replacing the language server.</p>
+
+                    <h2>What could not be verified</h2>
+                    <p>The items this article could not back with a source, collected in one place.</p>
+                    <ul>
+                        <li>A published table measuring resident memory of two Rust language servers side by side on the same repository and machine. The only published side-by-side comparison covers indexing time.</li>
+                        <li>What the reasonably sized project behind the target actually means. It is not defined by line count, crate count or dependency count.</li>
+                        <li>An official figure for rust-analyzer's typical resident memory. The troubleshooting page in its documentation has no memory section at all.</li>
+                        <li>A published benchmark that actually measures the memory growth curve against repository size. The claim in section five that growth is not linear is an argument from data structure properties, not a measurement.</li>
+                        <li>Which ledger the per-process Memory column in macOS Activity Monitor reads. Apple's support document defines only the system-level items.</li>
+                    </ul>
+
+                    <h2>Conclusion: memory is a budget, not a score</h2>
+                    <p>Reading language server memory as a scoreboard where lower wins leads to bad decisions. That number is not a score, it is a <strong>budget</strong>. A tool with a large budget spent it on immediacy and accuracy; a tool with a small one decided not to buy some of that. Which is right depends on the machine's RAM, the size of the repository, and the personal habit of pressing save.</p>
+                    <p>Three things are available today. Check what your current tool uses by reading <strong>RSS together with swap</strong>, decide whether system headroom is genuinely short using available or memory pressure, and if it is short start with the nearly costless moves such as excluding directories from the index. Replacing the tool is the option after that.</p>
+                    <p>And whenever a new tool arrives with an impressive multiplier, the same three questions apply. Against what, under which conditions, and what was surrendered in exchange. A project that answers all three in its documentation is generally trustworthy, and a project that answers none leaves you without material to judge, however large the number.</p>
+
+                    <h2>References</h2>
+                    <ul>
+                        <li><a href="https://rust-glancer.github.io/blog/hello-world/" target="_blank" rel="noopener">Rust Glancer - Hello, world! (project blog)</a></li>
+                        <li><a href="https://news.hada.io/topic?id=32768" target="_blank" rel="noopener">GeekNews discussion - Rust Glancer</a></li>
+                        <li><a href="https://rust-analyzer.github.io/book/contributing/architecture.html" target="_blank" rel="noopener">rust-analyzer - Architecture</a></li>
+                        <li><a href="https://clangd.llvm.org/design/indexing" target="_blank" rel="noopener">clangd - Indexing design</a></li>
+                        <li><a href="https://github.com/golang/tools/blob/master/gopls/doc/troubleshooting.md" target="_blank" rel="noopener">gopls - Troubleshooting</a></li>
+                        <li><a href="https://man7.org/linux/man-pages/man5/proc_pid_smaps.5.html" target="_blank" rel="noopener">proc_pid_smaps(5) - PSS, Swap, Private_Dirty</a></li>
+                        <li><a href="https://docs.kernel.org/admin-guide/cgroup-v2.html" target="_blank" rel="noopener">Linux kernel - Control Group v2</a></li>
+                        <li><a href="https://docs.kernel.org/accounting/psi.html" target="_blank" rel="noopener">Linux kernel - PSI: Pressure Stall Information</a></li>
+                        <li><a href="https://learn.microsoft.com/en-us/windows/win32/memory/working-set" target="_blank" rel="noopener">Microsoft Learn - Working Set</a></li>
+                        <li><a href="https://support.apple.com/guide/activity-monitor/view-memory-usage-actmntr1004/mac" target="_blank" rel="noopener">Apple - View memory usage in Activity Monitor</a></li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>Share this article</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">Copy Link</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">Back to List</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Free tools you may find useful</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/code_image.html">Code Image Generator</a></li>
+      <li><a href="../static/char_counter.html">Character Counter</a></li>
+      <li><a href="../static/json_formatter.html">JSON Formatter</a></li>
+      <li><a href="../static/regex_tester.html">Regex Tester</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">See all tools &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Related Posts</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="tls_knowledge_expiry.html">Why What You Learned About SSL Is Now Wrong - A Record of the Name, the Protocol and Certificate Lifetimes Changing 2026</a></li>
+      <li><a href="typed_beam_language_gleam.html">Putting Static Types on the BEAM - What Gleam Moves and What Stays Dynamic</a></li>
+      <li><a href="software_performance_expectations.html">How We Agreed That Software Can Be Slow - Why Faster Hardware Never Feels Faster 2026</a></li>
+      <li><a href="observability_data_unused.html">Why the Observability Data You Collect Never Gets Read - Logs, Metrics and Traces Answer Different Questions 2026</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('Link copied! Paste it in the Threads app to share.');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('Link copied!'); });
+    });
+    </script>
+</body>
+</html>

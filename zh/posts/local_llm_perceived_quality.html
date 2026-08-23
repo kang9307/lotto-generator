@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<!--
+ * 技术博客文章模板
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>同一个模型为什么显得更笨 - 削弱本地 LLM 体感质量的那些设置 2026</title>
+    <meta name="description" content="同样的权重却给出不同结果，问题多半出在配置而不是模型。本文梳理聊天模板不匹配、各运行时不同的采样默认值、KV 缓存精度与上下文长度如何削弱体感质量的原理，并给出按顺序排查的清单，以及自建一套小规模评测集的具体做法。">
+    <meta name="keywords" content="本地 LLM, 体感质量, 聊天模板, 采样参数, temperature, top-p, 重复惩罚, KV 缓存量化, 上下文长度, num_ctx, llama.cpp, Ollama, 量化, 评测集, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/local_llm_perceived_quality.html">
+
+    <meta property="og:title" content="同一个模型为什么显得更笨 - 削弱本地 LLM 体感质量的那些设置">
+    <meta property="og:description" content="跑分没变，对话却变差了。本文从原理上说明模板、采样与上下文究竟在哪里削掉了质量。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/local_llm_perceived_quality.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-08-23">
+    <meta property="article:section" content="IT/技术">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="同一个模型为什么显得更笨">
+    <meta name="twitter:description" content="权重相同并不保证输出相同。把体感与实测分岔的地方按层拆开来看。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "同一个模型为什么显得更笨 - 削弱本地 LLM 体感质量的那些设置",
+      "alternativeHeadline": "跑分没变而对话变差的那个地方",
+      "datePublished": "2026-08-23",
+      "dateModified": "2026-08-23",
+      "inLanguage": "zh-CN",
+      "articleSection": "IT/技术",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "本地 LLM, 体感质量, 聊天模板, 采样参数, KV 缓存量化, 上下文长度, llama.cpp, Ollama, 评测集",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/local_llm_perceived_quality.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "跑的是同一个模型文件，为什么每个人的结果不一样？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "权重只决定到概率分布为止。真正从这个分布里挑出哪个词元，是由权重之外的几层决定的。第一层是聊天模板。如果角色分隔词元和生成提示与训练时的格式不同，模型读到的就是另一串文字。第二层是采样。temperature、top-p、top-k 和重复惩罚的默认值各运行时不同，例如 llama.cpp 服务端文档把 repeat_penalty 的默认值写作 1.1，而 Ollama 的 Modelfile 文档写的是 1.0，也就是实际上关闭。第三层是精度。权重量化和 KV 缓存精度会在势均力敌的分岔点上把排名颠倒过来。第四层是上下文设置。窗口若被设得比模型上限还小，前面的内容会被悄悄截断。这四层是相乘关系，所以拿到同一个文件，真正进入模型的输入和产出的输出仍然可以不同。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "怎么确认聊天模板是不是对不上？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "唯一可靠的办法是亲眼看最终进入模型的那串文字。用 Transformers 时，给 apply_chat_template 传 tokenize=False 并直接打印结果，确认角色词元是否存在、结尾是否有开启助手轮次的生成提示。Hugging Face 文档明确指出，不加 add_generation_prompt 时模型可能不去回答，而是顺着用户消息继续往下写。另一类常见事故是特殊词元重复。文档警告说模板里已经包含了必要的特殊词元，之后再做分词时若不设 add_special_tokens=False，像 BOS 这样的词元就会重复，从而损害性能。如果是服务端部署，就读请求日志里的最终提示，并与模型卡上公布的格式逐字比对。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "本地模型看起来不如商用聊天服务，这是模型能力的差距吗？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "很大一部分是因为比较对象本身就错位了。商用聊天服务不是一个模型，而是一个产品。它按问题性质把请求路由到不同模型或不同的推理预算，默认接好了搜索、代码执行和文件读取等工具，套着一段用户看不到的又长又讲究的系统提示，还有负责修正格式和失败重试的后处理。而本地的默认配置是一份权重、空的系统提示、没有工具、运行时给什么采样就用什么。所以常见的那种比较不是模型对模型，而是模型对产品。要比得公平，要么给双方同样的系统提示和同样的工具权限，要么反过来把两边的工具都关掉，只比纯文本回答。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "上下文长度是不是开得越大越好？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "不是。有三项成本会同时上升。第一是内存，KV 缓存与上下文长度成正比，窗口一放大，本来勉强装得下的模型就可能装不下或者开始交换。第二是速度，提示越长，首个词元的等待时间越久，后续解码也更慢。第三是质量。Liu 等人发表在 TACL 2023 的论文 Lost in the Middle 报告说，相关信息位于输入开头或结尾时性能最高，而位于长文本中部时会明显下降，并指出即使是为长上下文而做的模型也有同样的倾向。所以实务上与其一味放大窗口，不如只挑需要的内容放进去，并把关键指令放在最前或最后。不过窗口若小于实际输入，前半段会被悄悄截掉，因此当前的设定值一定要确认。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "想在自己的环境里认真比较质量，需要准备什么？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "把四样固定住、只改一样，这就是全部。第一，用同样的提示，从文件里读取而不是重新手打。第二，用同样的聊天模板，把最终文字保存下来每次比对。第三，用同样的采样设置，明确指定而不是交给运行时默认值，涉及随机性时要么固定种子，要么多跑几次看分布。第四，用同样的上下文长度。在此之上，再叠一套从自己业务里做出来的小规模评测集。二十到五十题就够，关键是必须取自真正在做的工作。把需要工具调用的请求、需要读长文档再作答的请求、必须遵守格式的请求、多轮往返的对话，以及不应该作答的请求混在一起。评分做轻一点，让一半左右可以机器判定，比如检查预期字符串是否出现。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/local_llm_perceived_quality.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/local_llm_perceived_quality.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/local_llm_perceived_quality.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/local_llm_perceived_quality.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/local_llm_perceived_quality.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "首页",
+      "item": "https://braindetox.kr/zh/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "IT/技术",
+      "item": "https://braindetox.kr/zh/category/tech.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "同一个模型为什么显得更笨 - 削弱本地 LLM 体感质量的那些设置 2026",
+      "item": "https://braindetox.kr/zh/posts/local_llm_perceived_quality.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="同一个模型为什么显得更笨 - 削弱本地 LLM 体感质量的那些设置">
+                <meta itemprop="datePublished" content="2026-08-23">
+                <meta itemprop="dateModified" content="2026-08-23">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="本地 LLM, 体感质量, 聊天模板, 采样参数, KV 缓存量化, 上下文长度, llama.cpp, Ollama">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/local_llm_perceived_quality.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">同一个模型为什么显得更笨 - 削弱本地 LLM 体感质量的那些设置</h1>
+                    <h2 class="post-subtitle">跑分没变而对话变差的那个地方</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-08-23">2026年8月23日</span>
+                        <span class="post-category" itemprop="articleSection">IT/技术</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <h2>引言：跑分没变，变差的是对话</h2>
+                    <p>下载来的模型卡上写着不错的分数，别人的使用反馈也不差。可一放到自己机器上跑，它就把指令听一半、把格式写坏、在生成工具调用时漏掉一个花括号。到这一步，结论往往收敛成一句话：<strong>「本地果然还不行」。</strong></p>
+                    <p>这个结论下得太早，因为即使权重完全相同，<strong>权重之外至少还有五层会让结果分岔</strong>。这些层不会报错，只会安静地生成另一个答案。日志里什么都不留，留下的印象就只剩「模型笨」。</p>
+                    <p>本文把这五层逐一打开。安装与运行方式已经写在<a href="local_llm_running_guide_2026.html">本地 LLM 运行指南</a>里，选机器写在<a href="local_llm_hardware_selection_guide_2026.html">硬件选择指南</a>里，这里不再重复。这里要谈的是<strong>在一套已经跑起来的配置里，体感质量被削掉的地方</strong>。</p>
+
+                    <h2>1. 引发讨论的实验——权重相同，结果分岔</h2>
+                    <p>这个话题重新被提起，源于 Level1Techs 论坛上的一篇实验记录。作者<strong>只固定模型权重、单独改变执行环境</strong>，观察输出会漂移多少。他以 BF16 的 Qwen3.6-27B 为基准线，组合注意力后端（FlashAttention2、Flash Inference、Triton）、KV 缓存精度（BF16、INT8、INT4）以及权重量化格式（FP8、INT8 W8A16、NVFP4、AWQ W4A16），测量<strong>最高概率词元与基准线不一致的比例</strong>以及概率分布之间的距离。</p>
+                    <p>报告的方向可以归纳为三点。其一，<strong>上下文越长，不一致越大</strong>：开头几乎一致，越往后差距越开。其二，<strong>把 KV 缓存压到 4 位会让工具调用崩掉。</strong>其三，部分 4 位权重格式在长上下文下有接近一半的最高概率词元发生了变化。作者举的失败例子包括路由器命令变成另一条命令、端口号 <code>5432</code> 被写坏成 <code>543ql</code> 之类的形态。</p>
+                    <p>值得带走的不是某个具体数字，而是这个结构。<strong>权重定的只是概率分布，真正挑词元这件事发生在它之外。</strong>分布轻微晃动时，绝大多数分岔点什么都不会发生；但在第一名和第二名咬得很紧的地方，顺序就会翻过来。而那些地方偏偏就是<strong>标识符、数字、右括号这类一错就立刻看得见的位置</strong>。</p>
+                    <div class="callout">
+                        <p><strong>关于分布距离数字，有一个常见的误读。</strong>KL 散度这类指标说的是<strong>相对基准线移动了多远</strong>，并不意味着数值越低越好，因为没人保证基准线本身在你的任务上就是最优。模型卡上写着「KL 散度低」时，只有同时知道<strong>以什么为基准、在什么数据上、在多长的上下文里测的</strong>，这句话才有意义。</p>
+                    </div>
+
+                    <h2>2. 让相同权重给出不同答案的五层</h2>
+                    <p>先把层分开，排查就有了顺序。下面这五层<strong>各自独立地失效，而且是相乘关系。</strong></p>
+                    <table>
+                        <thead>
+                            <tr><th>层</th><th>变化的是什么</th><th>怎样削掉体感质量</th><th>先查什么</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><strong>聊天模板</strong></td><td>角色分隔词元、生成提示、特殊词元重复</td><td>指令不被当作指令读、角色混淆、停不下来</td><td>最终送进模型的那串文字</td></tr>
+                            <tr><td><strong>采样</strong></td><td>temperature、top-p、top-k、min-p、重复惩罚</td><td>发散、啰嗦、重复，数字与标识符被写坏</td><td>当前运行时的默认值</td></tr>
+                            <tr><td><strong>权重精度</strong></td><td>BF16、8 位与 4 位系列之间</td><td>平均值保住了，势均力敌的分岔被翻转</td><td>实际下载到的文件上的量化标记</td></tr>
+                            <tr><td><strong>KV 缓存精度</strong></td><td>f16、q8 与 q4 之间</td><td>越长误差越累积，工具调用和长引用先崩</td><td>缓存数据类型选项的取值</td></tr>
+                            <tr><td><strong>上下文配置</strong></td><td>窗口长度、截断处理、有没有系统提示</td><td>前半段被静默截断、中部信息遗漏、延迟上升</td><td>实际生效的上下文长度</td></tr>
+                        </tbody>
+                    </table>
+                    <p>这张表里最常当凶手的是第一行。而且<strong>第一行是跑分抓不到的。</strong>为什么抓不到，是下一节的内容。</p>
+
+                    <h2>3. 聊天模板不匹配——安静坏掉的那一边</h2>
+                    <p>对话模型并不是懂得对话的另一个物种。用 Hugging Face 文档的说法，<strong>所有因果语言模型都只是把词元序列往下续写</strong>，对话会被转换成一串混入角色控制词元的序列送进去。用哪些词元因模型而异，文档明确写道<strong>即使从同一基座微调出来的模型，格式也可能不同</strong>。</p>
+                    <p>所以格式一旦对不上，就会出现这些情况。</p>
+                    <ul>
+                        <li><strong>指令不再被当作指令读。</strong>没有系统角色词元、只是把指令贴在前面，在模型看来那不过是用户铺陈的背景说明</li>
+                        <li><strong>它不回答，而是接着往下写。</strong>文档说明，若不加上开启助手轮次的生成提示，模型可能顺着用户消息继续写下去而不是作答</li>
+                        <li><strong>特殊词元错位。</strong>文档直接警告：模板里已经带了句首词元，若在之后的分词步骤里再加一次会损害性能。反方向上，结束词元若与训练时不同，模型就不知道该在哪里停</li>
+                        <li><strong>工具调用格式垮掉。</strong>工具调用通常用专门的角色和专门的词元表达，模板一错它最先崩</li>
+                    </ul>
+                    <p>关键在于这类失效<strong>不会报错</strong>。格式错了词元序列依然合法，模型照样老老实实往下写。结果就是那句人人熟悉的话：能跑，但就是哪里不对。</p>
+                    <h3>3.1 跑分为什么抓不到这个</h3>
+                    <p>标准跑分大多是<strong>一个自成一体的问题、答一次</strong>，评分靠预期字符串或选项概率。在这种条件下，模板稍微错一点分数掉得并不多，因为只要正确词元还排第一就够了。</p>
+                    <p>真实对话恰好相反：<strong>多轮往返、角色交替出现、还要回指前面的回答。</strong>模板错误正是在这个结构里累积的。于是就形成了<strong>分数没动、用起来却更差</strong>的状态。「跑分明明不错，怎么会这样」的相当一部分答案就在这里。</p>
+                    <h3>3.2 确认方法只有一个</h3>
+                    <p>别猜，<strong>去看最终输入的那串文字。</strong>在分词之前把它当作字符串取出来是最快的路径。</p>
+<pre><code class="language-python">from transformers import AutoTokenizer
+
+tok = AutoTokenizer.from_pretrained("你的模型仓库名")
+messages = [
+    {"role": "system", "content": "请简洁作答。"},
+    {"role": "user", "content": "你好"},
+]
+
+# tokenize=False 可以直接看到将要进入模型的字符串
+print(tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True))
+</code></pre>
+                    <p>把输出的字符串与模型卡上写的格式<strong>逐字</strong>比对。只看三点就够：角色词元在不在、结尾有没有开启助手轮次的词元、句首词元有没有出现两次。<code>llama.cpp</code> 服务端会从模型元数据里挑模板并允许你指定，所以服务端部署的顺序是<strong>先从启动日志里确认选中的是哪个模板</strong>。</p>
+
+                    <h2>4. 采样参数——每个运行时的默认值都不一样</h2>
+                    <p>这是最被低估的一层。人们以为自己在换模型比较，<strong>实际上换掉的是运行时</strong>。把各家公开文档里的默认值并排放一下，差别就出来了。</p>
+                    <table>
+                        <thead>
+                            <tr><th>参数</th><th>llama.cpp 服务端文档</th><th>Ollama Modelfile 文档</th><th>Transformers GenerationConfig</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>temperature</td><td>0.80</td><td>0.8</td><td>取自模型的生成配置文件，缺省则 1.0</td></tr>
+                            <tr><td>top-p</td><td>0.95</td><td>0.9</td><td>同上，缺省则 1.0</td></tr>
+                            <tr><td>top-k</td><td>40</td><td>40</td><td>同上，缺省则 50</td></tr>
+                            <tr><td>min-p</td><td>0.05</td><td>文档表格中未列</td><td>未设默认值</td></tr>
+                            <tr><td>重复惩罚</td><td>1.1</td><td>1.0（关闭）</td><td>1.0（无惩罚）</td></tr>
+                            <tr><td>惩罚生效范围</td><td>最近 64 个词元</td><td>文档表格中未列</td><td>整个序列</td></tr>
+                            <tr><td>上下文长度</td><td>0 = 从模型读取</td><td>2048</td><td>不适用</td></tr>
+                        </tbody>
+                    </table>
+                    <p>表里最后三行在实战中尤其扎人。</p>
+                    <ul>
+                        <li><strong>重复惩罚是双刃剑。</strong>开着它，翻来覆去说同一句话的毛病会减少，但<strong>该正当重复的词元也一并被压住了。</strong>表格语法、缩进、反复出现的键名、需要多次写同一标识符的代码都是典型受害者</li>
+                        <li><strong>惩罚生效范围也不同。</strong>只看最近几十个词元的设置抓不住段落级重复；而作用于整个序列，长文档里的措辞就会被拧歪</li>
+                        <li><strong>上下文长度的默认值不同。</strong>一边直接用模型自己声明的值，另一边的文档写的是 2048。如果你贴了一份长文档、觉得「它记不住前面」，<strong>该先看的是这个数字而不是模型</strong></li>
+                    </ul>
+                    <p>还有一点。Transformers 一系<strong>遵循模型随包发布的生成配置文件。</strong>作者若在里面放了推荐采样值，那就会生效。而不读这个文件的运行时，用的是<strong>它自己的默认值</strong>。同一份权重在两个工具下性格不同，原因常常就在这里。</p>
+                    <div class="callout">
+                        <p><strong>一条实务准则。</strong>无论比较什么，<strong>都要显式指定采样。</strong>交给默认值，换个工具的那一刻比较就失效了。代码、结构化输出、工具调用这类看重准确性的任务，从降低随机性并关掉重复惩罚开始；只有写作这类需要多样性的任务才单独往上调，这样更好管理。</p>
+                    </div>
+
+                    <h2>5. 系统提示这个空位</h2>
+                    <p>本地配置的默认状态是<strong>系统提示为空</strong>。而人们拿来对比的商用聊天服务，永远带着一段又长又讲究的系统提示在作答。这里拉开的差距不是模型能力，而是<strong>有没有指令</strong>。</p>
+                    <p>系统提示实际上做三件事。</p>
+                    <ul>
+                        <li><strong>把格式钉死。</strong>长度、语气、用列表还是用表格、代码块要不要标语言，都在这里定下来</li>
+                        <li><strong>给出处理未知的规则。</strong>「不确定就说不确定」这一行有没有，直接改变你感受到的幻觉量</li>
+                        <li><strong>把任务语境固定在最前面。</strong>对话再长，系统消息仍留在序列开头，因此比中途淡掉的指令撑得更久</li>
+                    </ul>
+                    <p>不过<strong>各家模型处理系统角色的方式不同。</strong>有的把它作为独立角色训练，有的用的是把它并入第一条用户消息的模板。所以这里同样需要上一节那套流程——<strong>确认它以什么形态进入了最终字符串</strong>。</p>
+
+                    <h2>6. 量化——差别出在分岔点而不是平均值</h2>
+                    <p>该选哪种量化已经在<a href="local_llm_running_guide_2026.html">运行指南</a>里讲过，这里只挑<strong>与体感质量相连的那部分</strong>。要点是：量化不会均匀地削掉能力。<a href="ai_distillation_longtail_tradeoff.html">模型变小时平均值保住、长尾先被切掉</a>的结构在这里同样成立。</p>
+                    <p>另外，<strong>权重量化与 KV 缓存量化的性质不同。</strong>把两者混为一谈，诊断就会跑偏。</p>
+                    <ul>
+                        <li><strong>权重量化是静态的。</strong>误差均匀铺在整个模型上，与上下文长度无关地保持恒定，所以短问答里不容易暴露</li>
+                        <li><strong>KV 缓存量化会累积。</strong>先前算好的键和值以低精度存下来并被持续引用，于是<strong>上下文越长误差堆得越高。</strong>前几轮好好的、后半段开始出问题，它就是头号嫌疑</li>
+                        <li><strong>各层敏感度不同。</strong>vLLM 文档指出，滑动窗口一类的部分注意力层对缓存量化更敏感，并提供了<strong>让特定层保持原始数据类型的选项</strong>。全都压下去并不是唯一选择</li>
+                        <li><strong>实现会扩大波及面。</strong>同一份文档提到，在某个注意力后端上把缓存设为 8 位，会连<strong>查询也一并以低精度处理</strong>，并建议用基于数据集的校准来替代把所有缩放系数设为 1.0 的默认做法。影响范围可能比选项名字暗示的更宽</li>
+                    </ul>
+                    <p>所以顺序这样定。<strong>内存不够就先砍上下文长度，其次是权重量化，KV 缓存放到最后。</strong>压缓存会同时威胁长上下文和工具调用，而这两样恰恰是本地智能体最需要的能力。</p>
+
+                    <h2>7. 上下文长度的陷阱——不是越长越好</h2>
+                    <p>「上下文开到最大不会有损失」是常见的误解。实际上有三项成本会同时上升。</p>
+                    <ul>
+                        <li><strong>内存。</strong>KV 缓存与上下文长度成正比。窗口开大四倍，缓存也是四倍。在模型本来就勉强装下的机器上，光这一项就会开始交换</li>
+                        <li><strong>速度。</strong>提示越长，首个词元的等待时间越久，之后的解码也更慢。交互式使用中，你最先感受到的是延迟</li>
+                        <li><strong>准确度。</strong>长度本身不保证质量。Liu 等人发表在 TACL 2023 的 Lost in the Middle 报告说，<strong>相关信息位于输入开头或结尾时性能最高，位于长文本中部时会明显下降</strong>。论文指出，即使在为长上下文而做的模型上也观察到同样的倾向</li>
+                    </ul>
+                    <p>反方向也有陷阱。<strong>窗口比实际输入小时，前半段会被静默截掉。</strong>不报错，模型只看剩下的部分作答。在用户看来，那就是一个读不了长文档的笨模型。</p>
+                    <p>所以实用的标准是这样。<strong>窗口比真正需要的最大输入略大一点，但要在机器扛得住的范围内。</strong>而且在放大窗口之前，先看<strong>能不能少放点东西进去</strong>。关键指令放在最前或最后，参考资料只挑真正相关的放。</p>
+
+                    <h2>8. 比较本身不公平——不是模型对模型，是模型对产品</h2>
+                    <p>如果把设置都对齐之后商用服务看起来还是更好，最后要检查的就是<strong>比较对象本身</strong>。浏览器里用的聊天服务不是模型，而是<strong>包在模型外面的产品</strong>。</p>
+                    <table>
+                        <thead>
+                            <tr><th>构成要素</th><th>商用聊天服务</th><th>本地默认配置</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>模型选择</td><td>按问题性质路由到不同模型或不同推理预算</td><td>一份权重处理全部</td></tr>
+                            <tr><td>工具</td><td>搜索、代码执行、文件读取默认接好</td><td>需要自己接</td></tr>
+                            <tr><td>系统提示</td><td>始终套着又长又讲究的一段</td><td>通常是空的</td></tr>
+                            <tr><td>后处理</td><td>格式修正、安全过滤、失败重试</td><td>没有</td></tr>
+                            <tr><td>上下文管理</td><td>用摘要与筛选来管理窗口</td><td>超出就截断</td></tr>
+                            <tr><td>采样</td><td>按任务调过的设置</td><td>运行时默认值</td></tr>
+                        </tbody>
+                    </table>
+                    <p>看完这张表就清楚了：「同一个问题两边都问一遍」那种实验，实际测的到底是什么。<strong>大部分是流水线的差别，不是模型的差别。</strong>尤其在需要事实核查的问题上差距骤然拉大时，多半是对方在用搜索。</p>
+                    <p>要公平，方向只有两个：<strong>给双方同样的东西，或者从双方拿掉同样的东西。</strong>这之后仍然剩下的差距，才是真正的模型差距。</p>
+
+                    <h2>9. 怎样把评测做对——一套小规模的自建评测集</h2>
+                    <p>原文作者强调的，最后也落在方法论上：不要用温度 0 加三条提示就下判断，也不要在没有条件说明的情况下相信别人公布的指标。替代方案并不宏大。</p>
+                    <h3>9.1 要固定的四样</h3>
+                    <ul>
+                        <li><strong>同样的提示。</strong>从文件读取而不是重新手打，一个空格的差别就会改变词元序列</li>
+                        <li><strong>同样的聊天模板。</strong>把最终字符串存下来，每次运行都比对一次</li>
+                        <li><strong>同样的采样。</strong>显式指定。若使用随机性，就固定种子或多跑几次看分布</li>
+                        <li><strong>同样的上下文长度。</strong>窗口大小不同，截不截断就不同，比较本身根本不成立</li>
+                    </ul>
+                    <h3>9.2 评测集里该放什么</h3>
+                    <p>二十到五十题就够。重要的不是数量，而是<strong>题目是不是取自你真正在做的工作</strong>。目的是抓住标准跑分抓不到的东西，所以要照着前面那些失效类型来搭。</p>
+                    <ul>
+                        <li><strong>需要工具调用的请求。</strong>格式稍有偏差就失败，因此模板与缓存精度的问题在这里最先浮现</li>
+                        <li><strong>需要读长输入再作答的请求。</strong>故意把答案放在文档中部，用来检验上下文处理能力</li>
+                        <li><strong>必须遵守格式的多轮往返。</strong>强制只按固定结构作答，以观察重复惩罚与采样的影响。只放一问一答的题目会漏掉模板问题</li>
+                        <li><strong>不应该作答的请求。</strong>看它会说自己不知道，还是毫无依据地编出来</li>
+                    </ul>
+                    <p>评分做轻一点。把大约一半题目做成<strong>机器可判定</strong>的形式，比如检查预期字符串是否出现或格式是否合法，重复运行就轻松了，其余由人只标通过与否也够用。<strong>每次都在相同条件下跑，比把分数做精细重要得多。</strong></p>
+
+                    <h2>10. 本地依然占优的场合</h2>
+                    <p>读到这里，本地看起来是个费力的选择。确实如此。但也有一些场合，<strong>费这个力换来的东西</strong>非常明确。</p>
+                    <ul>
+                        <li><strong>数据不出门。</strong>合同禁止外带的资料、混有个人信息的日志、尚未公开的代码，这类情形下<strong>对外传输本身就是不合格事由</strong>，与质量差距无关，本地是唯一选项</li>
+                        <li><strong>成本不随用量线性增长。</strong>同一件事一天重复几千次的自动化里，按调用计费累积得很快，换成电费和折旧反而更可预测</li>
+                        <li><strong>离线可用且延迟稳定。</strong>在隔离网络里或第三方服务故障时照常运转，没有网络往返和排队，响应时间的波动很小</li>
+                        <li><strong>版本被钉住。</strong>下载下来的权重今天和昨天一样。对需要可复现的工作来说，这本身就是一项功能</li>
+                    </ul>
+                    <p>另一面也写下来。<strong>最高难度的推理、需要最新信息的问题、大体量的多模态处理</strong>，目前仍是商用一侧更省心。不过其中相当一部分是工具和流水线造成的差别，把同样的工具接到本地就会收窄。现实的方案不是二选一，而是<strong>按任务分工</strong>。</p>
+
+                    <h2>11. 没能确认的内容</h2>
+                    <p>把本文无法给出出处的条目集中在这里。</p>
+                    <ul>
+                        <li><strong>引发讨论那个实验的具体数值，以及各量化格式之间的优劣。</strong>那是单个实验者的论坛帖子，未经同行评审。数值来自某一套特定的硬件、驱动与软件组合，无法直接搬到别的环境，因此只取了<strong>方向与结构</strong>。也没有找到可以断言某种格式优于另一种的交叉验证资料</li>
+                        <li><strong>各运行时默认值的时效性。</strong>表中的数值照录自各项目的公开文档，<strong>为 2026 年 8 月的状态</strong>。这些值会随版本变化，作为判断依据时应当<strong>在你当前安装的版本上直接确认</strong></li>
+                        <li><strong>商用服务的内部构成。</strong>路由与后处理的真实结构并未公开，表中的描述只是在用户可观察到的行为范围内整理出来的</li>
+                    </ul>
+
+                    <h2>12. 结论——按顺序排查的清单</h2>
+                    <p>当你产生「这模型真笨」的印象时，先别换模型，按下面的顺序查一遍，大多数情况在靠前的几步就结束了。<strong>越靠上的项目成本越低，是真凶的概率也越高。</strong></p>
+                    <ol>
+                        <li><strong>把最终输入字符串打印出来。</strong>角色词元在不在、生成提示有没有加上、句首词元有没有重复</li>
+                        <li><strong>确认上下文长度的设定值。</strong>默认值是不是小于实际输入，把前半段截掉了</li>
+                        <li><strong>显式指定采样。</strong>特别是重复惩罚有没有开着，看重准确性的任务上有没有挂着多样性设置</li>
+                        <li><strong>试着加上系统提示。</strong>关于格式、长度和如何处理未知的三行，就足以改变体感</li>
+                        <li><strong>把精度设置回退一下。</strong>如果是从后半段开始变差的模式，KV 缓存嫌疑最大。顺便确认下载文件上的权重量化标记</li>
+                        <li><strong>还不行再换模型。</strong>走完上面这些步骤之后的比较，才是有意义的比较</li>
+                    </ol>
+                    <p>归纳起来是这样。<strong>权重只决定到概率分布为止。</strong>这个分布以怎样的句子被接收、被转成哪些词元，由模板、采样、精度和上下文决定。也就是说，「同一个模型」这句话保证的东西，比它听上去要少得多。</p>
+                    <p>如果今天只挑一件事去做，那就是第一条。<strong>把当前配置下真正进入模型的最终字符串打印一次。</strong>就此结束的情况，比你以为的要多。</p>
+
+                    <h2>参考资料</h2>
+                    <ul>
+                        <li><strong>一手。</strong><a href="https://huggingface.co/docs/transformers/main/en/chat_templating" target="_blank" rel="noopener">Hugging Face Transformers - Chat templates（官方文档）</a> — <strong>因果语言模型只是续写词元序列的说明、同一基座派生的模型格式也可能不同的表述、错误控制词元会显著降低性能的警告、<code>add_generation_prompt</code> 缺失时会续写用户消息的说明、特殊词元重复的警告</strong>的出处</li>
+                        <li><strong>一手。</strong><a href="https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md" target="_blank" rel="noopener">llama.cpp - HTTP server 文档（ggml-org/llama.cpp）</a> — <strong>temperature 0.80、top-p 0.95、top-k 40、min-p 0.05、repeat_penalty 1.1、repeat_last_n 64，<code>--ctx-size</code> 默认 0（从模型读取），<code>--chat-template</code> 与 <code>--jinja</code>，<code>--cache-type-k</code>/<code>--cache-type-v</code> 默认 f16</strong>的出处</li>
+                        <li><strong>一手。</strong><a href="https://docs.ollama.com/modelfile" target="_blank" rel="noopener">Ollama - Modelfile 文档（官方）</a> — <strong>num_ctx 默认 2048、temperature 0.8、top_p 0.9、top_k 40、repeat_penalty 1.0（关闭），以及 TEMPLATE 与 SYSTEM 指令</strong>的出处</li>
+                        <li><strong>一手。</strong><a href="https://huggingface.co/docs/transformers/main/en/main_classes/text_generation" target="_blank" rel="noopener">Hugging Face Transformers - GenerationConfig</a> — <strong>取值来自模型的生成配置文件，缺省时 temperature 1.0、top-k 50、top-p 1.0，repetition_penalty 1.0 表示无惩罚</strong>的出处</li>
+                        <li><strong>一手。</strong><a href="https://docs.vllm.ai/en/latest/features/quantization/quantized_kvcache.html" target="_blank" rel="noopener">vLLM - Quantized KV Cache（官方文档）</a> — <strong>滑动窗口等部分层对缓存量化更敏感及跳过特定层的选项、某注意力后端上查询也以低精度处理的说明、缩放系数默认 1.0 与建议基于数据集校准</strong>的出处</li>
+                        <li><strong>论文。</strong><a href="https://arxiv.org/abs/2307.03172" target="_blank" rel="noopener">Liu et al. - Lost in the Middle: How Language Models Use Long Contexts（TACL 2023）</a> — <strong>相关信息位于开头或结尾时性能最高、位于中部时明显下降的报告</strong>的出处</li>
+                        <li><strong>原文。</strong><a href="https://forum.level1techs.com/t/why-your-local-llm-feels-dumber-than-it-is/253917" target="_blank" rel="noopener">Level1Techs Forum - Why your local LLM feels dumber than it is</a> — 本文选题的起点。<strong>属于未经同行评审的单人实验帖，因此只引用方向而不搬运数值</strong></li>
+                        <li><strong>讨论。</strong><a href="https://news.hada.io/topic?id=32791" target="_blank" rel="noopener">GeekNews - 相关话题</a> — 选题出处</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>分享本文</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">返回列表</a>
+                </div>
+                            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/timezone_converter.html">时区转换器</a></li>
+      <li><a href="../static/char_counter.html">字数统计</a></li>
+      <li><a href="../static/ascii_art.html">ASCII艺术转换器</a></li>
+      <li><a href="../static/llm_price_calculator.html">LLM API 价格计算器</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+<!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="qwen_3_6_27b_local_2026.html">Qwen 3.6 27B — 本地开发的最优选择：性能、显存与速度的平衡分析</a></li>
+      <li><a href="local_llm_hardware_selection_guide_2026.html">本地LLM硬件选择完全指南2026 - 找到能在你电脑上实际运行的模型</a></li>
+      <li><a href="local_llm_running_guide_2026.html">本地运行LLM指南2026 - 硬件要求与GGUF量化权衡</a></li>
+      <li><a href="local_llm_agentic_coding_2026.html">用本地 LLM 做智能体编程 - 2026年6月的可行性、成本与硬件分析</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制！请粘贴到Threads应用中分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制！');
+        });
+    });
+    </script>
+</body>
+</html>

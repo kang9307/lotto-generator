@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<!--
+ * 技术博客文章模板
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>开发工具为什么吃内存 - 语言服务器内存的原理与代价</title>
+    <meta name="description" content="从原理上解释语言服务器为何要用掉数个 GB 的内存：为了让补全与定义跳转即时响应必须把什么放进内存、把索引挪到磁盘会失去什么、该看 RSS 还是 PSS、各种削减做法又分别要付出什么代价，本文按原理一次讲清楚。">
+    <meta name="keywords" content="语言服务器 内存, LSP 内存占用, rust-analyzer 内存, clangd 索引, gopls 内存, RSS PSS 区别, 开发机内存不足, 单一仓库 IDE, 交换分区, cgroup memory.max, PSI 内存压力, 工作集, 增量计算, 磁盘缓存索引, 开发工具选型">
+    <meta name="robots" content="index, follow">
+    <meta name="googlebot" content="index, follow">
+    <meta name="bingbot" content="index, follow">
+    <meta name="revisit-after" content="7 days">
+    <meta name="language" content="Chinese">
+    <meta name="rating" content="general">
+    <meta name="distribution" content="global">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/dev_tool_memory_footprint.html">
+
+    <meta property="og:title" content="开发工具为什么吃内存 - 语言服务器内存的原理与代价">
+    <meta property="og:description" content="为了让补全与定义跳转即时响应，必须把什么放进内存；而削减这块内存时，我们又在悄悄让出什么。含度量指标与选型标准。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/dev_tool_memory_footprint.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-08-23">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="开发工具为什么吃内存 - 语言服务器内存的原理与代价">
+    <meta name="twitter:description" content="语言服务器的内存从哪里来、会破坏什么，精度与内存的交换、度量指标、各种削减手法及其代价。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+    <meta name="twitter:site" content="@braindetox_kr">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "开发工具为什么吃内存 - 语言服务器内存的原理与代价",
+      "alternativeHeadline": "Why Developer Tools Eat Memory - The Mechanics and Cost of Language Server Footprint",
+      "datePublished": "2026-08-23",
+      "dateModified": "2026-08-23",
+      "inLanguage": "zh-CN",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "语言服务器 内存, LSP 内存占用, rust-analyzer 内存, clangd 索引, gopls 内存, RSS PSS 区别, 单一仓库 IDE, cgroup memory.max, PSI 内存压力, 工作集",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/dev_tool_memory_footprint.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "语言服务器为什么用的内存远远超过源代码本身？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "占内存的不是源代码，而是从源代码里推导出来的派生数据。rust-analyzer 的架构文档说明，作为输入的源代码通常最多也就几十兆字节，所以全部放进内存没有问题。真正膨胀的是叠在它上面的东西：语法树、名称解析结果、类型推断结果、符号索引与反向引用索引、依赖图，以及为了不重复计算同一个查询而保存下来的记忆化缓存，这些全都要驻留在内存里。补全能在毫秒内弹出、定义跳转能立刻生效，正是因为这些派生数据已经提前准备好了，而以 GB 计的占用就是这种即时性的价格。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "内存占用低的语言服务器放弃了什么？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "多数情况下放弃的是此刻的精确度。把分析结果卸载到文件系统、需要时才载入的设计能大幅削减常驻内存和重启时间，但必须引入判断缓存何时过期的规则。只在保存时才做完整分析的设计，则会出现刚写好却尚未保存的 import、结构体与 trait 根本不在索引里的空窗期。惰性加载会拖慢第一次查询，部分索引会让进入依赖库内部的跳转变浅。无论哪一种，本质上都是拿精确度、延迟、运维复杂度中的某一样去换内存。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "内存占用看 RSS 就够了吗？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "只看 RSS 会让你在内存吃紧时把情况读反。ps 手册把 RSS 定义为未被换出的物理内存，因此内存越紧张、页面越多被换到 swap，进程的 RSS 反而显得越小。所以 RSS 必须和 swap 用量一起看。要对多个进程求和时，用 PSS 更准确，因为共享库不会被重复计入。在容器里，cgroup v2 的 memory.current 给出该组及其子组的实际总用量。不过第一步永远是确认系统整体还有多少余量，在 Linux 上那个值是 available 列而不是 free 列。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "开发机内存不足时具体会发生什么？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "先是回收与换出开始，macOS 会在换出之前先做内存压缩。被压缩的页每次访问都要消耗 CPU，于是延迟以 CPU 占用率的面目出现。Windows 则是削减工作集，被削掉的页一旦再次被触碰就会产生硬缺页，必须从后备存储读回来，这正是一次补全变成一次磁盘读取的时刻。在容器和 CI 里则会撞上 cgroup v2 的上限：越过 memory.high 时进程会被节流并承受强烈的回收压力，而当 memory.max 已达上限且无法再减少用量时，该组内就会触发 OOM killer。在笔记本上，这些额外工作最终都会翻译成发热与耗电。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "内存少用一百倍这类宣传口径该怎么读？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "比起倍数本身，先要弄清楚是什么和什么在比、在什么条件下测的。区分目标值和实测值同样重要，目标 100MB 与实测 100MB 是完全不同的两句话。如果没有说明两边是否在同一仓库、同一机器、同一配置下测量，也没有说明一边是单实例而另一边是多个实例之和，那么这个倍数与其说是信息，不如说是印象。反过来，愿意在文档里写明什么东西在保存之前不会被索引、哪些功能尚未支持的项目，反而给出了值得信任的信号。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 4px; overflow-x: auto; margin: 1rem 0; }
+        .post-content pre code { background-color: transparent; padding: 0; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        .callout { background: #eef6ff; border-left: 4px solid #3498db; padding: 0.7rem 1rem; margin: 1rem 0; border-radius: 4px; font-size: 0.95em; }
+        .warn { background: #fff5f5; border-left: 4px solid #e74c3c; padding: 0.7rem 1rem; margin: 1rem 0; border-radius: 4px; font-size: 0.95em; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/dev_tool_memory_footprint.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/dev_tool_memory_footprint.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/dev_tool_memory_footprint.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/dev_tool_memory_footprint.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/dev_tool_memory_footprint.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    { "@type": "ListItem", "position": 1, "name": "首页", "item": "https://braindetox.kr/zh/" },
+    { "@type": "ListItem", "position": 2, "name": "开发/基础设施", "item": "https://braindetox.kr/zh/category/dev.html" },
+    { "@type": "ListItem", "position": 3, "name": "开发工具为什么吃内存 - 语言服务器内存的原理与代价", "item": "https://braindetox.kr/zh/posts/dev_tool_memory_footprint.html" }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="开发工具为什么吃内存 - 语言服务器内存的原理与代价">
+                <meta itemprop="datePublished" content="2026-08-23">
+                <meta itemprop="dateModified" content="2026-08-23">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="语言服务器 内存, LSP 内存占用, RSS PSS 区别, 单一仓库 IDE, cgroup memory.max, 工作集">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/dev_tool_memory_footprint.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">开发工具为什么吃内存 - 语言服务器内存的原理与代价</h1>
+                    <h2 class="post-subtitle">为了让补全即时响应必须放进内存的东西，以及削减它之后失去的东西</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-08-23">2026年8月23日</span>
+                        <span class="post-category" itemprop="articleSection">开发/基础设施</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+                    <h2>引言：一行代码都没敲，风扇却在转</h2>
+                    <p>编辑器开着，你去倒杯咖啡回来，笔记本已经发烫。再开一个视频会议窗口，刚才还很利落的补全就慢了半拍。切换分支之后，整个编辑器会僵住三十秒左右。这三个场景来自同一个地方：窗口背后运行的<strong>语言服务器</strong>，正在把整个项目读进去、重新绘制它自己的那张地图。</p>
+                    <p>2026 年 8 月，一个 Rust 的替代语言服务器以内存少用一百倍的标题出现在开发者社区。这篇文章既不是那个工具的介绍，也不是推荐。它要处理的是那个标题触到的真问题：<strong>开发工具的内存从哪里长出来，长出来的内存究竟破坏了什么。</strong>以及当我们动手去削减它时，悄悄让出去的又是什么。</p>
+                    <p>先把已发布的内容连同可核实的条件简短交代，然后就离开具体工具、回到原理。</p>
+
+                    <h2>1. 发布了什么 - 以及一百倍是什么比什么</h2>
+                    <p>引起讨论的项目是一个名为 Rust Glancer 的 Rust 语言服务器实现。项目站点把自己描述为与 rust-analyzer 不同的路线：不是把一切放在内存里动态重算，而是使用<em>冻结的工作区</em>，并且可以把它卸载到文件系统上。以承受一定性能损失换取极致的内存效率与瞬时重启，这是项目自己的总结，开发时间写的是大约四个月。</p>
+                    <p>在照搬标题里的倍数之前，必须先把比较的两端拆开。文档中真正能确认的内容如下。</p>
+                    <ul>
+                        <li>内存那一侧的数字是<strong>目标值</strong>。文档写的是在规模合理的项目上以低于 100MB 为目标，而所谓合理规模指的是什么，并没有交代。</li>
+                        <li>比较对象那一侧的数字是<strong>作者的轶事</strong>：在用同一个编辑器的两份实例同时打开多个项目的状态下，rust-analyzer 占了 16GB。那是整套配置的合计，而不是单个实例的常驻量。</li>
+                        <li>项目公开的<strong>并列对比表里没有内存这一列。</strong>表里只有索引耗时。</li>
+                        <li>因此一百倍更接近于用 100MB 的目标去除以 16GB 的轶事。把同一个仓库在同一台机器上用两个服务器分别打开、并列测量常驻内存的公开数据并不存在。</li>
+                    </ul>
+                    <p>公开的时间对比表如下。它始终是<strong>索引时间而不是内存</strong>，并且带着在两台 MacBook 上测量的条件。</p>
+                    <ul>
+                        <li>MacBook Pro M4 Max 36GB：Glancer 基础 5 秒、完整 8 秒，rust-analyzer 基础 6 秒、完整 13 秒</li>
+                        <li>MacBook Pro M1 8GB：Glancer 基础 6 秒、完整 9 秒，rust-analyzer 基础 7 秒、完整 14 秒</li>
+                    </ul>
+                    <p>代价也写在文档里。新写的 import、结构体与 trait <strong>在保存文档之前不会被索引。</strong>输入过程中只对当前函数体做浅层分析并复用之前的索引。需要真正执行构建脚本或过程宏才能得到的信息、以及 nightly 专属特性，都明确标注为暂不支持。这些句子不是缺陷而是信号。倍数只有附上条件才有意义，而要理解条件，就得先知道<strong>为什么一开始需要那么多内存</strong>。</p>
+
+                    <h2>2. 语言服务器为什么花内存 - 即时性的价格</h2>
+                    <p>语言服务器协议的存在，是为了把乘法问题变成除法。与其为 M 种语言和 N 个编辑器的每一种组合分别实现语言支持，不如每种语言配一个服务器，编辑器用标准协议对话。补全、定义跳转、查找引用、重命名、诊断，全都变成服务器这一侧的职责。</p>
+                    <p>这里会产生一个误解：以为吃内存的是源代码。rust-analyzer 的架构文档把这一点写得很清楚：分析器把全部输入数据放在内存里而不做任何 IO，因为输入就是源代码，而源代码顶多也就几十兆字节，全部拿着完全没问题。<strong>造出 GB 级占用的不是源代码，而是从源代码里推导出来的那些东西。</strong></p>
+                    <table>
+                        <thead>
+                            <tr><th>放进内存的东西</th><th>有了它才能做的事</th><th>没有它会怎样</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>语法树</td><td>判断光标所在位置的语法上下文</td><td>补全退化成字符串匹配</td></tr>
+                            <tr><td>名称解析结果与模块作用域表</td><td>确定这个标识符指向哪个定义</td><td>定义跳转与重命名变成猜测</td></tr>
+                            <tr><td>类型推断结果</td><td>计算点号之后可以接什么</td><td>方法候选不准确或者干脆为空</td></tr>
+                            <tr><td>符号索引与反向引用索引</td><td>查找引用、工作区全局搜索</td><td>每次查询都要重扫整个项目</td></tr>
+                            <tr><td>依赖图</td><td>判断变更之后要重算哪些部分</td><td>改一个字符就要全量重新分析</td></tr>
+                            <tr><td>记忆化的中间结果</td><td>同一个查询不算第二遍</td><td>每次敲键都在重复同样的工作</td></tr>
+                        </tbody>
+                    </table>
+                    <p>最后一行尤其重要。现代语言服务器是增量计算引擎。rust-analyzer 为此使用 Salsa，其设计的核心不变式是<strong>在函数体内部输入不会让全局派生数据失效</strong>。为了守住这个承诺，它给每个文件单独维护一份与函数体改动无关的摘要结构、把模块作用域索引成另一张表，语法树则只在需要时才解析。</p>
+                    <p>结构切得越细，需要重算的范围就越窄，而这些碎片与碎片的缓存正是内存。这一领域最根本的交易就在这里显形：<strong>为了买到快速重算而支付内存。</strong>补全能一眨眼就弹出来，说明做出那个答案所需的材料大多早已备在 RAM 里。</p>
+
+                    <h2>3. 精确度与内存的交换 - 本文的核心</h2>
+                    <p>全都装进内存，既准又快。问题在于精确度、延迟、内存这三样不可能同时拉满。轻量工具不是变了魔术，而是把三样中的一样放下了，放下的是哪一样决定了这个工具的性格。</p>
+                    <h3>3.1 放下的是什么</h3>
+                    <ul>
+                        <li><strong>惰性加载</strong> — 需要时才计算。总内存下降，但第一次查询变慢。只在第一次要等三秒这种现象几乎不会体现在平均响应时间的统计里，而人恰恰记住的就是那三秒。</li>
+                        <li><strong>部分索引</strong> — 工作区精确分析，依赖库只留摘要。在大型仓库上省下的最多，但进入库内部的定义跳转会在某个深度断掉。</li>
+                        <li><strong>磁盘缓存</strong> — 把结果写成文件，需要时再载入。重启速度提升极其明显，代价是需要判断缓存何时过期的规则；规则保守就总在重建，规则松散就会给出错误答案。</li>
+                        <li><strong>快照冻结</strong> — 输入时只看浅层，保存时才跑完整分析。省下的幅度最大，但会出现<strong>刚写好的东西还不存在</strong>的状态。</li>
+                    </ul>
+                    <h3>3.2 让出去的多半是时间轴</h3>
+                    <p>把这四样并排看，共同点就浮出来了。轻量工具真正让出去的往往不是功能清单，而是<strong>此刻的精确度</strong>。代码在两次保存之间一直在变，索引却停在上一次保存的时刻，这个间隔越大，工具就越是在回答关于过去那份代码的问题。</p>
+                    <p>新定义一个结构体，不保存就切到别的文件敲它的名字，候选里不会出现。因为按下保存就立刻消失，所以也没人会把它报成缺陷。于是这笔成本不会出现在基准测试里，而且<strong>体感完全取决于习惯。</strong>对每写两三行就保存的人来说几乎不存在，对写一大段之后再保存的人来说是每天都要撞的墙。</p>
+                    <h3>3.3 现实的答案是把层次分开</h3>
+                    <p>C/C++ 的语言服务器 clangd 所选的结构是这种折中的好例子。它不把索引做成一整块，而是叠几层再呈现为一个。最上面是负责当前正在编辑文件的动态索引，下面是扫描整个项目的后台索引。设计文档说明，得益于这个结构，<strong>即使后台索引尚未完成，你正在处理的那些文件的交叉引用也可以使用。</strong></p>
+                    <p>值得学的是原则而不是具体实现。一旦区分出必须保持最新的部分与不必如此的部分，什么该留在内存、什么该放到磁盘就自然分开了。光标所在的文件必须精确到毫秒级的最新，半年没碰过的 vendor 目录则不必。想把所有东西维持在同样的新鲜度时，内存就会炸开。</p>
+
+                    <h2>4. 开发机内存不够时实际发生的事</h2>
+                    <p>内存占用数字大本身不会伤到任何人。有害的是这个数字超过可用量之后开始的连锁反应，而它是有顺序的。</p>
+                    <ul>
+                        <li><strong>回收与换出</strong> — 内核先把用得少的页赶出去。第一个陷阱就在这里。ps 手册把 RSS 定义为<em>未被换出的</em>物理内存，所以内存越紧张，进程的 RSS <strong>反而显得越小。</strong></li>
+                        <li><strong>压缩</strong> — macOS 在换出之前先做内存压缩。Activity Monitor 里的 Compressed 就是为了腾出更多 RAM 而压缩掉的量。被压缩的页每次触碰都要花 CPU，于是内存问题伪装成 CPU 占用率出现。</li>
+                        <li><strong>工作集缩减</strong> — Windows 会从进程的工作集里削掉页面。工作集是虚拟地址空间中当前驻留在物理内存里的那些页，被削掉的页一旦再被触碰就会产生硬缺页，必须从后备存储读回来。<strong>这就是一次补全变成一次磁盘读取的那一刻。</strong></li>
+                        <li><strong>工具之间的竞争</strong> — 编辑器本体与扩展宿主、类型检查器、打包器的监视进程、容器运行时，还有开着四十个标签页的浏览器，共用同一块 RAM。它们会互相挤掉对方攒下的页缓存，所以减掉其中一个，另一个往往就变快了。</li>
+                        <li><strong>容器上限</strong> — 开发容器和 CI 里由 cgroup v2 立起围墙。越过 memory.high 时进程会被节流并承受强烈的回收压力，而内核文档明确写着越过 high 这条线<strong>并不会触发 OOM killer</strong>。只有当 memory.max 已达上限且无法再减少用量时，该组内才会真的触发 OOM killer。</li>
+                        <li><strong>发热与续航</strong> — 压缩、回收、重建索引全都是 CPU 的活。内存问题在笔记本上会被翻译成散热问题，<a href="laptop_buying_guide_2026.html">选笔记本时先看内存容量</a>这条建议正是从这里来的。</li>
+                    </ul>
+                    <p>如果在 CI 里遇到过语言服务器或类型检查器<strong>毫无理由地消失</strong>，那么有个地方比日志更该先看。cgroup v2 的 memory.events 文件带着 low、high、max、oom、oom_kill 这几个计数器，oom_kill 在涨，案子就算结了。</p>
+                    <p>还有直接度量压力本身的指标。Linux 的 PSI 在系统层面暴露为 <code>/proc/pressure/memory</code>，在 cgroup 层面暴露为 <code>memory.pressure</code>。some 行是至少有一部分任务因该资源而停滞的时间占比，full 行是所有非空闲任务同时停滞的时间占比。full 在上涨，那就不是慢，而是<strong>抖动</strong>。10 秒、60 秒、300 秒的平均值一起给出，所以瞬时尖峰与持续趋势可以在一屏之内分辨开。</p>
+
+                    <h2>5. 单一大仓库与大型代码库 - 规模不是线性增长</h2>
+                    <p>文件翻倍，内存看上去也该翻倍，实际却涨得更陡。原因在数据结构的性质里。</p>
+                    <ul>
+                        <li><strong>引用关系更接近符号的两两配对。</strong>符号数量与文件数成正比，但要让查找引用与安全重命名即时可用，就需要一份谁在用谁的反向索引，而这份索引比文件数长得快。</li>
+                        <li><strong>失效范围会变宽。</strong>依赖图越深，改动一个公共类型时需要重算的下游范围就越大。所以仓库越大，越会想把缓存开得更大。</li>
+                        <li><strong>生成代码会插进来。</strong>宏展开、代码生成、由 schema 派生的类型都不在源码里。分析对象的真实体量开始与仓库的表面体量脱节。</li>
+                        <li><strong>实例会被乘起来。</strong>rust-analyzer 的文档写着一个进程可以服务多个项目，但要是每个项目单开一个编辑器窗口，这个优势就没了，服务器数量也随窗口数增加。第 1 节里的 16GB 轶事正是这种配置。</li>
+                    </ul>
+                    <p>这个量级上会发生什么，clangd 的设计文档写得很平实：大型项目的后台索引<strong>通常要花好几个小时并消耗数 GB 的 RAM</strong>。所以 clangd 提供了挂载预先构建好的静态索引这一选项，而远程索引功能正是为了把全局索引带来的巨大内存开销挪到另一台机器上而设计的。</p>
+                    <p>规模的答案由此浮现。仓库超过某个体量之后，在个人机器上靠调优硬撑的阶段就结束了，<strong>把索引挪到开发机之外</strong>成为剩下的方向。一台索引服务器最终会比给全体成员加内存更便宜，而这笔账在<a href="ddr5_memory_price_surge_ai_demand_2026.html">内存价格大幅上涨的行情</a>里又会再度动摇。</p>
+
+                    <h2>6. 怎么量 - 该看哪个数字</h2>
+                    <p>关于内存的讨论多半会错位，原因是不同的数字被叫了同一个名字。定义不同，同样的情形就会得出不同的结论。</p>
+                    <table>
+                        <thead>
+                            <tr><th>指标</th><th>定义</th><th>在哪里看</th><th>注意什么</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>RSS</td><td>未被换出的、该任务实际用掉的物理内存</td><td>ps、top、/proc 状态文件</td><td>换出的部分不计入；共享库会按进程重复计入</td></tr>
+                            <tr><td>VSZ</td><td>进程的虚拟内存大小，不含设备映射</td><td>ps</td><td>是预留而不是使用。映射大文件会让它虚高</td></tr>
+                            <tr><td>PSS</td><td>该进程在这块映射上的按比例份额</td><td>smaps、smaps_rollup</td><td>适合对多进程求和；只看单个进程会低估</td></tr>
+                            <tr><td>Private_Dirty</td><td>只有该进程持有并且已被修改的页</td><td>smaps</td><td>最接近进程退出时真正能收回来的量</td></tr>
+                            <tr><td>Swap</td><td>本应是匿名内存但已被换到 swap 上的量</td><td>smaps</td><td>与 RSS 一起看才能看出真实用量</td></tr>
+                            <tr><td>available</td><td>无需换出即可启动新程序的内存估计值</td><td>free</td><td>真正的余量是这一列而不是 free 列</td></tr>
+                            <tr><td>memory.current</td><td>该 cgroup 及其子组当前使用的总量</td><td>cgroup v2</td><td>在容器与 CI 里这才是基准线</td></tr>
+                            <tr><td>工作集</td><td>虚拟地址空间中当前驻留在物理内存里的页</td><td>Windows 任务管理器</td><td>共享页会按进程分别计入</td></tr>
+                            <tr><td>Compressed</td><td>为腾出更多 RAM 而压缩掉的内存量</td><td>macOS Activity Monitor</td><td>这个值大，说明已经处在压力之下</td></tr>
+                        </tbody>
+                    </table>
+                    <p>读这些数字是有顺序的，守住顺序就能消掉大部分误诊。</p>
+                    <ul>
+                        <li><strong>先看系统余量</strong> — Linux 看 available，macOS 看内存压力曲线。这里宽裕的话，某个进程用掉 2GB 不是问题而是设计。</li>
+                        <li><strong>没有余量就分份额</strong> — 用 PSS 的合计看谁占了多少。把 RSS 简单相加会因为共享部分重复而得出超过物理内存的数值。</li>
+                        <li><strong>锁定进程之后 RSS 与 Swap 一起看</strong> — 只看其中一个，在紧张状态下会读得恰好相反。</li>
+                        <li><strong>先找工具自带的度量</strong> — Go 的语言服务器 gopls 在用量超过 1GB 时会自动把内存调试信息写到临时目录，启动调试服务器还能在浏览器里查看性能分析与内存状况。</li>
+                    </ul>
+                    <p>如果接下来还要把编辑器卡住的时刻与系统日志里的回收记录对齐，那时用到的工具与<a href="linux_log_analysis_commands_guide.html">Linux 日志分析命令</a>那一侧完全重合。</p>
+
+                    <h2>7. 削减的各种做法与各自付出的代价</h2>
+                    <p>削减内存的方法早已被整理成好几条路子，没有一条是免费的。每一条都在拿精确度、延迟、运维复杂度中的某一样去换内存。</p>
+                    <table>
+                        <thead>
+                            <tr><th>做法</th><th>做什么</th><th>得到什么</th><th>付出什么</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>卸载到磁盘</td><td>把分析结果放成文件，需要时才载入</td><td>常驻内存下降、重启时间缩短</td><td>首次访问的延迟、缓存失效规则的复杂度、磁盘写入</td></tr>
+                            <tr><td>保存时索引</td><td>输入时浅层处理，保存时做完整分析</td><td>内存与 CPU 的节省幅度最大</td><td>保存之前的新条目工具看不见</td></tr>
+                            <tr><td>部分索引与惰性索引</td><td>工作区精确，依赖只留摘要</td><td>在大型仓库上效果显著</td><td>进入库内部的探索会在某个深度断掉</td></tr>
+                            <tr><td>紧凑表示</td><td>驻留化、位打包、字符串池</td><td>没有精确度损失</td><td>实现复杂度、每次访问的少量 CPU</td></tr>
+                            <tr><td>进程分离</td><td>把索引隔离到编辑器之外的进程</td><td>编辑器变轻、故障不会蔓延</td><td>进程间通信开销、多一个要管的部件</td></tr>
+                            <tr><td>远程索引</td><td>由独立服务器提供共享索引</td><td>整个团队只需付一次索引成本</td><td>基础设施与访问控制、新鲜度管理</td></tr>
+                            <tr><td>范围排除</td><td>把构建产物与 vendor 目录从索引里剔除</td><td>立竿见影且没有额外成本</td><td>被排除的区域工具一无所知</td></tr>
+                        </tbody>
+                    </table>
+                    <p>实务上排顺序的话，最后一行排在最前。范围排除一行配置就完事，通常剔掉的是 <code>node_modules</code>、<code>target</code> 这类<strong>本来就不需要分析</strong>的东西。其次是进程分离与设定上限。紧凑表示和索引结构改造是造工具那一方的事，不是用工具这一方的选项。</p>
+
+                    <h2>8. 也要诚实地看另一面 - 那些内存买到了什么</h2>
+                    <p>如果轻就是无条件更好，那我们现在还在用文本搜索找定义。过去十年开发工具的内存占用上涨，是功能增加的结果而不是谁偷懒的结果。</p>
+                    <ul>
+                        <li><strong>基于类型的补全</strong> — 不是罗列名字相近的候选，而是只显示在那个位置上真正成立的东西。必须有类型推断结果驻留内存才做得到。</li>
+                        <li><strong>安全的重命名</strong> — 字符串替换会连注释和字面量一起改坏。基于引用图的重命名要有反向索引才成立。</li>
+                        <li><strong>保存前的诊断</strong> — 不跑构建就在输入过程中报错，靠的是增量计算缓存。</li>
+                        <li><strong>结构性导航</strong> — 查找引用、调用层级、查找实现，没有项目级全局索引就根本不存在。</li>
+                        <li><strong>重构自动化</strong> — 提取方法、内联、修改签名，只有同时知道类型与引用才安全。</li>
+                    </ul>
+                    <p>所以判断标准不是用量的绝对值。<strong>只有当你看不出这些内存买到了什么</strong>，它才成为问题。在 8GB 内存的机器上占 2GB 的语言服务器等于拿走了半台机器，而在 64GB 的机器上同样的 2GB 是笔好交易。补一句，轻的工具也未必总是更快。缓存持有得少，重复查询就要重算，还要加上从磁盘载入的时间。索引时间、响应时间与内存是各自独立的轴，改善其中一条必然存在让另一条变差的区间。</p>
+
+                    <h2>9. 选工具时真正该看的东西</h2>
+                    <p>把宣传话术剥掉之后，剩下的判断材料并不多。下面六条就够了。</p>
+                    <ul>
+                        <li><strong>看条件而不是倍数</strong> — 哪个仓库、哪台机器、哪套配置下测的。没有条件的倍数不是信息而是印象。</li>
+                        <li><strong>区分目标值与实测值</strong> — 目标 100MB 与实测 100MB 是两句话。文档要是把两者混着写，这本身就是信息。</li>
+                        <li><strong>精确度的边界是否写在文档里</strong> — 肯说明什么东西在什么时候之前不会被索引的项目值得信任，遮着掩着的那一方危险得多。</li>
+                        <li><strong>与自己的工作习惯是否合拍</strong> — 保存时索引的体感，在频繁保存的人与总是拖着的人身上恰好相反。别人的评测不如自己的习惯更能预测结果。</li>
+                        <li><strong>看最坏的时刻而不是平均值</strong> — 首次索引期间、大批量切换分支之后、更新依赖之后的那些尖峰。</li>
+                        <li><strong>有没有退路</strong> — 能否排除索引范围、能否设置内存上限、重启成本是多少。能设上限的工具在糟糕的日子里也能保住机器。</li>
+                    </ul>
+                    <p>换工具之前，<strong>先把共用这块 RAM 的其他东西数一遍</strong>通常更快。二十个编辑器扩展、三四个常驻监视进程，还有浏览器。比起换掉语言服务器省下 1GB，从这边掏出 3GB 才是更常见的情况。</p>
+
+                    <h2>未能核实的部分</h2>
+                    <p>把本文无法给出依据的项目集中列在一处。</p>
+                    <ul>
+                        <li>把同一个仓库在同一台机器上用两个 Rust 语言服务器分别打开、并列测量常驻内存的公开表格。已公开的并列对比只有索引耗时。</li>
+                        <li>目标值所预设的规模合理的项目究竟指什么。行数、crate 数、依赖数，哪一项都没有给出定义。</li>
+                        <li>关于 rust-analyzer 典型常驻内存的官方数值。其文档的故障排查页面根本没有内存这一项。</li>
+                        <li>实际测量仓库规模与内存增长曲线关系的公开基准。第 5 节中不是线性增长的说法是从数据结构性质推出的论点，不是实测值。</li>
+                        <li>macOS Activity Monitor 里按进程显示的内存这一列究竟读的是哪个账本。苹果的支持文档只定义了系统层面的项目。</li>
+                    </ul>
+
+                    <h2>结论：内存是预算而不是分数</h2>
+                    <p>把语言服务器的内存占用当成越低越赢的记分牌来读，判断就会出错。那个数字不是分数而是<strong>预算</strong>。预算大的工具用这笔钱买了即时性与精确度，预算小的工具则决定其中一部分不买。哪一边更对，取决于机器的内存容量、仓库的体量，以及那个按下保存键的人的个人习惯。</p>
+                    <p>今天能做的有三件。用<strong>RSS 与 swap 一起</strong>确认现在这个工具到底用了多少；用 available 或内存压力判断系统余量是不是真的不够；如果真不够，就从排除索引范围这种几乎没有代价的做法开始动手。换工具是这之后的选项。</p>
+                    <p>而每当一个新工具带着惊人的倍数出现，问同样的三个问题就好。是什么比什么、在什么条件下测的、作为交换又放弃了什么。三个问题都能在文档里给出答案的项目大体可信，一个都不答的项目，无论数字多大，都还处在没有材料可供判断的状态。</p>
+
+                    <h2>参考资料</h2>
+                    <ul>
+                        <li><a href="https://rust-glancer.github.io/blog/hello-world/" target="_blank" rel="noopener">Rust Glancer - Hello, world!（项目博客）</a></li>
+                        <li><a href="https://news.hada.io/topic?id=32768" target="_blank" rel="noopener">GeekNews 讨论 - Rust Glancer</a></li>
+                        <li><a href="https://rust-analyzer.github.io/book/contributing/architecture.html" target="_blank" rel="noopener">rust-analyzer - Architecture</a></li>
+                        <li><a href="https://clangd.llvm.org/design/indexing" target="_blank" rel="noopener">clangd - Indexing design</a></li>
+                        <li><a href="https://github.com/golang/tools/blob/master/gopls/doc/troubleshooting.md" target="_blank" rel="noopener">gopls - Troubleshooting</a></li>
+                        <li><a href="https://man7.org/linux/man-pages/man5/proc_pid_smaps.5.html" target="_blank" rel="noopener">proc_pid_smaps(5) - PSS、Swap、Private_Dirty</a></li>
+                        <li><a href="https://docs.kernel.org/admin-guide/cgroup-v2.html" target="_blank" rel="noopener">Linux kernel - Control Group v2</a></li>
+                        <li><a href="https://docs.kernel.org/accounting/psi.html" target="_blank" rel="noopener">Linux kernel - PSI: Pressure Stall Information</a></li>
+                        <li><a href="https://learn.microsoft.com/en-us/windows/win32/memory/working-set" target="_blank" rel="noopener">Microsoft Learn - Working Set</a></li>
+                        <li><a href="https://support.apple.com/guide/activity-monitor/view-memory-usage-actmntr1004/mac" target="_blank" rel="noopener">Apple - View memory usage in Activity Monitor</a></li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>分享本文</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">返回列表</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/code_image.html">代码图片生成器</a></li>
+      <li><a href="../static/char_counter.html">字数统计</a></li>
+      <li><a href="../static/json_formatter.html">JSON 格式化工具</a></li>
+      <li><a href="../static/regex_tester.html">正则表达式测试器</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="tls_knowledge_expiry.html">关于 SSL 学到的东西为何现在是错的 - 名称、协议与证书寿命依次改变的记录 2026</a></li>
+      <li><a href="typed_beam_language_gleam.html">在BEAM之上加载静态类型这一选择 - Gleam迁移了哪些边界又留下了哪些</a></li>
+      <li><a href="software_performance_expectations.html">可以慢下去的共识是怎么形成的 - 硬件越来越快为何体感依旧 2026</a></li>
+      <li><a href="observability_data_unused.html">收集的可观测性数据为何无人查看 - 日志、指标与追踪回答的是不同问题 2026</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制！请粘贴到Threads应用中分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制！'); });
+    });
+    </script>
+</body>
+</html>
