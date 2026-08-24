@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<!--
+ * Tech blog post template
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="en">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>How a Hard Kernel Bug Gets Narrowed Down - Bisection, Minimal Reproduction, Instrumentation and the Role of Tools</title>
+    <meta name="description" content="A black screen that returns on every cold boot. How such a bug is narrowed down step by step, and where a tool helps versus where reproduction still decides.">
+    <meta name="keywords" content="kernel debugging, git bisect, binary search debugging, minimal reproduction, driver bug, AI assisted debugging, Assisted-by tag, Linux kernel contribution, printk instrumentation, falsifiability, drm xe, flat CCS, regression tracking, debug patches, review burden">
+    <meta name="robots" content="index, follow">
+    <meta name="googlebot" content="index, follow">
+    <meta name="bingbot" content="index, follow">
+    <meta name="revisit-after" content="7 days">
+    <meta name="language" content="English">
+    <meta name="rating" content="general">
+    <meta name="distribution" content="global">
+
+    <link rel="canonical" href="https://braindetox.kr/en/posts/ai_assisted_kernel_debugging.html">
+
+    <meta property="og:title" content="How a Hard Kernel Bug Gets Narrowed Down - Bisection, Minimal Reproduction, Instrumentation and the Role of Tools">
+    <meta property="og:description" content="Narrowing down a candidate set and confirming a root cause are different jobs. That line is also where a tool can and cannot step in.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/en/posts/ai_assisted_kernel_debugging.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="en_US">
+    <meta property="article:published_time" content="2026-08-24">
+    <meta property="article:section" content="Dev &amp; Infra">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="How a Hard Kernel Bug Gets Narrowed Down - Bisection, Minimal Reproduction, Instrumentation and the Role of Tools">
+    <meta name="twitter:description" content="Reproduces every time, and the log says nothing. Separate narrowing from confirming and the role of tooling becomes clear.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+    <meta name="twitter:site" content="@braindetox_kr">
+
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "How a Hard Kernel Bug Gets Narrowed Down - Bisection, Minimal Reproduction, Instrumentation and the Role of Tools",
+      "alternativeHeadline": "Narrowing Down and Confirming Are Different Jobs",
+      "datePublished": "2026-08-24",
+      "dateModified": "2026-08-24",
+      "inLanguage": "en-US",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "kernel debugging, git bisect, minimal reproduction, driver bug, AI assisted debugging, Assisted-by tag, printk instrumentation, falsifiability, review burden",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/en/posts/ai_assisted_kernel_debugging.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "Why are kernel and driver bugs harder to catch than application bugs?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Four things stack up. First, the point where the symptom appears is far from the point where the cause lives. Between memory being handed out incorrectly and a screen going black there are several layers, and the symptom alone does not tell you which layer to look at. Second, a single attempt is expensive. You rebuild the kernel and power-cycle the machine, so the number of hypotheses you can test in a day is capped by physics rather than by thinking. Third, the observation tools are thin. Early in boot there is no user space, so about all you can leave behind is console output, and adding that output can shift code layout enough to move the symptom. Fourth, an actor that is not code takes part. Hardware and firmware write memory without executing a single instruction of yours, so they leave no name in any stack trace."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How does git bisect work and when can it not help?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "It is a binary search across the commit range between a known good point and a known bad point. As the progress lines in the official documentation show, roughly 10 steps remain with 675 revisions left and roughly 9 with 337 left, so the number of tests scales with the logarithm of the commit count. When you automate it with a script the exit codes carry the meaning: 0 means the current source is good, anything from 1 to 127 except 125 means it is bad, 125 means this revision cannot be tested and should be skipped, and any other value aborts the search. The failure modes are equally clear. If reproduction is intermittent, one revision wrongly marked good sends the rest of the search into the wrong region. If the cause lives in configuration or hardware rather than in a commit, no amount of bisecting will surface it. Above all, bisection answers since when, not why."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Where in a debugging session is an AI tool actually useful?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "In the narrowing phase. Tracing which function computes a value across a wide codebase and where that value flows is closer to bulk reading than to reasoning, and a wrong candidate costs almost nothing because you simply move on to the next one. Drafting instrumentation and summarizing accumulated output have the same shape. Confirmation is a different animal. A cause does not become true because the explanation reads well; it becomes true when an observation supports it, and that observation has to come from reproduction and verification on a real machine. The dividing rule is simple. Work where being wrong just means moving to the next candidate can be delegated. Work where being wrong collapses everything built on top of it stays with a person."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How does the Linux kernel expect AI-assisted contributions to be disclosed?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "The kernel document Documentation/process/coding-assistants.rst states that AI agents must not add Signed-off-by tags, because only a human can legally certify the Developer Certificate of Origin. The human submitter reviews all generated code, confirms licensing compliance, adds their own sign-off and takes full responsibility for the contribution. Attribution goes in an Assisted-by: LLM tag, optionally followed by specialized analysis tools such as coccinelle or sparse; basic tools like git, compilers and editors are not listed. The companion document generated-content.rst adds that if a tool was used to find the problem a change addresses, that should be noted in the changelog, and it explicitly includes the case where the changelog itself was generated by handing the patch to a tool. The wording described here was checked against the master branch on 24 August 2026."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Can one successful debugging story be used as evidence for a methodology?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Only as an existence proof. That something was solved this way once and that this way solves things are different claims. A single case has no control group, so nobody knows how long the same person chasing the same bug by other means would have taken, which means multiplier claims of the how much faster kind cannot honestly come out of it. Selection bias makes it worse: sessions that ended in a fix leave commits and write-ups behind, while sessions that ended in a dead end leave nothing at all, so the pool of stories we read is pre-filtered for success. Add the specificity of the conditions. Reproducing reliably on your own machine, deep familiarity with the code in question and unlimited time are not the conditions most engineers work under. What a story can legitimately teach is the order of operations, not a speedup number."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 4px; overflow-x: auto; margin: 1rem 0; }
+        .post-content pre code { background-color: transparent; padding: 0; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        .callout { background: #eef6ff; border-left: 4px solid #3498db; padding: 0.7rem 1rem; margin: 1rem 0; border-radius: 4px; font-size: 0.95em; }
+        .warn { background: #fff5f5; border-left: 4px solid #e74c3c; padding: 0.7rem 1rem; margin: 1rem 0; border-radius: 4px; font-size: 0.95em; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/ai_assisted_kernel_debugging.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/ai_assisted_kernel_debugging.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/ai_assisted_kernel_debugging.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/ai_assisted_kernel_debugging.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/ai_assisted_kernel_debugging.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "Home",
+      "item": "https://braindetox.kr/en/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "Dev & Infra",
+      "item": "https://braindetox.kr/en/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "How a Hard Kernel Bug Gets Narrowed Down - Bisection, Minimal Reproduction, Instrumentation and the Role of Tools",
+      "item": "https://braindetox.kr/en/posts/ai_assisted_kernel_debugging.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="How a Hard Kernel Bug Gets Narrowed Down - Bisection, Minimal Reproduction, Instrumentation and the Role of Tools">
+                <meta itemprop="datePublished" content="2026-08-24">
+                <meta itemprop="dateModified" content="2026-08-24">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="kernel debugging, git bisect, minimal reproduction, instrumentation, falsifiability, Assisted-by tag">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/en/posts/ai_assisted_kernel_debugging.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">How a Hard Kernel Bug Gets Narrowed Down - Bisection, Minimal Reproduction, Instrumentation and the Role of Tools</h1>
+                    <h2 class="post-subtitle">Shrinking the candidate set and confirming the cause are two different jobs</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-08-24">Aug 24, 2026</span>
+                        <span class="post-category" itemprop="articleSection">Dev &amp; Infra</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+                    <h2>Introduction: it reproduces every time, and the log says nothing</h2>
+                    <p>You power the machine on and get a black screen. Restart the login manager once and everything is fine, and nothing goes wrong after that. Until the next cold boot. Reproduction is one hundred percent, yet the logs hold no clue. A bug like this is hard not because information is missing but because <strong>the thing that failed never wrote anything down.</strong></p>
+                    <p>On 20 August 2026 a commit fixing exactly this kind of bug landed in the Linux kernel. The functional change is one line, turning a <code>round_up()</code> into a <code>round_down()</code>. What makes it worth reading is that the commit message records not only the result but the path to it: 24 patches that added more and more debug information, 18 kernel boots, and an account of what an AI tool did and did not do along the way.</p>
+                    <p>This article is not about how to use that tool. It is about <strong>the order in which a hard bug gets narrowed down</strong>, and about where inside that order a tool can take a slot and where it cannot. The argument over attitudes toward such tools in kernel development is covered in <a href="torvalds_llm_kernel_dev_2026.html">a separate article</a>; here we stay with method.</p>
+
+                    <h2>1. What happened - the confirmed scope</h2>
+                    <p>The commit touches one file, <code>drivers/gpu/drm/xe/xe_vram.c</code>, adding 18 lines and removing 5. Its subject says not to hand out the compression storage as usable VRAM. The chain of the problem is laid out in the commit message itself.</p>
+                    <ul>
+                        <li>In the Intel Xe driver, <code>get_flat_ccs_offset()</code> reads the base address of the region where compression metadata lives from the hardware, scales it by the number of enabled L3 nodes to get a software view, and then <strong>rounded that result up to 128KiB</strong>. Everything below that offset is handed to the VRAM allocator as usable memory.</li>
+                        <li>That is the defect. Rounding <em>up</em> a limit that means usable memory ends here publishes everything between the real base and the rounded value as free memory, and that stretch belongs to the compression hardware.</li>
+                        <li>On a Battlemage G21 with 16GiB the raw value <code>0x3fafff800</code> rounded to <code>0x3fb000000</code>, so the last 2KiB of page <code>0x3fafff000</code> landed in the allocator pool. In the commit message's words that tail gets overwritten by hardware that needs <strong>no page-table entry, no buffer object and no GPU submission</strong> to do it, and does it before user space exists.</li>
+                        <li>On this machine a Mesa VM's level-3 page table landed on that page on every cold boot. The entry covering the compositor's batch-buffer heap disappeared, the first submission faulted, and the display manager restarted it forever. Restarting it by hand cleared the symptom because the next VM's page tables were allocated somewhere else.</li>
+                        <li>The fix rounds <strong>down to the page size the allocator works in</strong> instead. On this machine that excludes exactly one page.</li>
+                    </ul>
+                    <p>What settled the case was an observation rather than an argument. Reading the excluded page afterwards showed <code>0xcccc000000000000</code> and <code>0xcc77000000000000</code> alternating, which the commit message identifies as compression metadata, two bytes per sixteen. That is the evidence that named who had been writing the memory.</p>
+                    <p>There is a more instructive detail still. <strong>An assertion meant to catch exactly this situation was already in the code.</strong> It compared the offset against <code>GSMBASE - ccs_size</code> for equality, and since that value is 128KiB aligned it <em>agrees with the rounded-up offset precisely when the base is not aligned</em>. It was a check that fell silent in the one case it existed for, and it is compiled out entirely unless <code>CONFIG_DRM_XE_DEBUG</code> is set. The replacement is shaped so that it can fail: compression storage must not run into the GSM region.</p>
+                    <p>The account of the process sits inside the commit message in brackets. Quoted directly:</p>
+                    <blockquote>And this was a debug session from hell, enormously helped by an AI doing much of the grunt-work.</blockquote>
+                    <blockquote>the AI several times stated flat out that this was impossible and unsolvable and that we should just write a report about it.</blockquote>
+                    <p>The same paragraph records that the tool was ready to give up several times but kept adding debug code and analyzing it faithfully when pushed, and that the body of the commit message was written by the tool. The numbers are there too: reaching a one-line fix took 24 patches adding more and more debug information and 18 kernel boots.</p>
+                    <div class="callout">That is everything the public commit confirms. It does not say which tool was used, or what each of the 24 patches printed. Rather than filling those blanks, this article looks at <strong>why the order of operations is the order it is</strong>.</div>
+
+                    <h2>2. Why kernel and driver bugs are hard</h2>
+                    <p>Walking into the kernel with an application developer's reflexes, the first thing that breaks is your sense of time. Checking one thing costs something entirely different here.</p>
+                    <table>
+                        <thead>
+                            <tr><th>Axis</th><th>Application</th><th>Kernel and drivers</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Distance from symptom to cause</td><td>Usually the same process and stack</td><td>Several layers between; the symptom does not identify one</td></tr>
+                            <tr><td>Cost of one attempt</td><td>A few seconds to rerun</td><td>Rebuild, reboot, and reset hardware state</td></tr>
+                            <tr><td>Means of observation</td><td>Breakpoints, structured logs, profilers</td><td>Console output, roughly, in early boot</td></tr>
+                            <tr><td>State isolation</td><td>Kill the process and it resets</td><td>The broken state lives in the whole machine</td></tr>
+                            <tr><td>Third-party actors</td><td>Essentially none</td><td>Hardware and firmware write memory without running code</td></tr>
+                            <tr><td>Side effects of looking</td><td>Mostly harmless</td><td>Debug options change layout and timing, moving the symptom</td></tr>
+                        </tbody>
+                    </table>
+                    <p>The last two rows describe this case precisely. What corrupted the memory was not code, so it left its name in no stack trace. And turning on debug options changes allocation order, which can put something else on the offending page. <strong>The act of observing moving the thing you are observing</strong> is a routine condition in kernel debugging.</p>
+                    <ul>
+                        <li><strong>Absence rather than trace</strong> — an overwrite leaves no footprint, only a hole. The missing page-table entry does not announce that it is missing; it shows up much later as a fault somewhere unrelated.</li>
+                        <li><strong>Combinatorial explosion</strong> — a specific chip, a specific memory size and a specific L3 configuration have to line up for the value to be misaligned. In other combinations the same code is fine.</li>
+                        <li><strong>Timing dependence</strong> — which allocation happens in which order decides who the victim is, and if the victim is not a page table the symptom looks completely different.</li>
+                        <li><strong>Indistinguishable from correct behaviour</strong> — memory handed out in error is perfectly valid memory as far as the allocator is concerned. No rule was broken, so no check fires.</li>
+                    </ul>
+                    <p>Under these conditions the fact that <strong>testing a single hypothesis is expensive</strong> determines the entire method. Where attempts are cheap, trying things is a viable strategy; where one boot equals one attempt, you have to design the order of your attempts.</p>
+
+                    <h2>3. The classical ways to narrow a bug down</h2>
+                    <p>The tools for narrowing are old and there are not many of them. What matters is what each one assumes, and how it fails when that assumption breaks.</p>
+                    <table>
+                        <thead>
+                            <tr><th>Method</th><th>Assumes</th><th>Gives you</th><th>Fails when</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Bisection</td><td>A good point, a bad point and a reliable verdict</td><td>The moment the change entered</td><td>Reproduction is intermittent, or the cause is outside the code</td></tr>
+                            <tr><td>Minimal reproduction</td><td>The symptom can be summoned reliably</td><td>A lower unit cost per attempt</td><td>The symptom vanishes while you reduce</td></tr>
+                            <tr><td>Instrumentation</td><td>A hypothesis about where to look</td><td>The lineage of an internal value</td><td>Printing changes the phenomenon</td></tr>
+                            <tr><td>Falsification</td><td>You can define an observation that kills it</td><td>Definitive removal of candidates</td><td>The hypothesis has no kill condition</td></tr>
+                            <tr><td>Post-mortem inspection</td><td>The broken state can be read as it is</td><td>Direct evidence naming the culprit</td><td>The traces have already been erased</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h3>3.1 Bisection answers since when, not why</h3>
+                    <p><code>git bisect</code> is a binary search that halves the range between a good commit and a bad one. As the documentation's progress lines show, roughly 10 steps remain with 675 revisions left and roughly 9 with 337 left, so the number of tests scales with the logarithm of the commit count. A range of a thousand commits collapses to one in about ten rounds.</p>
+                    <p>When you automate it, the rules are expressed as exit codes. The contract the documentation defines is this.</p>
+                    <ul>
+                        <li><strong>0</strong> — the current source is good.</li>
+                        <li><strong>1 to 127, excluding 125</strong> — the current source is bad.</li>
+                        <li><strong>125</strong> — the current source cannot be tested, so skip this revision. This is the value to use across ranges where the build is broken.</li>
+                        <li><strong>Anything else</strong> — abort the search entirely.</li>
+                    </ul>
+                    <p>The strength of the method is that you do not have to read the code. As long as the verdict is accurate, the range shrinks without understanding. The practical command combinations are written up separately in <a href="git_history_commands_guide_2026.html">the Git history commands guide</a>.</p>
+                    <p>The limit comes from the same place. <strong>Bisection answers the question since when, not the question why.</strong> This case carries a <code>Fixes</code> tag pointing at the commit that introduced the behaviour, and knowing that commit still does not explain why the value is misaligned only on this machine. The misalignment came from the <em>combination</em> of a code change and a hardware configuration, and combinations do not live on the commit list. Be careful with unstable verdicts too. Mark one good revision as bad and the search spends every remaining step in the wrong region.</p>
+
+                    <h3>3.2 Minimal reproduction is really buying time</h3>
+                    <p>Minimising a reproduction is not a matter of elegance but of arithmetic. The speed of narrowing is ultimately <strong>how many hypotheses you can kill per day</strong>, and that number is divided by the time one reproduction takes. Shortening the reproduction is not tidying-up you do later; it is the first investment you make.</p>
+                    <ul>
+                        <li><strong>Pin one axis at a time</strong> — kernel configuration, user-space setup, hardware. Change all three at once and the result tells you nothing.</li>
+                        <li><strong>The conditions under which the symptom disappears are data too</strong> — the single fact that restarting the display manager cures it points the cause away from persistent corruption and toward <em>an accident of placement</em>. If the symptom vanishes as you reduce, step back and re-examine the last thing you removed.</li>
+                        <li><strong>Build the automatic verdict first</strong> — if a human has to look at a screen to judge, bisection cannot be automated. The exit-code contract from the previous section only means something once a verdict script exists.</li>
+                    </ul>
+
+                    <h3>3.3 Instrumentation is making logs, not reading them</h3>
+                    <p>Debugging an application is mostly reading logs that already exist. On the kernel side it is closer to <strong>manufacturing logs that do not exist</strong>. Twenty-four debug patches is precisely that work: print something, boot, find the value is not what you expected, print the next point, boot again.</p>
+                    <p>Choosing what to print is where skill shows. Print one value alone and you cannot even tell whether it is wrong. What you need is the <strong>lineage of a value</strong>: the raw reading from the hardware, the scaled version, the aligned version, printed side by side, so you can see which transformation went off. The commit message putting the raw and rounded values next to each other is not decoration; placing them together is what makes the defect visible.</p>
+                    <p>Post-mortem inspection is a form of instrumentation too. What proved decisive here was not a log taken during execution but the result of <em>reading the offending page afterwards</em>. When the culprit is hardware rather than code, reading what was left behind is effectively the only direct evidence available. Handling the output that piles up overlaps with <a href="linux_log_analysis_commands_guide.html">the Linux log analysis commands</a> material.</p>
+
+                    <h3>3.4 A hypothesis needs a way to die</h3>
+                    <p>What you must write down beside a hypothesis is not its supporting reasons but its <strong>execution condition</strong>. What observation, if it comes back true, kills this? If you cannot write that sentence alongside it, what you have is an impression, not a hypothesis.</p>
+                    <p>The assertion from section 1 demonstrates the principle from the other side. It was written so that it came out true in the very situation it was supposed to catch. That is <strong>a hypothesis with no falsification condition frozen into code</strong>, which is why it existed and did nothing. When you write a replacement, one test suffices: can I imagine an input that makes this check fail?</p>
+                    <ul>
+                        <li>Write the <strong>killing observation</strong> next to each hypothesis, and handle the cheap kills first. A hypothesis that dies to a one-line print goes before a half-day experiment.</li>
+                        <li>When several hypotheses survive, look for the observation that <strong>splits more than one of them at once</strong>.</li>
+                        <li>Keep what you confirmed and what you inferred separate in your notes. The moment they mix, an inference gets promoted to a premise.</li>
+                    </ul>
+
+                    <h2>4. Where the tool helped and where it could not</h2>
+                    <p>The commit message names three contributions from the tool: much of the grunt-work, continuing to add debug code and analyze it when pushed, and writing the body of the commit message. What generalizes from this is not the capability of the tool but <strong>the nature of the work</strong>.</p>
+                    <h3>4.1 Narrowing and confirming are different jobs</h3>
+                    <p><strong>Narrowing</strong> shrinks the candidate set. Finding which function produces a value in a wide codebase and where that value flows is closer to bulk reading, and a wrong candidate costs almost nothing because you move on to the next one. <strong>Confirming</strong> is saying this is the cause. A cause does not become true because the explanation reads well; it becomes true when an observation supports it, and in this case what produced the confirmation was not an argument but <strong>the value read out of the reserved page</strong>.</p>
+                    <p>So the rule is simple. <strong>Work where being wrong just means moving to the next candidate can be delegated; work where being wrong collapses everything built on top of it stays with a person.</strong> Because the distinction comes from the nature of the work, it holds whether tools get better or worse.</p>
+                    <h3>4.2 What a tool structurally cannot do</h3>
+                    <ul>
+                        <li><strong>It is not attached to the machine</strong> — 18 boots means somebody actually powered a computer on 18 times. As long as reproduction and verification are what create confirmation, the physical trials cannot be delegated.</li>
+                        <li><strong>Its verdict of impossible carries no weight</strong> — the commit message records that the tool stated flat out several times that this was unsolvable, and it was in fact solved. A cannot-do answer is information about the shape of that response, not about the shape of the problem.</li>
+                        <li><strong>It does not separate plausible from true</strong> — a well-written explanation is still well written when it is wrong. That property generates the cost described in the next section.</li>
+                    </ul>
+
+                    <h2>5. Why a wrong hypothesis is expensive - where to put verification</h2>
+                    <p>Time in debugging usually leaks not in the stretch where you know nothing but in <strong>the stretch where you are holding a wrong conviction</strong>. The costs are not symmetric.</p>
+                    <ul>
+                        <li>A correct hypothesis ends after one verification. A wrong one does not end when verification fails, because you then spend the same time again checking whether your instrumentation was faulty or your conditions differed.</li>
+                        <li>The instrumentation and experimental setup you built in the meantime are shaped around the wrong hypothesis, so almost none of it carries over to the next one.</li>
+                        <li>The most expensive kind is the <strong>plausible wrong answer</strong>. A random wrong answer is discarded instantly; a plausible one gets defended. Even when a refutation arrives you find yourself attaching an exception to keep it alive.</li>
+                    </ul>
+                    <p>The answer, then, is not to postpone verification. <strong>Decide the observation that would kill a hypothesis in the same breath as stating it, and build nothing on top of that hypothesis until the observation has been made.</strong> The discipline matters more when tools are involved, because when the production rate of explanations rises, so does the accumulation rate of unverified ones.</p>
+                    <p>The kernel documentation draws a line in the same place. The paragraph defining the procedure for AI assistants finding bugs requires that for any non-trivial bug you attempt to <strong>create a reproducer to demonstrate that it is real</strong>, and it gives the reason: many unverified reports sent to maintainers turn out to be invalid. The same paragraph requires that you <strong>state explicitly what could not be done</strong> when something could not be built or tested. Separating what was confirmed from what was not is prescribed as procedure, not as manners.</p>
+
+                    <h2>6. Why one anecdote is not a methodology</h2>
+                    <p>The story is vivid, but the sample size is one. It is worth separating what can and cannot be drawn from it.</p>
+                    <ul>
+                        <li><strong>There is no control group</strong> — nobody knows how many boots the same person chasing the same bug by other means would have needed. Multiplier claims cannot come out of this case. What the commit records are the absolute numbers 24 and 18, and absolute numbers without a comparison do not produce a ratio.</li>
+                        <li><strong>Only successful samples are visible</strong> — sessions that ended in a fix leave commits behind; sessions that ended in a dead end leave nothing anywhere. The pool of stories we read is pre-filtered.</li>
+                        <li><strong>The conditions are unusual</strong> — reproducing reliably on your own machine, deep familiarity with the code in question, and as much time as you want. Remove any one of them and the same path does not hold.</li>
+                        <li><strong>A one-line fix is not a difficulty rating</strong> — if anything it is the opposite. The shorter the fix, the further the symptom often sits from the cause, and the harder the narrowing. And once solved, every step looks inevitable in hindsight, when most of them were probably discarded hypotheses.</li>
+                    </ul>
+                    <p>What can legitimately be drawn is an <strong>existence proof</strong>. That something was solved this way once and that this way solves things are different sentences. What you take from the story is the order, not the multiplier.</p>
+
+                    <h2>7. The open source problem - attribution and review burden</h2>
+                    <p>The moment tool-produced work heads for a public repository the nature of the problem changes. It stops being about how you spend your own time and becomes about <strong>how you spend other people's</strong>. The Linux kernel has written this down, and as checked against the master branch on 24 August 2026 the content is as follows.</p>
+                    <ul>
+                        <li><strong>AI agents must not add <code>Signed-off-by</code></strong> — the stated reason is that only humans can legally certify the Developer Certificate of Origin. Reviewing generated code, confirming licensing compliance, signing off and taking full responsibility all sit on the human submitter's side.</li>
+                        <li><strong>Attribution takes the form <code>Assisted-by: LLM</code></strong> — optionally followed by specialized analysis tools such as coccinelle or sparse, while basic tools like git and compilers are not listed.</li>
+                        <li><strong>Using a tool to find the bug is also disclosable</strong> — the companion document says that if a tool was used to find the problem a change addresses, that belongs in the changelog, and it includes the case where the changelog itself was tool-generated.</li>
+                        <li><strong>The reason is bandwidth</strong> — that document states plainly that reviewer and maintainer bandwidth is a scarce resource, and that knowing which parts came from humans and which from tools is how that resource is protected.</li>
+                    </ul>
+                    <p>A distinction worth carrying into practice falls out here. Disclosure comes in two forms: <strong>prose in the message</strong> and <strong>a machine-readable trailer</strong>. In the commit above the trailer lines carry only <code>Fixes</code>, <code>Cc</code> and <code>Signed-off-by</code>, while the tool use is disclosed inside the body. That is enough for a human reader and invisible to any tally. If you ever intend to count who used what and where, you need a rule that puts it in a fixed place in a fixed format from the start.</p>
+                    <p>The larger axis is the asymmetry of review. <strong>The cost of producing went down and the cost of reading did not.</strong> Translated into practice on the receiving end, that looks like this.</p>
+                    <ul>
+                        <li>Proposals without a reproduction procedure and verification results go to the back of the review queue. Keeping the verification burden on the submitter is the only way to protect bandwidth.</li>
+                        <li>Proposals that do not state what was not done get sent back. If the reviewer cannot see what went untested, the reviewer ends up running those tests.</li>
+                        <li>Fix the attribution format and reject what ignores it; unifying it after the fact costs far more. And length is not a quality signal — long, smooth explanations are the easiest place to hide an unverified claim.</li>
+                    </ul>
+
+                    <h2>8. What a practitioner takes away</h2>
+                    <p>Cut the discussion into units of work and the delegation question becomes a table. The criterion is not capability but <strong>the cost of recovering from being wrong</strong>.</p>
+                    <table>
+                        <thead>
+                            <tr><th>Work</th><th>What a tool is good at</th><th>What a person must do</th><th>Why the line falls there</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Sweeping code paths</td><td>Listing candidate functions and call flows</td><td>Accepting or rejecting the list</td><td>Being wrong just means the next candidate</td></tr>
+                            <tr><td>Forming hypotheses</td><td>Enumerating possible causes broadly</td><td>Defining the killing observation</td><td>Variety is cheap, falsification design is not</td></tr>
+                            <tr><td>Reproduction design and runs</td><td>Draft procedure and verdict script</td><td>The actual trials and the verdict</td><td>Physical trials cannot be delegated</td></tr>
+                            <tr><td>Instrumentation code</td><td>Writing the prints, collating results</td><td>Deciding what to print and where</td><td>Choosing the print point is the hypothesis</td></tr>
+                            <tr><td>Confirming the cause</td><td>Nothing</td><td>Judging whether observation supports it</td><td>A plausible explanation is not evidence</td></tr>
+                            <tr><td>Deciding to stop</td><td>Nothing</td><td>Calling halt or continue</td><td>A tool's impossible verdict is not grounds</td></tr>
+                            <tr><td>Commit message</td><td>Drafting</td><td>Fact-checking and the final wording</td><td>The record gets cited as evidence later</td></tr>
+                            <tr><td>Sign-off and liability</td><td>Nothing</td><td>All of it</td><td>Procedure places it explicitly on humans</td></tr>
+                        </tbody>
+                    </table>
+                    <p>Turned into the order of a working day, the table reads like this.</p>
+                    <ul>
+                        <li>Cut the reproduction time first. The unit cost of every other activity is set here.</li>
+                        <li>Automate the verdict. If human eyes are in the judging loop, repeated trials are bound to human hours.</li>
+                        <li>Write the killing observation on the same line as the hypothesis, and execute the cheap refutations first. Only survivors go to expensive experiments.</li>
+                        <li>In your notes, separate what you confirmed from what you inferred, and record what you could not do. It saves the next person from the same wall.</li>
+                    </ul>
+                    <p>If you do not decide what a print is meant to answer before you add it, the accumulated output becomes a new burden rather than an answer. The root of that is the same problem covered in <a href="observability_data_unused.html">why the observability data you collect never gets read</a>.</p>
+
+                    <h2>9. The same method works without any tool</h2>
+                    <p>None of the methods in this article require a tool. Bisection has been used in kernel development for a long time, and minimal reproduction, instrumentation and falsification are older discipline still. What tooling changed is <strong>the speed of narrowing candidates</strong>, not <strong>what counts as evidence</strong>.</p>
+                    <p>Reverse the order and you lose. Put a tool on top of an absent method and the only thing that improves is the production rate of plausible wrong answers, which section 5 identified as the most expensive kind.</p>
+                    <ul>
+                        <li><strong>The learning order</strong> — method first, tool second. Without the ability to design a refutation you have no way to judge whether a tool's answer is right.</li>
+                        <li><strong>The self-check question</strong> — can I design the observation that would kill the answer this tool gave me? If not, that answer is not yet even a hypothesis.</li>
+                        <li><strong>What changed and what did not</strong> — the upfront cost of pulling candidates out of a large codebase went down, and verification became the bottleneck by the same amount. That confirmation comes from reproduction and verification is unchanged.</li>
+                    </ul>
+                    <p>Skill, in the end, separates people on the <strong>confirming</strong> side rather than the narrowing side. Listing candidates got cheap; deciding which of them is true is still expensive and still a person's job.</p>
+
+                    <h2>What could not be confirmed</h2>
+                    <p>The items this article could not ground are collected here.</p>
+                    <ul>
+                        <li>Which AI tool was used. The commit message names none.</li>
+                        <li>The contents of the 24 debug patches and the output of the 18 boots. Only the final commit is public, and the elapsed time and the split between human and tool hours are not recorded either.</li>
+                        <li>Why this commit's trailers carry no <code>Assisted-by</code>. The trailer composition is verifiable in the public commit, but the reasoning behind it is not.</li>
+                        <li>The current state of discussion around that tag requirement. The wording quoted here was checked in the master branch documentation on 24 August 2026; whether it has changed since was not verified.</li>
+                        <li>How widely the same defect appeared across other hardware configurations. The commit records the values from one machine.</li>
+                    </ul>
+
+                    <h2>Conclusion: narrowing and confirming are not the same act</h2>
+                    <p>The procedure for narrowing a hard bug was not newly invented. Halve the range between good and bad, shorten the reproduction, manufacture the logs that do not exist and print the lineage of a value, attach a killing observation to each hypothesis and erase them one by one. What remains at the end is not an explanation but an <strong>observation</strong>.</p>
+                    <p>A tool can occupy some of these slots: reading broadly, pulling candidates, drafting. The slots it cannot occupy are equally clear — powering on the machine, judging whether an observation supports an explanation, deciding whether to stop or continue, and signing off and carrying the liability. That division does not shift as tools improve, because it came from <strong>the nature of the work</strong> rather than from capability.</p>
+                    <p>It is better to set aside the urge to extract a multiplier from a single story. What you can do instead is keep the order the next time you meet a bug whose logs say nothing: shorten the reproduction, decide the killing observation first, and record what you confirmed apart from what you inferred. With that order the bug narrows whether or not a tool is present; without it, a tool only piles up plausible wrong answers faster.</p>
+
+                    <h2>References</h2>
+                    <ul>
+                        <li><a href="https://github.com/torvalds/linux/commit/818bebeb63dd6bf5f4e07e145f6cdbace520a34c" target="_blank" rel="noopener">Linux kernel commit 818bebeb63dd - drm/xe: Don't hand out the flat CCS storage as usable VRAM (2026-08-20)</a></li>
+                        <li><a href="https://news.hada.io/topic?id=32807" target="_blank" rel="noopener">GeekNews discussion of the commit</a></li>
+                        <li><a href="https://www.kernel.org/doc/html/latest/process/coding-assistants.html" target="_blank" rel="noopener">Linux kernel docs - AI Coding Assistants</a></li>
+                        <li><a href="https://www.kernel.org/doc/html/latest/process/generated-content.html" target="_blank" rel="noopener">Linux kernel docs - Kernel Guidelines for Tool-Generated Content</a></li>
+                        <li><a href="https://git-scm.com/docs/git-bisect" target="_blank" rel="noopener">Git documentation - git-bisect</a></li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>Share this article</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">Copy Link</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">Back to list</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Free tools you may find useful</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/code_image.html">Code Image Generator</a></li>
+      <li><a href="../static/char_counter.html">Character Counter</a></li>
+      <li><a href="../static/json_formatter.html">JSON Formatter</a></li>
+      <li><a href="../static/regex_tester.html">Regex Tester</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">See all tools &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Related Posts</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="test_order_dependency_detection.html">What Shuffling Test Order Reveals - Finding the Hidden Dependency 2026</a></li>
+      <li><a href="commit_message_authorship.html">Why Developers Still Hand-Write Commit Messages - What a Diff Cannot Tell You 2026</a></li>
+      <li><a href="git_history_commands_guide_2026.html">Git History Commands That Deserve More Love - A Practical Guide to Pickaxe, log -L, Bisect, and Reflog 2026</a></li>
+      <li><a href="ai_reverse_engineering_shift.html">What Changes When a Machine Reads the Binary - Which Parts of Reverse Engineering Move and Which Do Not</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('Link copied! Paste it in the Threads app to share.');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('Link copied!'); });
+    });
+    </script>
+</body>
+</html>

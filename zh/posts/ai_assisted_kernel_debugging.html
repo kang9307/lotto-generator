@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<!--
+ * 技术博客文章模板
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>内核 Bug 是怎样被一步步收窄的 - 二分查找、最小复现、埋点，以及工具的那一份</title>
+    <meta name="description" content="每次冷启动都回到黑屏的 Bug，究竟按什么顺序被收窄。本文从原理讲清二分查找、最小复现、埋点与证伪这套经典手法，划出工具能进的格子与进不去的格子，并说明为什么确定根因这一步，至今仍然只能由真机上的复现与验证来完成。">
+    <meta name="keywords" content="内核调试, git bisect, 二分查找, 最小复现, 驱动 Bug, AI 辅助调试, Assisted-by 标签, Linux 内核贡献, printk 埋点, 可证伪性, drm xe, flat CCS, 回归定位, 调试补丁, 评审负担">
+    <meta name="robots" content="index, follow">
+    <meta name="googlebot" content="index, follow">
+    <meta name="bingbot" content="index, follow">
+    <meta name="revisit-after" content="7 days">
+    <meta name="language" content="Chinese">
+    <meta name="rating" content="general">
+    <meta name="distribution" content="global">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/ai_assisted_kernel_debugging.html">
+
+    <meta property="og:title" content="内核 Bug 是怎样被一步步收窄的 - 二分查找、最小复现、埋点，以及工具的那一份">
+    <meta property="og:description" content="缩小候选集与确定根因是两种不同的工作，工具能进哪一格、进不了哪一格，也正是在这条线上分开的。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/ai_assisted_kernel_debugging.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-08-24">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="内核 Bug 是怎样被一步步收窄的 - 二分查找、最小复现、埋点，以及工具的那一份">
+    <meta name="twitter:description" content="百分之百可复现，日志却什么也不说。把收窄与确定分开来看，工具的位置就清楚了。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+    <meta name="twitter:site" content="@braindetox_kr">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "内核 Bug 是怎样被一步步收窄的 - 二分查找、最小复现、埋点，以及工具的那一份",
+      "alternativeHeadline": "How a Hard Kernel Bug Gets Narrowed Down - Bisection, Minimal Reproduction, Instrumentation and the Role of Tools",
+      "datePublished": "2026-08-24",
+      "dateModified": "2026-08-24",
+      "inLanguage": "zh-CN",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "内核调试, git bisect, 二分查找, 最小复现, 驱动 Bug, AI 辅助调试, Assisted-by 标签, printk 埋点, 可证伪性, 评审负担",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/ai_assisted_kernel_debugging.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "内核与驱动的 Bug 为什么比应用层的更难抓？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "四个条件叠加在一起。第一，症状出现的位置与原因所在的位置相距很远，内存分配出错的那一刻与屏幕变黑的那一刻之间隔着好几层，仅凭症状无法确定是哪一层。第二，单次尝试的代价很高，要重新编译内核并重启机器，因此一天能检验多少个假设从物理上就被卡住了。第三，观测手段贫乏，启动早期用户空间尚不存在，能留下的大约只有控制台输出，而加入这些输出的动作本身又可能改变代码布局、让现象移位。第四，参与者中有不是代码的角色，硬件与固件不执行任何一条指令就能写内存，因此不会在任何调用栈里留下名字。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "git bisect 的原理是什么，什么时候用不上？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "它是在已知正常点与已知故障点之间对提交区间做折半的二分查找。正如官方文档的进度提示所示，剩余 675 个版本时大约还需 10 步、剩余 337 个时大约 9 步，所需的检验次数与提交数量的对数成正比。用脚本自动化时，含义由退出码承担：0 表示当前源码正常，除 125 以外的 1 到 127 表示当前源码有故障，125 表示当前版本无法检验、应当跳过，其余任何值都会中止整个查找。失效的场景同样清楚。若复现是间歇性的，把一个正常版本误标为故障，剩下的步骤就全部消耗在错误的区间里。若原因不在提交而在配置或硬件组合上，再怎么二分也不会浮出来。更重要的是，二分查找回答的是从何时开始，而不是为什么。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "AI 工具在调试的哪个阶段真正有用？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "在收窄候选的阶段。在庞大的代码库里追踪哪个函数产出了某个值、这个值又流向何处，这类工作更接近大量阅读，而且给出错误候选几乎没有代价，换下一个就是。起草埋点代码、整理堆积的输出，性质也一样。相反，确定这就是根因是另一回事。原因不会因为解释写得好看就成立，而要有观测支撑才成立，而那个观测必须来自真机上的复现与验证。判断标准很简单：错了只需换下一个候选的工作可以交出去，错了会让在其之上堆起来的一切全部塌掉的工作，必须由人自己扛。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Linux 内核对 AI 辅助贡献的署名是怎么规定的？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "内核文档 Documentation/process/coding-assistants.rst 明确规定，AI 代理不得添加 Signed-off-by 标签，理由是只有人类才能在法律意义上为开发者原创声明作证。人类提交者要审阅全部生成代码、确认许可证合规、以自己的名义签署并对该贡献承担全部责任。署名本身采用 Assisted-by: LLM 的形式，其后可选地附上 coccinelle、sparse 这类专门分析工具的名字，而 git、编译器一类基础工具不写进去。与之并列的 generated-content.rst 进一步要求：如果是借助工具发现了这个变更所修复的问题，就应当在变更记录里写明；变更记录本身由工具生成的情形也在披露范围之内。本文所述措辞是 2026 年 8 月 24 日在主分支上核对的。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "能不能把一次成功的调试经历当作方法论的依据？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "只能当作存在性证明。用这种方式解出过一次，与这种方式就能解出来，是两句不同的话。单个案例没有对照组，没人知道同一个人用别的方式追同一个 Bug 要花多久，因此快多少倍这类数字根本无从产生。更麻烦的是选择偏差：解开的过程会留下提交与记录，走进死胡同的过程哪里也不会留下，于是我们读到的案例集合从一开始就只筛出了成功。再加上条件的特殊性，在自己的机器上必然复现、对相关代码理解极深、时间可以随意投入，这些与多数人的实际工作条件并不相同。案例能教的是收窄的顺序，不是结果的倍数。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 4px; overflow-x: auto; margin: 1rem 0; }
+        .post-content pre code { background-color: transparent; padding: 0; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        .callout { background: #eef6ff; border-left: 4px solid #3498db; padding: 0.7rem 1rem; margin: 1rem 0; border-radius: 4px; font-size: 0.95em; }
+        .warn { background: #fff5f5; border-left: 4px solid #e74c3c; padding: 0.7rem 1rem; margin: 1rem 0; border-radius: 4px; font-size: 0.95em; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/ai_assisted_kernel_debugging.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/ai_assisted_kernel_debugging.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/ai_assisted_kernel_debugging.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/ai_assisted_kernel_debugging.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/ai_assisted_kernel_debugging.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "首页",
+      "item": "https://braindetox.kr/zh/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "开发/基础设施",
+      "item": "https://braindetox.kr/zh/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "内核 Bug 是怎样被一步步收窄的 - 二分查找、最小复现、埋点，以及工具的那一份",
+      "item": "https://braindetox.kr/zh/posts/ai_assisted_kernel_debugging.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="内核 Bug 是怎样被一步步收窄的 - 二分查找、最小复现、埋点，以及工具的那一份">
+                <meta itemprop="datePublished" content="2026-08-24">
+                <meta itemprop="dateModified" content="2026-08-24">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="内核调试, git bisect, 最小复现, 埋点, 可证伪性, Assisted-by 标签">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/ai_assisted_kernel_debugging.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">内核 Bug 是怎样被一步步收窄的 - 二分查找、最小复现、埋点，以及工具的那一份</h1>
+                    <h2 class="post-subtitle">缩小候选集与确定根因，是两种不同的工作</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-08-24">2026年8月24日</span>
+                        <span class="post-category" itemprop="articleSection">开发/基础设施</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+                    <h2>引言：百分之百可复现，日志却什么也不说</h2>
+                    <p>一通电就是黑屏。把登录界面管理器重启一次就恢复正常，之后再没出过事。直到下一次冷启动。复现率是百分之百，日志里却没有线索。这类 Bug 之所以难，不是因为信息不够，而是因为<strong>出错的那一方根本没有留下任何记录</strong>。</p>
+                    <p>2026 年 8 月 20 日，修复这类 Bug 的一个提交进入了 Linux 内核。实质改动只有一行，把 <code>round_up()</code> 换成 <code>round_down()</code>。值得一读的地方在于，提交信息记下的不只是结果，还有走到那里的过程：不断追加调试信息的补丁 24 个、内核启动 18 次，以及这中间 AI 工具做到的与没能做到的部分。</p>
+                    <p>本文谈的不是工具怎么用，而是<strong>一个困难的 Bug 按什么顺序被收窄</strong>。在这个顺序里，工具能占哪一格、不能占哪一格，界线落在哪里，就是本文的轴。围绕内核开发与 AI 工具的态度之争已在<a href="torvalds_llm_kernel_dev_2026.html">另一篇文章</a>里谈过，这里只看方法。</p>
+
+                    <h2>1. 到底发生了什么 - 已确认的范围</h2>
+                    <p>这个提交只改一个文件 <code>drivers/gpu/drm/xe/xe_vram.c</code>，加了 18 行、删了 5 行。标题的意思是：不要把压缩用的存储区当作可用显存发出去。问题的链条在提交信息里就已经理清了。</p>
+                    <ul>
+                        <li>Intel Xe 驱动的 <code>get_flat_ccs_offset()</code> 会从硬件读出压缩元数据所在区域的起始地址，乘以已启用的 L3 节点数换算成软件视角的地址，然后把结果<strong>向上取整到 128KiB 边界</strong>。低于该偏移的一切都会作为可用内存交给显存分配器。</li>
+                        <li>缺陷就在这里。把一个意为可用内存到此为止的上限值<strong>向上</strong>取整，真实起点与取整后数值之间的那一段就被公布成了空闲内存，而这段的主人是压缩硬件。</li>
+                        <li>在 16GiB 的 Battlemage G21 上，原始值 <code>0x3fafff800</code> 被取整成 <code>0x3fb000000</code>，于是页 <code>0x3fafff000</code> 的最后 2KiB 落进了分配池。按提交信息的说法，这 2KiB 会被压缩硬件覆写，而后者<strong>不需要页表项、不需要缓冲对象、也不需要向 GPU 提交</strong>，并且是在用户空间存在之前就这么做的。</li>
+                        <li>在这台机器上，每次冷启动 Mesa VM 的三级页表都恰好落在那一页。覆盖合成器批处理缓冲堆的表项消失，第一次提交就发生缺页故障，显示管理器于是无休止地重启它。手动重启之所以能好，是因为下一个 VM 的页表被分到了别处。</li>
+                        <li>修复是把向上取整改成<strong>向下取整到分配器所用的页大小</strong>。在这台机器上，恰好排除了一页。</li>
+                    </ul>
+                    <p>真正定案的是观测而不是解释。事后去读被排除的那一页，看到 <code>0xcccc000000000000</code> 与 <code>0xcc77000000000000</code> 交替出现，提交信息把它认作每十六字节两字节的压缩元数据。回答了是谁在写这块内存的，正是这些数值。</p>
+                    <p>不过还有一处更值得学。<strong>本该抓住这种情况的断言，早就在代码里了。</strong>那个检查比较偏移是否等于 <code>GSMBASE - ccs_size</code>，而该值是 128KiB 对齐的，于是它<em>恰好在原始地址未对齐时与向上取整后的偏移相等</em>。这是一个只在自己存在理由成立的场合才保持沉默的检查，而且不开 <code>CONFIG_DRM_XE_DEBUG</code> 时会被整个编译掉。新的检查被改写成可能失败的形状：压缩存储区不得侵入 GSM 区域。</p>
+                    <p>关于过程的记述放在提交信息里的方括号中。照原文引用如下。</p>
+                    <blockquote>And this was a debug session from hell, enormously helped by an AI doing much of the grunt-work.<br>（这是一次地狱般的调试，AI 承担了大量苦力活，帮助极大。）</blockquote>
+                    <blockquote>the AI several times stated flat out that this was impossible and unsolvable and that we should just write a report about it.<br>（AI 好几次直截了当地说这不可能、无法解决，不如写份报告了事。）</blockquote>
+                    <p>同一段还写到：工具几次准备放弃，但被推着走时仍持续追加调试代码并认真分析；提交信息的正文本身也是交给工具写的。数字同样在那里：走到这一行修复之前，追加调试信息的补丁 24 个、内核启动 18 次。</p>
+                    <div class="callout">以上就是公开提交里能确认的全部。用的是哪个工具、24 个补丁各自打印了什么，都没有写。本文不去填这些空白，而是去看<strong>为什么这个顺序是这个顺序</strong>。</div>
+
+                    <h2>2. 内核与驱动的 Bug 为什么难</h2>
+                    <p>带着修应用的手感走进内核，最先崩掉的是时间感。确认一件事所付的代价完全不同。</p>
+                    <table>
+                        <thead>
+                            <tr><th>维度</th><th>应用程序</th><th>内核与驱动</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>症状与原因的距离</td><td>多半在同一进程、同一调用栈</td><td>中间隔着多层，症状无法指认是哪一层</td></tr>
+                            <tr><td>单次尝试的代价</td><td>重跑几秒钟</td><td>重新编译、重启，还要复位硬件状态</td></tr>
+                            <tr><td>观测手段</td><td>断点、结构化日志、性能剖析器</td><td>启动早期大致只有控制台输出</td></tr>
+                            <tr><td>状态隔离</td><td>杀掉进程就复位</td><td>损坏的状态留在整台机器上</td></tr>
+                            <tr><td>第三方角色</td><td>基本没有</td><td>硬件与固件不执行代码也能写内存</td></tr>
+                            <tr><td>观察的副作用</td><td>大体无害</td><td>调试选项改变布局与时序，让现象移位</td></tr>
+                        </tbody>
+                    </table>
+                    <p>表里最后两行正好解释了这次的事。破坏内存的主体不是代码，所以它没在任何调用栈里留下名字。而且打开调试选项会改变分配顺序，问题页上可能换成别的东西。<strong>观察这个动作本身把观察对象挪走</strong>，在内核调试里是常态。</p>
+                    <ul>
+                        <li><strong>记录的缺席</strong> — 覆写留下的不是痕迹而是空缺。消失的页表项不会说自己消失了，它会在很久之后从毫不相干的地方以缺页故障的形式冒出来。</li>
+                        <li><strong>组合爆炸</strong> — 要特定芯片、特定内存容量、特定 L3 配置叠在一起，数值才会错位。换个组合，同样的代码安然无恙。</li>
+                        <li><strong>时序依赖</strong> — 哪次分配以什么顺序发生，决定了受害者是谁；受害者若不是页表，症状看起来完全是另一回事。</li>
+                        <li><strong>与正常行为无从区分</strong> — 被错误发出的内存，在分配器看来是完全合法的内存。没有任何规则被违反，检查自然不会触发。</li>
+                    </ul>
+                    <p>在这种条件下，<strong>检验一个假设的代价很高</strong>这一事实决定了整套方法论。代价低廉的环境里，随手一试可以是策略；一次启动就等于一次尝试的环境里，必须先设计尝试的顺序。</p>
+
+                    <h2>3. 收窄 Bug 的几种经典方法</h2>
+                    <p>收窄用的工具很老，种类也不多。要紧的是每种方法各自假定了什么，以及假定被打破时它怎样失效。</p>
+                    <table>
+                        <thead>
+                            <tr><th>方法</th><th>前提</th><th>得到什么</th><th>失效条件</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>二分查找</td><td>有正常点与故障点，且判定可靠</td><td>变化进入的时点</td><td>复现间歇，或原因在代码之外</td></tr>
+                            <tr><td>最小复现</td><td>症状可以稳定地唤出来</td><td>降低单次尝试的单价</td><td>缩减过程中症状消失</td></tr>
+                            <tr><td>埋点</td><td>对该看哪里已有假设</td><td>内部数值的来龙去脉</td><td>打印这个动作改变了现象</td></tr>
+                            <tr><td>证伪</td><td>能定义出杀死假设的观测</td><td>确凿地剔除候选</td><td>立了没有证伪条件的假设</td></tr>
+                            <tr><td>事后勘验</td><td>损坏状态可以原样读出</td><td>直接指认凶手的证据</td><td>痕迹已被抹去</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h3>3.1 二分查找只回答从何时开始</h3>
+                    <p><code>git bisect</code> 是在正常提交与故障提交之间折半推进的二分查找。正如文档的进度提示所示，剩余 675 个版本时大约还需 10 步、剩余 337 个时大约 9 步，所需检验次数与提交数量的对数成正比。一千个提交的区间，十来轮也就收到一个。</p>
+                    <p>自动化时，规则由退出码表达。文档定下的约定如下。</p>
+                    <ul>
+                        <li><strong>0</strong> — 当前源码是正常的。</li>
+                        <li><strong>1 到 127，125 除外</strong> — 当前源码是故障的。</li>
+                        <li><strong>125</strong> — 当前源码无法检验，跳过这个版本。构建被破坏的区间就用这个值。</li>
+                        <li><strong>其余任何值</strong> — 中止整个查找。</li>
+                    </ul>
+                    <p>这个方法的力量在于不必读代码。只要判定准确，不理解也能把范围缩小。实操中的命令组合，写在<a href="git_history_commands_guide_2026.html">Git 历史命令整理</a>那边。</p>
+                    <p>局限也出在同一个地方。<strong>二分查找回答的是从何时开始，而不是为什么。</strong>这次的提交也带着指向原因提交的 <code>Fixes</code> 标签，但知道那个提交，依然解释不了为什么只在这台机器上数值会错位。制造错位的是代码改动与硬件配置的<em>组合</em>，而组合并不排在提交列表上。判定不稳的情况也要当心：把一个正常版本误标成故障，剩下的步骤就全部消耗在错误的区间里。</p>
+
+                    <h3>3.2 最小复现实质上是在买时间</h3>
+                    <p>最小复现不是优雅与否的问题，而是算术问题。收窄的速度归根到底是<strong>一天能杀掉多少个假设</strong>，而这个数要被单次复现所需的时间除。压缩复现时间不是事后的收拾，而是最先投下的一笔投资。</p>
+                    <ul>
+                        <li><strong>一次只固定一个维度</strong> — 内核配置、用户空间构成、硬件。三者同时改动，结果就说明不了任何事。</li>
+                        <li><strong>症状消失的条件同样是材料</strong> — 光是重启显示管理器就能好这一条事实，就把原因的方向从持续性损坏引向了<em>布局上的偶然</em>。缩减过程中症状若消失，退回去重看最后拿掉的那一步。</li>
+                        <li><strong>先把自动判定做出来</strong> — 要靠人盯着屏幕下判断，二分查找就无法自动化。只有先有判定脚本，上一节的退出码约定才有意义。</li>
+                    </ul>
+
+                    <h3>3.3 埋点不是读日志，而是造日志</h3>
+                    <p>调试应用大体是读已有的日志，内核这边则更接近<strong>制造并不存在的日志</strong>。二十四个调试补丁说的就是这件事：打印一处、启动一次，发现数值与预期不符，再打印下一处、再启动一次。</p>
+                    <p>打印什么，才是分水岭。只打印一个数值，你连它是不是异常都判断不了。真正需要的是<strong>数值的来龙去脉</strong>：从硬件读到的原始值、乘上倍数后的值、施加对齐后的值，并排打出来，才看得见是哪一次变换出了错。这次的提交信息把原始值与取整后的值并排写下，不是修饰，而是因为把这两个摆在一起的那一刻，缺陷就现形了。</p>
+                    <p>事后勘验也是埋点的一种。这次起决定作用的不是运行中的日志，而是<em>事后去读那一页</em>的结果。当凶手是硬件而非代码时，读取残留的痕迹几乎是唯一可得的直接证据。堆积起来的输出怎么处理，与<a href="linux_log_analysis_commands_guide.html">Linux 日志分析命令</a>那边是重合的。</p>
+
+                    <h3>3.4 假设要配上它的死法</h3>
+                    <p>立假设时该一并写下的，不是支持它的理由，而是它的<strong>执行条件</strong>：什么被观测为真，这个假设就死。写不出这句话的，不是假设，是印象。</p>
+                    <p>第 1 节那个断言从反面演示了这条原理。它被写成在自己本该抓住的场合里必然为真。那等于<strong>把一个没有证伪条件的假设固化进了代码</strong>，所以它存在着却什么也没做。重写检查时，一个标准就够：我能不能想象出一个让这个检查失败的输入。</p>
+                    <ul>
+                        <li>为每个假设先写下<strong>杀死它的观测</strong>，并从杀死成本低的开始处理。能被一行打印杀死的假设，要排在半天的实验前面。</li>
+                        <li>若幸存的假设有好几个，就去找一次观测能<strong>同时分开多个</strong>的位置。</li>
+                        <li>在笔记里把确认过的与推断出的分开。二者一混，推断就被提拔成了前提。</li>
+                    </ul>
+
+                    <h2>4. 工具帮上忙的地方，和帮不上的地方</h2>
+                    <p>提交信息点明的工具贡献有三项：大量苦力活、被推着走时持续追加调试代码并分析、以及撰写提交信息正文。从中能一般化的不是工具的性能，而是<strong>工作的性质</strong>。</p>
+                    <h3>4.1 收窄与确定是两种工作</h3>
+                    <p><strong>收窄</strong>是缩小候选集合。在庞大的代码里找出哪个函数造出这个值、这个值又流向何处，这类活儿更接近大量阅读，给出错误候选也几乎没有代价，换下一个就是。而<strong>确定</strong>是说出这就是根因。原因不会因为解释好看就成立，要有观测支撑才成立；这次做成确定的也不是论证，而是<strong>从预留页里读出来的数值</strong>。</p>
+                    <p>所以标准很简单：<strong>错了只需换下一个候选的工作可以交出去，错了会让在其之上堆起来的一切全部塌掉的工作，由人自己扛。</strong>因为这个区分出自工作的性质，所以工具变好还是变差，它都照样成立。</p>
+                    <h3>4.2 工具在结构上做不到的事</h3>
+                    <ul>
+                        <li><strong>它没有连在机器上</strong> — 启动 18 次意味着有人真的通了 18 次电。只要确定是由复现与验证造就的，物理试验就无法外包。</li>
+                        <li><strong>它说不可能没有分量</strong> — 提交信息记下工具几次斩钉截铁地说这解不了，而事实上解开了。做不到这个回答，是关于该回答性质的信息，不是关于问题性质的信息。</li>
+                        <li><strong>它不替你区分似是而非与真</strong> — 写得好的解释，错的时候也一样写得好。这个性质制造了下一节的成本。</li>
+                    </ul>
+
+                    <h2>5. 错误假设为什么昂贵 - 把验证放在哪里</h2>
+                    <p>调试中漏掉时间的地方，多半不是什么都不知道的那一段，而是<strong>抱着错误确信的那一段</strong>。因为成本并不对称。</p>
+                    <ul>
+                        <li>正确的假设一次验证就结束；错误的假设在验证失败之后并不结束，你还要花同样的时间去确认是不是埋点有误、是不是条件不同。</li>
+                        <li>这期间搭起来的埋点代码与实验配置，形状是围着错误假设长的，几乎没法拿给下一个假设复用。</li>
+                        <li>最贵的是<strong>似是而非的错误答案</strong>。随机的错答立刻就被丢掉，似是而非的错答却会被辩护。哪怕证伪摆在面前，人也会加个例外条件把它留下来。</li>
+                    </ul>
+                    <p>所以答案是别把验证往后推。<strong>在立下假设的同一口气里，把能杀死它的观测也定下来；在做出那个观测之前，不在这个假设上再堆任何东西。</strong>用工具时这条纪律更要紧，因为解释的产出速度一旦提高，未经验证的解释堆积的速度也会同步提高。</p>
+                    <p>内核文档也在同一处划了线。规定 AI 助手查找 Bug 步骤的那一段要求：找到非平凡的 Bug，就要<strong>构造复现程序证明它真实存在</strong>，并给出理由——送到维护者手上的未经验证的报告，相当一部分其实并不成立。同一段还规定，若有构建不了或测试不了的部分，就要<strong>明确说明哪些没做到</strong>。把确认过的与没做到的分开写，在这里是被当作流程而非礼节来规定的。</p>
+
+                    <h2>6. 为什么不能把一则轶事读成方法论</h2>
+                    <p>这个案例很有冲击力，但样本只有一个。有必要分清从中能推出什么、不能推出什么。</p>
+                    <ul>
+                        <li><strong>没有对照组</strong> — 同一个人用别的方式追同一个 Bug 要启动多少次，没人知道。所以快多少倍这类数字从这个案例里出不来。提交里写下的只有 24 和 18 这两个绝对值，而没有比较对象的绝对值造不出倍数。</li>
+                        <li><strong>只看得见成功样本</strong> — 解开的过程留下提交，走进死胡同的过程哪里也不留。我们读到的案例集合从一开始就被筛过了。</li>
+                        <li><strong>条件很特殊</strong> — 在自己的机器上必然复现、对相关代码理解极深、时间可以随意投入。其中缺一项，同样的路径就走不通。</li>
+                        <li><strong>一行修复不是难度标尺</strong> — 恰恰相反。修复越短，症状与原因往往离得越远，收窄也越难。何况解开之后回看，每一步都像是必然，而实际上多数很可能是被丢掉的假设。</li>
+                    </ul>
+                    <p>能正当推出的，只到<strong>存在性证明</strong>。用这种方式解出过一次，与这种方式就能解出来，是两句不同的话。该带走的是顺序，不是结果的倍数。</p>
+
+                    <h2>7. 开源协作的问题 - 来源标注与评审负担</h2>
+                    <p>工具产出的东西一旦要进公共仓库，问题的性质就变了：从怎么花自己的时间，变成<strong>怎么花别人的时间</strong>。Linux 内核把这部分写进了文档，2026 年 8 月 24 日在主分支上能核对到的内容如下。</p>
+                    <ul>
+                        <li><strong>AI 代理不得添加 <code>Signed-off-by</code></strong> — 文档写明的理由是，只有人类才能在法律意义上为开发者原创声明作证。审阅生成代码、确认许可证合规、签署，以及对贡献承担责任，全都落在人类提交者这一侧。</li>
+                        <li><strong>署名采用 <code>Assisted-by: LLM</code> 形式</strong> — 其后可选地附上 coccinelle、sparse 这类专门分析工具的名字，而 git、编译器一类基础工具不写。</li>
+                        <li><strong>用工具找到 Bug 同样属于披露范围</strong> — 并列的那份文档要求：借助工具发现了变更所修复的问题，就该写进变更记录；变更记录本身由工具生成的情形也包含在内。</li>
+                        <li><strong>理由是带宽</strong> — 那份文档明确指出评审者与维护者的带宽是稀缺资源，并说明知道哪部分来自人、哪部分来自工具，正是保护这项资源的办法。</li>
+                    </ul>
+                    <p>从这里能带走一个实务上的区分。披露有两种形态：<strong>在正文里用散文说明</strong>，与<strong>用机器可读的尾标注上</strong>。看前面那个提交，尾标行里只有 <code>Fixes</code>、<code>Cc</code> 与 <code>Signed-off-by</code>，工具的使用是在正文中说明的。对人类读者足够，对任何统计都不可见。若日后打算统计谁在哪里用了多少，就得从一开始就定下规则，把它写进固定位置、用固定格式。</p>
+                    <p>更大的一条轴是评审负担的不对称。<strong>生产的成本降下来了，阅读的成本没有。</strong>把这个问题落到接收方的实务上，大致是这样。</p>
+                    <ul>
+                        <li>没有复现步骤与验证结果的提案，排到评审队列后面去。把验证责任留在提交者一侧，是保护带宽的唯一办法。</li>
+                        <li>不说明哪些没做到的提案，退回去。评审者看不出什么没被测试，就只能自己把那些测试跑一遍。</li>
+                        <li>定下署名格式，不守就不收；事后统一的代价要高得多。而且长度不是质量的信号，又长又顺的解释，恰恰最容易藏住未经验证的主张。</li>
+                    </ul>
+
+                    <h2>8. 一线工程师能带走什么</h2>
+                    <p>把前面的讨论切成工作单元，交给谁做就成了一张表。标准不是能力，而是<strong>做错之后的恢复成本</strong>。</p>
+                    <table>
+                        <thead>
+                            <tr><th>工作</th><th>工具擅长的一侧</th><th>必须由人做的一侧</th><th>界线为何落在这里</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>扫读代码路径</td><td>列举候选函数与调用流向</td><td>对候选清单的取舍</td><td>错了换下一个候选即可</td></tr>
+                            <tr><td>形成假设</td><td>广泛枚举可能的原因</td><td>定义杀死它的观测</td><td>多样性便宜，证伪设计昂贵</td></tr>
+                            <tr><td>复现设计与执行</td><td>步骤草案、判定脚本草案</td><td>实际试验与判定</td><td>物理试验无法外包</td></tr>
+                            <tr><td>埋点代码</td><td>写打印语句、整理结果</td><td>决定打印什么、打在哪</td><td>选打印点本身就是假设</td></tr>
+                            <tr><td>确定根因</td><td>无</td><td>判断观测是否支撑</td><td>解释好看不等于证据</td></tr>
+                            <tr><td>放弃与否</td><td>无</td><td>决定中止还是继续</td><td>工具说不可能不构成依据</td></tr>
+                            <tr><td>提交信息</td><td>起草</td><td>事实核对与定稿</td><td>记录日后会被当作依据引用</td></tr>
+                            <tr><td>签署与责任</td><td>无</td><td>全部</td><td>流程明确把它放在人身上</td></tr>
+                        </tbody>
+                    </table>
+                    <p>把这张表换成一天的顺序，就是下面这样。</p>
+                    <ul>
+                        <li>先削复现时间。其余一切活动的单价都在这里定下。</li>
+                        <li>把判定自动化。人眼一旦进入判定环路，反复试验就被绑在人的工时上。</li>
+                        <li>写假设时把杀死它的观测写在同一行，并先执行便宜的证伪。只有幸存者才送去做昂贵的实验。</li>
+                        <li>记录里把确认过的与推断出的分开写，并留下哪些没能做到。这能让下一个人不必再撞同一堵墙。</li>
+                    </ul>
+                    <p>如果在打印之前没想清楚它要回答什么，堆起来的输出就不是答案而是新的负担。这与<a href="observability_data_unused.html">收集的可观测性数据为何无人查看</a>那边谈的问题同根。</p>
+
+                    <h2>9. 没有工具，同样的方法照样成立</h2>
+                    <p>本文里的方法，没有一样是需要工具的。二分查找在内核开发中用了很久，最小复现、埋点与证伪则是更老的纪律。工具改变的是<strong>收窄候选的速度</strong>，不是<strong>什么才算证据</strong>。</p>
+                    <p>把顺序颠倒过来就要吃亏。在没有方法的状态上加一件工具，变好的只有似是而非的错答的产出速度，而第 5 节说过，那是最贵的一种错答。</p>
+                    <ul>
+                        <li><strong>学习的顺序</strong> — 方法在前，工具在后。不会设计证伪，就没有手段判断工具给出的答案对不对。</li>
+                        <li><strong>自检的问题</strong> — 我能不能自己设计出杀死这个答案的观测。答不上来，那个答案就还算不上假设。</li>
+                        <li><strong>变了的与没变的</strong> — 从庞大代码里捞出候选的前期成本降了，验证也就相应地成了瓶颈。而确定由复现与验证做出这一条，没有变。</li>
+                    </ul>
+                    <p>说到底，本事是在<strong>确定</strong>这一侧分高下，而不是在收窄那一侧。列出候选变便宜了，判断其中哪一个为真依然昂贵，依然是人的那一份。</p>
+
+                    <h2>没能确认的部分</h2>
+                    <p>本文拿不出依据的条目，集中放在这里。</p>
+                    <ul>
+                        <li>用的是哪个 AI 工具。提交信息里没有工具名。</li>
+                        <li>24 个调试补丁的内容与 18 次启动的输出。公开的只有最终那一个提交，投入的实际时长以及人与工具各自占用的时间比例也没有记录。</li>
+                        <li>这个提交的尾标里为何没有 <code>Assisted-by</code>。尾标构成在公开提交中可以核对，但这一判断背后的缘由无从确认。</li>
+                        <li>该标签规定当前的讨论进展。本文所引措辞是 2026 年 8 月 24 日在主分支文档上核对的，此后是否有变动没有确认。</li>
+                        <li>同一缺陷在其他硬件配置上出现得有多广。提交只记录了一台机器上的数值。</li>
+                    </ul>
+
+                    <h2>结论：收窄与确定不是同一件事</h2>
+                    <p>收窄一个困难 Bug 的流程并不是新发明的。把正常与故障之间折半、把复现缩短、造出并不存在的日志并打印数值的来龙去脉、给每个假设配上杀死它的观测并逐个划掉。最后留下的不是解释，而是<strong>观测</strong>。</p>
+                    <p>工具能占住这套流程里的几格：广泛阅读、捞出候选、起草。占不住的格子同样清楚——给机器通电、判断观测是否支撑解释、决定停下还是继续，以及签字并承担责任。这个划分不会随工具变好而移动，因为它出自<strong>工作的性质</strong>而非能力。</p>
+                    <p>把从单个故事里榨出倍数的冲动放到一边会更好。能做的是：下次遇到日志什么也不说的 Bug 时守住顺序——缩短复现、先定下杀死它的观测、把确认过的与推断出的分开记录。有这个顺序，无论有没有工具都能收窄；没有这个顺序，就算有工具，也只是让似是而非的错答堆得更快。</p>
+
+                    <h2>参考资料</h2>
+                    <ul>
+                        <li><a href="https://github.com/torvalds/linux/commit/818bebeb63dd6bf5f4e07e145f6cdbace520a34c" target="_blank" rel="noopener">Linux kernel commit 818bebeb63dd - drm/xe: Don't hand out the flat CCS storage as usable VRAM (2026-08-20)</a></li>
+                        <li><a href="https://news.hada.io/topic?id=32807" target="_blank" rel="noopener">GeekNews - 该提交的讨论</a></li>
+                        <li><a href="https://www.kernel.org/doc/html/latest/process/coding-assistants.html" target="_blank" rel="noopener">Linux kernel docs - AI Coding Assistants</a></li>
+                        <li><a href="https://www.kernel.org/doc/html/latest/process/generated-content.html" target="_blank" rel="noopener">Linux kernel docs - Kernel Guidelines for Tool-Generated Content</a></li>
+                        <li><a href="https://git-scm.com/docs/git-bisect" target="_blank" rel="noopener">Git documentation - git-bisect</a></li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>分享本文</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">返回列表</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/code_image.html">代码图片生成器</a></li>
+      <li><a href="../static/char_counter.html">字数统计</a></li>
+      <li><a href="../static/json_formatter.html">JSON 格式化工具</a></li>
+      <li><a href="../static/regex_tester.html">正则表达式测试器</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="test_order_dependency_detection.html">打乱测试顺序才会暴露的东西 - 揪出隐藏依赖的方法 2026</a></li>
+      <li><a href="commit_message_authorship.html">为什么仍然亲手写提交信息 - 差异不会告诉你的事与自动生成的边界 2026</a></li>
+      <li><a href="git_history_commands_guide_2026.html">被低估的 Git 历史命令 - pickaxe·log -L·bisect·reflog 实用指南 2026</a></li>
+      <li><a href="ai_reverse_engineering_shift.html">当机器替你读二进制,究竟改变了什么 - 逆向工程中变了的部分与没变的部分</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制！请粘贴到Threads应用中分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制！'); });
+    });
+    </script>
+</body>
+</html>
