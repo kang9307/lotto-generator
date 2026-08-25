@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>给编译型语言加上交互式执行意味着什么 - Go解释器打开的位置与付出的代价</title>
+    <meta name="description" content="以给Go加上REPL的解释器为例，梳理在编译型语言之上叠加交互式执行时，静态类型、包初始化、链接与优化前提各自如何成为障碍，解释执行与编译执行又在哪里分道扬镳，以及添加语言本身没有的功能要在可移植性上付出什么代价。">
+    <meta name="keywords" content="gomacro, Go解释器, REPL, 交互式执行, 编译型语言, 宏, 泛型, Go插件, 源码调试器, 静态类型, 包初始化, 可移植性, JShell, evcxr, 脚本执行">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/interpreter_for_compiled_language.html">
+
+    <meta property="og:title" content="给编译型语言加上交互式执行意味着什么 - Go解释器打开的位置与付出的代价">
+    <meta property="og:description" content="往返消失后会有什么改变，解释执行与编译执行又在哪里分道扬镳。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/interpreter_for_compiled_language.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-08-25">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="给编译型语言加上交互式执行意味着什么">
+    <meta name="twitter:description" content="REPL带来什么、编译型语言为何难以承接它，以及可移植性这张账单。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "给编译型语言加上交互式执行意味着什么 - Go解释器打开的位置与付出的代价",
+      "alternativeHeadline": "Adding Interactive Execution to a Compiled Language - What It Opens and What It Costs",
+      "datePublished": "2026-08-25",
+      "dateModified": "2026-08-25",
+      "inLanguage": "zh-CN",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "gomacro, Go解释器, REPL, 交互式执行, 编译型语言, 宏, 泛型, Go插件, 源码调试器, 可移植性",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/interpreter_for_compiled_language.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "面向编译型语言的解释器到底是做什么的?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "它是不把源码变成二进制、而是就地解释运行的执行器。引出本文的gomacro是用纯Go实现的Go解释器，同时提供交互式REPL与脚本执行，仓库把自己介绍为一个几乎完整的Go解释器。它要求Go 1.18及以上，按MPL 2.0发布。仓库还列出把它作为库嵌入程序以及用作源码调试器的用途。本文关心的并不是这一个工具，而是这样一个问题：当你把交互式执行叠加到一门以编译为前提设计的语言上时，什么被打开、什么被计入账单。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "给编译型语言加REPL为什么难?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "因为编译器建立在一次看到全部并就此确定的前提上，而REPL收到的是一行一行的碎片。障碍主要有四个。其一是静态类型 — 必须接受引用了尚未声明之物的定义，而当变量以不同类型被重新声明时，还得决定此前用过它的定义该怎么办。其二是包初始化 — Go中包级变量初始化与init函数在程序启动时按确定顺序恰好运行一次，而会话没有这个启动点。其三是链接 — 在生成单个静态链接二进制的模型里，运行中引入新包就意味着打破已经确定的东西。其四是优化 — 内联与逃逸分析建立在掌握整个程序的前提上，而解释器无法建立这个前提。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "在解释器里跑通的代码，编译后行为会一样吗?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "大体一样，而大体正是最危险的地方。仅看gomacro仓库自己列出的限制就够说明问题：第三方库的运行时导入只在Linux、macOS与*BSD上可用；从包中不会导入泛型；不支持与unsafe.Pointer之间的转换；涉及解释接口与递归类型的部分边角情形尚未实现；goto只能向后跳转。它还有一项扩展是未使用的变量与未使用的返回值不会报错，这意味着在标准Go下通不过编译的代码在这里能通过。至于并发语义，限制清单里根本没有提及，而没有提及应当读作没有处理，而不是读作保证相同。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "使用宏这类原语言没有的功能会带来什么问题?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "那段代码将只能在那个解释器里运行。gomacro提供宏与quoting、quasiquoting、无类型常量的任意精度运算、零值构造器等标准Go所没有的扩展，泛型也用自有语法处理。每一项都确有用处，但一旦使用，那份源码就变成标准工具链不接受的语法。REPL的价值在于探索并把所得搬进程序这条链路，而扩展会切断这条链路。所以判断标准只有一个：这段代码是在一次会话中被消费掉，还是被保存成文件留下来。一旦保存，它就是一门只有一个实现的新语言的源码。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "那么该用在哪里、不该用在哪里?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "价值明确的位置是学习、探索、原型设计，以及那些用完即弃的确认。想知道一个陌生API返回什么、以什么顺序返回，本来要付出一个文件加一次构建的税，而交互式执行免掉了这笔税。反过来，结果取决于执行特性的事情 — 竞争、调度、性能、内存布局 — 解释器无法代劳，因为那些东西只存在于编译后的二进制里。如果确认到的事实需要团队共同查看，或者过些时日仍要成立，它就该是测试文件而不是会话。至于放到生产执行路径上，本文不作推荐。这不是对质量的评价，而是因为做这个决定所需的材料，比如并发语义一致到什么程度、长期运行时表现如何，仅凭公开资料无法确认。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 4px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/interpreter_for_compiled_language.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/interpreter_for_compiled_language.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/interpreter_for_compiled_language.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/interpreter_for_compiled_language.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/interpreter_for_compiled_language.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "首页",
+      "item": "https://braindetox.kr/zh/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "开发/基础设施",
+      "item": "https://braindetox.kr/zh/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "给编译型语言加上交互式执行意味着什么 - Go解释器打开的位置与付出的代价",
+      "item": "https://braindetox.kr/zh/posts/interpreter_for_compiled_language.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="给编译型语言加上交互式执行意味着什么 - Go解释器打开的位置与付出的代价">
+                <meta itemprop="datePublished" content="2026-08-25">
+                <meta itemprop="dateModified" content="2026-08-25">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="gomacro, Go解释器, REPL, 交互式执行, 编译型语言, 宏, 泛型, Go插件, 可移植性">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/interpreter_for_compiled_language.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">给编译型语言加上交互式执行意味着什么</h1>
+                    <h2 class="post-subtitle">往返消失后什么会改变，两种执行又在哪里分道扬镳</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-08-25">2026年8月25日</span>
+                        <span class="post-category" itemprop="articleSection">开发/基础设施</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+                    <h2>引言：为了确认一行而新建一个文件</h2>
+                    <p>这个函数返回分隔符前面的部分还是后面的部分。把这个结构体转成JSON，字段名会长成什么样。答案三十秒就能出来，可为了看到它，你得建一个临时目录、写一个<code>main</code>函数、跑一次构建，看完再删掉。一天重复好几次的这段往返，与其说浪费时间，不如说<strong>打断了思路</strong>。</p>
+                    <p>所以在以编译为前提设计的语言上加装交互式执行的尝试一直不断。最近再次进入视野的是Go解释器<strong>gomacro</strong>。它同时提供REPL与脚本执行，还在此之上加了Go本身没有的宏。</p>
+                    <p>本文不是这个工具的使用说明。关心的只有一件事：<strong>把交互式执行叠加到编译型语言上，什么被打开，作为代价又有什么被计入账单。</strong>账单不是以性能的形式到来，它来自别处。在Go运行时之上承载另一门语言，见<a href="glojure_clojure_on_go_2026.html">glojure — 在Go运行时上运行Clojure解释器的意义与技术挑战 2026</a>；语言语法如何改变验证成本，见<a href="go_language_ai_coding_fit.html">降低 AI 生成代码验证成本的语言特性 - Go 占优的五点及其代价</a>。这里多出来的条件是<strong>同一门语言有了两种执行方式</strong>。</p>
+
+                    <h2>gomacro是什么 — 截至2026年8月确认到的范围</h2>
+                    <p>仓库把它介绍为<strong>用纯Go实现的、几乎完整的Go解释器</strong>。它同时支持交互式REPL与脚本执行，除导入第三方包之外，运行时并不需要Go工具链。要求Go 1.18及以上，按MPL 2.0发布。</p>
+                    <p>有意思的地方在于它<strong>补上了标准Go没有的东西</strong>。仓库列为扩展的项目如下。</p>
+                    <ul>
+                        <li><strong>集成调试器</strong>与可配置的特殊命令</li>
+                        <li>可在REPL中<strong>直接操作无类型常量</strong>，并隐式转换为<code>*big.Int</code>、<code>*big.Rat</code>、<code>*big.Float</code></li>
+                        <li><strong>零值构造器</strong> — 写成<code>T()</code>即可得到该类型的零值</li>
+                        <li><strong>宏与quoting、quasiquoting</strong> — 承自Lisp家族的代码生成机制</li>
+                        <li><strong>未使用的变量与未使用的返回值不会报错</strong></li>
+                    </ul>
+                    <p>泛型仍处于实验阶段。仓库里同时带着两套不同实现，一套仿照C++模板，另一套是把契约视为接口的CTI方式，后者为默认。使用的是<code>Pair#[T,U]</code>之类的语法。仓库列出的当前约束有这些。</p>
+                    <ul>
+                        <li>泛型实参<strong>没有类型推断</strong></li>
+                        <li><strong>无法定义泛型方法</strong></li>
+                        <li>类型是否满足契约<strong>不会被校验</strong></li>
+                    </ul>
+                    <p>这段介绍里值得盯住的词是<strong>几乎</strong>。本文余下的篇幅，实际上都是围绕这一个词展开的。</p>
+
+                    <h2>REPL真正改变的是什么</h2>
+                    <p>人容易以为往返消失省下的是时间。真正改变的是<strong>探索的粒度</strong>。</p>
+                    <p>当编辑、构建、运行捆成一个昂贵的整块时，人会一次改动好几个假设。反正只跑一次，索性这里那里一起改了。于是结果出来的时候，<strong>你不知道是哪一处造就了这个结果</strong>。反过来，当往返几乎免费，人就会一次只改一处。原因之所以变得容易定位，不是因为工具变聪明了，而是因为人的行为变了。</p>
+                    <p>第二个改变的是状态。写成文件去跑，每次都从头开始。交互式会话里，上一行造出来的值还在，下一行就在它之上运行。那些构造代价高昂的值 — 解析好的文档、开着的连接、填满的大型数据结构 — 可以<strong>造一次，敲很多次</strong>。对象越大，这个差距越明显。</p>
+                    <ul>
+                        <li><strong>探索粒度变细</strong> — 一次只验证一个假设，因而原因得以定位</li>
+                        <li><strong>昂贵的准备被复用</strong> — 只反复触碰你关心的那一部分</li>
+                        <li><strong>试错成本几乎为零</strong> — 没把握的表达式可以直接敲进去</li>
+                    </ul>
+                    <table>
+                        <thead><tr><th>维度</th><th>编辑、构建、运行的往返</th><th>保持状态的会话</th></tr></thead>
+                        <tbody>
+                            <tr><td>一轮改动的假设数</td><td>多个（因为往返昂贵）</td><td>一个（因为往返便宜）</td></tr>
+                            <tr><td>准备成本</td><td>每次运行重付一遍</td><td>每个会话付一次</td></tr>
+                            <tr><td>失败的代价</td><td>构建时间加上思路中断</td><td>几乎为零</td></tr>
+                            <tr><td>留下的产物</td><td>文件 — 可提交、可评审、可重跑</td><td>回滚缓冲 — 会话结束即消失</td></tr>
+                            <tr><td>执行语义</td><td>就是将要上线的代码</td><td>将要上线代码的近似</td></tr>
+                        </tbody>
+                    </table>
+                    <p>表格最后两行就是本文的另一半。得到的东西有多明确，让出去的东西就有多明确。</p>
+
+                    <h2>编译型语言为何难以承接交互性</h2>
+                    <p>REPL在Python或Ruby里之所以自然，是因为那些语言本来就被设计成一次执行一个片段。编译型语言站在相反的前提上：<strong>一次看到全部、就此确定、并在这份确定之上做优化。</strong>障碍就从这三条前提里逐一冒出来。</p>
+
+                    <h3>静态类型 — 声明与使用在时间轴上被拆开</h3>
+                    <p>编译器同时看到整个包。函数<code>a</code>调用下方的<code>b</code>之所以不成问题，是因为两者都已经摆在眼前。而在REPL里，<code>a</code>先到，<code>b</code>还不存在。那么是拒绝<code>a</code>的定义，还是先收下?</p>
+                    <p>Java的JShell正面处理了这个问题，选择了<strong>收下但拦住调用</strong>。官方文档给出的理由是支持探索式编程，因此接受引用了尚未定义之物的方法定义。</p>
+                    <pre><code>jshell&gt; double volume(double radius) {
+   ...&gt;    return 4.0 / 3.0 * PI * cube(radius);
+   ...&gt; }
+|  created method volume(double), however, it cannot be invoked until variable PI,
+   and method cube(double) are declared</code></pre>
+                    <p>第二个问题是重定义。把<code>x</code>先声明成整数、再重新声明成字符串，那么此前用过这个<code>x</code>的函数该怎么办?JShell把这件事分成<strong>修改、替换、覆盖</strong>三档反馈，并在不兼容的重定义破坏了依赖它的定义时发出警告。编译型语言的REPL必须<strong>在语言规范帮不上忙的情况下自己发明这类规则</strong>。语言与工具，从这里就已经开始分岔。</p>
+
+                    <h3>包初始化 — 不存在叫做启动的那个时刻</h3>
+                    <p>在Go里，包级变量的初始化与<code>init</code>函数<strong>在程序启动时按确定顺序恰好运行一次</strong>。顺序依照依赖关系排定，而依赖这个顺序的代码确实存在。</p>
+                    <p>交互式会话没有那个启动点。如果用户二十分钟后再加一个导入，初始化就在那一刻运行，而这在程序里本该早就结束了。依赖初始化顺序的代码、把全局状态注册进去的库、只为副作用而写的导入，在这里都获得了<strong>表现不同的余地</strong>。</p>
+
+                    <h3>链接 — 运行中引入新代码就得打破已定之事</h3>
+                    <p>Go的标准产物是一个静态链接的二进制。哪个符号在哪里，构建时就被钉死。想在运行途中引入新包，就得把这颗钉子拔出来。</p>
+                    <p>gomacro选的路是这样：在Linux、macOS与*BSD上，它在内部编译并加载<strong>单个</strong>Go插件，其中包含<code>import ( ... )</code>里列出的所有包的导出声明。也就是说那一刻仍然需要Go工具链，而Go标准库<code>plugin</code>包附带的条件也就一并跟了过来。</p>
+                    <ul>
+                        <li>插件<strong>仅在Linux、FreeBSD与macOS上</strong>受支持，因此不适合以可移植性为目标的程序</li>
+                        <li>应用与插件必须用<strong>完全相同的工具链版本、构建标签与环境变量</strong>构建，共同依赖也必须出自同一份源码</li>
+                        <li>插件在首次加载时只初始化一次，而且<strong>无法关闭或卸载</strong></li>
+                        <li>竞态检测器对其支持不佳，<strong>即便是简单的竞争也可能不会被自动检出</strong></li>
+                    </ul>
+                    <p>第三条最扎人。一边换着导入一边探索的图景，与一旦装上就卸不下来的性质正面冲突。标准文档自己就写道，实践中应用与插件必须一起构建，并建议改用套接字或RPC这类进程间通信作为替代。这不是解释器实现偷懒，而是<strong>Go这门语言所处位置带来的约束</strong>。</p>
+
+                    <h3>优化前提 — 优化连可观测的东西一并改变</h3>
+                    <p>编译器在掌握整个程序的前提下做内联、逃逸分析与边界检查消除。解释器建立不起这个前提，也就做不了同样的优化。到这里为止讲的是速度。</p>
+                    <p>真正的问题在于优化<strong>改变的不只是速度</strong>。一个值坐在栈上还是逃到堆上，会改变内存行为；函数被内联，栈回溯的形状就会变。也就是说，优化保住了程序的结果值，却<strong>保不住程序对自身的观测</strong>。</p>
+
+                    <h2>解释执行与编译执行分道扬镳的地方</h2>
+                    <p>把仓库自己列出的限制清单与编译时的Go并排放，是这样的。</p>
+                    <table>
+                        <thead><tr><th>项目</th><th>编译时的Go</th><th>仓库所述的解释器状态</th></tr></thead>
+                        <tbody>
+                            <tr><td>第三方导入</td><td>构建时确定</td><td>运行时导入仅限Linux、macOS与*BSD</td></tr>
+                            <tr><td>包内的泛型</td><td>直接使用</td><td>导入时不会带入泛型</td></tr>
+                            <tr><td>泛型定义</td><td>语言特性</td><td>在解释代码中属实验性且不完整</td></tr>
+                            <tr><td><code>unsafe.Pointer</code>转换</td><td>支持</td><td>不支持</td></tr>
+                            <tr><td>接口断言与类型开关</td><td>完整</td><td>部分边角情形未实现</td></tr>
+                            <tr><td>递归类型</td><td>完整</td><td>部分边角情形可能无法正确运作</td></tr>
+                            <tr><td><code>goto</code></td><td>前后皆可</td><td>只能向后跳转</td></tr>
+                            <tr><td>未使用的变量与返回值</td><td>编译错误</td><td>不算错误</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h3>大体一样最危险的位置</h3>
+                    <p>表里的条目分成两类。上面大部分属于<strong>解释器更窄</strong>的情形：编译时的Go做得到，这里做不到。这类差异是安全的，因为一试就当场失败。</p>
+                    <p>危险的是最后一行那种<strong>解释器更宽</strong>的情形。未使用变量不算错误，在交互式摆弄时确实省事，可反过来看，它意味着<strong>标准Go下通不过编译的代码在这里能通过</strong>。这里通得过所以那里也通得过，这个推论并不成立。而且这类差异不会失败，所以当场也察觉不到。</p>
+                    <ul>
+                        <li><strong>并发</strong> — 限制清单对goroutine、channel、<code>select</code>的调度特性只字未提。没有提及并不是相同的保证，而是<strong>没有处理</strong>的意思。竞争本就取决于时序，执行方式不同，时序就不同。<strong>在解释器里没看到竞争，这个事实什么也证明不了。</strong></li>
+                        <li><strong>反射</strong> — 在运行中翻查类型信息的代码，对这些信息由谁、以何种方式准备十分敏感。解释出来的类型与编译出来的类型在反射面前是否长得一样，公开资料并未给出保证</li>
+                        <li><strong><code>unsafe</code></strong> — 文档明确写了不支持指针转换。明示的约束反而好办，悄悄跑出不同结果的那一类始终更贵</li>
+                        <li><strong>构建标签</strong> — 决定哪些文件进入构建的机制。若解释器复现这个判断的方式有出入，<strong>同一份源码树就会执行不同的代码</strong></li>
+                    </ul>
+                    <p>所以只需立下一条规矩：<strong>在解释器里通过，不能代替编译构建的通过。</strong>反方向同样成立。两种执行并不是彼此的代理人。</p>
+
+                    <h2>当解释器补上语言没有的功能</h2>
+                    <p>这里是本文的核心。前面扩展清单里的宏与quasiquoting、自有的泛型语法、无类型常量的任意精度运算，都是<strong>标准Go没有的功能</strong>。而且每一项都确有用处。</p>
+                    <p>宏尤其如此。Go是有意把宏拿掉的语言，正因为这份缺席，代码生成被推到了<code>go:generate</code>与独立程序那边。另写一个生成器、把它接进构建阶段、再把产物提交上去 — 这一整套流程，就是<strong>语言里没有宏而付出的成本</strong>。能在语言内部完成这件事，确实是一种力量。</p>
+                    <p>然而用上这份力量的那一刻，<strong>这段代码就只能在那个解释器里运行</strong>。<code>go build</code>不会接收这份源码，因为语法不是Go。而交互式执行的价值恰恰在于<strong>探索、得出结论、再把结论搬进程序</strong>这条链路，扩展会把这条链路切断。</p>
+                    <ul>
+                        <li><strong>只在标准Go的子集里玩</strong> — 所得可以原样搬走。代价是解释器永远只能是一个快速确认的工具</li>
+                        <li><strong>用上扩展</strong> — 在当场强大得多。代价是那段代码被绑在工具上，工具的寿命就成了代码的寿命</li>
+                    </ul>
+                    <p>这不是某个项目的缺陷，而是<strong>凡从语言之外补上语言所没有之物的工具，都要付的代价</strong>。宏在Lisp家族里之所以自然，是因为宏本就是语言的一部分，编译器看到的是同一样东西。从语言外面补，这份一致就断了，源码变成两个实现里只有一个肯接收的东西。</p>
+                    <p>同样的边界问题在反方向上也会出现。Rust的交互式工具evcxr在文档中写明，<strong>目前没有办法从外部crate导入宏</strong>。把语言的功能完整带进REPL很难，把REPL里语言所没有的功能带出去同样很难。</p>
+                    <p>所以判断标准既不是性能也不是语法偏好。<strong>此刻敲下的这段代码，是在一次会话里被消费掉，还是会被保存成文件?</strong>若是前者，扩展尽管放开用，代价很低。若是后者，它在那一刻就成了只有一个实现的新语言的源文件，时间越久越难搬动。</p>
+
+                    <h2>作为调试器时，诉求完全不同</h2>
+                    <p>gomacro也被用作源码调试器，并内置了一个集成调试器。进入方式有三种：在解释代码运行途中按CTRL+C、在提示符下敲<code>:debug 语句</code>、或在代码里塞一个<code>break</code>字符串。调试器接受的命令是<code>step</code>、<code>next</code>、<code>finish</code>、<code>continue</code>、<code>env</code>、<code>inspect</code>、<code>list</code>与<code>print</code>。</p>
+                    <p>同一个执行器兼着两个角色，但两个角色要的东西不同，某种程度上还互相妨碍。</p>
+                    <ul>
+                        <li><strong>脚本执行</strong>要的是速度与语义一致 — 跑得快，并且结果与编译时相同</li>
+                        <li><strong>调试</strong>要的是停住与观察 — 在任意时刻停下、看全那一刻的局部变量、一行一行往前走</li>
+                    </ul>
+                    <p>编译型语言的标准答案是<strong>在编译后的二进制里埋入调试信息，再挂上外部调试器</strong>。观察麻烦一些，但观察的对象是<strong>真正会上线的代码</strong>。解释器调试器的答案正相反。解释器本来就在一个节点一个节点地走，停下来不需要特别的装置，局部状态也在手里。代价是<strong>被观察的对象不是会上线的代码</strong>。</p>
+                    <p>所以能抓到的缺陷也分了岔。我这段逻辑写错了这一类错误，用解释器调试器完全抓得住。而源自执行特性的错误 — 竞争、调度、内存布局、与优化的相互作用 — 抓不住，因为<strong>那些缺陷只存在于编译产物里</strong>。不是工具不够强，而是被观察的对象一开始就没带着那个缺陷。</p>
+
+                    <h2>用在哪里才值得</h2>
+                    <p>先从价值明确的位置写起。</p>
+                    <ul>
+                        <li><strong>学习</strong> — 对正在学这门语言的人收益最大。为了确认一个标准库函数的返回顺序而需要一个文件加一次构建，这是学习要交的税。Oracle介绍JShell时第一句就把它钉为<strong>用于学习与原型设计的工具</strong>，说的正是同一个位置</li>
+                        <li><strong>探索</strong> — 熟悉一个陌生的库时。确实有那么些场合，直接敲值比读文档更快</li>
+                        <li><strong>原型设计</strong> — 抓住那些形状还没定下来的东西</li>
+                        <li><strong>配置与自动化脚本</strong> — 想用Go的语法又不想留下构建产物时。不过这里也是最该小心的位置：脚本会被保存、被反复执行，前几节说的语义差异会随时间越咬越紧</li>
+                        <li><strong>嵌入</strong> — 放进程序里以接收用户自定义逻辑。这是仓库列出的用途之一</li>
+                    </ul>
+                    <p>反过来，<strong>把它放到生产执行路径上，本文不作推荐</strong>。这不是对工具质量的评价。而是做这个判断所需的材料 — 并发语义一致到什么程度、长期运行时内存如何表现、版本之间以何种策略处理兼容 — 仅凭公开资料无法确认。</p>
+
+                    <h2>先例 — 站稳的地方与没站稳的地方</h2>
+                    <p>给编译型语言配交互式工具，这不是第一次尝试。站稳了的那些有共同点。</p>
+                    <table>
+                        <thead><tr><th>工具</th><th>语言</th><th>站稳的位置</th><th>文档划出的界线</th></tr></thead>
+                        <tbody>
+                            <tr><td>JShell</td><td>Java</td><td>学习与原型设计，随JDK一同分发</td><td>自己写明它不取代IDE</td></tr>
+                            <tr><td>evcxr</td><td>Rust</td><td>笔记本与交互式探索</td><td>代码一死进程就重启，所有变量丢失</td></tr>
+                            <tr><td>gomacro</td><td>Go</td><td>REPL、脚本、嵌入、源码调试</td><td>第三方导入受平台限制，泛型仍属实验性</td></tr>
+                        </tbody>
+                    </table>
+                    <p>evcxr的约束尤其耐人寻味。文档写道，代码若异常终止，<strong>运行它的进程会重启，所有变量随之丢失</strong>，并且指出会话里留存的变量不能引用其他变量。前面被列为REPL好处的<strong>状态得以留存</strong>这一性质，一旦撞上语言处理内存安全与所有权的方式，就变成了有条件的。交互性并不是能脱离语言自身性质而独立叠加上去的东西。</p>
+                    <p>站稳了的工具，共同点最终汇到一处。</p>
+                    <ul>
+                        <li><strong>它们与语言实现出自同一处</strong> — JShell在JDK内部，Haskell的GHCi在编译器发行版内部，一起交付。版本一起走，语义分岔的余地就在结构上变小了</li>
+                        <li><strong>独立项目没有这份优势</strong> — 语言一变就得追，追不上的部分原样变成语义差异。泛型在Go 1.18进入语言，而解释器的泛型至今仍属实验性，正把这个结构摆在明面上</li>
+                    </ul>
+                    <p>不过正因为是独立项目，有些事才做得成。像宏这种被语言<strong>刻意拿掉的功能</strong>，官方工具是绝不会加的。上一节那张可移植性的账单，恰恰是这份自由的背面。</p>
+
+                    <h2>另一面 — 直接编译运行仍然更合理的场合</h2>
+                    <p>这段往返在Go里之所以格外能忍，是有原因的。构建快、测试运行器是标配、可以按名字只跑一个、示例函数兼作文档与测试。也就是说，<strong>把临时确认变成长期资产的通道，语言里本来就有。</strong></p>
+                    <ul>
+                        <li><strong>确认的东西必须留下时</strong> — 测试文件会留下，会话不会。要让确认过这件事对下一个人也成立，它就得是文件</li>
+                        <li><strong>结果取决于执行特性时</strong> — 并发、性能、内存。基于前面几节的理由，解释器的结果当不了代理</li>
+                        <li><strong>需要团队一起看时</strong> — 会话日志不是评审的对象</li>
+                        <li><strong>牵涉构建标签或平台相关代码时</strong> — 如果争的就是哪些文件真正进了构建，那就该用真实构建去看</li>
+                    </ul>
+                    <p>反过来，交互式明确占优的位置也很窄、很清楚。</p>
+                    <ul>
+                        <li>答案<strong>用一次就扔</strong>的确认</li>
+                        <li>在准备成本高的对象上<strong>反复敲打</strong>的工作</li>
+                        <li>弄清陌生API<strong>返回什么、以什么顺序</strong>返回</li>
+                    </ul>
+                    <p>归结起来，判断分野在<strong>结果的寿命</strong>。要留下就用文件，要扔掉就用会话。另外还要一并看到，REPL是便利而非能力 — 没有它，原来做的事照样做得成，所以它是要跟多一个依赖的成本放在天平上称量的东西。</p>
+
+                    <h2>没能确认的部分</h2>
+                    <p>以下条目仅凭公开资料得不出答案，本文也不用推测去填。</p>
+                    <ul>
+                        <li>解释执行与编译执行的<strong>语义一致范围</strong>。限制清单是公开的，但没有任何东西保证那份清单就是全部</li>
+                        <li>goroutine、channel与<code>select</code>在解释器下具有的<strong>调度特性</strong>。限制清单未曾提及</li>
+                        <li><strong>构建标签与条件编译</strong>是如何处理的</li>
+                        <li><strong>性能</strong>。本文未核实任何基准测试，也不提出相对编译执行是多少倍的数字</li>
+                        <li>嵌入使用时的<strong>内存与隔离特性</strong>，以及长期运行下的表现</li>
+                        <li>两套泛型实现的<strong>成熟度差异</strong>，以及最终哪一套会留下来</li>
+                    </ul>
+                    <p>除了用自己的代码亲自去量，别无他法，而这个事实本身就是把引入判断往后放的理由。</p>
+
+                    <h2>结论：是留下来的代码，还是要扔掉的代码</h2>
+                    <p>给编译型语言加上交互式执行，不是多挂一个便利功能。它是<strong>让同一份源码承载两套执行语义</strong>。这两套之所以难以完全一致，并不是因为实现还不够，而是因为编译这个阶段本来就要做那几件事 — 看到全部、就此确定、并加以优化。无论实现推进到什么地步，只要这三件事不放手，缝隙就仍在。</p>
+                    <p>即便如此，得到的东西是实在的。而且这份收益并不是人们常说的省时间，而在于<strong>探索的粒度变细</strong>。一次只验证一个假设，原因就能被定位。</p>
+                    <p>账单也来自同样明确的地方。用上语言所没有的功能的那一刻，那段代码就出不去了。看清这条界线再用，它是工具；看不清就用，它会变成日后搬不走的资产。所以要决定的只有一件事：<strong>此刻敲下的这段代码，是留下来的代码，还是要扔掉的代码?</strong>这个答案定了，工具用到哪一步也就跟着定了。</p>
+
+                    <h2>参考资料</h2>
+                    <ul>
+                        <li>gomacro仓库 — 扩展功能、两套泛型实现、限制清单、调试器命令、基于插件的导入：<a href="https://github.com/cosmos72/gomacro" target="_blank" rel="noopener">github.com/cosmos72/gomacro</a></li>
+                        <li>Go标准库<code>plugin</code>包文档 — 受支持平台、工具链一致要求、加载后无法卸载、竞态检测器的限制：<a href="https://pkg.go.dev/plugin" target="_blank" rel="noopener">pkg.go.dev/plugin</a></li>
+                        <li>Oracle JShell文档 — 定位为学习与原型设计工具、前向引用与重定义的处理：<a href="https://docs.oracle.com/en/java/javase/21/jshell/introduction-jshell.html" target="_blank" rel="noopener">介绍</a>、<a href="https://docs.oracle.com/en/java/javase/21/jshell/snippets.html" target="_blank" rel="noopener">代码片段</a></li>
+                        <li>evcxr文档 — 进程重启时变量丢失、持久变量的引用约束、不支持外部crate的宏：<a href="https://github.com/evcxr/evcxr/blob/main/COMMON.md" target="_blank" rel="noopener">github.com/evcxr/evcxr</a></li>
+                        <li>引出本文的话题：<a href="https://news.hada.io/topic?id=32785" target="_blank" rel="noopener">news.hada.io/topic?id=32785</a></li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>分享本文</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">返回列表</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/code_image.html">代码图片生成器</a></li>
+      <li><a href="../static/char_counter.html">字数统计</a></li>
+      <li><a href="../static/json_formatter.html">JSON 格式化工具</a></li>
+      <li><a href="../static/regex_tester.html">正则表达式测试器</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="go_language_ai_coding_fit.html">降低 AI 生成代码验证成本的语言特性 - Go 占优的五点及其代价</a></li>
+      <li><a href="typed_beam_language_gleam.html">在BEAM之上加载静态类型这一选择 - Gleam迁移了哪些边界又留下了哪些</a></li>
+      <li><a href="why_lisp_still_matters_2026.html">为什么现在依然是 Lisp - 宏与 REPL 的力量，以及双极性程序员的悖论</a></li>
+      <li><a href="single_file_data_format.html">一个文件两种身份 - 当数据库同时也是可执行文件时动摇的东西</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制！请粘贴到Threads应用中分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制！'); });
+    });
+    </script>
+</body>
+</html>
