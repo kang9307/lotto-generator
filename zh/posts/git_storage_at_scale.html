@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<!--
+ * 技术博客文章模板
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Git 在大规模下变慢的地方 - 深度、宽度、体积这三条扩展轴 2026</title>
+    <meta name="description" content="Git 是基于什么前提设计的，这个前提又在哪里崩塌。本文从对象存储与增量压缩的基本原理讲起，梳理历史深度、目录树宽度、文件体积这三条互相独立的扩展轴，并说明每一种少下载的对策把成本推迟到了哪里、后面又要如何偿还。">
+    <meta name="keywords" content="Git 大规模, 单体仓库, 打包文件, 增量压缩, partial clone, shallow clone, sparse-checkout, Git 对象, 内容寻址, Git LFS, 重写历史, git filter-repo, fsmonitor, 引用广播, Git 性能">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/git_storage_at_scale.html">
+
+    <meta property="og:title" content="Git 在大规模下变慢的地方 - 深度、宽度、体积这三条扩展轴 2026">
+    <meta property="og:description" content="对象存储与增量压缩预设了什么，这个预设在哪里崩塌，以及少下载的各种方法分别要交出什么。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/git_storage_at_scale.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-08-28">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Git 在大规模下变慢的地方 - 深度、宽度、体积">
+    <meta name="twitter:description" content="Git 预设了什么，这个预设又在哪里崩塌。三条扩展轴，以及每一种对策要付的代价。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "Git 在大规模下变慢的地方 - 深度、宽度、体积这三条扩展轴 2026",
+      "alternativeHeadline": "Where Git Slows Down at Scale - Depth, Width, and Size Are Three Different Problems",
+      "datePublished": "2026-08-28",
+      "dateModified": "2026-08-28",
+      "inLanguage": "zh-CN",
+      "articleSection": "开发/基础设施",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "Git 大规模, 单体仓库, 打包文件, 增量压缩, partial clone, shallow clone, sparse-checkout, Git 对象, Git LFS, 重写历史",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/git_storage_at_scale.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "说一个 Git 仓库变大了，到底是什么在变大？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "有三样东西各自在变大。第一是历史深度，也就是提交的数量，它让协商和版本遍历变重。第二是目录树宽度，也就是一次提交里装了多少文件和目录，它影响检出、状态检查和索引大小。第三是单个文件的体积，尤其是压缩和增量都不起作用的二进制文件，它直接拉高传输量和磁盘占用。三条轴的成因不同，对策也不同。只盯着克隆很慢这一个症状去挑对策，往往会动错轴。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "partial clone、shallow clone 和 sparse-checkout 有什么区别？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "区别在于不下载什么。shallow clone(--depth)不下载较早的提交。partial clone(--filter)下载提交和 tree，但把 blob 之类的对象推迟到以后。sparse-checkout 并不是减少下载的功能，它收窄的是展开到工作树里的路径，要连下载一起减少就必须和 partial clone 配合使用。三者的共同点是，被推迟的东西并没有消失。等到后面真的需要，它会以网络往返的形式回来。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "分支不删一直堆着，真的会让克隆变慢吗？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "引用(ref)的数量先体现在协商成本上，而不是存储容量上。在旧协议里，每次连接服务端都会广播全部引用，Git 文档也写明引用一多这项开销就可能变大。协议 v2 改成不请求就不广播引用，并通过 ref-prefix 只取需要的部分。不过客户端和服务端都跑 v2 才有效果，而且引用一多，服务端的重新打包和可达性计算负担依然存在。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "可以靠重写历史来缩小仓库吗？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "可以，但这是很难回退的操作。Git 用内容给对象寻址，所以过去某次提交的内容一变，它之后所有提交的哈希都会变。git-filter-branch 文档警告说，被重写的历史会让所有对象都拿到不同的名字，并且不会与原分支汇合。签名、标签、外部系统里写死的提交哈希、同时在做事的同事的本地分支，全都会受影响。文档建议用 git filter-repo 之类的工具替代 filter-branch。动手之前先用副本演练一遍，并事先确保有回到原状态的路径，这是最低条件。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "单体仓库和多仓库哪个更好？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "哪一边都不是无条件更好。成本不会消失，只会换个位置。单体仓库换来原子变更和单一依赖图，代价是目录树宽度和引用数量集中到一处，工具投入变成必需品。多仓库让每个仓库都保持轻量，代价是跨仓库的变更、版本对齐和发布协调都落到人身上。判断标准不是口味而是变更的形状。如果一个功能经常同时动到好几个仓库，说明边界画错了，这时该先修的是边界而不是仓库数量。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/git_storage_at_scale.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/git_storage_at_scale.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/git_storage_at_scale.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/git_storage_at_scale.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/git_storage_at_scale.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "首页",
+      "item": "https://braindetox.kr/zh/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "开发/基础设施",
+      "item": "https://braindetox.kr/zh/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "Git 在大规模下变慢的地方 - 深度、宽度、体积这三条扩展轴 2026",
+      "item": "https://braindetox.kr/zh/posts/git_storage_at_scale.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="Git 在大规模下变慢的地方 - 深度、宽度、体积这三条扩展轴 2026">
+                <meta itemprop="datePublished" content="2026-08-28">
+                <meta itemprop="dateModified" content="2026-08-28">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="Git 大规模, 单体仓库, 打包文件, 增量压缩, partial clone, sparse-checkout, Git LFS">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/git_storage_at_scale.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">Git 在大规模下变慢的地方 - 深度、宽度、体积是不同的问题</h1>
+                    <h2 class="post-subtitle">对象存储与增量压缩预设了什么、这个预设在哪里崩塌，以及各种少下载的方法分别交出了什么</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-08-28">2026年8月28日</span>
+                        <span class="post-category" itemprop="articleSection">开发/基础设施</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+                    <h2>引言：仓库变重的方式不止一种</h2>
+                    <p>在新机器上把仓库拉下来要花二十分钟。敲一次 <code>git status</code> 就流走几秒钟。症状看着相似，成因却可能落在完全不同的地方，所以把别人写的对策照搬过来，大多不起作用。</p>
+                    <p>这个话题重新浮上来是有由头的。2026年8月，Cursor 公开了重新设计自家 Git 托管存储层的 <strong>Continuity</strong>。按该公司的说法，他们不再把本地 Git 仓库当作真相之源，而是把<strong>放在 S3 兼容对象存储上的预写日志(WAL)</strong>当作源头，本地 NVMe 磁盘上的 Git 仓库则被视为随时可以重建的缓存。推送顺序通过对象存储的原子比较交换(CAS)来排定，这是整套设计的骨架。同一篇文章里，该公司还一并给出了每秒推送吞吐、副本增加到一百个时的读取扩展、副本一致性检查延迟等数字，但那是<strong>该公司在自家环境中测量并发布的值</strong>，硬件与部署条件并未在文中写明。这也是本文不把这些数字当作性能依据的原因。</p>
+                    <p>产品的部分到此为止。真正有意思的是他们想解决的那个问题。为什么大规模托管 Git 这件事很难，为什么一个巨大的单一仓库和无数个微小仓库会朝相反的方向折磨同一套系统。答案不在某家公司的架构里，而在<strong>Git 当初是基于什么前提设计的</strong>。下面先顺着这个前提走一遍，再逐个指出它崩塌的地方。如果更关心工具，可以把<a href="git_history_commands_guide_2026.html">深挖历史的 Git 命令整理</a>放在旁边；如果关心托管格局，可以参考<a href="cursor_origin_git_service_2026.html">对 Cursor 的 Git 代码托管发布的分析</a>。</p>
+
+                    <h2>1. Git 实际存储的东西 - 四种对象与内容寻址</h2>
+                    <p>如果你把 Git 理解成一串文件变更(diff)的清单，那有一半是错的。Git 存的不是变更而是<strong>快照</strong>。而且存储的最小单位不是文件，是<strong>对象</strong>。</p>
+                    <ul>
+                        <li><strong>blob</strong> — 只装文件的内容。里面没有文件名，没有权限，也没有路径。</li>
+                        <li><strong>tree</strong> — 相当于目录。逐条装着模式、类型、名字以及目标对象的哈希。名字在这里。</li>
+                        <li><strong>commit</strong> — 装着一个顶层 tree、若干父提交、作者与提交者信息，以及提交消息。</li>
+                        <li><strong>tag</strong> — 指向某个特定对象，可以附上签名和消息的附注标签。</li>
+                    </ul>
+                    <p>关键在于这些对象的名字<strong>是从内容里长出来的</strong>。Git 会在内容前面加一小段带类型和长度的头，然后对整体算哈希，再把这个哈希直接当作对象的名字。存储路径也由这个哈希决定 — 前两个字符是目录，其余是文件名。内容用 zlib 压缩后写入。</p>
+                    <p>由此引出一条常让人吃惊的性质。<strong>相同的内容在一个仓库里只存一次。</strong>同一个文件被复制到十个目录里，blob 依然只有一个。一百次提交里都没动过的文件不会被存一百次。每次提交都会新建 tree，但没有变化的子 tree 和 blob 仍然指向原来的哈希。这里并没有一套专门的去重机制，而是<strong>名字就是内容，所以重复根本不会产生。</strong></p>
+                    <p>这个设计也在悄悄收费。因为名字就是内容，所以<strong>内容一变，名字就变。</strong>提交里装着父提交的哈希，所以只要改动过去的某个点，它之后所有提交的名字都会连锁地改变。后面会讲到的重写历史之所以危险，不是出于什么政策，而是直接从这个存储结构里推出来的。</p>
+
+                    <h2>2. 打包文件与增量压缩 - 打包之后什么变便宜、什么变贵</h2>
+                    <p>一个对象就是一个文件的状态叫作<strong>松散对象(loose object)</strong>。理解起来容易，长期放着却不好。给一个 22KB 的文件加一行再提交，就会多出一个内容几乎相同的 22KB 对象，两者各自压缩、各自占地方。</p>
+                    <p>所以当对象堆到一定程度、跑 <code>git gc</code> 或者往远端推送时，Git 会把对象打成一个<strong>打包文件</strong>。这时相似的对象之间会加上<strong>增量压缩</strong>。在前面那个例子里，新版本被完整存下，旧版本只留下指向新版本的几个字节的差异。Git Book 的例子中，22,054 字节的对象被完整保存，22,044 字节的对象则缩成了 9 字节的增量。</p>
+                    <p>方向值得留意。<strong>把最新版本完整放着，把过去做成增量。</strong>这是照着真实使用形态做的选择 — 人最常翻的是最近的东西。代价同样清楚。</p>
+                    <ul>
+                        <li>要读一个以增量形式保存的对象，就得<strong>沿着链条回溯还原</strong>。读取从纯粹的文件读取变成了掺着计算的活。</li>
+                        <li>所以 Git 会限制增量链的深度。无限拉长虽然省磁盘，但读取会变慢。</li>
+                        <li>寻找增量基准这件事本身就<strong>要吃 CPU 和内存</strong>。大仓库重新打包很重的原因就在这里。</li>
+                        <li>打包文件内部的对象排布遵循逻辑上的相邻性，所以访问模式很容易变成<strong>磁盘上的离散读取</strong>。</li>
+                    </ul>
+                    <p>归纳起来，打包文件是拿<em>容量与传输量</em>换<em>CPU 与随机访问</em>的一桩交易。对绝大多数仓库来说，这桩交易是压倒性地划算的。问题在于仓库变大时，交易的两头会一起变大。</p>
+
+                    <h2>3. 变大这个说法有三种 - 深度、宽度、体积</h2>
+                    <p>这里是本文的核心。<strong>仓库很大这一句话里，混着三条互相独立的轴。</strong>三者成因不同、症状不同，最要紧的是对策不同。</p>
+                    <ul>
+                        <li><strong>历史深度</strong> — 提交以及随之而来的 tree 对象的累计数量。一个存在了十年的仓库，不管文件有几个都是深的。</li>
+                        <li><strong>目录树宽度</strong> — 一次提交里装的文件与目录的数量。昨天新建的仓库，只要文件有五十万个就是宽的。</li>
+                        <li><strong>文件体积</strong> — 单个对象的块头。压缩和增量到底管不管用，在这里分出胜负。</li>
+                    </ul>
+                    <table>
+                        <thead>
+                            <tr><th>轴</th><th>什么会变慢</th><th>通常管用的对策</th><th>这个对策交出去的东西</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>历史深度</td><td>初次克隆、可达性计算、版本遍历、与服务端协商</td><td>shallow clone、提交图缓存、必要时切分历史</td><td>追问过去的操作(log、blame、bisect)会卡住，或者引发重新拉取</td></tr>
+                            <tr><td>目录树宽度</td><td>检出、状态检查、索引刷新、切换分支</td><td>sparse-checkout、文件系统监视、稀疏索引</td><td>工具兼容性与运维复杂度，以及碰到范围之外时的混乱</td></tr>
+                            <tr><td>文件体积</td><td>传输量、磁盘、打包时间、内存</td><td>把大文件外置(LFS 之类)，或者干脆不放进去</td><td>要另外运维一套存储的认证与备份，还多了一条工具链依赖</td></tr>
+                        </tbody>
+                    </table>
+                    <p>把三条轴混在一起，诊断就会跑偏。嫌克隆慢就加了 <code>--depth 1</code>，结果还是慢，那多半原来就不是深度问题，而是宽度或体积。提交数量不多，但一次提交里有四十万个文件的话，砍掉深度也不会改变要下载的 tree 和 blob 的总量。反过来，文件数量不多却克隆很重，就要先怀疑历史深处的某个大体积二进制文件。</p>
+                    <p>判断标准很简单。<strong>先选出占主导的那一条轴，只上那条轴的对策，然后重新测一遍。</strong>三条一起上，既不知道是哪一条起了作用，出问题时也不知道该回退哪一个。</p>
+
+                    <h2>4. 大体积二进制文件为什么格外糟糕</h2>
+                    <p>文本源代码是 Git 最擅长的对象。按行小幅改动，压缩管用，增量非常管用。大体积二进制文件正好站在对面。</p>
+                    <ul>
+                        <li><strong>增量不管用。</strong>已经压缩过的格式(图片、视频、归档)只要改一个像素，整个字节序列就全变了。于是每次新提交实际上都塞进去一个完整的新文件。</li>
+                        <li><strong>压缩也不管用。</strong>把压过的东西再压一遍几乎不会变小，打包文件的一个好处就此消失。</li>
+                        <li><strong>内存开销很大。</strong>处理一个对象所需的工作空间会随文件体积成比例增长。</li>
+                        <li><strong>一旦进去就留下了。</strong>就算下一次提交把它删掉，那个 blob 依然处在能被过去的提交到达的状态。每一个克隆的人都会一直下载它。</li>
+                    </ul>
+                    <p>最后一条最贵。误提交进去的 500MB 构建产物，不会因为下一次提交删掉它就消失。删除提交只是造了一棵没有那个条目的新 tree，而更早的提交依然指向那个 blob。要真正把它从仓库里拿掉，<strong>只能重写过去</strong>。这笔账后面单独讲。</p>
+                    <p>因此对大体积资产，<strong>换成指针放到外面</strong>的做法被广泛采用。Git LFS 是典型：提交里只放一个轻量的指针文件，真正的内容放在另一套存储里。仓库确实变轻了。代价是要先装扩展，要另外运维那套存储的认证、容量和备份，而那套存储一旦消失，手里就只剩指针。<strong>重量并没有消失，只是挪走了。</strong></p>
+
+                    <h2>5. 少下载的三种方法 - 各自不下载什么</h2>
+                    <p>大规模仓库的对策里，相当一部分可以归纳成<strong>少下载</strong>。只是这三种少下载的东西各不相同，而被推迟的账多半会在后面结算。</p>
+                    <table>
+                        <thead>
+                            <tr><th>方法</th><th>不下载的东西</th><th>后面什么会变慢</th><th>要一并注意的点</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>shallow clone(<code>--depth</code>)</td><td>指定深度之外的较早提交</td><td>追问过去的操作。需要时还得再把历史补下来</td><td>默认会收窄成单一分支</td></tr>
+                            <tr><td>partial clone(<code>--filter</code>)</td><td>全部 blob 或超过某个体积的 blob，按配置甚至连 tree 一起</td><td>缺失对象被用到的那一刻的即时拉取。文档写明这种拉取偏慢</td><td>远端必须活着，而且认证可能会反复发生</td></tr>
+                            <tr><td>sparse-checkout</td><td><em>什么都没少下载</em>。它只收窄展开到工作树里的路径</td><td>扩大范围的那一刻，以及处理范围之外的变更时</td><td>推荐 cone 模式。非 cone 的模式写法在文档里不被推荐</td></tr>
+                        </tbody>
+                    </table>
+                    <p>第三行经常被误读。sparse-checkout <strong>不是省流量的功能。</strong>它只是用索引里的 skip-worktree 位不把文件展开到工作树，对象其实早就下载好了。要连下载一起减少，就必须和 partial clone 搭配使用，而那时对面的代价也会跟过来。Git 文档明说这个命令是实验性的、行为可能变化，同时还提醒稀疏索引会以外部工具无法理解的方式改动索引。</p>
+                    <p>partial clone 文档里写下的提醒同样值得照原样读一遍。缺失的对象会在需要时从<strong>承诺者远端(promisor remote)</strong>取回，但取回是按条目发生的，所以<strong>对象一多就会带来相当可观的开销和多次认证请求</strong>。离线工作的属性被削弱，在网络不好的地方，初次克隆是快了，日常操作却会不规律地卡住。</p>
+
+                    <h2>6. 从服务端看到的东西 - 引用数量、协商、重新打包</h2>
+                    <p>只从客户端看会漏掉一条轴，那就是<strong>引用(ref)的数量</strong>。分支和标签只是装着一个哈希的小条目，从容量上看可以忽略不计。成本出在别处。</p>
+                    <ul>
+                        <li><strong>引用广播</strong> — 在旧协议里，每次连接服务端都会把手上所有引用发过来。partial clone 文档也写到，引用一多这一段就可能产生相当可观的开销。</li>
+                        <li><strong>协商</strong> — 客户端和服务端互相交换各自已经有什么，据此决定要发送哪些对象。引用和提交越多，这几个来回就越重。</li>
+                        <li><strong>可达性计算</strong> — 哪些对象还活着，必须从引用出发把图走一遍才知道。清理(gc)和重新打包的真实成本就在这里。</li>
+                    </ul>
+                    <p>协议 v2 正面改掉了其中的第一项。引用广播改成<strong>不请求就省略</strong>，并给 <code>ls-refs</code> 加上 <code>ref-prefix</code>，只取需要的前缀下的引用。所以分支放着不管就会让克隆变慢这条老经验，今天是有条件的。两端都跑 v2 时广播成本会大幅下降，但<strong>可达性计算和重新打包的负担依然原样留着。</strong></p>
+                    <p>从运维视角看更有意思的是，<strong>方向完全相反的两种负载会同时压到同一套系统上</strong>。一端是要用几百个副本扛住 CI 的巨大单一仓库，另一端是自动化造出来的、用过几次就被遗忘的小仓库堆积如山。前者要求读取可扩展，后者要求单个仓库的固定成本趋近于零。Continuity 那篇公开文章处理的问题，说到底也是这两个方向的同时要求。<a href="grit_git_rust_rewrite_2026.html">把 Git 重写成库的尝试</a>之所以出现，背后也有类似的压力。</p>
+
+                    <h2>7. 文件系统与状态检查 - 与文件数量成正比的工作</h2>
+                    <p><code>git status</code> 很慢的仓库，问题多半不在历史而在<strong>宽度</strong>。Git 要知道工作树是否与索引不一致，就必须检查文件的状态，而这项检查基本上<strong>与文件数量成正比</strong>。文件到了几十万个，哪怕什么都没做，检查本身就成了一件苦差事。</p>
+                    <p>Git 备了两套机制来削减这项成本。</p>
+                    <ul>
+                        <li><strong>未跟踪文件缓存</strong> — 记下目录的修改时间，如果时间没变就不再读里面的内容。这要求操作系统和文件系统正确更新目录的修改时间才能成立，所以 Git 同时提供了事先测试这一点的办法。</li>
+                        <li><strong>文件系统监视</strong> — 直接向外部的监视程序询问什么变了，从而省掉逐个检查全部文件这件事本身。两者一起打开，就能把变更检测和新文件搜索都跳过去。</li>
+                    </ul>
+                    <p>不过文档附上的但书也要一起读。<strong>并不是所有命令都尊重这个标记。</strong>有的命令会变快，有的命令原地不动。多出一个常驻的监视进程本身也是成本，而在网络文件系统或容器里，前提条件本身就可能动摇。</p>
+
+                    <h2>8. 单体仓库与多仓库不是答案而是选择</h2>
+                    <p>仓库一变重，就会有人提议改结构。可这个决定与其说是性能问题，不如说是关于<strong>把成本挪到哪里</strong>的决定。哪一边都不会帮你减少总量。</p>
+                    <table>
+                        <thead>
+                            <tr><th>视角</th><th>单体仓库里会发生什么</th><th>多仓库里会发生什么</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>变更单位</td><td>多个模块在一次提交里被原子地改掉</td><td>变更按仓库边界被切碎，顺序由人来对齐</td></tr>
+                            <tr><td>依赖关系</td><td>一张图。版本对齐的问题变少</td><td>版本锁定与发布顺序成了常态工作</td></tr>
+                            <tr><td>Git 负载</td><td>宽度和引用数量集中到一处。工具投入变成必需</td><td>每个仓库都很轻。代价是仓库的数量本身成了管理对象</td></tr>
+                            <tr><td>权限</td><td>按路径的访问控制得在另一层解决</td><td>按仓库天然就分开了</td></tr>
+                            <tr><td>构建与 CI</td><td>影响范围计算是必需的，不做的话每次变更都变成全量构建</td><td>构建很简单，但做集成验证的位置消失了</td></tr>
+                            <tr><td>发布</td><td>一个点就能确定整体状态</td><td>要用若干标签的组合去重建状态</td></tr>
+                        </tbody>
+                    </table>
+                    <p>哪一边我都不推荐。要说给一条判断标准的话，<strong>去看变更的形状。</strong>如果一次功能变更习惯性地同时动到三个以上的仓库，那就是仓库边界与真实耦合度对不上的信号。这时把仓库合并只是选项之一，重新划边界或者把接口稳定下来，往往才是更靠前的一步。反过来，如果每个仓库都独立发布、互相不知道对方的内部，那就没有理由合并进来、把左边那一列的成本重新扛上身。分支方式本身也会随团队规模和发布周期改变价值，那部分在<a href="git_github_guide_03_branch.html">分支策略整理</a>里另外讲过。</p>
+
+                    <h2>9. 削减历史这件事的风险</h2>
+                    <p>这一节不是操作指南，写的是<strong>动手之前该知道的事</strong>。</p>
+                    <p>第 1 节看到的那条性质在这里开账单。因为对象的名字来自内容，所以改动过去的某次提交，<strong>它之后所有提交的哈希都会变。</strong><code>git filter-branch</code> 的文档对此有明确警告：被重写的历史会让所有对象都拿到不同的名字，并且不会与原分支汇合。同一篇文档还说这个命令本身坑多、性能差，建议改用 <code>git filter-repo</code> 之类的替代工具。</p>
+                    <p>把实际会坏掉的东西列成清单会更清楚。</p>
+                    <ul>
+                        <li><strong>签名</strong> — 提交签名是对那次提交内容的签名。内容一变，验证就通不过。</li>
+                        <li><strong>标签</strong> — 原本指向旧提交的标签，会变成指向新历史之外。不一起搬走的话，旧的图就会以引用的形式活下来。</li>
+                        <li><strong>写在外部的哈希</strong> — 问题跟踪系统、发布记录、文档、锁文件里写着的提交哈希，会全部失去指向。</li>
+                        <li><strong>同时在做事的同事</strong> — 文档写明协作者必须把自己的改动重新叠到新历史上，或者删掉仓库重新拉取。人越多，出事的可能性越大。</li>
+                        <li><strong>自动化</strong> — 把提交哈希当作缓存键或发布标识的流水线，会悄无声息地开始指向别的东西。</li>
+                    </ul>
+                    <p>所以最低前提是这样的。<strong>先用完整副本演练一遍，把动手前的状态单独保存，在重写进行期间关闭写入口不让任何人写，结束之后事先约定好所有人要怎么重新拉取。</strong>没有回退路径就不要动手。而且这项操作唯一正当的理由，通常只有三种之一 — 秘密信息进去了，有法律上的删除义务，或者嵌进去了别的办法碰不了的大体积资产。如果动机只是想让仓库轻一点，那就先把前面几节的少下载对策全都试过一遍再说。</p>
+
+                    <h2>10. 该测量什么</h2>
+                    <p>光凭慢的印象是选不出轴的。要看的是<strong>不是总时间，而是时间花在了哪个阶段</strong>。</p>
+                    <ul>
+                        <li><strong>把克隆拆成阶段</strong> — 服务端数对象并压缩的时间、传输的时间、收到之后解开并建索引的时间、最后检出的时间，各自指向完全不同的成因。传输很短而总时间很长，问题就不在网络。</li>
+                        <li><strong>检出与状态检查</strong> — 只有这两项格外慢，那就是宽度在主导。</li>
+                        <li><strong>对象构成</strong> — 打包里是哪些对象在占地方，超大的 blob 有几个，它们又来自哪些路径。</li>
+                        <li><strong>引用与提交的数量</strong> — 判断协商是否吃力的第一个指标。</li>
+                        <li><strong>工作树的文件数量</strong> — 宽度这条轴最简单的代理指标。</li>
+                        <li><strong>可复现的条件</strong> — 不区分缓存已经预热和缓存是冷的两种状态，比较就不成立。</li>
+                    </ul>
+                    <p>上了对策之后，也要回到同一处再测一遍。一次只改一样东西，把改了什么、测了什么都记下来。没有记录的话，半年后会有人把同一个问题从头再诊断一遍。</p>
+
+                    <h2>未能确认的部分</h2>
+                    <ul>
+                        <li>Continuity 公开文章里那些吞吐与延迟数字的<strong>测量条件</strong>(硬件、对象体积分布、并发水平)在文中没有写明，无法确认。这也是正文没有把这些数字当作比较或依据的原因。</li>
+                        <li>同一篇文章中描述其他系统设计的部分，同样是<strong>发布方的叙述</strong>，未能用那套系统运营方的资料做交叉确认。</li>
+                        <li>少下载的各种对策实际能省下百分之几，仓库之间差异很大，因此不给出可以一般化的数字。</li>
+                        <li>文件系统监视在哪些命令上有效、在哪些命令上无效，会随版本和平台变化，必须到自己所用 Git 版本的文档里直接确认。</li>
+                    </ul>
+
+                    <h2>小结</h2>
+                    <p>Git 是一个<strong>用内容给东西命名的对象存储</strong>。正因为这个前提，重复会自行消失；也正因为这个前提，改动过去就会让之后的一切都变。打包文件与增量压缩是拿容量换 CPU 和随机访问的一桩好交易，但仓库一变大，交易的两头就一起长大。</p>
+                    <p>要带走的有三条。第一，<strong>把变大这个说法拆成深度、宽度、体积。</strong>对策因轴而异，轴挑错了什么都不会改善。第二，<strong>少下载的各种方法并不消除成本，只是推迟它。</strong>要在知道被推迟的账何时以何种形态回来的前提下做选择。第三，<strong>重写历史是最后手段</strong>，不是在没有回退路径和共识的情况下能开工的事。</p>
+                    <p>结构的选择也一样。单体仓库与多仓库不是性能处方，而是改变成本所在位置的选择，依据不是潮流而是<strong>我们的变更实际长成什么形状</strong>。下次再听到有人说仓库很重，先别急着挑对策，试着用一句话回答那到底是哪一条轴。</p>
+
+                    <h2>参考资料</h2>
+                    <ul>
+                        <li><a href="https://git-scm.com/book/en/v2/Git-Internals-Git-Objects" target="_blank" rel="noopener">Pro Git - Git Internals: Git Objects</a> — 对象种类与内容寻址</li>
+                        <li><a href="https://git-scm.com/book/en/v2/Git-Internals-Packfiles" target="_blank" rel="noopener">Pro Git - Git Internals: Packfiles</a> — 打包文件与增量压缩</li>
+                        <li><a href="https://git-scm.com/docs/partial-clone" target="_blank" rel="noopener">git partial-clone</a> — 承诺者远端与即时拉取的成本</li>
+                        <li><a href="https://git-scm.com/docs/git-sparse-checkout" target="_blank" rel="noopener">git-sparse-checkout</a> — cone 模式与注意事项</li>
+                        <li><a href="https://git-scm.com/docs/git-clone" target="_blank" rel="noopener">git-clone</a> — <code>--depth</code>、<code>--filter</code>、<code>--single-branch</code></li>
+                        <li><a href="https://git-scm.com/docs/git-update-index" target="_blank" rel="noopener">git-update-index</a> — 文件系统监视与未跟踪文件缓存</li>
+                        <li><a href="https://git-scm.com/docs/protocol-v2" target="_blank" rel="noopener">Git protocol v2</a> — 引用广播与 <code>ls-refs</code></li>
+                        <li><a href="https://git-scm.com/docs/git-filter-branch" target="_blank" rel="noopener">git-filter-branch</a> — 关于重写历史的警告</li>
+                        <li><a href="https://github.com/git-lfs/git-lfs" target="_blank" rel="noopener">Git LFS</a> — 大文件外置</li>
+                        <li><a href="https://cursor.com/ko/blog/git-at-any-scale" target="_blank" rel="noopener">Cursor - How to Scale Git at Any Scale</a> — Continuity 公开文章(含自行发布的数字)</li>
+                        <li><a href="https://news.hada.io/topic?id=32926" target="_blank" rel="noopener">GeekNews 话题 32926</a></li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>分享本文</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">返回列表</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/char_counter.html">字数统计</a></li>
+      <li><a href="../static/json_formatter.html">JSON 格式化工具</a></li>
+      <li><a href="../static/regex_tester.html">正则表达式测试器</a></li>
+      <li><a href="../static/jwt_decoder.html">JWT解码生成器 2026</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="weekday_calculation_algorithms.html">求星期几为什么需要公式 — 把日历搬进代码这件事 2026</a></li>
+      <li><a href="image_cdn_optimization.html">一张图片为什么是页面上最重的东西 — 决定传输的那些因素 2026</a></li>
+      <li><a href="nat_traversal_basics.html">两台计算机为什么难以找到彼此 — NAT穿透的原理 2026</a></li>
+      <li><a href="copyleft_compliance_reality.html">copyleft 在实务中错位的地方 - 分发那一刻产生的义务</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制，请粘贴到Threads应用中分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制。'); });
+    });
+    </script>
+</body>
+</html>
