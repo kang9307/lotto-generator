@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>从外部测量模型规模的尝试 - 什么读得出来，什么会变模糊</title>
+    <meta name="description" content="闭源模型的参数量无法从外部精确得知。价格、延迟、输出分布、记忆量各自暗示了什么，又无法暗示什么，混合专家结构如何打碎了旧直觉，推定值该信到哪一步，以及该用什么来代替规模去测量，本文逐一梳理，并附上遇到推定值时该问的六个问题。">
+    <meta name="keywords" content="LLM 参数估计, 黑盒模型, 模型规模, 激活参数, 总参数, 混合专家, 推理延迟, 词元单价, 对数概率, 蒸馏, 量化, 模型路由, 基准测试局限, LLM 评估">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/llm_size_estimation.html">
+
+    <meta property="og:title" content="从外部测量模型规模的尝试 - 什么读得出来，什么会变模糊">
+    <meta property="og:description" content="外部可见的信号全是多种原因的合成。各信号暗示什么、无法暗示什么，以及推定值该信到哪一步。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/llm_size_estimation.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-08-29">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="从外部测量模型规模的尝试">
+    <meta name="twitter:description" content="价格、延迟、输出分布各自暗示什么，又无法暗示什么。推定值的处理准则，以及该用什么代替规模去测量。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "从外部测量模型规模的尝试 - 什么读得出来，什么会变模糊",
+      "alternativeHeadline": "Measuring a Model Size From the Outside",
+      "datePublished": "2026-08-29",
+      "dateModified": "2026-08-29",
+      "inLanguage": "zh-CN",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "LLM 参数估计, 黑盒模型, 激活参数, 总参数, 混合专家, 推理延迟, 词元单价, 模型路由",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/llm_size_estimation.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "能从外部精确查出闭源模型的参数量吗?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "不能。从外部能观测到的值全部是多种原因叠加而成的合成信号。响应延迟里同时装着排队等待、批处理策略与硬件世代，价格里装着的是市场策略而不是成本。要从这类信号中反推出单一变量，就得把其余变量固定住，而站在外面的人没有可以固定它们的把手。所以这个领域的成果永远是带着范围与前提的量级判断，而不是精确数值。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "模型规模这个词到底指什么?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "至少混着四样东西。权重总个数的总参数、处理一个词元时真正参与计算的激活参数、去掉嵌入矩阵后的其余部分，以及训练所用的词元量。总参数决定内存常驻量，激活参数决定每个词元的运算量，训练词元量则在同样规模下把性能拉开差距。不先说清楚指的是哪一个，两个人就会用同一个词说着不同的数字。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "能从词元单价推断模型规模吗?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "价格不是成本加上利润，而是由市场位置决定的值。为抢份额而设的引流价、塞进高阶订阅的打包销售、免费额度、批处理与缓存命中所对应的另一套单价，都会在同一组权重之上造出不同的数字。从价格走向规模，需要先跨过成本这个未知数，再跨过定价策略这个未知数。经过两次跳跃得到的推定，很难当作依据来用。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "混合专家结构如何改变了规模估计?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "在混合专家结构里，总参数与激活参数分了家。内存必须装下全部，但处理一个词元时只有一部分参与计算。于是大就慢、大就贵的直觉被打破了。总量很大而激活量很小时，响应可以很快、单价可以很低。从外部看到的速度与价格更贴近激活一侧，知识量则更贴近总量一侧，因此一旦用多少 B 这样一个数字去说，就已经把其中一侧说错了。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "不知道规模时，实务中该改测什么?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "测自己工作里的结果更实用。自建评测集上的准确率、失败出现的类型、不是词元单价而是完成一项任务的总花费、拆成 p50 与 p95 来看的延迟、拒答率与重试率、以及不是标称上下文长度而是质量真正撑得住的长度。这些值在模型被悄悄替换之后仍可以用同样的方式重新测量，而就算精确知道参数量，它们也不会因此得到回答。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/llm_size_estimation.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/llm_size_estimation.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/llm_size_estimation.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/llm_size_estimation.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/llm_size_estimation.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "首页",
+      "item": "https://braindetox.kr/zh/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "开发/基础设施",
+      "item": "https://braindetox.kr/zh/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "从外部测量模型规模的尝试 - 什么读得出来，什么会变模糊",
+      "item": "https://braindetox.kr/zh/posts/llm_size_estimation.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="从外部测量模型规模的尝试 - 什么读得出来，什么会变模糊">
+                <meta itemprop="datePublished" content="2026-08-29">
+                <meta itemprop="dateModified" content="2026-08-29">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="LLM 参数估计, 黑盒模型, 激活参数, 总参数, 混合专家, 推理延迟, 词元单价, 模型路由">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/llm_size_estimation.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title">从外部测量模型规模的尝试</h1>
+                    <h2 class="post-subtitle">什么能成为信号，什么成不了 - 以及推定值该信到哪一步</h2>
+                    <div class="post-meta">
+                        <span class="post-date">2026年8月29日</span>
+                        <span class="post-category">开发/基础设施</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <h2>引言: 报价单上有一格填不出来</h2>
+                    <p>写引入评估文档时，总有一格没人填得出来。这个模型到底有多大。要判断能否自建托管，得知道权重占多少 GB；要给出性能预期，得知道它属于哪个量级。可供应方公开的只有价目表和上下文长度。于是团队里有人复述一个在别处看到的数字，那个数字进了会议纪要，两个月后就在出处消失的情况下被当成前提使用。</p>
+                    <p>不公开本身不是什么坏事。权重规模会把训练开销与基础设施形态直接暴露出来，因此选择不公开是常见的商业决定。只是这个决定让外面的人只能靠可观测的信号去推测内部，并且得自己判断这份推测有多牢靠。</p>
+                    <p>最近有一种正面处理这个题目的方法公开了。Trillion Labs 博客提出的 <strong>IKP(Incompressible Knowledge Probes)</strong> 通过测量模型记住了多少<em>稀有事实</em>来反推量级。前提是推理能力可以靠训练方法提升，而需要被记住的事实本身是压不掉的。</p>
+                    <p>这里不打算搬运那篇文章，而是退后一步来看。<strong>只凭外部可见之物去推断内部，原理上是一件什么样的工作，又会在哪里塌掉。</strong>先说结论：从外部得到的信号全部是多种原因的合成，所以给出的答案永远不是数值，而是范围。</p>
+
+                    <h2>1. 为什么想知道规模</h2>
+                    <p>这个问题常被当成好奇心，但实际上问起规模的场合，多半是决定即将做出的场合。</p>
+                    <ul>
+                        <li><strong>为了定出成本下限</strong> — 权重整体必须驻留在内存里，因此规模决定了自建托管所需的加速卡数量与最低配置。只有这一处，规模几乎就是直接的答案</li>
+                        <li><strong>为了预先校准性能预期</strong> — 知道量级，就大致清楚它能顺利跨过多难的任务，从哪里开始需要靠提示词去补</li>
+                        <li><strong>为了保住可复现性</strong> — 要复核论文或内部实验的结论，就需要对照条件。不知道规模，比较本身就不成立</li>
+                        <li><strong>为了读懂市场坐标</strong> — 判断开放权重模型追赶闭源模型追到了哪一步，不能只看分数，还要看拿出这份分数所动用的规模</li>
+                        <li><strong>为了判断能否往下降</strong> — 能不能换成更便宜的档位，终归要先知道现在用的是什么量级；在讨论单价是否合理的谈判桌上，需要的也是同一个数字</li>
+                    </ul>
+                    <p>这几条里只有第一条与规模一一对应。其余的即便把数字交到手上，答案也不会自动出现。这个事实在文章后半还会再出现一次，因为估计规模所花的力气里，相当一部分其实是<strong>把别的问题错译成了规模</strong>。</p>
+
+                    <h2>2. 规模这个词指着的四样东西</h2>
+                    <p>动手估计之前得先定下一件事：要测的是什么。没有这个共识，两个人就会用同一个词说着不同的数字互相争论。</p>
+                    <table>
+                        <thead>
+                            <tr><th>是什么</th><th>决定什么</th><th>从外部如何显现</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>总参数</td><td>内存常驻量、存储容量、部署难度</td><td>几乎看不见。只有与知识量相关的观测结论</td></tr>
+                            <tr><td>激活参数</td><td>处理单个词元所需的运算量</td><td>与每词元生成时间、单价反应得比较接近</td></tr>
+                            <tr><td>非嵌入参数</td><td>主体的表达力，不受词表大小影响的比较</td><td>看不见。只有词表大小能从分词器确认</td></tr>
+                            <tr><td>训练词元量</td><td>在同样规模下把性能拉开</td><td>看不见。只能从知识覆盖面间接推测</td></tr>
+                        </tbody>
+                    </table>
+                    <p>实务中最常错开的就是前两行。说某个模型<em>大</em>的时候，这句话是在讲内存还是在讲运算，会导向完全不同的结论。自混合专家结构普及以来，这两者可以拉开十倍以上。</p>
+                    <p>第四行同样常被忘掉。参数量相同，投入训练的词元量不同，结果就不同。想只凭规模预测性能的尝试之所以一再落空，有一半原因就在这里。</p>
+
+                    <h2>3. 这次的提案选中的信号 — 压不掉的知识</h2>
+                    <p>IKP 的想法很简单。去问那些推理导不出来的事实，也就是<strong>不存在某处就答不上来的信息</strong>，再从答对的数量反推存储容量。某个活动是哪一年开始的这类问题，再聪明也推不出来。</p>
+                    <p>它靠两个前提。一是被存下的事实量与模型规模之间存在很强的关系。二是推理能力会随时间在同样规模下变好，而<strong>记忆量不会以同样的速度变好</strong>。解题的方法可以变得高效，但要背下来的东西本身仍然占地方。</p>
+                    <p>该提案说明的测量条件如下。搬运数值时，必须把测的是什么、在什么条件下测的一并写上。</p>
+                    <ul>
+                        <li>基线用<strong>93 个开放权重模型</strong>建立。先在规模公开的模型上把记忆量与规模的关系拟合出来，再把闭源模型放到那条线上</li>
+                        <li>题目分成<strong>七个难度档</strong>。简单的事实小模型也答得出来，不分档的话高端区间就没有区分度了</li>
+                        <li>用逐个抽掉一个模型、再用其余模型去预测它的方式验证，报告的<strong>一般误差约为 1.48 倍</strong></li>
+                        <li>随时间的走势另外在<strong>100 个模型</strong>上检查，混合专家结构的处理方式则通过<strong>41 个 MoE 模型</strong>的比较来确认</li>
+                        <li>MoE 按<strong>总参数口径</strong>换算。依据是记忆量与总参数的关联强于与激活参数的关联这一观测</li>
+                    </ul>
+                    <p>作者自己讲明的局限同样清楚。精确参数量查不出来；<strong>一万亿以上的区间只有两个可作参照的公开模型</strong>，不确定性很大；经常拒答的模型，其数值应当读作下限而不是真实的知识容量。</p>
+                    <p>这条路子相对其他信号有一个好处。<strong>它较少被部署方式扰动。</strong>价格与延迟会被服务基础设施改写，而记住了什么则在权重里面。代价是它引入了训练数据构成这个新变量。大量灌入事实训练出的小模型，与偏重代码和推理的大模型，并不会落在同一条线上。</p>
+
+                    <h2>4. 从外部可见的其他信号</h2>
+                    <p>除了记忆量，可观测的值还有好几个。麻烦在于它们个个都是<strong>多种原因的合成</strong>。把每个信号暗示什么、无法暗示什么分开摆好，就能判断哪些主张可以当依据用。</p>
+                    <table>
+                        <thead>
+                            <tr><th>信号</th><th>它暗示什么</th><th>它无法暗示什么</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>首个词元的等待时间</td><td>队列状态、预填充余量、路由结构</td><td>参数量。输入长度与服务器拥塞的影响更大</td></tr>
+                            <tr><td>每词元生成时间</td><td>解码路径的宽度、内存带宽的余裕</td><td>总参数。若是 MoE，只照亮激活那一侧</td></tr>
+                            <tr><td>并发吞吐量</td><td>批处理余量与基础设施规模</td><td>模型规模。大集群跑大模型同样很快</td></tr>
+                            <tr><td>词元单价</td><td>供应方的市场策略与目标客群</td><td>成本。价格与成本之间还隔着一层策略</td></tr>
+                            <tr><td>上下文长度</td><td>关于注意力设计与缓存预算的决定</td><td>参数量。这是设计选择，不是规模的结果</td></tr>
+                            <tr><td>分词器词表大小</td><td>嵌入矩阵的规模、模型的谱系</td><td>主体大小。词表大而层数浅是可能的</td></tr>
+                            <tr><td>知识覆盖面</td><td>存储容量与训练数据的结合</td><td>两者的分离。数据构成不同，同样规模看起来也不同</td></tr>
+                        </tbody>
+                    </table>
+                    <p>表格右列最接近本文的核心。没有任何单一信号能独自指向规模。反推要成立就得把其余变量固定住，而站在外面的人没有可以握住它们的把手。</p>
+
+                    <h2>5. 价格是策略，不是成本</h2>
+                    <p>看上去最省事的信号，偏得也最厉害。单价是公开的，落成一个干净的数字，看着好比较，可在这个数字被造出来的过程里，成本只是若干输入之一。</p>
+                    <ul>
+                        <li><strong>引流价</strong> — 新入场的供应方为买份额，可能把价格定在成本之下；到了面向开发者的免费额度，与成本的联系干脆断掉。在这个区间用价格读规模，读出来会偏小</li>
+                        <li><strong>打包销售</strong> — 含在高阶订阅里的用量并不换算成单价。同一个模型在不同渠道有不同的面孔</li>
+                        <li><strong>分档定价</strong> — 批处理、夜间时段、缓存命中部分各有各的单价。一组权重身上挂着三四个价格</li>
+                        <li><strong>利用率</strong> — 同样的硬件，闲置时间一长，实际成本就上去了。把需求填得满的供应方卖得更便宜也仍有余</li>
+                        <li><strong>硬件世代与电力</strong> — 成本本身就随合同条款和当地电价而变。从外面甚至看不出它跑在哪一代硬件上</li>
+                    </ul>
+                    <p>归拢起来，从价格通向规模的箭头要跨过两次未知数：一次从价格到成本，一次从成本到规模。把经过两次跳跃的值当依据，实际上就是<strong>读了对方公司的销售策略，然后管它叫模型规模</strong>。单价为什么降了而账单不动，另有一篇<a href="ai_inference_price_decline.html">推理单价一直在降，账单却没变</a>专门谈过。</p>
+
+                    <h2>6. 延迟与输出分布 — 两扇窗各自看见什么</h2>
+                    <p>比起价格，时间与概率更靠近物理。只是各自都带着特有的模糊。</p>
+
+                    <h3>6.1 首个词元与每个词元测的是两回事</h3>
+                    <p>把响应延迟看成一个数字，什么也看不出来。至少要拆成两截。<strong>首个词元出现之前</strong>的时间，是请求在队列里等待的时间加上把输入整体过一遍的预填充时间；<strong>后续词元之间</strong>的间隔，则是单个生成步的开销。前者随输入长度增长，后者大体恒定。</p>
+                    <p>与规模有关的是后者。生成步通常被内存带宽卡住，所以造一个词元要读的权重越多就越慢。可一旦想从实测中把这层关系取出来，就会撞上好几重雾。</p>
+                    <ul>
+                        <li><strong>动态批处理</strong> — 请求会与其他用户的流量捆在一起处理，同一个请求在不同时段会呈现不同速度</li>
+                        <li><strong>前缀缓存</strong> — 前半部分若已算过，预填充会被整段跳过。同一段提示词发两次，第二次更快就是这个缘故</li>
+                        <li><strong>投机解码</strong> — 若采用小模型先提出若干词元、大模型一次性校验的方式，每词元时间就与主体规模对不上了</li>
+                        <li><strong>路由与调度</strong> — 查询可能被送往不同的后端，落在哪个数据中心的哪块加速卡上也会改变数值。被测的对象本身随请求而变</li>
+                    </ul>
+                    <p>这四项改变延迟的理由都与规模无关。所以基于延迟的估计，要凑齐<strong>同一时刻、同样输入长度、足够多的重复</strong>才勉强得到可比的值，而这样得到的值也只照亮激活参数那一侧。硬件这条轴上究竟什么会成为瓶颈，整理在<a href="inference_hardware_tradeoffs.html">选推理硬件时真正拉开差距的是什么</a>里。</p>
+
+                    <h3>6.2 输出分布这扇窄窗</h3>
+                    <p>只要能看到模型对下一个词元赋予的概率哪怕一部分，得到的信息就远多于只看文本：词表的大小、输出层的结构、同一谱系分出的模型之间的相似度。学术界之所以出现这个方向的方法，原因也在这里。输出层维度上限这类结构性质，只要收集到足够多样的输出，原理上就会浮现出来。</p>
+                    <p>只是这扇窗在实务中大多是关着的。商用 API 要么根本不返回概率值，要么限制在前若干个候选，而且那也是经过安全过滤与采样设置之后的值。何况这类结构估计需要<strong>大量查询</strong>，这里连着费用问题与服务条款问题。商用服务的使用条件中，限制试图查明模型内部结构之行为的条款相当常见。所以本文不写方法。<strong>研究会用到这类思路</strong>，到此为止就是这一节要谈的范围。</p>
+
+                    <h2>7. 混合专家打碎的直觉</h2>
+                    <p>在混合专家结构普及之前，规模、成本与能力大体朝同一个方向走。大就聪明、就慢、就贵。现在不是了。</p>
+                    <ul>
+                        <li>内存要装下<strong>总量</strong>。所以自建托管的开销由总参数决定</li>
+                        <li>单个词元的运算只用到<strong>激活</strong>那部分。所以响应速度与单价跟着激活参数走</li>
+                        <li>有观测显示，记住的事实量更贴着总量一侧。这也是这次的提案把 MoE 按总参数口径换算的依据</li>
+                        <li>于是<strong>又快又便宜却知道得多</strong>的组合成为可能，这是旧直觉解释不了的位置。何况从外部连密集型还是混合型都分不出来，这次的方法也明确写着无法作此区分</li>
+                    </ul>
+                    <p>正因如此，用<strong>多少 B</strong> 这样一个数字去说的那一刻，就已经把其中一侧说错了。说总量，就在速度与单价上给出错误预期；说激活量，就在部署成本与知识广度上给出错误预期。至少写上两个数字，句子才立得住。架构为什么朝这个方向走，在<a href="llm_architecture_kv_cache_trends_2026.html">LLM架构最新动向2026</a>里谈过。</p>
+
+                    <h2>8. 估计常常出错的四条路</h2>
+                    <p>测量方法再精细，被测的对象不肯待着不动，结果就会偏。真正把估计打垮的，多半不是方法论，而是下面这四样。</p>
+                    <ul>
+                        <li><strong>蒸馏</strong> — 用大模型的输出去教小模型，小模型就会显出与自身规模不相称的能力。从能力通向规模的回归线在这一点上被掰弯</li>
+                        <li><strong>量化与服务优化</strong> — 同样的权重以更低精度运行，内存占用与速度都会变。想从延迟读规模的尝试，会在这里拾到系统性误差</li>
+                        <li><strong>路由</strong> — 一个名字后面可能站着好几个模型。短而简单的查询走轻量后端、困难查询走重型后端时，究竟测到了什么，取决于查询的构成</li>
+                        <li><strong>版本更替</strong> — 端点名保持不变而里面的东西被更新，这是会发生的。上个月的测量值属于上个月的模型，没有任何东西保证它今天仍然成立</li>
+                    </ul>
+                    <p>上面还要再压一条。我们通过 API 遇到的，通常不是模型本身，而是<strong>叠了系统提示词、工具调用与检索增强的产品</strong>。答对了某个事实，不等于那个事实原本就在权重里。对基于知识的估计来说，这个区分是致命的。</p>
+                    <p>所以从外部得到的测量值必须带上<strong>日期、端点与配置</strong>。缺了这三样就没法复核，而无法复核的数字不是依据。</p>
+
+                    <h2>9. 该怎样拿捏推定值</h2>
+                    <p>那么该信到哪一步。准则可以缩成一句：<strong>没有范围与前提的数字不用。</strong></p>
+                    <p>先对误差倍数究竟意味着什么建立感觉，判断就容易了。假设某方法的一般误差在 1.5 倍上下，那么三千亿量级这个推定，意思是大约在两千亿到四千五百亿之间。这个宽度<strong>用来划量级绰绰有余，用来比较供应商则完全不够。</strong>同一方法给出的两个推定若相差 1.3 倍，那不是差异，是噪声。</p>
+                    <table>
+                        <thead>
+                            <tr><th>遇到推定值时该问的</th><th>若没有答案</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>说的是总参数还是激活参数</td><td>不拿它与其他推定值作比较</td></tr>
+                            <tr><td>什么时候测的</td><td>当作没有保质期的值处理，也就是不引用</td></tr>
+                            <tr><td>作为基线的模型集合是什么</td><td>该集合之外属于外推，可信度大幅下调</td></tr>
+                            <tr><td>报告的误差是多少</td><td>不当作点估计来读，只用于判断量级</td></tr>
+                            <tr><td>是否对拒答与安全过滤做了校正</td><td>只当作下限来读</td></tr>
+                            <tr><td>中间是否夹着检索或工具调用</td><td>不解释为模型自身的性质</td></tr>
+                        </tbody>
+                    </table>
+                    <p>就算是通过了这张表的推定值，能说的话也有限。<strong>这个模型大致处在某个量级</strong>是上限；<strong>这个模型有多少 B</strong> 则不论出自何处都已越界。引用时把原作者附上的条件摘掉、只搬走数字，那一刻，谨慎做出的推定就变成了没有依据的事实。实际上大部分污染并非发生在方法论，而是发生在<strong>引用这一步</strong>。</p>
+
+                    <h2>10. 该用什么代替规模去测</h2>
+                    <p>回到前面搁下的话。问规模的问题里，相当一部分其实是别的问题。而那些别的问题，多半<strong>可以直接测量，甚至更容易</strong>。</p>
+                    <ul>
+                        <li><strong>自己工作里的准确率</strong> — 几十条规模的自建评测集就足以起步。它比任何公开排行榜都更直接地回答引入决策</li>
+                        <li><strong>失败的类型与频率</strong> — 比起错得多不多，怎么错更要紧。悄无声息地错与直接拒答，应对方式完全不同；而触发安全过滤的比例随业务性质差得很远，却与规模无关地左右着产品质量</li>
+                        <li><strong>每项任务的成本</strong> — 看的是完成一项工作的总花费，而不是词元单价。这个数字要把重试与冗长的思考过程都算进去才有意义</li>
+                        <li><strong>延迟的分布</strong> — 不看平均，拆成 p50 与 p95 来看。用户感受到的是尾部</li>
+                        <li><strong>有效上下文</strong> — 看的不是标称长度，而是在那个长度上质量是否撑得住。两者常常不同</li>
+                        <li><strong>对替换的耐受度</strong> — 模型被悄悄更新之后还撑得住吗。手里攥着一套回归用例，至少能在事后察觉更新发生过</li>
+                    </ul>
+                    <p>这份清单上的值有个共同点。<strong>可以自己动手重新测，对象一变，值也跟着变。</strong>从外部估出来的参数量两条都不满足。评测集要怎么起步，另写在<a href="llm_evals_practical_faq.html">没有定义失败的评估只会产出数字</a>里。</p>
+                    <p>那规模估计是没用的吗。并非如此。要把握整个市场的格局、要给开放权重阵营走到了哪一步定位、要分辨某项能力是靠规模还是靠数据与训练方法，这类估计是唯一的材料。<strong>只是那个位置是理解产业的位置，不是设计自己系统的位置。</strong>设计上的决定，用自己测出来的值。</p>
+
+                    <h2>未能确认的部分</h2>
+                    <ul>
+                        <li>IKP 所用题目集合的具体构成与题量，未能从公开文章中确认。已公开的只到难度分为七档这一步</li>
+                        <li>报告中约 1.48 倍这个误差出自何种分布假设、是否随规模区间而不同，未能确认</li>
+                        <li>把该方法应用于商用模型所得的数值，本文没有搬运。既无从验证，搬来也等于把带条件的推定当作事实去流通</li>
+                        <li>其他研究团队的复现结果，以及服务条款如何界定结构估计，均未能确认。前者发布时间尚近、后续验证还没有出现；后者各供应方条款不一，本文未逐条比对</li>
+                    </ul>
+
+                    <h2>结论: 留下的三件事</h2>
+                    <p>从外部测量内部，原理上是<strong>从多种原因的合成信号中把其中一个拣出来</strong>的工作。只要其余变量固定不住，答案就以区间而非点的形式出现。接受这一点，对待推定值的态度也就理顺了。</p>
+                    <ul>
+                        <li><strong>先定下说的是哪一种规模。</strong>自从总量与激活量分家之后，没有这个共识，任何比较都不成立</li>
+                        <li><strong>不引用缺少范围与前提的数字。</strong>摘掉条件的引用制造了绝大部分污染</li>
+                        <li><strong>决定要用自己测出来的值。</strong>准确率、每任务成本、尾部延迟不知道规模也测得出来，而知道了规模它们也不会因此得到回答</li>
+                    </ul>
+                    <p>用记忆量去读量级之所以有意思，不是因为它准，而是因为<strong>它在价格与延迟晃动得最厉害的地方，挑了一个相对不那么晃的信号</strong>。好的估计不来自猜中答案，而来自知道哪块地面更稳。而知道这一点的人，不会因为给自己的推定值加上范围而觉得难为情。</p>
+
+                    <h2>参考资料</h2>
+                    <ul>
+                        <li>Trillion Labs - Estimating Closed-Source LLM Parameters: <a href="https://blog.trillionlabs.co/posts/estimating-closed-source-llm-parameters/" target="_blank" rel="noopener">blog.trillionlabs.co/posts/estimating-closed-source-llm-parameters</a> (确认于 2026-08-29)</li>
+                        <li>GeekNews 话题 32977 - 测量黑盒 LLM 规模的方法: <a href="https://news.hada.io/topic?id=32977" target="_blank" rel="noopener">news.hada.io/topic?id=32977</a> (确认于 2026-08-29)</li>
+                        <li>BrainDetox - <a href="ai_inference_price_decline.html">推理单价一直在降，账单却没变</a></li>
+                        <li>BrainDetox - <a href="inference_hardware_tradeoffs.html">选推理硬件时真正拉开差距的是什么</a></li>
+                        <li>BrainDetox - <a href="llm_architecture_kv_cache_trends_2026.html">LLM架构最新动向2026</a></li>
+                        <li>BrainDetox - <a href="llm_evals_practical_faq.html">没有定义失败的评估只会产出数字</a></li>
+                    </ul>
+
+                </div>
+
+                <div class="share-section">
+                    <h3>分享本文</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">返回列表</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/nginx_generator.html">Nginx 配置生成器</a></li>
+      <li><a href="../static/ssh_config_generator.html">SSH config生成器 2026</a></li>
+      <li><a href="../static/iptables_generator.html">iptables 防火墙规则生成器</a></li>
+      <li><a href="../static/code_image.html">代码图片生成器</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+<!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="unsloth_local_ai_toolchain.html">在本地跑模型并训练它这个选择 - VRAM、量化与数据实际索取的代价 2026</a></li>
+      <li><a href="llm_evals_practical_faq.html">没有定义失败的评估只会产出数字 - 为自己的产品搭建LLM评估 2026</a></li>
+      <li><a href="opus5_collaboration_friction.html">模型变强了却更难协作的原因 - 能力与协作适配是两条不同的轴 2026</a></li>
+      <li><a href="ai_coding_cost_management_guide.html">在组织层面控制AI编程费用 - 预算·路由·缓存·网关 2026</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制！请粘贴到Threads应用中分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制！');});
+    });
+    </script>
+</body>
+</html>

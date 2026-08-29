@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DNS 缓存告诉我们的事 - 把什么放在哪里、放多久 2026</title>
+    <meta name="description" content="缓存归根结底是把什么放在哪里、放多久的问题。本文逐一梳理作为契约的 TTL、从浏览器到权威服务器的四个层级、大规模解析器的内存瓶颈、淘汰策略的陷阱与度量口径、否定缓存与拼写错误，以及缓存把发布与回滚绑住的那段时间与代价。">
+    <meta name="keywords" content="DNS 缓存, TTL, 递归解析器, 权威服务器, 否定缓存, NXDOMAIN, 缓存层级, 淘汰策略, LRU, LFU, 缓存命中率, serve-stale, RFC 2308, RFC 8767, DNS 内存优化">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/dns_cache_optimization.html">
+
+    <meta property="og:title" content="DNS 缓存告诉我们的事 - 把什么放在哪里、放多久 2026">
+    <meta property="og:description" content="作为契约的 TTL、分成四层的缓存、决定丢弃什么的问题，以及缓存悄悄绑在发布与回滚上的时间。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/dns_cache_optimization.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-08-29">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="DNS 缓存告诉我们的事 - 把什么放在哪里、放多久">
+    <meta name="twitter:description" content="作为契约的 TTL、四层缓存、淘汰策略的陷阱，以及缓存绑住的时间。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "DNS 缓存告诉我们的事 - 把什么放在哪里、放多久 2026",
+      "alternativeHeadline": "What DNS Caching Teaches - Where to Keep What, and for How Long",
+      "datePublished": "2026-08-29",
+      "dateModified": "2026-08-29",
+      "inLanguage": "zh-CN",
+      "articleSection": "开发/基础设施",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "DNS 缓存, TTL, 递归解析器, 否定缓存, NXDOMAIN, 缓存层级, 淘汰策略, 缓存命中率, serve-stale",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/dns_cache_optimization.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "DNS 缓存只保存名字和地址吗？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "不是。缓存的单位不是一行地址，而是对一次查询的完整应答。名字、记录类型与类别的组合构成键，值里除了应答本体，还带有创建时刻、剩余寿命之类的管理信息。同一个名字下的 A 与 AAAA 是两个独立条目，用于邮件投递的 MX、指示委派的 NS、承载校验字符串的 TXT、限制证书签发的 CAA 也各自单独缓存。更重要的是，不存在这一事实同样会被缓存。名字不存在的答复，以及名字存在但没有该类型记录的答复，两者都在缓存范围内，这就是否定缓存。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "TTL 由谁决定，调短之后什么会变贵？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "由运营权威服务器的一方，也就是域名所有者，逐条记录决定。解析器承诺不会超过这个时长复用答案。RFC 2181 明确写道，TTL 是最长存活时间而不是强制存活时间，因此解析器把它截得更短是符合规范的。调短之后变更传播更快，但发往权威服务器的查询会增加，未命中变得频繁，名字解析的往返会直接落到用户的体感上。权威服务器出故障时缓存很快清空、影响更早抵达，也属于要付的代价。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "为什么重启浏览器有时能看到变更、有时看不到？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "因为缓存不止一层。应用自身的缓存、操作系统的存根解析器，以及递归解析器，各自都握着一份答案。重启浏览器只清掉第一层，下面两层原封不动。递归解析器的缓存尤其如此，它是使用该解析器的所有人共享的，个别用户无法清空，只能等剩余寿命走完。有的人看到新地址、有的人还看到旧地址，多半就源于这里。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "不存在的名字也会被缓存吗？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "会。这正是 RFC 2308 所定义的否定缓存。否定答复的寿命来自随应答一同返回的 SOA 记录，文档规定该条目的 TTL 取 SOA 的 MINIMUM 字段与 SOA 自身 TTL 中较小的一个。同一份文档提到，一到三小时的取值被证明运作良好，超过一天的取值出现过引发问题的情况；并指出如果所有解析器都实现否定缓存，互联网上相当一部分 DNS 流量将被消除。若有程序因拼写错误或过期配置反复查询不存在的名字，这些错误答复就会占住缓存席位。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "命中率高就说明缓存是健康的吗？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "单看命中率无法判断。只要少数热门名字撑起了整体查询量，其余全部落空，比率照样很高。真正要看的是落空那一侧的性质。是从未被请求过因而本来就不可能命中，还是曾经在缓存里但寿命到期而消失，抑或是因位置不够被挤出去之后又被请求，三者对应的处方完全不同。第三类在增加，就该查看容量与淘汰策略；第二类占多数，问题则在 TTL 那一侧。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/dns_cache_optimization.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/dns_cache_optimization.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/dns_cache_optimization.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/dns_cache_optimization.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/dns_cache_optimization.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "首页",
+      "item": "https://braindetox.kr/zh/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "开发/基础设施",
+      "item": "https://braindetox.kr/zh/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "DNS 缓存告诉我们的事 - 把什么放在哪里、放多久 2026",
+      "item": "https://braindetox.kr/zh/posts/dns_cache_optimization.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="DNS 缓存告诉我们的事 - 把什么放在哪里、放多久 2026">
+                <meta itemprop="datePublished" content="2026-08-29">
+                <meta itemprop="dateModified" content="2026-08-29">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="DNS 缓存, TTL, 递归解析器, 否定缓存, 淘汰策略, 缓存命中率">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/dns_cache_optimization.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">DNS 缓存告诉我们的事 - 把什么放在哪里、放多久</h1>
+                    <h2 class="post-subtitle">作为契约的 TTL、分成四层的缓存、决定丢弃什么的问题，以及缓存悄悄绑在发布与回滚上的那段时间</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-08-29">2026年8月29日</span>
+                        <span class="post-category" itemprop="articleSection">开发/基础设施</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+                    <h2>引言：从 953 字节到 420 字节，以及随之而来的问题</h2>
+                    <p>发布刚完成，有人看到的是新页面，有人看到的还是旧页面。代码一样，服务器也一样。唯一不同的是<strong>这个人的机器在把名字换成地址时跑了多远</strong>。处理缓存这件事，一半的门道都藏在这一句话里。</p>
+                    <p>眼下正好有个由头。Cloudflare 在技术博客上公开了它如何压缩自家 DNS 平台上每条缓存条目占用的内存。按该公司的说法，这个平台支撑着包括 1.1.1.1 在内的多项 DNS 服务，<strong>在任一时刻都持有超过 2,500 亿条缓存条目</strong>。经过五项优化，<strong>在其自家基准测试中，单条条目内存从 953 字节降到 420 字节，减少 56%</strong>。</p>
+                    <p>被当作标题传播的<strong>100TB</strong>，值得把它究竟是什么对什么讲清楚。原文的表述是：<strong>在其服务器群（fleet）范围内，这些改动总共释放了约 100 TB 内存，相当于其第 13 代服务器 130 台的 RAM 容量</strong>。这不是单台机器省下的量，不是某个数据中心的数字，也不是某段时间累计出来的量，而是<strong>横跨众多机器的合计值</strong>。这个值究竟是峰值还是平均值、服务器群总共有多少台，原文并未说明。单条 953→420 字节同样<strong>来自基准测试而非生产环境测量</strong>；生产环境的数字是另外给出的 — 实例常驻内存 p99 从 9.3 GB 降到 5.3 GB，而原文自己就注明<strong>常驻内存里除了缓存还混着其他进程数据</strong>。以上全部是<strong>该运营方自行公布的数值</strong>，并非经第三方核验的数据。</p>
+                    <p>产品的部分到此为止。这篇文章不打算推荐你使用哪一家 DNS 服务。真正有意思的是他们撞上的那个问题的形状。<strong>缓存归根结底就是把什么放在哪里、放多久</strong>，而 DNS 正是这三个决定显现得最清楚的地方。下面逐一走一遍。如果想弄清名字究竟握在谁手里，可以把<a href="nameserver_delegation_trust.html">域名服务器委派与信任的层级</a>放在旁边；想看同样的原理在图片上如何体现，可参考<a href="image_cdn_optimization.html">决定图片分发的那些因素</a>。</p>
+
+                    <h2>1. DNS 缓存实际保存的是什么</h2>
+                    <p>如果你把 DNS 缓存理解成<em>一个名字对一个地址</em>的表格，那就偏了一半。缓存的单位不是地址，而是<strong>对一次查询的完整应答</strong>。</p>
+                    <p>作为键的是三样东西的组合：<strong>名字</strong>、<strong>记录类型</strong>、<strong>类别</strong>。同一个名字下，问 IPv4 地址的 A 与问 IPv6 的 AAAA 是两个条目。一个在缓存里、另一个不在，是完全正常的状态。</p>
+                    <ul>
+                        <li><strong>A 与 AAAA</strong> — 名字对应的地址。最常见，也是变动最频繁的一条轴。</li>
+                        <li><strong>CNAME</strong> — 指向另一个名字的别名。顺着走下去会多出一次查询。</li>
+                        <li><strong>NS</strong> — 这个区由谁负责。委派路径本身就会被缓存。</li>
+                        <li><strong>MX</strong> — 邮件送往何处。变动频率很低，但一旦出错投递就停。</li>
+                        <li><strong>TXT</strong> — 所有权证明、邮件策略之类的字符串。校验流程常常挂在这上面。</li>
+                        <li><strong>SOA</strong> — 区的基准信息。后面要讲的<strong>否定答复的寿命</strong>就出自这里。</li>
+                        <li><strong>CAA</strong> — 哪些证书机构可以为这个名字签发证书。</li>
+                    </ul>
+                    <p>值这一侧也不是一行地址。应答的三个区段 — 回答、权威、附加 — 整块存入，再附上管理信息。Cloudflare 在介绍自家结构时举的例子也是同一个形状：值里除了应答本体，还装着<strong>创建时刻</strong>、<strong>命中次数</strong>与<strong>剩余寿命（TTL）</strong>。命中次数为什么有用，第 5 节会再出现。</p>
+                    <p>还有一项最容易被忘掉。<strong>不存在这件事同样会被保存。</strong>名字不存在的答复，与名字存在但没有该类型记录的答复，是两种不同的情形，两者都在缓存范围内。这叫否定缓存，至于它为什么是<em>稳定性</em>问题而非性能问题，第 8 节单独来看。</p>
+
+                    <h2>2. 作为契约的 TTL — 权威服务器定，解析器守</h2>
+                    <p>在缓存里放多久，不由持有缓存的一方决定。<strong>由发布记录的一方，也就是域名所有者决定。</strong>随应答返回的 TTL 就是这个值，解析器承诺不超过这段时间复用答案。所有权与保存期限分属两方，这一点几乎决定了 DNS 缓存的全部性格。</p>
+                    <p>不过这份契约只在一个方向上严格。RFC 2181 明确写道，<strong>TTL 是最长存活时间而非强制存活时间</strong>，实现可以对收到的值设上限。解析器把一天的 TTL 截成一小时，是在规范之内的；反过来延长则属于违约。同一份文档定下的其他规则，在实务中也常撞见。</p>
+                    <ul>
+                        <li>同一组（RRSet）内的所有记录<strong>必须携带相同的 TTL。</strong>取值不一致会造成只有一部分留在缓存里的半截状态。</li>
+                        <li>TTL 是无符号值，<strong>最大为 2,147,483,647</strong>。32 位字段中只使用低 31 位。</li>
+                        <li>最高位被置起的 TTL <strong>必须按 0 处理</strong>。这是防止一个错误的巨大值永远留存的护栏。</li>
+                        <li><strong>TTL 为 0 意味着不要缓存。</strong>这是最短的寿命，每次都要走到源头。</li>
+                    </ul>
+                    <p>所以定 TTL 不是挑一个数字，而是<strong>挑一笔交易</strong>。得到什么、交出什么，分野如下。</p>
+                    <table>
+                        <thead>
+                            <tr><th>观察的轴</th><th>TTL 调短</th><th>TTL 调长</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>变更生效速度</td><td>快。切换与回滚来得及</td><td>慢。旧答案还要活那么久</td></tr>
+                            <tr><td>权威服务器负载</td><td>查询增加，并随流量成比例放大</td><td>大多在缓存终结，根本不会抵达源头</td></tr>
+                            <tr><td>用户体感</td><td>未命中频繁，解析往返直接压在页面前面</td><td>解析开销几乎消失</td></tr>
+                            <tr><td>权威服务器故障时</td><td>缓存很快清空，影响迅速抵达</td><td>能撑一阵，但恢复的消息也来得晚</td></tr>
+                            <tr><td>发出了错误的值</td><td>召回很快</td><td>错误答案会流通整整一个窗口</td></tr>
+                            <tr><td>解析器内存</td><td>周转快，不会长期占位</td><td>条目久留，长期占着位置</td></tr>
+                        </tbody>
+                    </table>
+                    <p>表里的两列是<strong>互相交换的关系</strong>。没有哪种设置能白拿一边。实务中出事的地方，通常是把短 TTL 只当成<em>保险</em>而没算负载那一侧的代价；或者反过来，挂着长 TTL 却计划<strong>在故障时用 DNS 做切换</strong>。后者更疼。从决定切换的那一刻起，你得等已经散出去的所有缓存副本过期，流量才真的会挪。</p>
+
+                    <h2>3. 缓存不止一层</h2>
+                    <p>问同一个名字，答案来自哪里每次都可能不同。而<strong>命中在哪一层，体感、清除方式与影响范围全都不一样。</strong></p>
+                    <table>
+                        <thead>
+                            <tr><th>层级</th><th>谁掌控</th><th>影响范围</th><th>如何清除</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>应用或浏览器自带缓存</td><td>那个程序</td><td>一个进程</td><td>重启程序，或用它自己的设置</td></tr>
+                            <tr><td>操作系统存根解析器</td><td>设备管理者</td><td>整台设备</td><td>操作系统提供的功能、重启</td></tr>
+                            <tr><td>递归解析器（内部或公共）</td><td>解析器运营方</td><td>使用该解析器的所有人</td><td>只有运营方能做，用户只能等过期</td></tr>
+                            <tr><td>权威服务器</td><td>域名所有者</td><td>源头，不是缓存</td><td>没有可清的对象，靠 TTL 调控</td></tr>
+                        </tbody>
+                    </table>
+                    <p>第三行解释了大部分麻烦。递归解析器的缓存是<strong>共享资源</strong>。无论你在自己机器上清掉什么，那一层纹丝不动。发布之后人与人看到的页面不同、不同地区生效时间不一，多半都能追到这里，因为每个解析器过期的时刻各不相同。</p>
+                    <p>分层这一事实还强制了一个规划决定。<strong>决定调短 TTL 之后，要以传播完成的时刻为基准做计划，而不是以下决定的时刻。</strong>把 TTL 降到 5 分钟这个改动本身，也是按旧 TTL 到期的先后顺序陆续抵达各个解析器的。旧值若是一天，新值传遍所有人最长要一天。迁移时<strong>提前一天</strong>把 TTL 调短的惯例，正是从这个性质推出来的，并非迷信。</p>
+                    <p>还要补一点。选用哪个递归解析器，不只是响应速度的问题。还有另一条轴：<strong>查询被记录在哪里、依照什么策略处理。</strong>解析器所处的位置能看到某个用户在什么时候查了什么名字，而延迟数字替代不了这条轴。<em>因为快所以用它</em>是只看了两条轴之一得出的结论。各运营方公布的策略与保存期限并不相同，选择的一方应当直接阅读各自的官方文档自行判断。</p>
+
+                    <h2>4. 规模一大，内存先成为墙</h2>
+                    <p>在个人设备上，DNS 缓存的大小不构成话题，几千条条目占几兆字节。可对大规模运营递归解析器的一方来说，这个条目数会来到<strong>几十亿乃至几千亿的量级</strong>。如前所述，Cloudflare 称其平台在任一时刻持有超过 2,500 亿条条目。</p>
+                    <p>在这个规模上，内存按三项之积增长。</p>
+                    <ul>
+                        <li><strong>条目数</strong> — 不同名字与记录类型的组合个数。一个名字会产生多条条目。</li>
+                        <li><strong>单条大小</strong> — 应答本体、键字符串、管理信息，以及数据结构本身的附带开销。</li>
+                        <li><strong>复制</strong> — 同一份缓存分别存在于多个实例与多个站点。一台上省下的字节要乘以台数。</li>
+                    </ul>
+                    <p>第三项就是 100TB 这个数字的真身。每条省下五百字节左右，乘遍整个服务器群得出的合计值，并不意味着某一台机器少用了 100TB。</p>
+                    <p>这里浮出缓存设计一个让人不太舒服的性质。<strong>热门的名字是少数，绝大多数名字用过一次就再也不来。</strong>少数大型服务的名字每秒被查无数次，而它们身后拖着一条长长的尾巴：自动生成的主机名、追踪用的子域、一次性的校验字符串，还有拼写错误。缓存容量里相当一部分被<em>不会再被用到的东西</em>占着。</p>
+                    <p>这是浪费，但也是从缓存的本质直接推出的结果。缓存必须<strong>在不知道接下来会来什么的状态下</strong>作决定。如果事先就能认出那些不会再来的条目，一开始就不会收下它们。于是剩下的问题收窄成一个 — 位置不够时<strong>丢弃什么</strong>。</p>
+
+                    <h2>5. 丢弃什么 — 淘汰策略与它的陷阱</h2>
+                    <p>条目离开 DNS 缓存有两条路。一条是<strong>寿命到期</strong>，一条是<strong>位置不够</strong>。前者是契约，后者是策略。而后者没有标准答案。</p>
+                    <p>Cloudflare 描述自家行为的那句话正好呈现了这个结构：随着查询涌入，缓存一直填到<strong>条目数上限，此时淘汰更旧或更不热门的条目腾出位置</strong>。注意这句描述里同时出现了两个判据。</p>
+                    <ul>
+                        <li><strong>最近是否被用过（LRU）</strong> — 从最久没被碰过的开始丢。实现简单，能很好地跟上近期走势。</li>
+                        <li><strong>被用得有多频繁（LFU）</strong> — 从命中次数最低的开始丢。保护持续的热度。</li>
+                    </ul>
+                    <p>两者各以自己的方式失败。<strong>LRU 的软肋是扫过一遍就走的负载。</strong>当只会被查一次的名字大量涌入时，它们会轮流成为<em>最近使用过的条目</em>，把长期守住位置的热门条目挤出去。刚刚进来、以后再也用不到的东西，赶走了下一刻确定会用到的东西。自动化程序或扫描器批量查询不存在的名字时，这件事真的会发生。</p>
+                    <p><strong>LFU 的软肋在另一端。</strong>曾经热门的条目靠计数长期赖着不走。新起来的名字计数低，还没站稳就被挤掉，缓存于是被冻结在过去。所以实际实现大多不用纯粹的某一种，而是走向<strong>两者混合、给新条目一段试用期，或让计数随时间衰减</strong>。这些都不是<em>白白更优</em>的策略，而是按负载性质来挑的问题。把淘汰逻辑保持在最低限度、选择简单，也依然是有效的设计路线，这一脉思路在<a href="memcached_appreciation_2026.html">一台坚持简单的缓存服务器</a>里另行讨论过。</p>
+                    <p>DNS 还要在此之上叠一个条件。<strong>挑选丢弃对象时，剩余寿命也得一起看。</strong>马上就要过期的条目守不住多久位置；反过来，剩余寿命还长的条目只要仍在被使用，就值得留下。最近性、频度与剩余寿命这三个信号，进入同一个判断。</p>
+
+                    <h2>6. 缩小表示的那一侧 — 同一个值不放两遍</h2>
+                    <p>到这里谈的都是<em>丢什么</em>。还有反方向的做法：<strong>什么都不丢，把同样的东西用更少的字节放下。</strong>如果能在丝毫不牺牲正确性的前提下只压缩体积，这条路永远排在前面。</p>
+                    <p>Cloudflare 公开的五项全属这一脉。细节实现绑在他们的语言与数据结构上，但<strong>思路本身可以搬到任何做缓存的地方。</strong>把该公司列出的项目按理路归拢，大致可以这样读。</p>
+                    <ul>
+                        <li><strong>不携带富余容量</strong> — 日后可能变大的容器，总会预留比实际内容更多的位置。条目进入缓存后内容不再变化，于是把这些可增长容器换成定长表示。原文明确写道，应答一旦存入缓存<strong>此后绝不再修改</strong>，这个不变性正是其余优化的前提。</li>
+                        <li><strong>不把列表拆开</strong> — 把应答的三个区段各做一个列表，每个列表都要付一份管理开销。合并成一个、只标出边界，这份开销就只付一次。</li>
+                        <li><strong>省掉重复的名字</strong> — 一次应答里的记录常常拥有相同的所有者名。与其把同一串字符放很多遍，不如只放一次、其余省略。</li>
+                        <li><strong>不按最大的情形对齐全体</strong> — 能容纳多种形态的类型，通常按<em>最大的那种形态</em>确定大小。把罕见的大形态挪到外面，常见的情形就会变小。</li>
+                        <li><strong>不去重建已经有的表示</strong> — 记录是以传输格式抵达的。与其把它拆成结构体存放，不如保留原始字节序列，需要时再解析。</li>
+                    </ul>
+                    <p>贯穿五项的原则只有一条：<strong>同一份信息不要持有两遍，用不上的余地不要预先买下。</strong>这里也有代价。像最后一项那样压紧的表示，会在<em>读取时</em>付出解析开销。这是以空间换时间的经典交易，只不过在这个案例里，该公司称按其自家基准测试，查询延迟反而从 828 纳秒降到 670 纳秒，减少 19%。原因不难猜：数据变小后能更多地装进处理器缓存，这份收益可能盖过解析开销。<strong>但这是从他们的负载与他们的基准测试里得出的结果</strong>，换一种数据结构未必是同一个方向。</p>
+
+                    <h2>7. 缓存带来的副作用 — 陈旧的答案与被捆住的手脚</h2>
+                    <p>缓存不是白得的加速装置。它是<strong>用一部分正确性换来的时间</strong>，而这笔账偏偏在你最急的时候被追讨。</p>
+                    <ul>
+                        <li><strong>陈旧答案流通的那段时间</strong> — 从改动值的那一刻起，到所有缓存都看到新值为止，最长有一个 TTL 的空窗。在这段区间里，<em>两个答案都有效</em>。</li>
+                        <li><strong>回滚比发布更慢</strong> — 撤回一个错误的值同样要挨这份延迟。你可能五秒就发现了问题，召回却仍要一个 TTL。</li>
+                        <li><strong>故障传播与恢复感知的不对称</strong> — 长 TTL 会替权威服务器的故障遮掩一阵。听上去是好事，但同一个理由也意味着<strong>你已恢复这件事同样迟到</strong>。</li>
+                        <li><strong>部分生效</strong> — 各解析器过期的时刻不同，同一时刻不同用户会去往不同的目的地。会话横跨两代之后，排查会变得棘手。</li>
+                        <li><strong>校验流程被拖住</strong> — 所有权证明、证书签发这类要确认某条记录存在的流程，会撞上被缓存的旧状态。尤其当<em>不存在</em>被缓存下来时，你刚添加的记录会有一阵子看不见。</li>
+                    </ul>
+                    <p>有一种看法认为，完全不用过期答案也不是答案。RFC 8767 整理了<strong>在递归解析器无法刷新信息这一例外情形下使用过期数据</strong>的做法，其判断是：源头挂掉时，给出一个旧答案好过给不出任何答案。文档要求先尝试刷新、确实失败后才使用，并给出推荐值：过期后的保留窗口为<strong>1 到 3 天</strong>，向客户端返回过期答案时附加的 TTL 为<strong>30 秒</strong>。</p>
+                    <p>同一份文档列出的风险也要一并读。签名可能在有效期之外被返回，<strong>针对域名验证型证书的攻击窗口可能被拉宽</strong>，长期持有过期数据还会加重内存压力。一句话，这个功能是<em>卖出新鲜度以买入可用性</em>的选择。它不是开或关的问题，而是哪一种失败对你更贵的问题。</p>
+
+                    <h2>8. 不存在的答案与拼写错误 — 否定缓存做的事</h2>
+                    <p>对不存在名字的查询比想象中多：拼写错误、废弃配置里残留的名字、写坏的自动化，还有专门抛出随机名字的流量。要是每次都把这些查询送到权威服务器，等于<strong>为了取回最没用的答案而走了最贵的路</strong>。</p>
+                    <p>RFC 2308 正面处理了这个问题。文档把否定答复分成两类。<strong>NXDOMAIN</strong> 是所查询的名字本身不存在；<strong>NODATA</strong> 是应答没有报错，但没有所请求类型的记录。两者是不同的情形，理应分开对待。</p>
+                    <p>寿命从何而来？否定答复会带上该区的 SOA 记录，文档规定该条目的 TTL 取<strong>SOA 的 MINIMUM 字段与 SOA 自身 TTL 中较小的一个</strong>。推荐范围也写了下来 — <strong>一到三小时的取值被证明运作良好，超过一天的取值出现过引发问题的情况</strong>。至于效果，文档写道<strong>如果所有解析器都实现否定缓存，互联网上相当一部分 DNS 流量将被消除</strong>。</p>
+                    <p>对运营一方而言，这一节有两重意思。</p>
+                    <ul>
+                        <li><strong>你刚建好的记录看不见，原因就在这里。</strong>只要在建立之前有人查过这个名字，那份否定答复就还留在缓存里。你等待生效的时间不取决于新记录的 TTL，而取决于旧否定应答的剩余寿命。</li>
+                        <li><strong>SOA 的 MINIMUM 是一个容易被遗忘的旋钮。</strong>它在建区时定一次、之后再也不看，实际上却决定了不存在这件事要流通多久。</li>
+                    </ul>
+                    <p>否定缓存污染缓存的机理也值得点明。不存在的名字<strong>彼此互不重合。</strong>近乎随机的名字大量涌入时，条目数就随之膨胀，而按第 5 节所述，它们会成为<em>最近使用过的条目</em>并拿到位置。偏偏这些名字不会被再查一次。否定缓存保护了源头，但这份保护是拿缓存席位这另一项资源付的账。</p>
+
+                    <h2>9. 运营方真正要定的事 — 挑选 TTL 的判据</h2>
+                    <p>这一节不会写<em>设成多少秒</em>。那个数字因名字而异，照搬别人的取值多半不合身。这里放的是<strong>要先回答哪些问题，数字才定得下来</strong>。</p>
+                    <p>基本的轴有两条：<strong>这个名字变得有多频繁</strong>，以及<strong>一个错误的值活着的时间你能承受多久</strong>。这两条定了，其余自然跟上。</p>
+                    <table>
+                        <thead>
+                            <tr><th>先回答这个</th><th>倾向调短的信号</th><th>倾向调长的信号</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>这个名字的目的地变动频率</td><td>扩容与切换确实经常发生</td><td>好几年都指着同一个地方</td></tr>
+                            <tr><td>出错时可承受的时间</td><td>支付、登录这类失败即刻变成成本</td><td>静态资源，短时间看到旧值也无妨</td></tr>
+                            <tr><td>切换靠什么完成</td><td>DNS 是唯一的切换手段</td><td>任播或负载均衡在下层吸收掉了</td></tr>
+                            <tr><td>权威服务器的余量</td><td>查询增加也扛得住</td><td>已经吃紧，或按查询次数计费</td></tr>
+                            <tr><td>近期的变更计划</td><td>迁移窗口已经排定</td><td>短期内不打算动</td></tr>
+                            <tr><td>绑在这条记录上的流程</td><td>证书签发、所有权证明依赖它</td><td>更接近给人看的便利用途</td></tr>
+                        </tbody>
+                    </table>
+                    <p>这张表的用法很简单。<strong>不要给整个域名挂同一个 TTL，按记录的性质分开。</strong>常搬家的服务的 A 记录，与好几年固定不动的 MX 记录，没有理由取同一个值。而如果迁移已经排上日程，就要把第 3 节的性质写进时间表：<strong>调短这件事本身要按旧 TTL 的时长才传得开。</strong></p>
+                    <p>最后再补一条。<strong>短 TTL 不是可用性设计的替代品。</strong>故障时用 DNS 切换的计划，建立在所有缓存都会配合的假设之上，而规范并不为这个假设背书。解析器可以把 TTL 截得更短，却没有必须严格遵守的义务；若启用了使用过期答案的行为，答案会在你所设想的那类例外情形里活得更久。DNS 是<em>宣告</em>切换的手段，不是立刻强制切换的手段。</p>
+
+                    <h2>10. 度量 — 只看命中率会漏掉什么</h2>
+                    <p>缓存看板上挂得最大的就是命中率，可这一个数字说的话少得惊人。<strong>只要少数热门项撑起了整体查询量，其余全部落空，比率照样很高。</strong>90% 是出色还是糟糕，光凭它自己判断不了。</p>
+                    <p>该看的是<strong>落空那一侧的性质</strong>。未命中至少有三种，三者的处方各不相同。</p>
+                    <ul>
+                        <li><strong>第一次到来的请求</strong> — 从未被请求过，本来就不在缓存里。这是躲不掉的未命中；要动它，谈的应该是预加载而不是缓存。</li>
+                        <li><strong>寿命耗尽的条目</strong> — 本来在，过期了。这一类在增加，就该去看 TTL 的设置。</li>
+                        <li><strong>被挤出去的条目</strong> — 过期之前因位置不够被推走，之后又被请求。<strong>这一类在增长，问题就在容量或淘汰策略。</strong>它也是缓存确实被浪费掉的唯一直接信号。</li>
+                    </ul>
+                    <p>还有几项值得一并观察。</p>
+                    <ul>
+                        <li><strong>未命中时的延迟分布</strong> — 看尾部而不是均值。未命中很少但每一次都极贵，体感照样很差。</li>
+                        <li><strong>条目数与内存的关系</strong> — 单条大小是否在悄悄膨胀，只有把这两者放在一起看才看得出来。</li>
+                        <li><strong>否定应答的占比</strong> — 不存在这类答复的份额上升，就该怀疑第 8 节说的污染。</li>
+                        <li><strong>淘汰发生率</strong> — 因过期离场与因被挤出离场，务必分开计数。</li>
+                        <li><strong>从未被复用的条目比例</strong> — 进来之后一次都没再被用到就消失的份额。它最诚实地显示缓存究竟有没有在干活。</li>
+                    </ul>
+                    <p>再补一条度量原则：<strong>比较只有在条件对齐之后才成立。</strong>把缓存预热过的状态与冷启动的状态混在一起测，哪一边的数字都不可信。改了策略就一次只改一样，并把改了什么与量到什么一起留档。</p>
+
+                    <h2>未能确认的事</h2>
+                    <ul>
+                        <li>100TB 究竟是<strong>峰值还是平均值</strong>，以及服务器群总共有多少台，原文没有说明。可确认的只有它是服务器群合计值，以及它折合为第 13 代服务器 130 台的 RAM。</li>
+                        <li>单条 953→420 字节、插入吞吐每秒 62.5 万→89.3 万、查询延迟 828→670 纳秒，全部是<strong>该运营方的自家基准测试</strong>数值。硬件与负载构成在撰写本文时未能确认。</li>
+                        <li>作为生产数值给出的实例常驻内存 p99 由 9.3 降到 5.3 GB，原文自己注明<strong>其中包含缓存之外的进程数据</strong>，不能当作纯粹的缓存节省量来读。</li>
+                        <li>所有数值都是<strong>该运营方自行发布的</strong>，未能找到第三方核验资料。</li>
+                        <li>那 2,500 亿条条目中<strong>实际被复用的比例</strong>并未公开。第 4 节关于长尾的论述基于缓存的一般性质，而非该平台的实测值。</li>
+                        <li>原文<strong>没有讨论否定缓存与 NXDOMAIN。</strong>第 8 节的内容完全来自 RFC 2308。</li>
+                    </ul>
+
+                    <h2>小结</h2>
+                    <p>缓存设计可以压缩成三个决定：<strong>放在哪里、放什么、放多久。</strong>DNS 之所以是好教材，是因为这三者分别握在不同主体手里。放在哪里由各层不同的人决定，丢弃什么由解析器运营方决定，放多久由域名所有者决定。三者一旦错位，缝隙里就长出<em>人与人看到不同页面</em>的现象。</p>
+                    <p>可以带走的有三点。第一，<strong>TTL 是契约而不是性能开关。</strong>调短所得与所失分列在那张表的两侧，只看一侧作决定，必定从另一侧被追账。第二，<strong>内存成为瓶颈时，答案有两个方向</strong> — 决定丢弃什么，或者把同样的东西放得更小。不损害正确性的那一条永远排在前面。第三，<strong>命中率是问题的开始而不是结论。</strong>漏掉了什么、为什么漏掉，才决定处方。</p>
+                    <p>下次再听到发布生效因人而异，先别急着找原因，用一句话回答：<strong>此刻还握着旧答案的是哪一层。</strong>光是把那一层指认出来，能做什么与做不了什么就分清楚了。</p>
+
+                    <h2>参考资料</h2>
+                    <ul>
+                        <li><a href="https://blog.cloudflare.com/dns-cache-memory-optimization-1111/" target="_blank" rel="noopener">Cloudflare - How we cut DNS cache memory usage</a> — 引出本文的公开文章（含其自行发布的数值）</li>
+                        <li><a href="https://www.rfc-editor.org/rfc/rfc2181.html" target="_blank" rel="noopener">RFC 2181 - Clarifications to the DNS Specification</a> — TTL 取值范围与 RRSet 规则</li>
+                        <li><a href="https://www.rfc-editor.org/rfc/rfc2308.html" target="_blank" rel="noopener">RFC 2308 - Negative Caching of DNS Queries</a> — NXDOMAIN、NODATA 与否定缓存寿命</li>
+                        <li><a href="https://www.rfc-editor.org/rfc/rfc8767.html" target="_blank" rel="noopener">RFC 8767 - Serving Stale Data to Improve DNS Resiliency</a> — 使用过期答案的条件与风险</li>
+                        <li><a href="https://news.hada.io/topic?id=32955" target="_blank" rel="noopener">GeekNews 话题 32955</a></li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>分享本文</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">返回列表</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/json_formatter.html">JSON 格式化工具</a></li>
+      <li><a href="../static/regex_tester.html">正则表达式测试器</a></li>
+      <li><a href="../static/jwt_decoder.html">JWT解码生成器 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 编码器/解码器</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+<!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="terminal_file_manager_role.html">处理文件时画面究竟做了什么 - 终端文件管理器填补的位置</a></li>
+      <li><a href="agent_secret_handling.html">不把凭据交给智能体也能让它干活 - 密钥与上下文的分离</a></li>
+      <li><a href="git_storage_at_scale.html">Git 在大规模下变慢的地方 - 深度、宽度、体积这三条扩展轴 2026</a></li>
+      <li><a href="weekday_calculation_algorithms.html">求星期几为什么需要公式 — 把日历搬进代码这件事 2026</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制！请粘贴到Threads应用中分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制！'); });
+    });
+    </script>
+</body>
+</html>
