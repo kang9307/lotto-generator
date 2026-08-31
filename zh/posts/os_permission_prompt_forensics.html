@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<!--
+ * 技术博客文章模板
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>权限提示是结果 - 逆向追踪触发该API的代码路径</title>
+    <meta name="description" content="没有照片代码的应用却弹出照片权限窗口，那不是应用主动请求的，而是某条路径碰到了受保护的资源。本文把提示当作结果，梳理从复现条件到调用栈逐步缩小原因范围的顺序，说明权限模型为何落在应用这一级，以及开发者能实际减少的部分。">
+    <meta name="keywords" content="权限提示, macOS TCC, 隐私权限, 权限调试, 调用栈, 代码路径追踪, 照片权限, 应用沙箱, 运行时权限, 依赖权限, 最小权限, 权限模型, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/os_permission_prompt_forensics.html">
+
+    <meta property="og:title" content="权限提示是结果 - 逆向追踪触发该API的代码路径">
+    <meta property="og:description" content="该问的不是为什么是这个应用，而是哪条代码路径碰到了那个资源。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/os_permission_prompt_forensics.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-08-31">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="权限提示是结果">
+    <meta name="twitter:description" content="一个没有任何照片代码的应用请求了照片权限。原因藏在提示之下很深的地方。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "权限提示是结果 - 逆向追踪触发该API的代码路径",
+      "alternativeHeadline": "A Permission Prompt Is an Effect - Tracing Back the Code Path",
+      "datePublished": "2026-08-31",
+      "dateModified": "2026-08-31",
+      "inLanguage": "zh-CN",
+      "articleSection": "开发/基础设施",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "权限提示, macOS TCC, 隐私权限, 权限调试, 调用栈, 代码路径追踪, 依赖权限, 最小权限, 权限模型",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/os_permission_prompt_forensics.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "应用里一行照片代码都没有，也会弹出照片权限窗口吗",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "会。弹出提示的主体不是应用，而是操作系统。窗口并非只有在应用调用照片框架时才出现，而是在进程碰到被标记为受保护的资源那一刻，系统拦下这次访问并询问用户。资源不是按框架划分的，而是按路径和服务标识符逐项标记的。所以一次普通的文件打开操作，只要那条路径被标记成照片服务，同样会拉起照片权限窗口。从应用角度看，它只是打开了一个文件，照片这个API名称在代码里根本不存在。屏幕上的那句话和代码里写的东西看起来对不上，原因就在这里。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "为什么「这个应用为什么要」是一个错误的起点",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "这个问题把应用假定成一个有单一意图的行为者。真实的进程不是这个形状。你自己的代码、框架、插件、系统对话框、后台任务，都在同一个进程里共享同一套权限运行。操作系统能看到的是这一整块，应用名只是贴在这块上的标签。能问出答案的问题不是为什么是这个应用，而是哪条代码路径碰到了那个资源。前一种问法在追问意图，所以一旦确认代码里没有照片这个词就走进了死胡同。后一种问法针对的是可观测的事实，而且在提示还挂在屏幕上的那一刻，答案就留在进程里面。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "我没用过的权限，库会替我请求吗",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "会。安卓官方文档在建议开发者审查第三方库和SDK所需权限的同时，明确指出来自库的权限请求在用户看来是来自你的应用，而不是来自那个库。请求的来源和责任的归属在这里分开了。常见路径有三条。第一，像文件列举、目录体积统计这类通用工具会遍历文件夹，连受保护的路径一起遍历。第二，仅仅是链接了某个框架，初始化时相关组件就被唤醒。第三，系统提供的文件选择界面这类在应用进程之外运行的组件参与了进来。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "拒绝权限窗口之后，应用会怎么样",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "只有对该资源的访问会失败，应用本身继续运行。但失败以什么形式返回，因资源而异。有时返回空列表，有时返回权限错误，如果是按路径访问，就只有那条路径读不到。拒绝的真正代价，取决于应用有没有预料到这次失败。预料到的应用会把那一块留空，其余功能照常提供。没有预料到的应用会出现列表为空、进度停住，或者反复弹出同一个窗口。这个决定随时可以在系统设置的隐私项里改回来，而且改完之后往往需要重启应用才会生效。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "开发者要怎么减少不必要的权限窗口",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "有三点。第一，不链接用不到的权限，把依赖带进来的权限也一并算上，只留下真正需要的。第二，在需要的那一刻再问。安卓官方文档建议在用户开始使用该功能时请求，而不是在应用启动时。第三，提前说明为什么需要。苹果要求访问照片图库的应用在应用信息文件里声明说明理由的文案，没有这段文案，应用在访问时会退出。在这三点之上还要加一条。如果有遍历文件夹的后台任务，就把受保护的路径从目标清单里去掉。这和让权限界面失效的方向正好相反，属于一开始就不去碰用不到的数据。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/os_permission_prompt_forensics.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/os_permission_prompt_forensics.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/os_permission_prompt_forensics.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/os_permission_prompt_forensics.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/os_permission_prompt_forensics.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "首页",
+      "item": "https://braindetox.kr/zh/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "开发/基础设施",
+      "item": "https://braindetox.kr/zh/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "权限提示是结果 - 逆向追踪触发该API的代码路径",
+      "item": "https://braindetox.kr/zh/posts/os_permission_prompt_forensics.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="权限提示是结果 - 逆向追踪触发该API的代码路径">
+                <meta itemprop="datePublished" content="2026-08-31">
+                <meta itemprop="dateModified" content="2026-08-31">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="权限提示, macOS TCC, 隐私权限, 权限调试, 调用栈, 代码路径追踪, 依赖权限, 最小权限, 权限模型">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/os_permission_prompt_forensics.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title">一个没有任何照片代码的应用请求了照片权限</h1>
+                    <h2 class="post-subtitle">该问的不是为什么是这个应用，而是哪条路径碰到了那个资源</h2>
+                    <div class="post-meta">
+                        <span class="post-date">2026年8月31日</span>
+                        <span class="post-category">开发/基础设施</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <nav class="post-toc">
+                        <h3>目录</h3>
+                        <ol>
+                            <li><a href="#sec-1">提示是结果，扣扳机的另有其人</a></li>
+                            <li><a href="#sec-2">为什么「这个应用为什么要」问不出答案</a></li>
+                            <li><a href="#sec-3">依赖替你发起了请求</a></li>
+                            <li><a href="#sec-4">缩小嫌疑范围的顺序</a></li>
+                            <li><a href="#sec-5">调用栈能告诉你什么，不能告诉你什么</a></li>
+                            <li><a href="#sec-6">权限模型为什么落在应用这一级</a></li>
+                            <li><a href="#sec-7">那句话在用户那边到底意味着什么</a></li>
+                            <li><a href="#sec-8">开发者该做的事</a></li>
+                            <li><a href="#sec-9">在别的平台上重复出现的同一结构</a></li>
+                            <li><a href="#sec-10">没能确认的部分</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2>引言：代码里没有的词出现在了屏幕上</h2>
+                    <p>在开发一个文件管理器，打开主目录，系统弹出提示说应用正在尝试访问照片图库。代码里跟照片相关的东西一个都没有，没链接过框架、没做图像处理，把整个源码翻一遍也找不到那个词。可是每次打开主目录，同样的窗口又回来了。最近有开发者真的踩到这个坑，并把追踪过程公开了出来。先说结局：真凶是一个叫 <code>~/Library/Photos</code> 的目录，而应用只不过打开了一个文件夹。</p>
+                    <p>有意思的不是结局，而是<strong>问题的形状发生了什么变化</strong>。最初的问题是我的应用为什么要看照片。这个问题问不出答案。代码里没有照片这件事已经确认过了，越查越往迷宫里走。真正问出答案的是另一个问题。<strong>哪条代码路径碰到了受保护的资源？</strong>这个转变就是本文的全部。</p>
+                    <p>而且这个转变不只属于 macOS。在安卓上、在浏览器里、在 Windows 上，同样形状的困惑一再重演。屏幕上挂着应用的名字，原因却不在这个应用亲手写的代码里，而在更下面的层。<strong>提示不是原因，是结果。</strong>要找原因，就不能顺着结果指的方向走，而要往它下面钻。</p>
+                    <div class="callout">
+                        <p style="margin:0;">先说清楚一点。本文<strong>不包含让权限窗口不再出现的办法</strong>，也不涉及关闭或绕过隐私保护的步骤。它走的是相反的方向：窗口弹出来之后，<strong>怎么查清是什么把它召唤出来的</strong>，以及查清之后能修什么。在不知道原因的情况下只让窗口消失，那不是修好了，是盖住了。</p>
+                    </div>
+
+                    <h2 id="sec-1">1. 提示是结果，扣扳机的另有其人</h2>
+                    <p>很多开发者把权限提示理解成<strong>因为应用请求了才出现的界面</strong>。调用请求函数，窗口弹出，用户一按，结果通过回调返回。这个模型只对了一半。对的那一半是显式请求 API，错的那一半是：<strong>确实存在没调用却照样弹出</strong>的情况。</p>
+                    <p>从操作系统那边看，结构长得不一样。macOS 和 iOS 的隐私管理子系统通常被简称为 TCC，它做的事不是接收应用的请求然后弹窗，而是<strong>在进程碰到被标记为受保护的资源那一刻把它拦下来</strong>。资源按服务标识符分组，照片相关的访问归在一个叫 <code>kTCCServicePhotos</code> 的标识符下。在前面提到的那份追踪记录里，通过系统日志确认到的也就只有这一个标识符。</p>
+                    <p>关键在于，<strong>什么东西属于这个标识符，是由资源清单决定的，不是由框架名决定的</strong>。调用照片框架当然会触发，但不调用照片框架、只要打开清单里的某条路径，一样会触发。打开一个文件的系统调用并不携带处理照片的意图。可一旦越过内核碰到那条路径，判定依据的是<strong>目标</strong>，不是意图。</p>
+                    <p>于是屏幕上的那句话和代码里写的东西之间就出现了裂缝。用户看到的是应用想访问照片图库，而应用实际做的只是遍历了主目录里的目录列表。两句都是事实，彼此并不矛盾，因为它们是<strong>在不同层次上被描述的同一件事</strong>。</p>
+                    <table>
+                        <thead>
+                            <tr><th>实际发生的事</th><th>用户屏幕上出现的</th><th>应用自己知道吗</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>调用照片框架的查询 API</td><td>照片访问请求</td><td>知道，是自己调的</td></tr>
+                            <tr><td>访问受保护清单里的某条路径</td><td>照片访问请求</td><td><strong>不知道</strong>，只是打开了一个文件</td></tr>
+                            <tr><td>依赖在初始化时发起的查询</td><td>以应用名义出现的请求</td><td>不知道，自己代码里没有这个调用</td></tr>
+                            <tr><td>使用系统提供的选择界面</td><td>基本什么都不弹</td><td>知道，本来就不拿权限</td></tr>
+                        </tbody>
+                    </table>
+                    <p>表里出问题的是第二行和第三行。这两行都处在<strong>应用不知道自己碰了什么</strong>的状态。在这里靠重读自己的代码是得不出答案的，因为代码里确实没有那个词。</p>
+
+                    <h2 id="sec-2">2. 为什么「这个应用为什么要」问不出答案</h2>
+                    <p>这个应用为什么要看照片。这是个自然的问题，但这句话<strong>把应用假定成了一个有单一意图的行为者</strong>。卡住的地方就在于这个假定不成立。</p>
+                    <p>一个进程里跑着来自多个源头的代码：你写的代码、语言运行时、UI 框架、包管理器拉进来的库，以及那些库又拉进来的东西。还有系统注入进进程的组件。这些全部<strong>共享同一条权限边界</strong>。在操作系统眼里它们不可区分，就是一个进程，而进程上挂着应用的名牌。</p>
+                    <p>所以权限窗口里的应用名指的是<strong>事情发生在哪条边界之内，而不是谁发起的请求</strong>。在这里问「这个应用为什么要」，就是在追问意图，而意图不在代码里，调查当场结束。反过来这样问，调查才能继续。</p>
+                    <ul>
+                        <li><strong>哪条代码路径碰到了那个资源</strong> — 问的是执行路径，不是意图。这是可观测的对象。</li>
+                        <li><strong>那条路径什么时候执行</strong> — 应用启动时、某个特定界面，还是后台任务。</li>
+                        <li><strong>它以什么为目标</strong> — 是框架调用还是文件路径。如果是后者，是哪一条。</li>
+                        <li><strong>为什么那个东西进了这条路径</strong> — 到这一步才有资格去问设计意图。</li>
+                    </ul>
+                    <p>问题变了，调查方法也跟着变。前一种问法想用搜索源码来回答，而代码里没有那个词，所以失败。后一种问法用<strong>运行中进程的状态</strong>来回答。而且这里有一个决定性的事实：权限提示挂在屏幕上的时候，<strong>召唤它的那条执行流正停在原地等待回应。</strong>证据没有消失，而是被钉在了屏幕上。</p>
+                    <p>这个性质同样适用于别种调试。只要能在症状复现的那一刻抓住状态，根因追踪的难度就降一个档次。追查一个复现不了的重复推送时用的其实是同一条原理，那个案例我在<a href="fcm_duplicate_push_debug_2026.html">重新部署之后昨天的通知又发了一遍</a>里单独写过。</p>
+
+                    <h2 id="sec-3">3. 依赖替你发起了请求</h2>
+                    <p>我没用的功能，库在用。这句话在权限问题上格外难缠，因为<strong>请求的来源和责任的归属分开了</strong>。安卓官方文档把这一点写得很清楚：它建议审查第三方库和 SDK 所需的权限，同时指出<strong>来自库的权限请求在用户看来是来自你的应用，而不是来自那个库</strong>。用户看到的永远是应用名。</p>
+                    <p>实务中这件事发生的路径大致有三条。</p>
+                    <ul>
+                        <li><strong>通用工具不挑对象</strong> — 目录体积统计、文件列举、建索引、备份扫描，这类功能天然要遍历<em>全部</em>。如果一开始就没有排除受保护路径的想法，那些路径也会被一起遍历。开头那个案例正是这一类。</li>
+                        <li><strong>只要链接了就会被唤醒</strong> — 把某个框架放进依赖，初始化时相关组件在准备过程中可能顺带发起查询。哪怕你自己的代码一次都没调用过。</li>
+                        <li><strong>进程外的组件介入</strong> — 系统提供的文件选择界面、分享面板这类在应用之外运行的组件。这一侧多数被设计成不索要权限，但如果不清楚自己用的是哪一种，就无法预测结果。</li>
+                    </ul>
+                    <p>这里要强调一句。面对这类现象，<strong>下结论说那个库在偷偷做什么，多半是错的。</strong>遍历文件夹的代码本来就是为遍历而写的，只是没料到受保护的路径会落在它的范围里。开头那个案例里，出问题的目录甚至不是照片图库的标准位置。苹果说明的照片图库默认位置是主目录下的图片文件夹，而出问题的路径在别处。遍历的那一方本来就没有理由知道它。</p>
+                    <p>所以这一节的结论不是怀疑，而是<strong>清点</strong>。掌握自己的应用最终会索要的全部权限清单，并且能把每一项对应到它来自哪个依赖，这就够了。如果有对应不上的项，那时候再开始调查。</p>
+
+                    <h2 id="sec-4">4. 缩小嫌疑范围的顺序</h2>
+                    <p>从这里开始才是实际操作。核心不是工具怎么用，而是<strong>顺序</strong>。守住顺序，用什么工具都能走到答案；跳过顺序，工具再好也会绕。</p>
+                    <h3>第一步 - 把复现条件固定下来</h3>
+                    <p>首先要做的是造出<strong>最小的复现步骤</strong>。什么时候出现？每次启动、只在打开某个文件夹时，还是过了一段时间之后？这一步要一个一个地去掉条件，看窗口还会不会来。条件越窄，后面所有步骤越轻松。</p>
+                    <p>跳过这一步是最常见的错误。复现不稳定，下一步就等不到可抓的瞬间；抓不住，剩下的就只有猜。</p>
+                    <h3>第二步 - 先分清是哪一类</h3>
+                    <p>接下来确认<strong>这是对什么的请求</strong>，依据的是系统留下的记录，而不是窗口上的文字。在 macOS 上，观察隐私子系统留下的日志，就能看到请求的是哪个服务标识符。前面提到的那份追踪记录，确认到的也就是这个层级。</p>
+                    <p>这里重要的是<strong>知道这份记录只说到哪里为止</strong>。它给出服务标识符，但不会给出扣扳机的是哪条路径。这不是缺陷，而是设计。那份日志不是为应用开发者调试而存在的，而是为系统记录判定而存在的。判定需要的是主体和服务，不是路径。</p>
+                    <h3>第三步 - 在边界处停住</h3>
+                    <p>这一点是转折。既然日志不再多说，那就<strong>直接去看停住的那条执行流。</strong>权限提示挂着的时候，召唤它的线程正卡在系统调用里等待回应。在不关掉窗口的状态下把调试器附加到进程上，那一刻就原样保存着。</p>
+                    <p>开头案例里作者做的正是这件事。他让窗口挂着，抓住进程，确认哪些线程卡在文件打开调用里，然后读出传给那次调用的参数。躺在里面的就是问题目录的路径。</p>
+                    <h3>第四步 - 把调用栈往上读</h3>
+                    <p>知道路径还没完，<strong>是谁把这条路径传进去的</strong>仍然悬着。把停住线程的调用栈从下往上读，就能看到系统调用之上你自己的代码延伸到哪里。这一步的答案会落在三种之一：你的代码直接传的、你调用的某个工具展开的清单里含着它、或者你的代码根本不在栈上。</p>
+                    <table>
+                        <thead>
+                            <tr><th>步骤</th><th>要确认的东西</th><th>过不去时的信号</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>1. 固定复现</td><td>什么时候出现、最小条件是什么</td><td>同样的操作有时弹有时不弹</td></tr>
+                            <tr><td>2. 判别类型</td><td>是对哪个资源的请求</td><td>记录只说到服务就停了</td></tr>
+                            <tr><td>3. 边界处停住</td><td>卡在哪个调用里、目标是什么</td><td>关掉窗口之后才附加，证据没了</td></tr>
+                            <tr><td>4. 逆推调用栈</td><td>调用方往上到哪里还是自己的代码</td><td>栈上一行自己的代码都没有</td></tr>
+                        </tbody>
+                    </table>
+                    <p>表格最后一栏就是信号。第三步里关掉窗口之后再附加，已经晚了。第四步里完全看不到自己的代码，说明原因在进程内的其他组件上，这时调查对象就从自己的源码转向依赖清单。</p>
+
+                    <h2 id="sec-5">5. 调用栈能告诉你什么，不能告诉你什么</h2>
+                    <p>栈很强，但不是万能。要知道<strong>它能被信到哪一步</strong>，才不会把结论下错。</p>
+                    <p>先说它能告诉你的。</p>
+                    <ul>
+                        <li><strong>此刻的调用关系</strong> — 现在停住的这一帧下面站着谁，这是事实，不是推测。</li>
+                        <li><strong>边界处的参数</strong> — 传给系统调用的值原样留在那里，目标就在这里被确定下来。</li>
+                        <li><strong>自己代码在不在</strong> — 栈上有没有你写的函数，是决定下一步方向的关键信息。</li>
+                    </ul>
+                    <p>再说它做不到的。</p>
+                    <ul>
+                        <li><strong>为什么是那个参数</strong> — 那条路径是怎么进清单的，栈上没有。这要靠读源码。</li>
+                        <li><strong>异步之前的历史</strong> — 跨过任务队列过来的流，起点在栈上是断的，因为入队的那一方早就返回了。</li>
+                        <li><strong>被优化掉的帧</strong> — 内联或尾调用整理掉的帧根本看不到，没有和被抹掉无法区分。</li>
+                        <li><strong>没有符号的区段</strong> — 只剩地址的区段最多能认到模块，函数名出不来。</li>
+                    </ul>
+                    <p>所以实务上的结论是两段分工：<strong>用栈确定目标，用源码确认原因。</strong>想只靠一个栈走到结论，在异步边界上必定会得出错误答案。反过来只读源码，就又回到最初那个地方——代码里没有那个词的地方。</p>
+
+                    <h2 id="sec-6">6. 权限模型为什么落在应用这一级</h2>
+                    <p>读到这里会生出一个自然的不满：反正进程里混着多个源头的代码，<strong>为什么不按库来问权限？</strong>那样也就没人能躲在应用名后面了。</p>
+                    <p>这个问题的答案不是技术上的偷懒，而在于<strong>边界能画在哪里</strong>。权限判定要成立，边界必须满足三个性质。</p>
+                    <ul>
+                        <li><strong>必须能强制</strong> — 系统要能挡住边界内侧随意去碰外面的资源。共享同一地址空间的代码之间可以自由读写彼此的内存。就算不给某个库权限，那个库照样可以调用应用代码里的函数去做同一件事。</li>
+                        <li><strong>必须能被人理解</strong> — 权限最终由人来判断。应用名是用户认识的对象，内部的库名不是。让人对着几十个从没见过的名字逐个判断的界面，不是防御，是噪音。</li>
+                        <li><strong>必须能稳定识别</strong> — 应用由签名和包标识符固定下来。依赖每换一个版本就变，名字也会变。你没法把保存下来的决定挂在一个不断变化的对象上。</li>
+                    </ul>
+                    <p>能同时满足这三条的单位，实质上就是<strong>进程以及挂在这个进程上的签名身份</strong>。权限模型收敛到应用这一级是因为这个，而不是没想过要切得更细。</p>
+                    <p>作为代价，这个设计有明确的短板。当进程有多个、或者进程内部本身很异质时，<strong>判定的对象就会模糊。</strong>模糊的方向有两种。</p>
+                    <table>
+                        <thead>
+                            <tr><th>结构</th><th>权限挂在哪里</th><th>模糊掉的是什么</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>单进程、多依赖</td><td>一个应用</td><td>是谁发起的。里面全部看起来像一个</td></tr>
+                            <tr><td>拆成多进程的应用</td><td>各个可执行文件</td><td>对用户是一个应用，决定却可能分岔</td></tr>
+                            <tr><td>系统代跑的选择界面</td><td>系统，而不是应用</td><td>几乎没有。应用只拿到选中的结果</td></tr>
+                            <tr><td>启动器再拉起别的可执行文件</td><td>真正碰到资源的那一方</td><td>可能和用户记忆里授权的对象不是一个</td></tr>
+                        </tbody>
+                    </table>
+                    <p>表里第三行是这一节最实用的一项。<strong>由系统代跑的组件几乎不产生模糊。</strong>选择发生在应用之外，应用只拿到用户选中的东西。这是唯一一种不给应用授权也能让功能成立的结构，所以后面还会再提到。</p>
+                    <p>补一句，从用户那边看，这场关于边界的讨论其实连着所有权与控制权分离的问题。设备里哪些部分属于谁的决定范围，我在<a href="device_ownership_boundaries.html">买下来却不属于你的那部分</a>里另外整理过。</p>
+
+                    <h2 id="sec-7">7. 那句话在用户那边到底意味着什么</h2>
+                    <p>现在换到屏幕的另一侧。此应用想要访问你的照片，用户会怎么读这句话？多半读成<strong>这个应用想看我的照片</strong>。实际范围比这句话既窄又宽。</p>
+                    <p>先说窄的一面：这句话说的是<strong>此时此刻的这一次访问尝试</strong>。应用会怎么用照片、会送到哪里、会留多久，这个窗口一概不保证。窗口只问要不要开门，门里做什么是另一回事。</p>
+                    <p>再说宽的一面：允许通常<strong>按一次就会保留下去。</strong>下次发生同样的访问时窗口不会再弹。所以那一瞬间的判断，效力比感觉上要长得多。而且正如开头的案例所示，被允许的对象可能<strong>比用户想象的更宽，或者根本是另一个地方</strong>。用户想到的是相册，实际目标却是一个被标成那个服务的目录。</p>
+                    <h3>拒绝之后会发生什么</h3>
+                    <p>拒绝不会让应用退出。<strong>只有对那个资源的访问失败</strong>，其余照常运行。但失败以什么形式返回因资源而异，用户看到的结果也就随之分叉。</p>
+                    <ul>
+                        <li><strong>做得好的应用</strong> — 只把那个功能置灰，其余照常提供，等真正需要时再重新说明。</li>
+                        <li><strong>没预料到的应用</strong> — 列表空了，或者进度条卡住。最糟的是看起来<em>什么都没发生</em>，而不是报错。</li>
+                        <li><strong>反复追问的应用</strong> — 不处理失败，再次发起同样的访问。开头案例里每打开一次文件夹窗口就回来一次，就是这一类。</li>
+                    </ul>
+                    <p>这个决定随时可以在系统设置的隐私项里翻转过来。只是<strong>改完之后往往需要重启应用才会生效。</strong>如果打开了却没变化，先查这一点更快。再补一条判断标准：<strong>如果并没有在用那个功能，先拒绝并不吃亏。</strong>真正需要的时候还会再问一次，而那时候是为了什么的上下文一目了然。</p>
+
+                    <h2 id="sec-8">8. 开发者该做的事</h2>
+                    <p>在这里能做的不是让窗口消失，而是<strong>让窗口出现的那一刻变得可以理解</strong>。归纳成四条。</p>
+                    <h3>提前说明为什么需要</h3>
+                    <p>苹果要求访问照片图库的应用在应用信息文件里声明一段说明理由的文案。没有这段文案，应用在访问时会退出。也就是说这不是可选项，而是<strong>前提条件</strong>。安卓官方文档同样建议在请求之前解释理由，依据是用户知道原因时对权限请求要自在得多。</p>
+                    <p>这里常犯的错误是把文案当成形式来填。需要访问照片这种句子什么也没解释。用户需要知道的是<strong>这是为了哪个功能</strong>。</p>
+                    <h3>在需要的那一刻再问</h3>
+                    <p>安卓文档明确写着，应当在<strong>用户开始使用该功能时</strong>在运行时请求，而不是在应用启动时。按下麦克风按钮时才问麦克风权限，就是这个意思。理由很简单：有上下文才有判断的材料，没有上下文，用户要么随手按过去，要么条件反射地拒绝。</p>
+                    <p>把执行时机提前的常见原因是初始化代码。启动时把一切都准备好的结构很省事，但如果连带权限的资源也一起准备，<strong>应用一打开窗口就弹出来。</strong>这种布置会拉低通过率，还会制造后面那个问题：如果用户最终没用那个功能，那份权限就毫无理由地一直开着。</p>
+                    <h3>不链接用不到的权限</h3>
+                    <p>这是效果最大的一条。安卓文档建议只在应用确实需要相应服务或数据时才请求，并指出减少请求总数本身就能降低被拒的概率。而且它把<strong>第三方库和 SDK 所需的权限</strong>明确列入了要审查的范围。</p>
+                    <p>很多时候还存在更好的选项。安卓的照片选择器<strong>完全不需要运行时权限。</strong>系统只对用户选中的项授予临时读取权限，应用不必持有对整个图库的权限，就能拿到用户选好的照片。当索要权限的实现和不索要权限的实现并排摆着时，<strong>先确认后者存不存在，才是顺序。</strong></p>
+                    <h3>别把受保护的位置放进遍历的代码里</h3>
+                    <p>开头案例里真正的处置就是这一条。他把出问题的目录从那个后台统计文件夹体积的任务的目标清单里去掉了。其他受保护的照片位置本来就已经排除在外，所以这更接近<strong>把同一条规则多应用到一个地方</strong>。</p>
+                    <div class="callout">
+                        <p style="margin:0;">把这个处置<strong>读成规避权限窗口的小技巧，方向就反了</strong>。这里做的不是绕过访问判定，而是<strong>决定不去读一份本来就不需要的数据</strong>。权限还在那里，用户说要用照片功能时照样正常询问。最小权限落到实处，多半就是这个样子：不去动那道拦阻的机关，而是<strong>缩小自己伸手的范围</strong>。同一条原理在智能体工具里怎么转化成分级，我在<a href="ai_agent_permission_design_2026.html">该允许 AI 智能体做什么</a>里写过。</p>
+                    </div>
+
+                    <h2 id="sec-9">9. 在别的平台上重复出现的同一结构</h2>
+                    <p>这个问题不是 macOS 独有的。在<strong>所有按应用询问权限的平台</strong>上，它都以同样的形状出现。在原理层面整理如下。</p>
+                    <ul>
+                        <li><strong>移动端运行时权限</strong> — 请求的是应用，真正扣扳机的常常是库。常见到官方文档要专门提醒。</li>
+                        <li><strong>浏览器权限</strong> — 标签页上出现的是站点地址，实际发起调用的可能是嵌在那个页面里的第三方脚本。判定单位是来源，不是脚本文件。</li>
+                        <li><strong>桌面端文件访问</strong> — 程序做的是目录遍历，而受保护的对象混在里面。遍历的代码并不认识这些对象。</li>
+                        <li><strong>服务端凭据</strong> — 没有窗口，结构却一样。一个进程装着多个库，凭据挂在进程上。哪个库用了哪把钥匙，默认是不被记录的。</li>
+                    </ul>
+                    <p>把共同点压成一句话：<strong>判定的单位和原因的单位不是同一个。</strong>判定必须挂在可强制、可稳定识别的单位上，所以画得粗；原因则藏在那个单位的里面某处。这道裂缝不是设计失败，而是<strong>可执行的隔离边界的极限</strong>。</p>
+                    <p>所以在哪个平台上，调查顺序都一样。从判定记录里确认<strong>这是对什么的请求</strong>，记录不再说话时就往<strong>运行中的状态</strong>下沉，确定目标之后再<strong>去源码里找原因</strong>。变的只是工具的名字。</p>
+                    <p>审批界面本身在什么条件下才算得上防御、这个条件又在哪里垮掉，是另一个主题。那一侧我整理在<a href="approval_gate_governance.html">当按下批准键的人就是防线时</a>。本文讲的比它低一层，是<strong>那个界面为什么会出现</strong>。</p>
+
+                    <h2 id="sec-10">10. 没能确认的部分</h2>
+                    <p>本文无法给出确定说法的条目，集中放在这里。</p>
+                    <ul>
+                        <li><strong>TCC 这个缩写的准确全称</strong> — 苹果并未以这个名字在官方文档中说明，所以各处资料的写法不一致。本文只使用缩写。</li>
+                        <li><strong>出问题那个目录的官方文档</strong> — 苹果说明的照片图库默认位置是主目录下的图片文件夹。开头案例里出现的另一条路径，我没能找到公开文档。称该路径受那个服务保护的说法，来源只有原文那一份记录。</li>
+                        <li><strong>不同系统版本之间的差异</strong> — 从哪个版本开始那条路径被这样标记，没能确认。这里的叙述是原文记录时点上的观察。</li>
+                        <li><strong>其他服务标识符的清单</strong> — 照片之外的资源各自包含哪些路径，公开文档里没有整理。</li>
+                        <li><strong>多进程应用的决定共享规则</strong> — 表里写的模糊是从结构推出来的，各平台的细则我没有逐条比对。</li>
+                    </ul>
+
+                    <h2>结论：界面是结果，原因在下面</h2>
+                    <p>看到权限提示时最没用的反应是怀疑。这个应用为什么要看这个，这个问题把应用假定成一个有意图的行为者，而进程不是这个形状。里面是你的代码和别人的代码共享同一条边界在跑，<strong>操作系统只是给这一整块贴上应用的名牌拿给用户看</strong>。</p>
+                    <p>能问出答案的问题只有一个。<strong>哪条代码路径碰到了那个资源？</strong>换成这个问法，调查就落在可观测的对象上推进。收窄复现条件，从判定记录里分清类型，在记录不再说话的地方抓住停住的执行流，再把栈往上读。走到尽头拿到的多半是<strong>范围设定的疏漏，而不是恶意</strong>。开头那个案例就是这样：遍历文件夹的代码，遍历到了本来不必去的地方。</p>
+                    <p>开发者要留下的原则很短：不链接用不到的权限、在需要的那一刻再问、提前说明为什么需要、把受保护的位置从遍历代码的目标里去掉。这四条指向的是<strong>同一个方向</strong>。不是让窗口不出现，而是<strong>真正缩小自己伸手的范围</strong>。这样一来，剩下的窗口只在真正需要的时刻出现，那时候用户才会第一次真的去读它。</p>
+
+                    <h2>参考资料</h2>
+                    <ul>
+                        <li><a href="https://unifyl.app/blog/macos-photos-permission-lldb.html" target="_blank" rel="noopener">Debugging a Mysterious Privacy Prompt in macOS - 本文的起点记录</a></li>
+                        <li><a href="https://news.hada.io/topic?id=33053" target="_blank" rel="noopener">GeekNews 讨论</a></li>
+                        <li><a href="https://developer.apple.com/documentation/BundleResources/Information-Property-List/NSPhotoLibraryUsageDescription" target="_blank" rel="noopener">Apple Developer - 照片图库使用说明键</a></li>
+                        <li><a href="https://developer.android.com/training/permissions/usage-notes" target="_blank" rel="noopener">Android Developers - 应用权限最佳实践</a></li>
+                        <li><a href="https://developer.android.com/training/data-storage/shared/photo-picker" target="_blank" rel="noopener">Android Developers - 照片选择器</a></li>
+                        <li><a href="https://support.apple.com/guide/photos/photo-library-overview-pht211de786/mac" target="_blank" rel="noopener">Apple 支持 - Mac 上的照片图库概览</a></li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>分享本文</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">返回列表</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/jwt_decoder.html">JWT解码生成器 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 编码器/解码器</a></li>
+      <li><a href="../static/yaml_json_converter.html">YAML JSON转换器 2026</a></li>
+      <li><a href="../static/curl_builder.html">curl命令生成器 2026</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="approval_gate_governance.html">批准按钮何时才算防线 - 智能体默认权限模式变更时该检查什么</a></li>
+      <li><a href="oauth_common_misunderstandings.html">OAuth 被误解的地方 - 它是委托授权而不是身份认证 2026</a></li>
+      <li><a href="tls_knowledge_expiry.html">关于 SSL 学到的东西为何现在是错的 - 名称、协议与证书寿命依次改变的记录 2026</a></li>
+      <li><a href="observability_data_unused.html">收集的可观测性数据为何无人查看 - 日志、指标与追踪回答的是不同问题 2026</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制！请粘贴到Threads应用中分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制！'); });
+    });
+    </script>
+</body>
+</html>

@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<!--
+ * 技術ブログ記事テンプレート
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ja">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>権限プロンプトは結果である - そのAPIに触れたコード経路を逆にたどる</title>
+    <meta name="description" content="写真のコードがないアプリに写真の権限ダイアログが出たなら、アプリが要求したのではなく、どこかの経路が保護対象に触れている。プロンプトを結果として扱い、原因の経路を絞り込む順序と、作る側が減らせることを整理した。">
+    <meta name="keywords" content="権限プロンプト, macOS TCC, プライバシー権限, 権限デバッグ, コールスタック, コード経路の追跡, 写真の権限, アプリサンドボックス, ランタイム権限, 依存関係の権限, 最小権限, 権限モデル, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/ja/posts/os_permission_prompt_forensics.html">
+
+    <meta property="og:title" content="権限プロンプトは結果である - そのAPIに触れたコード経路を逆にたどる">
+    <meta property="og:description" content="問うべきは「なぜこのアプリが」ではなく「どの経路がその資源に触れたか」だ。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/ja/posts/os_permission_prompt_forensics.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ja_JP">
+    <meta property="article:published_time" content="2026-08-31">
+    <meta property="article:section" content="開発・インフラ">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="権限プロンプトは結果である">
+    <meta name="twitter:description" content="写真のコードが一行もないアプリが写真の権限を求めた。原因はプロンプトよりずっと下にあった。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "権限プロンプトは結果である - そのAPIに触れたコード経路を逆にたどる",
+      "alternativeHeadline": "A Permission Prompt Is an Effect - Tracing Back the Code Path",
+      "datePublished": "2026-08-31",
+      "dateModified": "2026-08-31",
+      "inLanguage": "ja-JP",
+      "articleSection": "開発・インフラ",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "権限プロンプト, macOS TCC, プライバシー権限, 権限デバッグ, コールスタック, コード経路の追跡, 依存関係の権限, 最小権限, 権限モデル",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/ja/posts/os_permission_prompt_forensics.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "写真を扱うコードが一行もないのに写真の権限ダイアログが出ることはあるか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "ある。プロンプトを出す主体はアプリではなくOSだ。アプリが写真フレームワークを呼んだときだけ出るのではなく、保護対象として指定された資源にプロセスが触れた瞬間、その接近を捕まえて利用者に尋ねる仕組みになっている。資源はフレームワーク単位ではなく、パスとサービス識別子の単位で印が付けられている。だから普通のファイルオープンでも、そのパスが写真サービスとして印を付けられていれば写真の権限ダイアログを呼ぶ。アプリ側から見ればファイルを一つ開いただけで、写真というAPI名はコードのどこにもない。画面に出た文とコードに書かれたものが食い違って見える理由はここにある。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "「なぜこのアプリが」という問いがなぜ出発点として誤りなのか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "その問いはアプリを一つの意図を持つ行為者として仮定している。実際のプロセスはそういう形をしていない。自分のコード、フレームワーク、プラグイン、システムのダイアログ、バックグラウンド処理が同じプロセスの中で同じ権限を共有して動く。OSが見られるのはこの塊全体であり、アプリ名はその塊に付いたラベルにすぎない。答えが出る問いは「なぜこのアプリが」ではなく「どのコード経路がその資源に触れたか」だ。前者は意図を追及するので、コードに写真という語がないと確認した時点で行き止まりになる。後者は観測可能な事実を問うており、プロンプトが出ているその瞬間、答えはプロセスの中に残っている。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "自分が使っていない権限をライブラリが代わりに要求することはあるか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "ある。Androidの公式ドキュメントはサードパーティのライブラリやSDKが要求する権限を確認するよう案内したうえで、ライブラリから出た権限要求は利用者にはライブラリではなくアプリから来たものとして見える、と明記している。要求の出どころと責任の所在が分かれる地点だ。よくある経路は三つある。第一に、ファイル一覧や容量計算のようにフォルダを走査する汎用ユーティリティが保護されたパスまで一緒に走査する場合。第二に、フレームワークをリンクしたという事実だけで初期化時に関連機能が目を覚ます場合。第三に、システムが提供するファイル選択画面のようにアプリのプロセス外で動く構成要素が介在する場合だ。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "権限ダイアログを拒否するとアプリはどうなるのか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "その資源への接近だけが失敗し、アプリ自体は動き続ける。ただし失敗がどんな形で返ってくるかは資源ごとに違う。空のリストが返ることもあれば権限エラーが返ることもあり、パスへの接近ならそのパスだけが読めない。拒否の本当の代償は、その失敗をアプリが想定していたかどうかで決まる。想定して作られたアプリはその部分だけを空けて残りを正常に提供する。想定していないアプリはリストが空になったり進捗が止まったり、同じダイアログを繰り返し出したりする。決定はシステム設定のプライバシー項目でいつでも変えられるが、変更後にアプリを再起動しないと反映されない場合が多い。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "作る側で不要な権限ダイアログを減らすには何をするか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "三つある。第一に、使わない権限をリンクしない。依存関係が引き込む権限まで含めて、実際に必要なものだけ残す。第二に、必要な瞬間に尋ねる。Androidの公式ドキュメントはアプリ起動時ではなく、その機能を使い始めるときに要求するよう勧めている。第三に、なぜ必要かを先に伝える。Appleは写真ライブラリへの接近について理由を説明する文言をアプリ情報ファイルに宣言するよう求めており、その文言がなければ接近時点でアプリが終了する。ここにもう一つ加わる。フォルダを走査するバックグラウンド処理があるなら、保護されたパスを対象から外すことだ。権限画面を無力化するのとは方向が逆の措置で、使わないデータをそもそも触らない側にある。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/os_permission_prompt_forensics.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/os_permission_prompt_forensics.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/os_permission_prompt_forensics.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/os_permission_prompt_forensics.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/os_permission_prompt_forensics.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "ホーム",
+      "item": "https://braindetox.kr/ja/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "開発・インフラ",
+      "item": "https://braindetox.kr/ja/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "権限プロンプトは結果である - そのAPIに触れたコード経路を逆にたどる",
+      "item": "https://braindetox.kr/ja/posts/os_permission_prompt_forensics.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="権限プロンプトは結果である - そのAPIに触れたコード経路を逆にたどる">
+                <meta itemprop="datePublished" content="2026-08-31">
+                <meta itemprop="dateModified" content="2026-08-31">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="権限プロンプト, macOS TCC, プライバシー権限, 権限デバッグ, コールスタック, コード経路の追跡, 依存関係の権限, 最小権限, 権限モデル">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/ja/posts/os_permission_prompt_forensics.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title">写真のコードが一行もないアプリが写真の権限を求めてきた</h1>
+                    <h2 class="post-subtitle">問うべきは「なぜこのアプリが」ではなく「どの経路がその資源に触れたか」だ</h2>
+                    <div class="post-meta">
+                        <span class="post-date">2026年8月31日</span>
+                        <span class="post-category">開発・インフラ</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <nav class="post-toc">
+                        <h3>目次</h3>
+                        <ol>
+                            <li><a href="#sec-1">プロンプトは結果だ - 引き金を引くのは別にいる</a></li>
+                            <li><a href="#sec-2">「なぜこのアプリが」が答えを出せない理由</a></li>
+                            <li><a href="#sec-3">依存関係が代わりに呼ぶ</a></li>
+                            <li><a href="#sec-4">犯人を絞り込む順序</a></li>
+                            <li><a href="#sec-5">コールスタックが語ることと語れないこと</a></li>
+                            <li><a href="#sec-6">権限モデルがアプリ単位になった理由</a></li>
+                            <li><a href="#sec-7">利用者にとってその一文は何を意味するか</a></li>
+                            <li><a href="#sec-8">作る側がやること</a></li>
+                            <li><a href="#sec-9">他のプラットフォームでも繰り返される同じ構造</a></li>
+                            <li><a href="#sec-10">確認できなかったこと</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2>序論: コードにない語が画面に出ているとき</h2>
+                    <p>ファイルマネージャーを作っていてホームフォルダを開いたら、写真ライブラリに接近しようとしている、というシステムの表示が出た。コードには写真に関するものが一つもない。フレームワークをリンクした覚えもなく、画像処理もしておらず、ソース全体を検索しても該当する語が出てこない。それなのにホームフォルダを開くたび同じダイアログが戻ってくる。この状況を実際に踏んで追跡の過程を公開した記録が、最近開発者コミュニティに上がった。結末から言うと、犯人は <code>~/Library/Photos</code> というディレクトリで、アプリはフォルダを一つ開いただけだった。</p>
+                    <p>ここで面白いのは結末ではなく、<strong>問いの形がどう変わったか</strong>だ。最初の問いは「なぜ自分のアプリが写真を見ようとするのか」だった。この問いでは答えが出ない。コードに写真がないことはすでに確認済みなので、確認すればするほど迷路に入る。答えが出た問いは別のものだった。<strong>どのコード経路が保護された資源に触れたのか。</strong>この転換がこの記事のすべてだ。</p>
+                    <p>そしてこの転換はmacOSだけの話ではない。Androidでも、ブラウザでも、Windowsでも同じ形の混乱が繰り返される。画面にはアプリ名が出ているのに、原因はそのアプリが直接書いたコードではなく、はるかに下の層にある。<strong>プロンプトは原因ではなく結果だ。</strong>原因を探すなら、結果が指す方向ではなくその下へ降りる必要がある。</p>
+                    <div class="callout">
+                        <p style="margin:0;">先に断っておく。この記事には<strong>権限画面が出ないようにする方法はない。</strong>プライバシー保護を切ったり回避したりする手順も扱わない。扱うのは逆方向だ。ダイアログが出たとき<strong>何がそれを呼んだのかを突き止めること</strong>、そして突き止めたあと何を直せるかだ。原因を知らないままダイアログだけ消すのは、直したのではなく覆っただけだ。</p>
+                    </div>
+
+                    <h2 id="sec-1">1. プロンプトは結果だ - 引き金を引くのは別にいる</h2>
+                    <p>多くの開発者は権限プロンプトを<strong>アプリが要求したから出る画面</strong>として理解している。要求関数を呼べばダイアログが出て、利用者が押せば結果がコールバックで戻る。このモデルは半分だけ正しい。正しい部分は明示的な要求APIを呼ぶときで、誤っている部分は<strong>呼んでいないのに出る場合</strong>が実際に存在する点だ。</p>
+                    <p>OS側から見ると構造の形が違う。macOSとiOSのプライバシー管理サブシステムは一般にTCCという略称で呼ばれるが、これがやっているのはアプリの要求を受けてダイアログを出すことではなく、<strong>保護対象として印を付けられた資源にプロセスが触れた瞬間を捕まえること</strong>だ。資源はサービス識別子で区分されており、写真関連の接近は <code>kTCCServicePhotos</code> という識別子でまとめられている。先に触れた追跡記録でも、システムログを通じて確認できたのはこの識別子ただ一つだった。</p>
+                    <p>重要なのは、<strong>この識別子に何が属するかがフレームワーク名ではなく資源の一覧で決まる</strong>という点だ。写真フレームワークを呼べば当然引っかかるが、写真フレームワークを呼ばなくてもその一覧に載ったパスを開いた瞬間に同じく引っかかる。ファイルを一つ開くシステムコールは、写真を扱うという意図を含んでいない。しかしカーネルを越えてそのパスに触れた瞬間、判定は意図ではなく<strong>対象</strong>を基準に下される。</p>
+                    <p>だから画面に出る一文とコードに書かれたものの間に隔たりが生まれる。利用者に見える一文は写真ライブラリに接近しようとしているというものだが、アプリが実際にやったのはホームフォルダ内のディレクトリ一覧を走査したことだけだ。どちらも事実で、二つは矛盾しない。<strong>違う層で記述された同じ出来事</strong>だからだ。</p>
+                    <table>
+                        <thead>
+                            <tr><th>実際に起きたこと</th><th>利用者の画面に出るもの</th><th>アプリは自分で分かるか</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>写真フレームワークの照会API呼び出し</td><td>写真への接近要求</td><td>分かる。自分が呼んだコードだ</td></tr>
+                            <tr><td>保護一覧に載ったパスへのファイル接近</td><td>写真への接近要求</td><td><strong>分からない。</strong>ファイルを一つ開いただけ</td></tr>
+                            <tr><td>依存関係が初期化時に呼んだ照会</td><td>アプリ名で出る要求</td><td>分からない。自分のコードに呼び出しがない</td></tr>
+                            <tr><td>システム提供の選択画面の利用</td><td>おおむね何も出ない</td><td>分かる。そもそも権限を受け取らない</td></tr>
+                        </tbody>
+                    </table>
+                    <p>この表で問題になるのは二行目と三行目だ。どちらも<strong>アプリが自分の触れたものを知らない状態</strong>にある。ここでコードを読み直すやり方では答えが出ない。コードには本当にその語がないからだ。</p>
+
+                    <h2 id="sec-2">2. 「なぜこのアプリが」が答えを出せない理由</h2>
+                    <p>なぜこのアプリが写真を見ようとするのか。自然な問いだが、この文は<strong>アプリを一つの意図を持つ行為者として仮定</strong>している。その仮定が成り立たないところで詰まる。</p>
+                    <p>一つのプロセスの中では複数の出どころのコードが混ざって動く。自分が書いたコードがあり、言語ランタイムがあり、UIフレームワークがあり、パッケージマネージャーが引き込んだライブラリがあり、そのライブラリがさらに引き込んだものがある。システムがプロセスに注入する構成要素もある。この全部が<strong>同じ権限境界を共有</strong>する。OSから見ればこれらは区別されない。一つのプロセスであり、プロセスにはアプリの名札が付いている。</p>
+                    <p>だから権限ダイアログのアプリ名は<strong>誰が要求したかではなく、どの境界の中で起きたか</strong>を指している。ここで「なぜこのアプリが」と問えば意図を追及することになり、意図はコードにないので調査はその場で終わる。逆にこう問えば調査は続く。</p>
+                    <ul>
+                        <li><strong>どのコード経路がその資源に触れたか</strong> — 意図ではなく実行経路を問う。観測できる対象だ。</li>
+                        <li><strong>その経路はいつ実行されるか</strong> — アプリ起動時か、特定の画面か、バックグラウンド処理か。</li>
+                        <li><strong>何を対象にしたか</strong> — フレームワーク呼び出しかファイルパスか。後者ならどの経路か。</li>
+                        <li><strong>その経路になぜそれが含まれたか</strong> — ここで初めて設計意図を問う資格が生まれる。</li>
+                    </ul>
+                    <p>問いを変えれば調査方法も変わる。前者の問いはソース検索で答えようとし、コードにその語がないので失敗する。後者の問いは<strong>実行中のプロセスの状態</strong>で答える。そして決定的な事実が一つある。権限プロンプトが出ている間、<strong>それを呼んだ実行の流れは応答を待って止まっている。</strong>証拠が消えずに画面の上に留め置かれているのだ。</p>
+                    <p>この性質は別種のデバッグにもそのまま当てはまる。症状が再現するその瞬間に状態を掴めれば、原因追跡の難度が一段下がる。再現しない重複送信を捕まえるときも結局同じ原理を使うが、その事例は<a href="fcm_duplicate_push_debug_2026.html">再デプロイしたら昨日の通知がまた届いた</a>で別に扱った。</p>
+
+                    <h2 id="sec-3">3. 依存関係が代わりに呼ぶ</h2>
+                    <p>自分が使っていない機能をライブラリが使う。この一文は権限問題で特に厄介に働くが、それは<strong>要求の出どころと責任の所在が分かれるから</strong>だ。Androidの公式ドキュメントはこの点を明確に書いている。サードパーティのライブラリやSDKが要求する権限を確認するよう勧めたうえで、<strong>ライブラリから出た権限要求は利用者にはライブラリではなくアプリから来たものとして見える</strong>と述べている。利用者が見るのはいつでもアプリ名だ。</p>
+                    <p>実務でこれが起きる経路はおおむね三つある。</p>
+                    <ul>
+                        <li><strong>汎用ユーティリティが対象を選ばない</strong> — フォルダ容量の計算、ファイル一覧の収集、インデックス作成、バックアップのスキャンといった機能は本質的に<em>全部</em>を走査する。保護されたパスを外そうという発想が最初からなければ、それも一緒に走査する。冒頭の事例がまさにこの型だ。</li>
+                        <li><strong>リンクしただけで目を覚ます</strong> — フレームワークを依存関係に入れると、初期化時に関連する構成要素が準備される過程で照会が一緒に起きることがある。自分のコードで一度も呼んでいなくてもそうなる。</li>
+                        <li><strong>プロセス外の構成要素が介在する</strong> — システムが提供するファイル選択画面や共有シートのようにアプリの外で動く要素がある。こちらはたいてい権限を要求しない方向で設計されているが、どちらなのかを知らずに使うと結果を予測できない。</li>
+                    </ul>
+                    <p>ここで強調しておきたいことがある。こうした現象について<strong>そのライブラリがこっそり何かをしていると結論づけるとたいてい外れる。</strong>フォルダを走査するコードは走査するために作られたコードであり、保護されたパスがその中にあると予想できなかっただけだ。冒頭の事例でも問題のディレクトリは写真ライブラリの標準的な位置ではなかった。Appleが案内する写真ライブラリの既定の位置はホームフォルダ下のピクチャフォルダであり、問題になった経路はそれとは別の場所だった。走査する側がそれを知っている理由がなかったわけだ。</p>
+                    <p>だからこの節の結論は疑いではなく<strong>目録化</strong>だ。自分のアプリが要求することになる権限の全体像を把握し、各項目がどの依存関係から来たかを対応づけられればそれで十分だ。対応づけられない項目があれば、そのとき調査を始める。</p>
+
+                    <h2 id="sec-4">4. 犯人を絞り込む順序</h2>
+                    <p>ここからが実作業だ。ツールの使い方ではなく<strong>順序</strong>が核心になる。順序を守ればツールが何であれ答えに到達し、順序を飛ばせばツールがいくら良くても迷う。</p>
+                    <h3>第1段階 - 再現条件を固定する</h3>
+                    <p>まずやるべきは<strong>最も小さい再現手順</strong>を作ることだ。いつ出るのか。アプリを起動するたびか、特定のフォルダを開くときか、一定時間が過ぎた後か。この段階で条件を一つずつ外しながら、ダイアログが出続けるかを確認する。条件が狭まるほど、以降のすべての段階が楽になる。</p>
+                    <p>この段階を飛ばすのが最もよくある誤りだ。再現が不安定なら次の段階で掴む瞬間が訪れず、掴めなければ残るのは推測だけになる。</p>
+                    <h3>第2段階 - どの種類かをまず分ける</h3>
+                    <p>次は<strong>何に対する要求なのか</strong>を確認する段階だ。画面の文ではなく、システムが残す記録で確認する。macOSならプライバシーのサブシステムが残すログを観察すれば、どのサービス識別子に対する要求かが出る。先に触れた追跡記録で確認されたのもこの水準までだった。</p>
+                    <p>ここで重要なのは<strong>この記録がどこまでしか語らないかを知ること</strong>だ。サービス識別子は出るが、どの経路が引き金だったかは出ない。これは欠陥ではなく設計だ。そのログはアプリ開発者のデバッグのために存在するのではなく、システムが判定を記録するために存在する。判定に必要なのは主体とサービスであってパスではない。</p>
+                    <h3>第3段階 - 境界で止める</h3>
+                    <p>この地点が転換点だ。ログがそれ以上語らないなら、<strong>止まっている実行の流れそのものを見る。</strong>権限プロンプトが出ている間、それを呼んだスレッドは応答を待ってシステムコールの中に捕らわれている。ダイアログを閉じない状態でプロセスにデバッガを取り付ければ、その瞬間がそのまま保存されている。</p>
+                    <p>冒頭の事例で著者がやったのがまさにこれだ。ダイアログを出したままプロセスを掴み、どのスレッドがファイルオープンの呼び出しの中で止まっているかを確認したうえで、その呼び出しに渡された引数を読んだ。そこに入っていたのが問題のディレクトリの経路だった。</p>
+                    <h3>第4段階 - コールスタックを上に読む</h3>
+                    <p>経路が分かって終わりではない。<strong>誰がその経路を渡したのか</strong>が残る。止まっているスレッドのコールスタックを下から上へ読めば、システムコールの上に自分のコードがどこまであるかが見える。この段階で答えは三つのうち一つになる。自分のコードが直接渡したか、自分が呼んだユーティリティが展開した一覧に入っていたか、自分のコードがスタックのどこにもないか。</p>
+                    <table>
+                        <thead>
+                            <tr><th>段階</th><th>確認すること</th><th>越えられないときの兆候</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>1. 再現の固定</td><td>いつ出るか、最小条件は何か</td><td>同じ操作で出るときと出ないときがある</td></tr>
+                            <tr><td>2. 種類の判別</td><td>どの資源に対する要求か</td><td>記録がサービスだけ伝えて止まる</td></tr>
+                            <tr><td>3. 境界での停止</td><td>どの呼び出しの中で止まり、対象は何か</td><td>ダイアログを閉じた後に取り付けて証拠がない</td></tr>
+                            <tr><td>4. スタックの逆追跡</td><td>その呼び出し元がどこまで自分のコードか</td><td>スタックに自分のコードが一つもない</td></tr>
+                        </tbody>
+                    </table>
+                    <p>表の最後の欄が兆候だ。第3段階でダイアログを閉じてから取り付けるのではすでに遅い。第4段階で自分のコードがまったく見えないなら、原因はプロセス内の別の構成要素にあるということで、そのときは調査対象が自分のコードから依存関係の一覧へ移る。</p>
+
+                    <h2 id="sec-5">5. コールスタックが語ることと語れないこと</h2>
+                    <p>スタックは強力だが万能ではない。<strong>どこまで信じられるか</strong>を知って使わなければ、結論を誤る。</p>
+                    <p>語ることから整理するとこうなる。</p>
+                    <ul>
+                        <li><strong>この瞬間の呼び出し関係</strong> — 今止まっているフレームの下に誰がいるかは事実だ。推測ではない。</li>
+                        <li><strong>境界面の引数</strong> — システムコールに渡された値はその場にそのまま残っている。どの対象だったかがここで確定する。</li>
+                        <li><strong>自分のコードの有無</strong> — スタックに自分が書いた関数があるかどうかは、調査の方向を分ける決定的な情報だ。</li>
+                    </ul>
+                    <p>語れないことは次のとおりだ。</p>
+                    <ul>
+                        <li><strong>なぜその引数だったか</strong> — 経路が一覧にどう入ったかはスタックにない。それはソースを読まなければ出てこない。</li>
+                        <li><strong>非同期以前の履歴</strong> — 作業キューを越えてきた流れは起点がスタックで切れる。キューに入れた側はすでに戻っているからだ。</li>
+                        <li><strong>最適化されたフレーム</strong> — インライン化されたり末尾呼び出しに整理されたフレームはそもそも見えない。ないことと消えたことを区別できない。</li>
+                        <li><strong>シンボルのない区間</strong> — アドレスだけ残る区間はどのモジュールかまでしか分からず、関数名は出ない。</li>
+                    </ul>
+                    <p>だから実務上の結論は<strong>スタックで対象を確定し、理由はソースで確認する</strong>という二段階の分業になる。スタック一つで結論まで行こうとすると、非同期の境界で必ず誤った結論が出る。逆にソースだけ読めば最初のあの場所に戻る。コードにその語がない、という場所だ。</p>
+
+                    <h2 id="sec-6">6. 権限モデルがアプリ単位になった理由</h2>
+                    <p>ここまで読むと自然な不満が生まれる。どうせプロセスの中に複数の出どころのコードが混ざっているなら、<strong>なぜライブラリ単位で権限を尋ねないのか。</strong>そうすればアプリ名の後ろに隠れることもないのに。</p>
+                    <p>この問いの答えは技術的な怠慢ではなく、<strong>境界をどこに引けるか</strong>にある。権限判定が成り立つには、境界が三つの性質を満たす必要がある。</p>
+                    <ul>
+                        <li><strong>強制できなければならない</strong> — 境界の内側が外の資源に勝手に触れられないよう、システムが止められなければならない。同じアドレス空間を共有するコードどうしは互いのメモリに自由に接近する。ライブラリにだけ権限を与えないとしても、そのライブラリはアプリのコードの関数を呼んで同じことができる。</li>
+                        <li><strong>利用者が理解できなければならない</strong> — 権限は結局人が判断する。アプリ名は利用者が知っている対象だが、内部のライブラリ名はそうではない。初めて見る名前を数十個並べてそれぞれ判断せよという画面は、防御ではなく雑音になる。</li>
+                        <li><strong>安定して識別されなければならない</strong> — アプリは署名とバンドル識別子で固定される。依存関係はバージョンごとに変わり名前も変わる。毎回変わる対象に保存された決定を結び付けることはできない。</li>
+                    </ul>
+                    <p>この三つを同時に満たす単位が実質的に<strong>プロセスと、そのプロセスに付いた署名済みの身元</strong>だ。だから権限モデルがアプリ単位に収束したのであって、より細かく分ける発想がなかったわけではない。</p>
+                    <p>代わりにこの設計には明確な代償がある。プロセスが複数だったり、プロセスの中が異質だったりすると、<strong>判定の対象がぼやける。</strong>ぼやける方向は二つだ。</p>
+                    <table>
+                        <thead>
+                            <tr><th>構造</th><th>権限が付く先</th><th>ぼやけるもの</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>単一プロセス、複数の依存関係</td><td>アプリ一つ</td><td>誰が要求したか。中が全部一つに見える</td></tr>
+                            <tr><td>複数プロセスに分けたアプリ</td><td>各実行ファイル</td><td>利用者には一つのアプリなのに決定が分かれうる</td></tr>
+                            <tr><td>システムが代わりに動かす選択画面</td><td>アプリではなくシステム</td><td>ほとんどない。アプリは選んだ結果だけ受け取る</td></tr>
+                            <tr><td>ランチャーが別の実行ファイルを起動する構造</td><td>実際に資源に触れる側</td><td>利用者が許可したと記憶する対象と違いうる</td></tr>
+                        </tbody>
+                    </table>
+                    <p>表の三行目がこの節で最も実用的な項目だ。<strong>システムが代わりに動かす構成要素はぼやけがほとんどない。</strong>選択はアプリの外で行われ、アプリは利用者が選んだものだけを受け取る。アプリに権限を与えずに機能が成り立つ唯一の構造なので、後でもう一度扱う。</p>
+                    <p>付け加えると、この境界の議論は利用者側から見れば所有と統制が分かれる問題につながっている。機器の中で何が誰の決定領域なのかについては<a href="device_ownership_boundaries.html">買ったのに自分のものではない部分</a>で別に整理した。</p>
+
+                    <h2 id="sec-7">7. 利用者にとってその一文は何を意味するか</h2>
+                    <p>今度は画面の反対側だ。このアプリが写真に接近しようとしています、という一文を利用者はどう読むか。おおむね<strong>このアプリが自分の写真を見ようとしている</strong>と読む。実際の範囲はそれより狭くもあり広くもある。</p>
+                    <p>狭い側から見ると、その一文は<strong>今この瞬間の接近の試み</strong>についてのものだ。アプリが写真をどう使うか、どこへ送るか、どれだけ長く持つかは、そのダイアログが保証しない。ダイアログは扉を開けるかどうかだけを尋ねる。扉の中で何をするかは別の問題だ。</p>
+                    <p>広い側を見ると、許可はたいてい<strong>一度押せば維持される。</strong>次に同じ接近が起きるときはダイアログが出ない。だからその瞬間の判断が思ったより長く効く。そして冒頭の事例が示すように、許可の対象は利用者が想像したものより<strong>広かったり別の場所だったり</strong>しうる。利用者はアルバムを思い浮かべたのに、実際の対象はそのサービスとして印を付けられたディレクトリ一つだった。</p>
+                    <h3>拒否すると何が起きるか</h3>
+                    <p>拒否はアプリを終了させない。<strong>その資源への接近だけが失敗</strong>し、残りはそのまま動く。ただし失敗がどんな形で返ってくるかは資源ごとに違い、そのため利用者が見る結果も分かれる。</p>
+                    <ul>
+                        <li><strong>よく作られたアプリ</strong> — 当該機能だけを無効にして残りを正常に提供する。必要になったらそのとき改めて案内する。</li>
+                        <li><strong>想定していなかったアプリ</strong> — 一覧が空になるか進捗が止まる。エラーではなく<em>何も起きていないように</em>見える場合が最も悪い。</li>
+                        <li><strong>繰り返し尋ねるアプリ</strong> — 失敗を処理せず同じ接近を再び試みる。冒頭の事例でフォルダを開くたびダイアログが戻ってきた理由がこの型だ。</li>
+                    </ul>
+                    <p>決定はシステム設定のプライバシー項目でいつでもひっくり返せる。ただし<strong>変更後にアプリを再起動しないと反映されない場合が多い。</strong>オンにしたのにそのままなら、まずこれを確認するほうが早い。そして判断の目安を一つ加えると、<strong>機能を使っていないのにダイアログが出たなら、ひとまず拒否しても損はない。</strong>必要になった瞬間にまた尋ねる作りになっており、そのときは何のためかという文脈がはっきりしている。</p>
+
+                    <h2 id="sec-8">8. 作る側がやること</h2>
+                    <p>ここでできるのはダイアログをなくすことではなく、<strong>ダイアログが出る瞬間を納得できるものにすること</strong>だ。四つに整理される。</p>
+                    <h3>なぜ必要かを先に伝える</h3>
+                    <p>Appleは写真ライブラリに接近するアプリについて、その理由を説明する文言をアプリ情報ファイルに宣言するよう求めている。文言がなければ接近時点でアプリが終了する。つまりこれは選択ではなく<strong>前提条件</strong>だ。Androidの公式ドキュメントも要求の前に理由を説明するよう勧めており、利用者は理由を知っているとき権限要求をはるかに受け入れやすいという点を根拠に挙げている。</p>
+                    <p>ここでよく出る誤りは文言を形式で埋めることだ。写真への接近が必要です、といった文は何も説明していない。利用者が知るべきなのは<strong>どの機能のためか</strong>だ。</p>
+                    <h3>必要な瞬間に尋ねる</h3>
+                    <p>Androidのドキュメントはアプリ起動時ではなく<strong>その機能を使い始めるとき</strong>に要求するよう明記している。マイクのボタンを押したときにマイクの権限を尋ねる、という具合だ。理由は単純だ。文脈があれば判断する材料があり、文脈がなければ利用者はただ押すか、ただ拒否する。</p>
+                    <p>実行時点を前に持ってくるよくある原因は初期化コードだ。起動時に全部準備しておく構造は楽だが、権限のかかった資源まで一緒に準備すると<strong>アプリを開いた途端にダイアログが出る。</strong>この配置は承認率を下げるうえ、後で出てくる問題も作る。利用者がその機能を結局使わなければ、その権限は理由もなく開いたままになる。</p>
+                    <h3>使わない権限をリンクしない</h3>
+                    <p>最も効果の大きい項目だ。Androidのドキュメントはアプリが実際に必要とするときだけ要求し、要求の数そのものを減らせば拒否される確率も下がると案内している。そしてその検討対象に<strong>サードパーティのライブラリやSDKが要求する権限</strong>を明示的に含めている。</p>
+                    <p>より良い選択肢がある場合も多い。Androidの写真選択ツールは<strong>ランタイム権限をまったく要求しない。</strong>利用者が選んだ項目についてだけシステムが一時的な読み取り権限を付与するからだ。アプリはライブラリ全体に対する権限を受け取らずに、利用者が選んだ写真を受け取る。権限を要求する実装と要求しない実装が並んでいるとき、<strong>後者が存在するかをまず確認するのが順序だ。</strong></p>
+                    <h3>走査するコードに保護された場所を入れない</h3>
+                    <p>冒頭の事例の実際の措置がこれだった。バックグラウンドでフォルダ容量を計算していた処理の対象一覧から、問題のディレクトリを外した。他の保護された写真の位置はすでに外していたので、<strong>同じ規則をもう一箇所に適用した</strong>ことに近い。</p>
+                    <div class="callout">
+                        <p style="margin:0;">この措置を<strong>権限画面を避ける小技として読むと方向が逆</strong>だ。ここでやったのは接近判定を回避することではなく、<strong>そもそも必要のなかったデータを読まないと決めたこと</strong>だ。権限はそのままあり、利用者が写真機能を使うと言えばそのとき正常に尋ねる。最小権限の実行形態はたいていこの形だ。止める仕組みに手を付けるのではなく、<strong>触れる範囲を減らす</strong>のだ。エージェントのツールで同じ原理をどう等級に移すかは<a href="ai_agent_permission_design_2026.html">AIエージェントに何を許すか</a>で扱った。</p>
+                    </div>
+
+                    <h2 id="sec-9">9. 他のプラットフォームでも繰り返される同じ構造</h2>
+                    <p>この問題はmacOS固有のものではない。<strong>権限をアプリ単位で尋ねるすべてのプラットフォーム</strong>で同じ形で現れる。原理の水準で整理するとこうなる。</p>
+                    <ul>
+                        <li><strong>モバイルのランタイム権限</strong> — アプリが要求するが、実際の引き金はライブラリである場合が多い。公式ドキュメントがその点を警告するほど多い。</li>
+                        <li><strong>ブラウザの権限</strong> — タブに出るのはサイトのアドレスで、実際に呼んだのはそのページに載ったサードパーティのスクリプトかもしれない。判定の単位はオリジンであってスクリプトファイルではない。</li>
+                        <li><strong>デスクトップのファイル接近</strong> — プログラムがやったのはディレクトリの巡回なのに、その中に保護対象が混ざっている。巡回するコードは対象を知らない。</li>
+                        <li><strong>サーバー側の資格情報</strong> — 画面はないが構造は同じだ。一つのプロセスが複数のライブラリを抱え、資格情報はプロセスに付く。どのライブラリがその鍵を使ったかは基本的に記録されない。</li>
+                    </ul>
+                    <p>共通点を一文に縮めると<strong>判定の単位と原因の単位が違う</strong>ということだ。判定は強制でき安定した単位に付かなければならないので粗く引かれ、原因はその内側のどこかにある。この隔たりは設計の失敗ではなく<strong>実行可能な隔離境界の限界</strong>だ。</p>
+                    <p>だからどのプラットフォームでも調査の順序が同じになる。判定の記録から<strong>何に対する要求か</strong>を確認し、そこで止まったら<strong>実行中の状態</strong>へ降り、対象を確定してから<strong>理由はソースで</strong>探す。ツールの名前だけが変わる。</p>
+                    <p>承認画面そのものが防御として成り立つ条件、そしてその条件が崩れる場所は別の主題だ。そちらは<a href="approval_gate_governance.html">承認ボタンを押す人が防御線であるとき</a>で整理した。この記事が扱ったのはそれより一層下、<strong>その画面がなぜ出たのか</strong>という話だ。</p>
+
+                    <h2 id="sec-10">10. 確認できなかったこと</h2>
+                    <p>この記事で確定的に言えない項目を一箇所に集める。</p>
+                    <ul>
+                        <li><strong>TCCという略称の正確な展開形</strong> — Appleが公式ドキュメントで説明する名前ではないため、資料ごとに表記が分かれる。この記事では略称だけを使った。</li>
+                        <li><strong>問題になったディレクトリの公式ドキュメント</strong> — Appleが案内する写真ライブラリの既定の位置はホームフォルダ下のピクチャフォルダだ。冒頭の事例に出た別の経路についての公開ドキュメントは確認できなかった。その経路が当該サービスとして保護されるという記述の出どころは原文の記録一つだけだ。</li>
+                        <li><strong>OSのバージョンごとの違い</strong> — どのバージョンからその経路がそう印を付けられたのかは確認できなかった。ここでの記述は原文が記録した時点の観察だ。</li>
+                        <li><strong>他のサービス識別子の一覧</strong> — 写真以外の資源がそれぞれどの経路を含むかは公開ドキュメントで整理されていない。</li>
+                        <li><strong>複数プロセスのアプリでの決定共有の規則</strong> — 表に書いたぼやけは構造から従うものであり、プラットフォームごとの細則までは突き合わせていない。</li>
+                    </ul>
+
+                    <h2>結論: 画面は結果であり原因は下にある</h2>
+                    <p>権限プロンプトを見たとき最も役に立たない反応は疑いだ。なぜこのアプリがこれを見ようとするのか、という問いはアプリを意図を持つ一つの行為者として仮定するが、プロセスはそういう形をしていない。その中では自分のコードと他人のコードが同じ境界を共有して動き、<strong>OSはその塊全体にアプリの名札を付けて利用者に見せているだけ</strong>だ。</p>
+                    <p>答えが出る問いは一つだけだ。<strong>どのコード経路がその資源に触れたか。</strong>この問いに変えれば、調査は観測可能な対象の上で進む。再現条件を狭め、判定の記録から種類を分け、それが語らない地点で止まっている実行の流れを掴み、スタックを上へ読む。その先に出てくるのはたいてい<strong>悪意ではなく範囲設定の抜け</strong>だ。冒頭の事例もそうだった。フォルダを走査するコードが、走査しなくてよい場所まで走査していた。</p>
+                    <p>作る側が残す原則は短い。使わない権限をリンクせず、必要な瞬間に尋ね、なぜ必要かを先に伝え、走査するコードの対象から保護された場所を外す。この四つはすべて<strong>同じ方向</strong>を指している。ダイアログを出ないようにすることではなく、<strong>触れる範囲を実際に減らすこと</strong>だ。そうすれば残ったダイアログは本当に必要な瞬間にだけ出て、そのとき利用者は初めてそのダイアログを読むことになる。</p>
+
+                    <h2>参考資料</h2>
+                    <ul>
+                        <li><a href="https://unifyl.app/blog/macos-photos-permission-lldb.html" target="_blank" rel="noopener">Debugging a Mysterious Privacy Prompt in macOS - この記事のきっかけになった追跡記録</a></li>
+                        <li><a href="https://news.hada.io/topic?id=33053" target="_blank" rel="noopener">GeekNewsの議論</a></li>
+                        <li><a href="https://developer.apple.com/documentation/BundleResources/Information-Property-List/NSPhotoLibraryUsageDescription" target="_blank" rel="noopener">Apple Developer - 写真ライブラリ利用理由のキー</a></li>
+                        <li><a href="https://developer.android.com/training/permissions/usage-notes" target="_blank" rel="noopener">Android Developers - アプリ権限のベストプラクティス</a></li>
+                        <li><a href="https://developer.android.com/training/data-storage/shared/photo-picker" target="_blank" rel="noopener">Android Developers - 写真選択ツール</a></li>
+                        <li><a href="https://support.apple.com/guide/photos/photo-library-overview-pht211de786/mac" target="_blank" rel="noopener">Appleサポート - Macの写真ライブラリの概要</a></li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>この記事をシェア</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">スレッズ</button>
+                        <button id="link-copy" class="share-btn link-btn">リンクをコピー</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">一覧に戻る</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">一緒に使うと便利な無料ツール</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/jwt_decoder.html">JWTデコーダー・生成器 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 エンコーダー/デコーダー</a></li>
+      <li><a href="../static/yaml_json_converter.html">YAML JSON変換器 2026</a></li>
+      <li><a href="../static/curl_builder.html">curlコマンド生成器 2026</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">すべてのツールを見る &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">関連記事</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="approval_gate_governance.html">承認ボタンはいつ防御になるのか - エージェントの既定権限モードが変わる日に確認すること</a></li>
+      <li><a href="oauth_common_misunderstandings.html">OAuthが誤解される場所 - 認証ではなく委譲された認可である 2026</a></li>
+      <li><a href="tls_knowledge_expiry.html">SSLで学んだことがなぜ今は間違いなのか - 名前もプロトコルも証明書の寿命も変わった記録 2026</a></li>
+      <li><a href="observability_data_unused.html">集めた観測データがなぜ読まれないのか - ログ・メトリクス・トレースは別の問いに答える 2026</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('リンクがコピーされました。Threadsアプリに貼り付けてシェアしてください！');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('リンクがコピーされました！'); });
+    });
+    </script>
+</body>
+</html>
