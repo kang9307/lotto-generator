@@ -1,0 +1,742 @@
+<!DOCTYPE html>
+<!--
+ * Tech blog post template
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="en">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>When a Regex Never Finishes - Greedy Matching and Backtracking Blowup</title>
+    <meta name="description" content="One regex spends 7.8 seconds on a 31-character input. Timings per input length, what makes the curve exponential, and fixes with before-and-after numbers.">
+    <meta name="keywords" content="regex, backtracking, catastrophic backtracking, ReDoS, greedy matching, lazy matching, possessive quantifier, atomic group, RE2, regex performance, Node.js, Python re, dev, infra, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/en/posts/regex_greedy_backtracking.html">
+
+    <meta property="og:title" content="When a Regex Never Finishes - Greedy Matching and Backtracking Blowup">
+    <meta property="og:description" content="Every extra character doubles the time. Measured timings per input length, and the before-and-after of four ways to cut the curve.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/en/posts/regex_greedy_backtracking.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="en_US">
+    <meta property="article:published_time" content="2026-09-01">
+    <meta property="article:section" content="Dev &amp; Infra">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="When a Regex Never Finishes">
+    <meta name="twitter:description" content="One character doubles the time. Measuring catastrophic backtracking, then cutting it.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "When a Regex Never Finishes - Greedy Matching and Backtracking Blowup",
+      "alternativeHeadline": "The structure that doubles the time for every extra character, and four ways to cut it",
+      "datePublished": "2026-09-01",
+      "dateModified": "2026-09-01",
+      "inLanguage": "en-US",
+      "articleSection": "Dev & Infra",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "regex, backtracking, catastrophic backtracking, ReDoS, greedy matching, possessive quantifier, atomic group, RE2, regex performance",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/en/posts/regex_greedy_backtracking.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "Why does a regex suddenly hang?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Because a backtracking engine walks back from a failed path and retries other branches. If the pattern contains a place where the same substring can be split in more than one way, the number of those branches grows exponentially with input length. On Node.js v22.16.0, feeding 「^(a+)+$」 a run of a characters followed by a single b gives 6.480 ms at length 21, 109.264 ms at length 25 and 7798.469 ms at length 31. Each extra character roughly doubles the time. Thirty-odd characters reaching seconds is a property of the pattern shape, not of input size."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Does switching a greedy quantifier to a lazy one make it faster?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Not reliably. A lazy quantifier starts small rather than large, but it does not give up backtracking. In a 200,000-character haystack with the target near the front, greedy took 0.2658 ms and lazy 0.0003 ms. With the target at the end of the same haystack, greedy took 0.0350 ms and lazy 0.0357 ms, effectively identical. Laziness only removes the waste of overshooting when the target is early. What actually stops the retrying is a possessive quantifier or an atomic group, and what removes the exponential curve is narrowing the character class so there is only one way to split the input."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Can JavaScript use possessive quantifiers or atomic groups?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "No. On Node.js v22.16.0 (V8 12.4.254.21-node.26) all three forms are rejected at compile time: 「(?>a+)+」 raises Invalid group, and 「a*+」 and 「a++」 both raise Nothing to repeat. The workaround is a lookahead wrapped around a capture group that is then consumed by a backreference, written as 「(?=(a+))\\1」. Rewritten that way, the same input dropped from 528.117 ms to 0.0005 ms, and a 100,000-character input finished in 0.0771 ms. Python 3.13.3 and Perl 5.38.2 support both atomic groups and possessive quantifiers directly."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "What is ReDoS and what actually prevents it?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "It is the situation where user-supplied text reaches a vulnerably shaped regex and a short input pins a worker thread long enough to stall the service. On a single-threaded runtime one request can block everything else in the process. The defence has three layers. First, cap input length before the regex sees it: with the same vulnerable pattern a 16-character cap produced a 0.195 ms worst case while a 28-character cap produced 849.141 ms. Second, remove the shape itself by un-nesting quantifiers and eliminating overlapping branches. Third, put user-facing matching behind a time-bounded path or an engine with a linear-time guarantee."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "If a pattern is not exponential, is it safe?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "No. Polynomial backtracking is far more common in practice and is what most teams actually hit. A pattern such as 「^.(.*). .(.*). .(.*).$」 built from several dot-star groups separated by delimiters does work proportional to the number of ways the delimiter positions can be chosen. On Node.js a line with 10 fields at 50 characters took 0.003 ms, while 160 fields at 1010 characters took 15.522 ms: a 20-fold increase in length produced a 5000-fold increase in time. Replacing the dot-star with a negated class flattened every size to 0.0001 ms."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/regex_greedy_backtracking.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/regex_greedy_backtracking.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/regex_greedy_backtracking.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/regex_greedy_backtracking.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/regex_greedy_backtracking.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "Home",
+      "item": "https://braindetox.kr/en/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "Dev & Infra",
+      "item": "https://braindetox.kr/en/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "When a Regex Never Finishes - Greedy Matching and Backtracking Blowup",
+      "item": "https://braindetox.kr/en/posts/regex_greedy_backtracking.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="When a Regex Never Finishes - Greedy Matching and Backtracking Blowup">
+                <meta itemprop="datePublished" content="2026-09-01">
+                <meta itemprop="dateModified" content="2026-09-01">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="regex, backtracking, catastrophic backtracking, ReDoS, greedy matching, possessive quantifier, atomic group, RE2, regex performance">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/en/posts/regex_greedy_backtracking.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">When a Regex Never Finishes - Greedy Matching and Backtracking Blowup</h1>
+                    <h2 class="post-subtitle">Measuring the structure that doubles the time for every extra character, then cutting it four different ways</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-01">2026-09-01</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">Dev &amp; Infra</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>When a regex returns the wrong answer, you find out quickly. A test goes red, or a badly truncated value shows up in the logs. The awkward case is the one where <strong>the regex returns no answer at all</strong>. There is no exception and no error message. The process is simply standing still on that line. One core sits pinned at 100 percent, and if you grab a stack trace it points somewhere inside <code>String.prototype.match</code>.</p>
+
+                    <p>The most common misreading of this situation is that the input must be large. The input in the example measured below is <strong>31 bytes</strong>, and processing it took 7.8 seconds. The cause is not the size of the data but the <strong>shape</strong> of the pattern. This article works out what that shape is, why it grows exponentially, and how to cut it, with a stopwatch on every claim.</p>
+
+                    <div class="callout">
+                        Every number in this article came from actually running the code on the single machine described under Measurement environment below. Absolute values will differ with CPU, runtime version and whatever else is competing for the machine. The thing to read is not the millisecond figure but <strong>the ratio by which time grows when the input grows a little</strong>. That ratio holds its shape across machines.
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>What this article covers</h3>
+                        <ol>
+                            <li><a href="#sec-1">Measurement environment</a></li>
+                            <li><a href="#sec-2">Backtracking as a structure</a></li>
+                            <li><a href="#sec-3">Reproducing the disaster - one character, twice the time</a></li>
+                            <li><a href="#sec-4">Why it explodes - counting the ways to split</a></li>
+                            <li><a href="#sec-5">It only blows up on failure</a></li>
+                            <li><a href="#sec-6">Greedy, lazy and possessive</a></li>
+                            <li><a href="#sec-7">Cutting the retries in JavaScript</a></li>
+                            <li><a href="#sec-8">Slow without being exponential</a></li>
+                            <li><a href="#sec-9">The shapes that actually show up at work</a></li>
+                            <li><a href="#sec-10">ReDoS - where termination becomes an availability problem</a></li>
+                            <li><a href="#sec-11">Engines differ</a></li>
+                            <li><a href="#sec-12">Fixing it - before and after, side by side</a></li>
+                            <li><a href="#sec-13">A minimal script for measuring your own pattern</a></li>
+                            <li><a href="#sec-14">When not to use a regex at all</a></li>
+                            <li><a href="#sec-15">What I could not verify</a></li>
+                            <li><a href="#sec-16">References</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">Measurement environment</h2>
+
+                    <p>The same pattern can behave completely differently on a different engine. Since that turns out to be one of the conclusions here, it is worth stating up front exactly what did the measuring.</p>
+
+<pre><code>$ node --version
+v22.16.0
+$ node -p "process.versions.v8"
+12.4.254.21-node.26
+$ bash --version | head -1
+GNU bash, version 5.2.37(1)-release (x86_64-pc-msys)
+$ python --version
+Python 3.13.3
+$ perl --version | sed -n 2p
+This is perl 5, version 38, subversion 2 (v5.38.2) built for x86_64-msys-thread-multi
+$ grep --version | head -1
+grep (GNU grep) 3.0
+
+CPU  : Intel(R) Core(TM) i7-4790 CPU @ 3.60GHz (8 logical cores)
+OS   : Windows 10 (10.0.19045) x64, Git Bash environment</code></pre>
+
+                    <p>Timings come from <code>process.hrtime.bigint()</code> in nanoseconds, converted to milliseconds. Fast cases were run five times and the minimum kept; slow cases already took seconds per run, so a single run was recorded. As a safety measure a <strong>cap stops the loop once any single run exceeds 4 seconds</strong>. Since the next step is known to be roughly double, there is no reason to go further.</p>
+
+                    <h2 id="sec-2">Backtracking as a structure</h2>
+
+                    <p>Most programming languages ship a <strong>backtracking</strong> regex engine. It behaves exactly as the name suggests. It reads the pattern left to right, matching it against the string, and when it gets stuck it <strong>returns to the most recent point where a choice was available and takes a different one.</strong> It is the maze strategy of marking every fork and walking back to the last mark on hitting a dead end.</p>
+
+                    <p>There is a reason this approach stays popular despite being slow in the worst case. Several features can only exist if the engine is able to walk back.</p>
+
+                    <ul>
+                        <li><strong>Backreferences</strong> — syntax like <code>(\w+)\s+\1</code>, which demands the same text that an earlier group captured. It only works if the engine can remember what was captured and try again</li>
+                        <li><strong>Lookaround</strong> — positional checks such as <code>(?=...)</code> and <code>(?&lt;=...)</code>. The engine matches a trial pattern at one point and then returns to where it started</li>
+                        <li><strong>Give-back in greedy quantifiers</strong> — <code>.*</code> consuming everything and then handing characters back one at a time when what follows fails to match is itself backtracking</li>
+                        <li><strong>Ordered alternation</strong> — the rule that <code>(a|ab)</code> tries the left branch first and falls through to the right on failure also sits on top of the ability to walk back</li>
+                    </ul>
+
+                    <p>These features reach past what formal language theory calls the regular languages. That means a single pass through a state machine cannot handle them, and a search is required. <strong>Searches have worst cases.</strong> That worst case is usually much closer than people expect.</p>
+
+                    <h2 id="sec-3">Reproducing the disaster - one character, twice the time</h2>
+
+                    <p>The textbook example is <code>^(a+)+$</code>. Feed it a string of n copies of <code>a</code> with a single <code>b</code> at the end. The <code>b</code> can never match, so the engine can only declare failure <strong>after it has tried every possible branch.</strong> The measuring code is this.</p>
+
+<pre><code>const CAP_MS = 4000;   // stop as soon as one run exceeds 4 s
+
+for (let n = 10; n &lt;= 34; n++) {
+  const s = 'a'.repeat(n) + 'b';
+  const re = new RegExp('^(a+)+$');
+  const t0 = process.hrtime.bigint();
+  re.test(s);
+  const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+  console.log(n, ms.toFixed(3));
+  if (ms &gt; CAP_MS) break;
+}</code></pre>
+
+                    <p>Here are the results. The final column is the multiple relative to the row above.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>n (count of a)</th><th>Input length</th><th>Elapsed</th><th>vs. previous row</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>15</td><td>16 chars</td><td>0.227 ms</td><td>—</td></tr>
+                            <tr><td>16</td><td>17 chars</td><td>0.398 ms</td><td>1.75x</td></tr>
+                            <tr><td>17</td><td>18 chars</td><td>0.935 ms</td><td>2.35x</td></tr>
+                            <tr><td>18</td><td>19 chars</td><td>1.794 ms</td><td>1.92x</td></tr>
+                            <tr><td>19</td><td>20 chars</td><td>3.511 ms</td><td>1.96x</td></tr>
+                            <tr><td>20</td><td>21 chars</td><td>6.480 ms</td><td>1.85x</td></tr>
+                            <tr><td>22</td><td>23 chars</td><td>26.601 ms</td><td>4.10x over two chars</td></tr>
+                            <tr><td>24</td><td>25 chars</td><td>109.264 ms</td><td>4.11x over two chars</td></tr>
+                            <tr><td>26</td><td>27 chars</td><td>457.580 ms</td><td>4.19x over two chars</td></tr>
+                            <tr><td>28</td><td>29 chars</td><td>2233.649 ms</td><td>4.88x over two chars</td></tr>
+                            <tr><td>29</td><td>30 chars</td><td>3995.791 ms</td><td>1.79x</td></tr>
+                            <tr><td>30</td><td>31 chars</td><td>7798.469 ms</td><td>1.95x</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>Every entry in the ratio column clusters around 2. That is the fingerprint of exponential growth. One character doubles the time, which means ten characters multiply it by <strong>a thousand</strong>. Extending the table gives hours at 40 characters and months at 50. That is why it feels like the process has stopped. Nothing has actually stopped; the finish time has simply moved outside human time.</p>
+
+                    <p>The striking part is <strong>how narrow the band is</strong>. Up to 20 characters it is 6 milliseconds, which passes any test suite you care to write. At 25 characters it is a tenth of a second, at 29 characters two seconds, at 31 characters 7.8 seconds. Short development samples will never trip it, and the first slightly longer production value crosses the whole range at once.</p>
+
+                    <h2 id="sec-4">Why it explodes - counting the ways to split</h2>
+
+                    <p>The disease has a name: <strong>ambiguity</strong>. In <code>(a+)+</code> the inner <code>a+</code> takes one or more <code>a</code> characters and the outer <code>+</code> repeats that one or more times. So there is not one way to match the four characters <code>aaaa</code>. There are 4, 3+1, 1+3, 2+2, 2+1+1, 1+2+1, 1+1+2 and 1+1+1+1 — eight of them. In general the number of ways to cut n characters like this is <strong>2<sup>n-1</sup></strong>.</p>
+
+                    <p>When the match succeeds, the engine stops at the first arrangement it finds. But when a trailing <code>b</code> makes <code>$</code> fail, the engine reasons that a different split might have worked and tries them all. There are 2<sup>n-1</sup> splits, so there are that many attempts. <strong>The blowup sits exactly where two conditions overlap: the same substring can be divided in several ways, and all of those divisions fail.</strong></p>
+
+                    <p>The way to confirm the diagnosis is to measure other shapes that carry the same property. They look nothing alike, but each one admits several ways to split.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Pattern</th><th>n=20</th><th>n=24</th><th>n=28</th><th>n=29</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>^(a+)+$</code></td><td>6.480 ms</td><td>109.264 ms</td><td>2233.649 ms</td><td>3995.791 ms</td></tr>
+                            <tr><td><code>^(a|a)*$</code></td><td>13.354 ms</td><td>191.011 ms</td><td>3368.902 ms</td><td>6640.935 ms</td></tr>
+                            <tr><td><code>^(a*)*$</code></td><td>12.359 ms</td><td>242.906 ms</td><td>3675.270 ms</td><td>7156.893 ms</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>All three trace the same curve. In <code>(a|a)*</code> the two branches <strong>match exactly the same thing</strong>. Either choice gives the same result, so n repetitions produce 2<sup>n</sup> paths that all fail identically. In <code>(a*)*</code> the inner part can match the empty string as well, which raises the count of splits further. The syntax differs; <strong>the disease is one thing</strong>.</p>
+
+                    <ul>
+                        <li>A quantifier inside a quantifier, where the inner one is <strong>variable length</strong> — <code>(a+)+</code>, <code>(\w+\s?)*</code>, <code>([a-z]*)+</code></li>
+                        <li>Alternatives that <strong>can match the same character</strong> — <code>(a|a)*</code>, <code>(\d|\w)*</code>, <code>(x|xy)*</code></li>
+                        <li>A repetition containing something that <strong>can match the empty string</strong> — <code>(a*)*</code>, <code>(\s?)*</code></li>
+                        <li>All three reduce to one condition. If <strong>the same input maps onto the pattern in two or more ways</strong>, failure means checking every one of them</li>
+                    </ul>
+
+                    <h2 id="sec-5">It only blows up on failure</h2>
+
+                    <p>This property is decisive when diagnosing. With the same pattern and the same size of input, <strong>nothing happens at all if the match succeeds</strong>, because the engine stops at the first success. Three cases at the same n=26, measured side by side.</p>
+
+<pre><code>input "a"x26 + "b"   pattern ^(a+)+$    447.897 ms   (fails)
+input "a"x26 + "b"   pattern ^(a+)+     0.0005 ms    (succeeds at once)
+input "a"x26        pattern ^(a+)+$    0.0002 ms    (succeeds at once)</code></pre>
+
+                    <p>The third line matters most. The pattern is the notorious one, unchanged, but with the single <code>b</code> removed it takes 0.0002 ms. <strong>A factor of more than a million rides on the last character of the input.</strong> The second line drops the <code>$</code>. Once there is no requirement to reach the end, the match succeeds early and stops.</p>
+
+                    <p>That yields a practical conclusion. <strong>Tests that only feed valid values will never catch this class of defect.</strong> Filling a regex test with success cases is a common habit, and this failure mode hides precisely in that blind spot. Meanwhile the values arriving in production are far more varied on the invalid side.</p>
+
+                    <p>For the same reason, anchoring changes the timing. Without a leading <code>^</code>, the engine fails at the first character, then restarts from the second, then from the third. At n=24, <code>^(a+)+$</code> took 116.532 ms while <code>(a+)+$</code> took 295.768 ms, a factor of <strong>2.5</strong>. An anchor does not remove the exponent, but it does remove the constant factor in front of it.</p>
+
+                    <h2 id="sec-6">Greedy, lazy and possessive</h2>
+
+                    <p>Quantifiers come in three temperaments. The difference is not how much they consume but <strong>whether they will give any of it back</strong>.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Notation</th><th>Name</th><th>Behaviour</th><th>JS (V8)</th><th>Python 3.13</th><th>Perl 5.38</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>*</code> <code>+</code></td><td>Greedy</td><td>Takes as much as possible, hands back one character at a time when blocked</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+                            <tr><td><code>*?</code> <code>+?</code></td><td>Lazy</td><td>Takes as little as possible, takes one more at a time when blocked</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+                            <tr><td><code>*+</code> <code>++</code></td><td>Possessive</td><td>Takes as much as possible and <strong>never gives any back</strong></td><td>No</td><td>Yes</td><td>Yes</td></tr>
+                            <tr><td><code>(?&gt;...)</code></td><td>Atomic group</td><td>Once the group is left, its choices are never revisited</td><td>No</td><td>Yes</td><td>Yes</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>Start with the common misconception. <strong>Switching to a lazy quantifier makes it faster is only half true.</strong> Laziness does not abandon backtracking; it reverses the <em>direction</em> of the backtracking. In a 200,000-character haystack the result flips entirely depending on where the target sits.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Pattern</th><th>Target near the front</th><th>Target at the end</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>&lt;h2&gt;(.*)&lt;/h2&gt;</code></td><td>0.2658 ms</td><td>0.0350 ms</td></tr>
+                            <tr><td><code>&lt;h2&gt;(.*?)&lt;/h2&gt;</code></td><td>0.0003 ms</td><td>0.0357 ms</td></tr>
+                            <tr><td><code>&lt;h2&gt;([^&lt;]*)&lt;/h2&gt;</code></td><td>0.0003 ms</td><td>0.0356 ms</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>With the target at the front, lazy is nearly 900 times faster, because greedy first swallows all 200,000 characters and walks back from there. With the target at the end, the three patterns are <strong>effectively identical</strong>, because laziness now extends one character at a time across 200,000 attempts. Laziness is not a performance measure but a <strong>choice of meaning</strong>. Use it when you want the shortest match; the speed follows the shape of the data.</p>
+
+                    <p>The real countermeasures are possessive quantifiers and atomic groups. Both tell the engine explicitly to <strong>give up backtracking here</strong>. <code>a++</code> takes as many <code>a</code> characters as it can and refuses to regurgitate them even when what follows fails. With nothing to hand back there are no branches, and with no branches there is no exponent. These are the values measured on Python 3.13.3 and Perl 5.38.2.</p>
+
+<pre><code>Python 3.13.3
+  ^(a+)+$    n=26        3323.962 ms
+  ^(a++)+$   n=100000    0.0398 ms
+  ^(?&gt;a+)+$  n=100000    0.0395 ms
+
+Perl 5.38.2
+  ^(a++)+$   n=100000    0.0091 ms
+  ^(?&gt;a+)+$  n=100000    0.0091 ms</code></pre>
+
+                    <p>The input grew by <strong>a factor of about 3800</strong> and the time is still four hundredths of a millisecond. One caution though: possessive quantifiers change meaning. Applied where no give-back is needed, as in <code>"[^"]*+"</code>, they are safe, but bolted onto a pattern that relies on give-back further along they will make <strong>things that used to match stop matching.</strong> Treat them as a declaration of intent, not a performance flag.</p>
+
+                    <h2 id="sec-7">Cutting the retries in JavaScript</h2>
+
+                    <p>JavaScript does not have those tools. On Node.js v22.16.0 (V8 12.4.254.21-node.26) all three are rejected at compile time.</p>
+
+<pre><code>&gt; new RegExp('^(?&gt;a+)+$')
+SyntaxError: Invalid regular expression: /^(?&gt;a+)+$/: Invalid group
+
+&gt; new RegExp('^a*+$')
+SyntaxError: Invalid regular expression: /^a*+$/: Nothing to repeat
+
+&gt; new RegExp('^a++$')
+SyntaxError: Invalid regular expression: /^a++$/: Nothing to repeat</code></pre>
+
+                    <p>The message <code>Nothing to repeat</code> tells the whole story. V8 does not read <code>a++</code> as a possessive quantifier; it reads it as a syntax error meaning repeat the <code>+</code> with another <code>+</code>. The concept simply is not there.</p>
+
+                    <p>There is an idiom that produces the same effect: <strong>put the group inside a lookahead and then consume it with a backreference</strong>. Rewrite <code>(?&gt;X)</code> as <code>(?=(X))\1</code>. A lookahead fixes its result once and does not hand it back from the outside, so consuming that result through a backreference behaves like an atomic group.</p>
+
+<pre><code>// making ^(a+)+$ atomic
+const naive  = /^(a+)+$/;
+const atomic = /^(?=(a+))\1+$/;
+
+// "a"x26 + "b"
+naive.test(s)    →  528.117 ms
+atomic.test(s)   →  0.0005 ms
+
+// the same atomic pattern on far larger inputs
+n=1000     0.0009 ms
+n=10000    0.0077 ms
+n=100000   0.0771 ms</code></pre>
+
+                    <p>Each hundredfold increase in input costs roughly ten times the time, which is close to linear. The idiom is undeniably hard to read, so if you use it, <strong>leave a comment explaining why.</strong> Otherwise someone will later mistake it for a pointless lookahead, tidy it away, and bring the defect straight back.</p>
+
+                    <h2 id="sec-8">Slow without being exponential</h2>
+
+                    <p>Exponential blowup is dramatic but not common. What turns up far more often in practice is <strong>polynomial backtracking</strong>, and the classic form is several <code>.*</code> groups separated by delimiters. It appears in almost every log parser and CSV handler ever written.</p>
+
+                    <p>I fed a pattern of the form <code>^"(.*)" "(.*)" "(.*)"$</code> a line holding many quoted fields, with one extra character on the end to force the match to fail. The three <code>.*</code> groups do work proportional to the number of ways the delimiter positions can be chosen.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Fields</th><th>Line length</th><th><code>"(.*)"</code></th><th><code>"([^"]*)"</code></th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>10</td><td>50 chars</td><td>0.003 ms</td><td>0.0001 ms</td></tr>
+                            <tr><td>20</td><td>110 chars</td><td>0.024 ms</td><td>0.0001 ms</td></tr>
+                            <tr><td>40</td><td>230 chars</td><td>0.208 ms</td><td>0.0001 ms</td></tr>
+                            <tr><td>80</td><td>470 chars</td><td>1.774 ms</td><td>0.0001 ms</td></tr>
+                            <tr><td>160</td><td>1010 chars</td><td>15.522 ms</td><td>0.0001 ms</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>A 20-fold increase in length produced a <strong>5000-fold</strong> increase in time. That is roughly 8 times per doubling, so about cubic. It does not kill instantly the way an exponent does, but as an explanation for a parser slowing down when log lines get longer, this is much the more frequent culprit. And the right-hand column already contains the answer: replacing <code>.*</code> with <code>[^"]*</code> <strong>flattens every size</strong>.</p>
+
+                    <p>The reason is simple. <code>[^"]*</code> is forced to stop at a quote. With the stopping point fixed there is no combinatorial choice to explore. <code>.*</code> can swallow quotes too, so the engine has to try each possible stopping point. <strong>Taking the delimiter out of the character class</strong> is the cheapest fix available in this family.</p>
+
+                    <h2 id="sec-9">The shapes that actually show up at work</h2>
+
+                    <p>Dangerous patterns rarely look dangerous. Nobody writes <code>(a+)+</code> on purpose; what is actually sitting in the codebase looks like the rows below.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Shape</th><th>How it really appears</th><th>What is hiding in it</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Nested quantifier</td><td><code>^(\w+\s?)*$</code> — checking a line of words joined by spaces</td><td><code>\s?</code> is optional, so <code>\w+</code> runs can abut and the split becomes ambiguous</td></tr>
+                            <tr><td>Overlapping alternatives</td><td><code>(\d|\w)+</code> — a run of digits or letters</td><td><code>\d</code> is contained in <code>\w</code>, so every digit creates two paths</td></tr>
+                            <tr><td>Chained dot-star</td><td><code>^(.*) (.*) \[(.*)\] "(.*)"$</code> — one access log line</td><td>Combinations of delimiter positions, growing polynomially as fields get longer</td></tr>
+                            <tr><td>Loose email validation</td><td><code>^([\w.-]+)+@([\w-]+\.)+[a-z]{2,}$</code></td><td>The local part is shaped like <code>(X+)+</code>, and the domain side is another repetition inside a repetition</td></tr>
+                            <tr><td>Whitespace cleanup</td><td><code>^(\s*)+$</code> or <code>(\s|\t)*$</code></td><td>Repetition of something that can match empty; it splits on mixed tabs and spaces</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>I measured the first row. Against <code>^(\w+\s?)*$</code> I fed n letters followed by a <code>!</code>. Even with no spaces in the string, <code>\s?</code> can match empty, which is enough to make the split ambiguous.</p>
+
+<pre><code>n=20    8.445 ms
+n=24    227.832 ms
+n=26    697.181 ms
+n=28    2268.459 ms
+n=29    4564.045 ms   ← stopped here</code></pre>
+
+                    <p>This pattern is a standard fixture in input validation that checks whether a user name consists only of words and spaces. And such validation sits, <strong>by definition, exactly where user input arrives.</strong></p>
+
+                    <h2 id="sec-10">ReDoS - where termination becomes an availability problem</h2>
+
+                    <p>Everything so far has been a performance story. The character of it changes the moment user input reaches one of these patterns. <strong>Regular expression denial of service (ReDoS)</strong> describes a short input pinning a worker long enough to stall the whole service. What defines the problem is that it needs no special privilege and no volume of traffic.</p>
+
+                    <p>On a runtime with a single-threaded event loop the blast radius is worse. If one request spends 7 seconds matching, <strong>every other request in that process waits for those 7 seconds.</strong> The health check stops responding, the instance gets replaced, and if the same request lands on the replacement the cycle simply repeats.</p>
+
+                    <p>This article does not cover how to construct a harmful input. What is needed is <strong>the ability to find and close these shapes yourself</strong>.</p>
+
+                    <ul>
+                        <li><strong>Cap the input length first.</strong> Putting <code>if (s.length &gt; 200) return false;</code> in front of the regex bounds the worst case to a constant. On an exponential curve, a few characters of cap make an enormous difference</li>
+                        <li><strong>Remove the shape from the pattern.</strong> This is the real fix: un-nest the quantifiers, stop the branches from overlapping, take the delimiter out of the character class</li>
+                        <li><strong>Put a time bound at the boundary.</strong> Move matching on user input into a separate worker or a path with a deadline. The standard JavaScript regex has no timeout of its own</li>
+                        <li><strong>Never accept a pattern as data.</strong> Building <code>new RegExp()</code> from a user-supplied string puts the pattern itself outside your control, and none of the review above applies any more</li>
+                        <li><strong>Patterns in your dependencies count too.</strong> If it is absent from your code but present inside a parser or validation library, the outcome is identical</li>
+                    </ul>
+
+                    <p>I measured the effect of the first item. These are worst-case values for the same vulnerable pattern under different caps.</p>
+
+<pre><code>maxLength=16   worst 0.195 ms
+maxLength=20   worst 3.131 ms
+maxLength=24   worst 51.605 ms
+maxLength=28   worst 849.141 ms</code></pre>
+
+                    <p>Moving the cap from 28 down to 16 removes a factor of about 4000. Still, this is <strong>mitigation rather than repair.</strong> A length cap quietly creeps upward the next time requirements change, and the defect comes back with it. Fixing the pattern itself always comes first.</p>
+
+                    <h2 id="sec-11">Engines differ</h2>
+
+                    <p>Here an unexpected result turned up. Running the same <code>^(a+)+$</code> under Perl 5.38.2, it <strong>did not explode.</strong> It stayed flat at 0.017 ms for n=20 and 0.018 ms for n=34. <code>^(a*)*$</code> and <code>^(\w+\s?)*$</code> behaved the same way. Perl's engine appears to remember which (position, pattern point) combinations have already failed and to decline to repeat that work.</p>
+
+                    <p>That does not make Perl safe. In the same Perl, the polynomial pattern from the previous section, <code>^"(.*)" "(.*)" "(.*)"$</code>, slowed down exactly as before: 0.011 ms at 10 fields, 6.199 ms at 80, and <strong>323.276 ms</strong> at 320. Some shapes are caught by the optimisation and others are not.</p>
+
+                    <p>At the opposite end sit <strong>automaton-based</strong> engines. Instead of walking back they carry all the possible states at once and read the input a single time. I measured the same pattern with GNU grep 3.0.</p>
+
+<pre><code>grep process startup alone (1-byte file)   0.046 ~ 0.052 s
+
+grep -E '^(a+)+$'
+  n=20         0.049 s
+  n=100        0.053 s
+  n=10000      0.050 s
+  n=100000     0.059 s
+  n=1000000    0.058 s
+  n=5000000    0.104 s</code></pre>
+
+                    <p>Startup costs 0.05 s, so nothing below that is measurable. The meaningful line is the last one. <strong>Five million characters were matched in roughly 0.05 s of actual work.</strong> That is the pattern on which Node spent 7.8 seconds for 31 characters. The curve itself is a different curve.</p>
+
+                    <p>There is a trade. The documentation for Go's <code>regexp</code> package states that «the regexp implementation provided by this package is guaranteed to run in time linear in the size of the input (this is a property not guaranteed by most open source implementations of regular expressions)». The price is that the RE2 syntax reference marks backreferences <code>\1</code> and the lookaround forms <code>(?=re)</code>, <code>(?!re)</code>, <code>(?&lt;=re)</code> and <code>(?&lt;!re)</code> all as <strong>NOT SUPPORTED</strong>.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Engine and version</th><th>Approach</th><th><code>^(a+)+$</code> observed</th><th>Possessive / atomic</th><th>Note</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Node.js v22.16.0 (V8 12.4)</td><td>Backtracking</td><td>7798 ms at 31 chars</td><td>Not supported</td><td>Emulated with lookahead plus backreference</td></tr>
+                            <tr><td>Python 3.13.3 <code>re</code></td><td>Backtracking</td><td>6961 ms at 28 chars</td><td>Supported</td><td>Both <code>(?&gt;...)</code> and <code>a++</code> compile</td></tr>
+                            <tr><td>Perl 5.38.2</td><td>Backtracking plus optimisation</td><td>0.018 ms up to 35 chars</td><td>Supported</td><td>Still slows down on polynomial patterns</td></tr>
+                            <tr><td>GNU grep 3.0 <code>-E</code></td><td>Automaton</td><td>About 0.05 s at 5M chars</td><td>Not applicable</td><td>Measured on ERE without backreferences</td></tr>
+                            <tr><td>Go <code>regexp</code> (RE2)</td><td>Automaton</td><td>Could not run it</td><td>Not applicable</td><td>Linear guarantee per docs; no backreferences or lookaround</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>There is a quiet symmetry here. The idiom that rescued JavaScript in the earlier section, <code>(?=(a+))\1</code>, <strong>uses both a lookahead and a backreference.</strong> The very tool that saves a backtracking engine cannot exist in an automaton engine, which is the one that never explodes in the first place. A linear-time guarantee and expressive power are two ends of the same axis.</p>
+
+                    <h2 id="sec-12">Fixing it - before and after, side by side</h2>
+
+                    <p>There are four fixes, and each has already appeared above. Here they are with before and after in one table. The order matters: <strong>the higher ones are more fundamental</strong>.</p>
+
+                    <h3>Un-nest the quantifiers</h3>
+
+                    <p>This is the surest repair. When a repetition contains an optional element, as in <code>(\w+\s?)*</code>, pull that optional element <strong>out of the repetition so the split becomes determined</strong>. Rewritten as <code>^\w+(\s\w+)*$</code>, a space must be present before the next repetition can start, so there is exactly one way to divide the string.</p>
+
+                    <h3>Narrow the character class</h3>
+
+                    <p>Remove the delimiter character from the class. <code>"(.*)"</code> becomes <code>"([^"]*)"</code>; <code>(.*) </code> becomes <code>(\S+) </code>. Once the stopping point is fixed, the combinatorics disappear. The meaning usually gets more precise as well.</p>
+
+                    <h3>Make it give up backtracking</h3>
+
+                    <p>On Python, Perl or a PCRE-family engine, use a possessive quantifier or an atomic group. On JavaScript, use the lookahead idiom. This treats the symptom while leaving the shape in place, so it is the option for when the two fixes above are unavailable.</p>
+
+                    <h3>Do not use a regex</h3>
+
+                    <p>If the job is splitting on a delimiter, string functions are both faster and easier to read. Here is the result of decomposing a 602-character three-field line 200,000 times.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Fix</th><th>Before</th><th>After</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>^(\w+\s?)*$</code> → <code>^\w+(\s\w+)*$</code></td><td>2268.459 ms at n=28</td><td>0.0003 ms at n=30 / 0.2574 ms at n=100000</td></tr>
+                            <tr><td><code>"(.*)"</code> → <code>"([^"]*)"</code></td><td>15.522 ms at 160 fields</td><td>0.0001 ms at 160 fields</td></tr>
+                            <tr><td>Python <code>^(a+)+$</code> → <code>^(a++)+$</code></td><td>3323.962 ms at n=26</td><td>0.0398 ms at n=100000</td></tr>
+                            <tr><td>JS <code>^(a+)+$</code> → <code>^(?=(a+))\1+$</code></td><td>528.117 ms at n=26</td><td>0.0771 ms at n=100000</td></tr>
+                            <tr><td>Regex <code>exec</code> → <code>indexOf</code> + <code>slice</code></td><td>83.5 ms for 200k runs</td><td>5.9 ms for 200k runs</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>Under the same conditions <code>String.split(',')</code> took 56.1 ms. <strong>But that difference only becomes visible across 200,000 runs.</strong> There is no reason to write unreadable code over the gap between 0.4 microseconds and 0.03 microseconds per call. The exponential and polynomial problems live at a completely different order of magnitude from this one.</p>
+
+                    <h2 id="sec-13">A minimal script for measuring your own pattern</h2>
+
+                    <p>Judging a pattern by eye is harder than it sounds. <strong>Growing the input length and timing it</strong> removes the need to judge at all. Linear keeps the ratio near 1; exponential keeps it near 2.</p>
+
+<pre><code>// redos-probe.js
+// usage: node redos-probe.js "&lt;pattern&gt;" [repeated unit] [suffix]
+const [, , src, unit = 'a', tail = 'b'] = process.argv;
+const BUDGET_MS = 2000;
+const re = new RegExp(src);
+let prev = 0;
+
+console.log('n\tms\tratio');
+for (let n = 2; n &lt;= 200000; n = n &lt; 40 ? n + 2 : Math.ceil(n * 1.6)) {
+  const s = unit.repeat(n) + tail;
+  const t0 = process.hrtime.bigint();
+  re.test(s);
+  const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+  const ratio = prev &gt; 0.05 ? (ms / prev).toFixed(2) : '-';
+  console.log(n + '\t' + ms.toFixed(3) + '\t' + ratio);
+  if (ms &gt; BUDGET_MS) {
+    console.log('\nVERDICT: super-linear. ' + ms.toFixed(0) + ' ms at n=' + n);
+    process.exit(2);
+  }
+  prev = ms;
+}
+console.log('\nVERDICT: stayed under ' + BUDGET_MS + ' ms up to n=200000');</code></pre>
+
+                    <p><code>BUDGET_MS</code> is the important part. The loop stops the moment one run exceeds it. On an exponential curve the next step is double, so running without a cap means stalling your own machine. The <code>tail</code> value must be <strong>a character that makes the match fail</strong>. Inputs that succeed reveal nothing, as the earlier measurement showed.</p>
+
+<pre><code>$ node redos-probe.js '^(\w+\s?)*$' a '!'
+n   ms        ratio
+16  0.437     4.09
+18  1.895     4.34
+20  6.975     3.68
+22  27.795    3.99
+24  120.978   4.35
+26  565.213   4.67
+28  2001.331  3.54
+VERDICT: super-linear. 2001 ms at n=28
+
+$ node redos-probe.js '^\w+(\s\w+)*$' a '!'
+n       ms      ratio
+29116   0.086   1.56
+46586   0.140   1.64
+74538   0.216   1.54
+119261  0.343   1.59
+190818  0.567   1.65
+VERDICT: stayed under 2000 ms up to n=200000</code></pre>
+
+                    <p>The difference between the two outputs is the diagnosis. In the first, n grows by 2 and time grows fourfold. In the second, n grows by a factor of 1.6 and so does the time. <strong>Read the third column, not the second.</strong> Absolute times vary by machine; the ratio is a property of the pattern.</p>
+
+                    <h2 id="sec-14">When not to use a regex at all</h2>
+
+                    <p>That covers the repairs. The last question is where not to reach for a regex in the first place. What a regex can express is everything <strong>except structures nested to an unbounded depth</strong>. Cross that boundary and the pattern grows long, and long patterns drag in the shapes described above.</p>
+
+                    <ul>
+                        <li><strong>HTML and XML</strong> — tags can wrap each other to any depth. A regex cannot pair an opening tag with its closing tag. Use a parser</li>
+                        <li><strong>JSON and YAML</strong> — the same reason. Objects inside objects are a recursive structure, and a parser already ships with the standard library</li>
+                        <li><strong>Balancing brackets</strong> — the canonical example formally proven to sit outside the regular languages. Code that walks and counts is the right answer</li>
+                        <li><strong>Email address validation</strong> — a regex that follows the specification exactly is long and usually contains a dangerous shape. Check the form only, roughly one <code>@</code> with something on each side, and do the real validation with a confirmation email</li>
+                        <li><strong>URL parsing</strong> — every language has a <code>URL</code> class or an equivalent. A hand-written pattern will be wrong on some edge case, guaranteed</li>
+                        <li><strong>Splitting on a fixed delimiter</strong> — using a regex where <code>split</code> or <code>indexOf</code> would do is slower and harder to read</li>
+                        <li><strong>Searching for a literal string</strong> — use <code>includes</code> or <code>grep -F</code>. There is no reason to feed something that is not a pattern to a pattern engine</li>
+                    </ul>
+
+                    <p>The territory where a regex belongs is still large. For <strong>flat, length-bounded, non-recursive text</strong> nothing states intent as compactly. The problem is continuing to use it after leaving that territory.</p>
+
+                    <p>The separate problem of the same regex meaning different things in different tools is covered in <a href="regex_everywhere_portable_2026.html">regex dialect portability</a>; practical uses of lookahead are in <a href="regex_lookahead_practical.html">lookahead in practice</a>; and the syllable trap when handling Korean text is in <a href="korean_regex_syllable_trap.html">the Korean regex syllable trap</a>. Confusing shell globs with regexes is covered in <a href="shell_glob_vs_regex.html">shell globs versus regular expressions</a>.</p>
+
+                    <h2 id="sec-15">What I could not verify</h2>
+
+                    <ul>
+                        <li>The <strong>exact mechanism</strong> by which Perl 5.38.2 avoided exploding on <code>^(a+)+$</code> is unconfirmed. It looks like an optimisation that remembers failed combinations, but <code>perldoc</code> was not functional on this machine, so I could not confirm its name or conditions in the official documentation. Only the measurements are reported</li>
+                        <li>Go and RE2 are <strong>not installed on this machine and could not be run.</strong> Those rows in the table are documentation, not measurement. The linear-time guarantee and the absence of backreferences and lookaround were confirmed in the docs, but no timing was taken</li>
+                        <li>I did not read GNU grep 3.0's source to confirm its internals. The automaton description is widely reported and the measurements are consistent with it, but what this article verified is only that <strong>no blowup was observed</strong></li>
+                        <li>The grep measurements are buried under roughly 0.05 s of process startup, so the actual matching cost below that could not be separated out. The five-million-character figure is an estimate obtained by subtracting startup from 0.104 s</li>
+                        <li>Python's third-party <code>regex</code> module and the <code>re2</code> bindings were absent from this environment and are missing from the comparison. Only the standard <code>re</code> was measured</li>
+                        <li>Other JavaScript engines (SpiderMonkey, JavaScriptCore) were not measured. There is no basis for assuming the V8 figures carry over to them</li>
+                    </ul>
+
+                    <h2 id="sec-16">References</h2>
+
+                    <ul>
+                        <li><a href="https://pkg.go.dev/regexp" target="_blank" rel="noopener">Go <code>regexp</code> package documentation</a> — source of the sentence about the implementation being guaranteed to run in time linear in the size of the input, and of the statement that the accepted syntax is RE2</li>
+                        <li><a href="https://github.com/google/re2/wiki/Syntax" target="_blank" rel="noopener">RE2 Syntax (google/re2 wiki)</a> — the syntax table marking backreferences <code>\1</code> and <code>\k&lt;name&gt;</code> and the lookaround forms <code>(?=re)</code>, <code>(?!re)</code>, <code>(?&lt;=re)</code> and <code>(?&lt;!re)</code> all as NOT SUPPORTED</li>
+                        <li>Every timing in this article — obtained by running Node.js v22.16.0, Python 3.13.3, Perl 5.38.2 and GNU grep 3.0 directly on the machine described under Measurement environment. The scripts are reproduced in full in the text</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>Share this post</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X (Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">Copy link</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">Back to list</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Free tools you may find useful</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/curl_builder.html">curl Command Builder 2026</a></li>
+      <li><a href="../static/http_status_codes.html">HTTP Status Codes Reference 2026</a></li>
+      <li><a href="../static/nginx_generator.html">Nginx Config Generator 2026</a></li>
+      <li><a href="../static/ssh_config_generator.html">SSH Config Generator 2026</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">See all tools &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Related Posts</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="shell_glob_vs_regex.html">Globs Are Not Regex - When the Asterisk Means Two Different Things</a></li>
+      <li><a href="regex_lookahead_practical.html">Lookaround Only Looks - Solving Regex Problems With Zero Width 2026</a></li>
+      <li><a href="shell_here_doc_guide.html">Here-Documents in Practice - Turning Expansion Off and On, and the Indentation Trap</a></li>
+      <li><a href="personal_agent_server.html">A Server With a Resident Agent - What Changes When One Person Runs It</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('Link copied. Paste it into the Threads app to share.');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('Link copied.'); });
+    });
+    </script>
+</body>
+</html>

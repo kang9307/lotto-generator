@@ -1,0 +1,774 @@
+<!DOCTYPE html>
+<!--
+ * 技术博客文章模板
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>磁盘没满却报 No space left on device - inode 与仍被打开的文件</title>
+    <meta name="description" content="df 显示还有空间，写入却失败。inode 耗尽、已删除但仍被打开的文件、预留块、看错挂载点，这四种原因各自有什么可区分的信号，如何借助真实的命令输出逐一分辨，以及按哪个顺序排查才能最快收工，本文都逐条做了整理。">
+    <meta name="keywords" content="No space left on device, ENOSPC, inode 耗尽, df -i, du, lsof, 已删除但打开的文件, 预留块, tune2fs, ext4, XFS, btrfs, 块大小, 内部碎片, resize2fs, 开发, 基础设施, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/no_space_left_but_disk_free.html">
+
+    <meta property="og:title" content="磁盘没满却报 No space left on device - inode 与仍被打开的文件">
+    <meta property="og:description" content="症状只有一个，原因却有四个。按顺序确认是哪个挂载点、是容量还是 inode、df 与 du 是否对不上。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/no_space_left_but_disk_free.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-09-01">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="磁盘没满却报 No space left on device">
+    <meta name="twitter:description" content="空间还有富余而写入却失败的四个理由，以及按顺序把它们分开的诊断流程。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "磁盘没满却报 No space left on device - inode 与仍被打开的文件",
+      "alternativeHeadline": "症状只有一个，原因却有四个。按顺序把这四个分开的方法",
+      "datePublished": "2026-09-01",
+      "dateModified": "2026-09-01",
+      "inLanguage": "zh-CN",
+      "articleSection": "开发/基础设施",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "No space left on device, ENOSPC, inode 耗尽, df -i, du, 已删除但打开的文件, 预留块, tune2fs, ext4, XFS, btrfs, 块大小, resize2fs",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/no_space_left_but_disk_free.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "df 显示还有空间，为什么会报 No space left on device？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "ENOSPC 只是内核说它无法接受这次写入的一个信号，其背后的情形至少有四种。第一种不是容量而是文件数量上限的 inode 满了，用 df -i 确认。第二种是文件已删除但仍有进程占着，空间没有归还，这时 df 与 du 会对不上。第三种是 ext4 默认留出的预留块，使得只有普通用户看起来是满的。第四种是真正满了的其实是另一个文件系统。所以不要只看 df -h，要在 df -h 后面直接跟上失败的路径，先确认那条路径实际挂在哪个设备上。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "文件已经删了，为什么空间没有回来？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "rm 不是删除数据的命令，而是从目录里摘掉一个名字的 unlink。只要还有一个进程打开着那个文件，即使链接数变成 0，引用依然存在，内核就不会归还这些块。在 Git Bash 里创建 1GiB 文件，用 tail 占住后再删除，结果 rm 之后立刻归还的空闲块在 262,147 个中只有 16 个，而 du 已经降到 1.0K，与 df 对不上。结束那个进程之后，262,143 个块一次性回来了。解决办法不是再删一次文件，而是重启占住它的进程，或者切断那个文件描述符。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "inode 不够了还能增加吗？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "这取决于文件系统的种类。ext4 在 mkfs 时就把 inode 数量固定下来，mke2fs 文档针对 bytes-per-inode 比率明确写道，文件系统创建之后这个比率无法更改，因此要慎重决定取值。也就是说，ext4 上 inode 满了没有扩充的选项，只能减少文件数量或者重建文件系统。XFS 动态分配 inode，其最大比率 maxpct 可以用 xfs_growfs 修改。btrfs 的内核文档把动态 inode 分配列在功能清单里，固定上限这个概念本身就不一样。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "小文件多了为什么反而更占空间？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "文件系统按块分配空间，因此占用的不是逻辑大小而是块大小的整数倍。创建一个 4,097 字节的文件来量，逻辑大小是 4,097，实际分配却是 8,192 字节。为了一个字节，整整多贴上一个块。在创建两万个 1 字节文件的实测中，逻辑合计是 20,000 字节，实际占用却是 24,674,304 字节，约 1,233 倍。在文件数量多的地方，容量和 inode 会同时消耗，所以两者都要看。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "情况紧急时先删什么才安全？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "最安全的第一步不是删除，而是确认有没有被占住的空间。如果原因是已删除但仍被打开的文件，删多少都收不回来。可以删的是轮转后压缩的旧日志、包管理器缓存、构建产物、明显过期的临时文件。反过来，用 rm 删掉当前正打开的日志本体，空间回不来，日志却丢了。数据库文件、锁文件、套接字以及内容不明的目录不要动。rm -rf 和 truncate 无法撤销，执行前要用眼睛把路径再读一遍。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/no_space_left_but_disk_free.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/no_space_left_but_disk_free.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/no_space_left_but_disk_free.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/no_space_left_but_disk_free.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/no_space_left_but_disk_free.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "首页",
+      "item": "https://braindetox.kr/zh/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "开发/基础设施",
+      "item": "https://braindetox.kr/zh/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "磁盘没满却报 No space left on device - inode 与仍被打开的文件",
+      "item": "https://braindetox.kr/zh/posts/no_space_left_but_disk_free.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="磁盘没满却报 No space left on device - inode 与仍被打开的文件">
+                <meta itemprop="datePublished" content="2026-09-01">
+                <meta itemprop="dateModified" content="2026-09-01">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="No space left on device, ENOSPC, inode 耗尽, df -i, du, 已删除但打开的文件, 预留块, tune2fs, ext4, XFS, btrfs, 块大小, resize2fs">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/no_space_left_but_disk_free.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">磁盘没满却报 No space left on device - inode 与仍被打开的文件</h1>
+                    <h2 class="post-subtitle">症状只有一个，原因却有四个。按顺序把这四个分开的方法</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-01">2026年9月1日</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">开发/基础设施</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>收到服务写不了日志的告警，登进服务器。照习惯敲下 <code>df -h</code>。空闲还剩三成以上。可是在同一个 shell 里只敲一次 <code>touch</code>，回来的却是 <strong>No space left on device</strong>。这一刻大部分时间被浪费掉的原因只有一个，<strong>就是以为 df 在撒谎</strong>。</p>
+
+                    <p>df 不撒谎。它只是<strong>对没问到的事情不作答</strong>。你问容量它就答容量，你问根目录它就答根目录。如果写入失败的真正原因不是容量、或者不是根目录，那么 df 的回答仍然准确，却毫无用处。这篇文章把产生这种错位的四个位置分开，并整理出按哪个顺序排查最快收工。</p>
+
+                    <nav class="post-toc">
+                        <h3>本文涵盖的内容</h3>
+                        <ol>
+                            <li><a href="#sec-1">症状只有一个，原因有四个</a></li>
+                            <li><a href="#sec-2">本文的运行环境与验证范围</a></li>
+                            <li><a href="#sec-3">先要问的 - 真的是那个文件系统吗</a></li>
+                            <li><a href="#sec-4">原因 ① inode 耗尽 - 容量还有，数量却满了</a></li>
+                            <li><a href="#sec-5">inode 是什么时候定下来的 - ext4、XFS、btrfs</a></li>
+                            <li><a href="#sec-6">原因 ② 已删除却仍被打开的文件</a></li>
+                            <li><a href="#sec-7">原因 ③ 预留块 - 只有 root 看得见的余量</a></li>
+                            <li><a href="#sec-8">小文件更占空间的原因</a></li>
+                            <li><a href="#sec-9">找出是什么吃掉的 - du 惯用法</a></li>
+                            <li><a href="#sec-10">诊断顺序 - 四个步骤</a></li>
+                            <li><a href="#sec-11">容器与云上会有哪些不同</a></li>
+                            <li><a href="#sec-12">情况紧急时 - 可以删的和不能删的</a></li>
+                            <li><a href="#sec-13">从源头上防住的办法</a></li>
+                            <li><a href="#sec-14">小结</a></li>
+                            <li><a href="#sec-15">未能确认的部分</a></li>
+                            <li><a href="#sec-16">参考资料</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">症状只有一个，原因有四个</h2>
+
+                    <p><code>ENOSPC</code> 是内核对应用程序说 <strong>这次写入我接不下</strong> 的一个信号。信号只有一个，并不意味着背后的情形也只有一种。用人来打比方就像发烧，发烧本身不是诊断，而是提示该开始诊断了。可是现场常见的做法是一看到 <code>ENOSPC</code> 就直接转入 <strong>找东西删</strong>，而当原因不是容量时，那些工作全都白费。</p>
+
+                    <p>要分开的位置有四个。下表最右边一列，也就是 <strong>可区分的信号</strong>，才是这篇文章的实质内容。只背左边两列，顺序依然排不出来。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>原因</th><th>真正满了的东西</th><th>确认命令</th><th>可区分的信号</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>① inode 耗尽</td><td>文件数量上限</td><td><code>df -i</code></td><td>Use% 很低，只有 IUse% 是 100%</td></tr>
+                            <tr><td>② 已删除但仍打开的文件</td><td>没有归还的块</td><td><code>lsof +L1</code>、<code>/proc/&lt;pid&gt;/fd</code></td><td><code>df</code> 显示满了，<code>du</code> 的合计小得多</td></tr>
+                            <tr><td>③ 预留块</td><td>专留给 root 的那一份</td><td><code>tune2fs -l</code></td><td>只有普通账号失败，root 会成功</td></tr>
+                            <tr><td>④ 另一个挂载点</td><td>自己没看的那个文件系统</td><td><code>df -h &lt;路径&gt;</code></td><td>根目录有余量，只有该路径是 100%</td></tr>
+                        </tbody>
+                    </table>
+
+                    <ul>
+                        <li>①和④ <strong>各只需一行就能确认</strong>。所以把这两个放在最前面最省时间</li>
+                        <li>②必须 <strong>把 <code>df</code> 和 <code>du</code> 一起看</strong> 才会显形。只看其中一个，永远看不见</li>
+                        <li>③虽然少见，却会制造出 <strong>同一台服务器上不同人得到不同结果</strong> 的诡异局面，很耗时间</li>
+                    </ul>
+
+                    <h2 id="sec-2">本文的运行环境与验证范围</h2>
+
+                    <p>本文的主题是 Linux 服务器，但真正产出这里这些输出的环境是 <strong>Windows 10 上的 Git Bash</strong>。先说明这一点不是为了显得谦虚，而是因为读者需要能分清 <strong>哪些输出可以照单全信，哪些输出压根不在这里</strong>。</p>
+
+                    <pre><code>$ bash --version | head -1
+GNU bash, version 5.2.37(1)-release (x86_64-pc-msys)
+
+$ uname -a
+MINGW64_NT-10.0-19045 3.5.7-882031da.x86_64 2025-01-30 11:14 UTC x86_64 Msys
+
+$ df --version | head -1
+df (GNU coreutils) 8.32</code></pre>
+
+                    <p>coreutils 与 Linux 一样是 GNU 8.32，因此 <code>df</code>、<code>du</code>、<code>stat</code>、<code>sort</code> 的 <strong>选项行为与计算方式完全相同</strong>。不同的只是底下的文件系统是 NTFS，而后面会看到，这个差别本身反倒有助于理解 inode。</p>
+
+                    <ul>
+                        <li><strong>实际跑过的</strong> - <code>df -h</code>、<code>df -i</code>、<code>df --output</code>、<code>stat -f</code>、<code>stat -c</code>、<code>du</code> 的各种组合、<code>find -printf</code>，以及 <strong>已删除但仍打开文件的完整复现</strong></li>
+                        <li><strong>没能跑的</strong> - <code>lsof +L1</code>（这个环境里根本没有 lsof）、<code>tune2fs</code>、<code>debugfs</code>、<code>resize2fs</code>（ext4 专用）、以及容器叠加层相关的全部内容</li>
+                        <li><strong>没有编造的</strong> - 没跑成的命令的输出，本文里一行都没有。只写了命令和 <strong>怎么读</strong></li>
+                        <li><strong>动过手的</strong> - 只把输出里的用户路径简写成了 <code>/tmp/demo</code> 和 <code>&lt;user&gt;</code>。<strong>数字一个都没改</strong></li>
+                        <li>块大小在这个环境里报告为 <strong>4,096 字节</strong>。本文所有块计算都以这个值为准</li>
+                        <li>其他 shell（dash、zsh）或 BSD 系的 <code>df</code>、<code>du</code>，选项名与输出格式都不同。下面的命令以 <strong>GNU coreutils 为准</strong></li>
+                    </ul>
+
+                    <h2 id="sec-3">先要问的 - 真的是那个文件系统吗</h2>
+
+                    <p>按顺序这是第一件事。在原因清单里它是第④个，但 <strong>因为确认起来最便宜</strong>。不带参数敲 <code>df -h</code> 会列出挂载清单，而人的眼睛通常停在最上面那行根目录上。真正失败的路径如果挂在别的文件系统上，那一行就在屏幕下面的某处。</p>
+
+                    <p>纠正的办法是 <strong>把路径直接交给 df</strong>。就连这个环境也会把同一块物理磁盘报告成两个不同的挂载点。</p>
+
+                    <pre><code>$ df -h . /
+Filesystem                        Size  Used Avail Use% Mounted on
+C:/Users/&lt;user&gt;/&lt;temp&gt;  931G  600G  332G  65% /tmp
+C:/Program Files/Git                931G  600G  332G  65% /
+
+# 要点 - 当前目录挂的不是 /，而是 /tmp。
+# Linux 上也一样。把失败的路径直接交给 df。
+$ df -h /var/log</code></pre>
+
+                    <p>在 Linux 服务器上，最常踩到这个坑的位置是固定的。下面这个清单是 <strong>根目录还有余量却写入失败</strong> 的典型布局。</p>
+
+                    <ul>
+                        <li><code>/var</code> 是独立分区的配置 - 日志和包缓存都堆在这里，所以比根目录早得多就满了</li>
+                        <li><code>/boot</code> - 通常只划几百 MB，堆上几个内核包就满了。症状表现为 <strong>内核更新失败</strong>，看起来不像磁盘问题</li>
+                        <li><code>/tmp</code> 是 <code>tmpfs</code> 的配置 - 用的是内存，与实际磁盘无关地被填满。重启就消失，原因随之蒸发</li>
+                        <li>容器内部 - 可写层和挂载进来的卷是 <strong>彼此不同的文件系统</strong>。卷还有余量，可写层满了照样失败</li>
+                        <li>绑定挂载或 NFS 交叠的路径 - 只看路径字符串像是同一棵树，设备却不同</li>
+                    </ul>
+
+                    <h2 id="sec-4">原因 ① inode 耗尽 - 容量还有，数量却满了</h2>
+
+                    <p>文件系统不只保存数据，还会另外管理 <strong>针对每一个文件的元数据条目</strong>。装着属主、权限、时间以及实际数据块位置的结构就是 inode。文件名不在里面。名字由目录持有，而目录是 <strong>把名字和 inode 号配成对的清单</strong>。正因为这种结构，一个 inode 可以挂上多个名字，那就是硬链接。</p>
+
+                    <p>要紧的是 <strong>这类条目的数量可能存在上限</strong>。上限一满，块再多也创建不了新文件。确认只要 <code>df -i</code> 一行。可是在这个环境里，这条命令是这样回答的。</p>
+
+                    <pre><code>$ df -i .
+Filesystem                       Inodes IUsed IFree IUse% Mounted on
+C:/Users/&lt;user&gt;/&lt;temp&gt;    -     -     -     - /tmp
+
+$ stat -f .
+  File: "."
+    ID: ea1df1ef00000000 Namelen: 255     Type: UNKNOWN
+Block size: 4096       Fundamental block size: 4096
+Blocks: Total: 244041727  Free: 86972107   Available: 86972107
+Inodes: Total: 18446744073709551615 Free: -1</code></pre>
+
+                    <p>全是 <code>-</code>。而 <code>stat -f</code> 把理由摆了出来。作为 inode 总数报告的 <strong>18,446,744,073,709,551,615</strong> 是无符号 64 位整数的最大值，也就是 <strong>表示没有上限的哨兵值</strong>，而 Free 是 <code>-1</code>。NTFS 没有 ext4 那样的固定 inode 表，因此压根就没有可报告的数字。</p>
+
+                    <p>这些空白不是失败，而是 <strong>把最重要的事实原样呈现出来的画面</strong>。inode 上限不是文件系统的普遍属性，而是 <strong>因实现而异的设计选择</strong>。所以在 ext4 服务器上管用的应对，搬到 XFS 服务器上未必管用。在 Linux 上填着真实数字的画面，以及那时接着要敲的命令是这样的。</p>
+
+                    <pre><code># ① 哪个挂载点的 inode 满了
+df -i
+
+# ② 该挂载点内文件扎堆的目录 (先粗看一遍)
+du --inodes -x -d 2 /var 2&gt;/dev/null | sort -n | tail -20
+
+# ③ 直接按目录统计文件数量 (没有 du --inodes 的老环境)
+find /var -xdev -type f -printf '%h\n' 2&gt;/dev/null \
+  | sort | uniq -c | sort -rn | head -20
+
+# 上面这三行在本环境里没能执行。
+# 因为 NTFS 不报告 inode 数量，①是空白。</code></pre>
+
+                    <p>小文件成百上千万堆起来的地方，大体是固定的。下面是 <strong>容量曲线毫无变化而 inode 却在悄悄涨满</strong> 的典型位置。</p>
+
+                    <ul>
+                        <li><strong>会话文件</strong> - 不设过期清理，就会按访客数量堆文件，每个只有几百字节</li>
+                        <li><strong>邮件队列与 Maildir</strong> - 一封消息就是一个文件。投递受阻，队列就原样变成数量留下来</li>
+                        <li><strong>缓存碎片</strong> - 把哈希拆成目录的缓存，会因为 <strong>目录也占 inode</strong> 而翻倍膨胀</li>
+                        <li><strong>日志碎片</strong> - 轮转周期短、保留份数多，压缩件就会一直留着。每个都小，胜负却由数量决定</li>
+                        <li><strong>依赖目录</strong> - 每个构建环境各生成一份的包目录树，光文件数就能涨到几十万量级</li>
+                    </ul>
+
+                    <h2 id="sec-5">inode 是什么时候定下来的 - ext4、XFS、btrfs</h2>
+
+                    <p>分岔就在这里。<code>mke2fs</code> 文档对 <code>-i</code> 选项，也就是每个 inode 分配多少字节，把话说死了，<strong>文件系统创建之后这个比率无法更改，因此要慎重决定取值</strong>。预留块比率默认值是 5% 这一点，也写在同一份文档里。</p>
+
+                    <p>这一句话在实务上分量很重。<strong>ext4 上 inode 满了，就没有扩充这个选项。</strong> 只能减少文件数量，或者把数据搬走重建文件系统。这是一个在故障当中才知道就太晚的事实，所以最好在设计存储时就预先定好。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>文件系统</th><th>inode 分配方式</th><th>之后还能增加吗</th><th>在实务上意味着什么</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>ext4</td><td>mkfs 时数量固定。用 <code>-i</code> 比率或 <code>-N</code> 数量指定</td><td>不行。文档明确写着无法更改</td><td>若知道小文件会很多，就在 <strong>创建时</strong> 把比率调低</td></tr>
+                            <tr><td>XFS</td><td>动态分配。只用 <code>maxpct</code> 管理上限</td><td>可以。用 <code>xfs_growfs -m</code> 修改上限</td><td>即使耗尽，也还有抬高上限来争取时间的余地</td></tr>
+                            <tr><td>btrfs</td><td>内核文档的功能清单里列着 <strong>动态 inode 分配</strong></td><td>固定上限这个概念本身就不一样</td><td>不能把 <code>df -i</code> 的数字按 ext4 的含义来读</td></tr>
+                        </tbody>
+                    </table>
+
+                    <ul>
+                        <li>XFS 的 <code>maxpct</code> 默认值随文件系统大小而变。按文档是 <strong>1TB 以下 25%、50TB 以下 5%、再往上 1%</strong></li>
+                        <li>文档写道，把 <code>maxpct</code> 设为 0，实际上整个文件系统都可能变成 inode 块。这 <strong>既是解开上限，也是让守护数据空间的那道机制消失</strong></li>
+                        <li>所以 <code>df -i</code> 的 IUse% 是 <strong>不知道文件系统类型就读不懂的数字</strong>。同样是 90%，在 ext4 上是警报，在 XFS 上则是判断要不要抬高上限的材料</li>
+                    </ul>
+
+                    <h2 id="sec-6">原因 ② 已删除却仍被打开的文件</h2>
+
+                    <p><code>rm</code> 不是删除数据的命令，而是 <strong>从目录里摘掉一个名字的 unlink</strong>。即便名字全没了、链接数变成 0，只要 <strong>还有一个进程打开着那个文件</strong>，内核就不会归还这些块。要等最后一个引用被关闭的那一刻，空间才回来。</p>
+
+                    <p>这个行为本身不是缺陷，而是 POSIX 定下的安全装置。它防止文件在读取途中消失而把进程搞崩。问题在于此时 <strong>观测工具会给出互相不同的答案</strong>。<code>df</code> 读的是文件系统的块账目，所以把被占住的空间算作 <strong>已使用</strong>。<code>du</code> 是走遍目录去数文件，所以 <strong>没有名字的文件它根本看不见</strong>。两者于是对不上。</p>
+
+                    <p>在这个环境里原样复现了。创建 1GiB 文件，用 <code>tail -f</code> 占住后删除，并在每一步读取空闲块数。下面是实际输出。</p>
+
+                    <pre><code>$ cd /tmp/demo
+$ free() { stat -f -c %f .; }          # 空闲块数 (1 块 = 4096 字节)
+
+STEP 0  空目录               空闲块: 86970141
+$ head -c 1073741824 /dev/zero &gt; big.log
+STEP 1  创建 1GiB            空闲块: 86707994   du -sh: 1.0G
+$ ( tail -f big.log &gt; /dev/null &amp; )
+STEP 2  tail 占住了它
+$ rm big.log
+STEP 3  rm 之后立刻          空闲块: 86708010   du -sh: 1.0K
+STEP 3b 2 秒后               空闲块: 86708010
+$ kill &lt;tail 的 pid&gt;
+STEP 4  进程结束之后         空闲块: 86970153</code></pre>
+
+                    <p>把数字照原样读就是这样。创建文件时少了 <strong>262,147 个块</strong>。乘以 4,096 字节约为 1.0GiB，与创建的大小对得上。可是 <code>rm</code> 之后立刻回来的只有 <strong>16 个块</strong>。删了 1GiB 只回来 64KiB，实际上等于零。而同一时刻 <code>du</code> 已经答的是 <strong>1.0K</strong>。<strong>df 与 du 差了整整 1GiB 的状态</strong> 就是在这里造出来的。</p>
+
+                    <p>接着一结束进程，<strong>262,143 个块</strong> 一次性回来了。删掉文件的是 <code>rm</code>，归还空间的却是 <code>kill</code>。<strong>解决办法不是把文件再删一遍，而是让占住它的一方松手</strong>，这句话的依据就是这两行。</p>
+
+                    <p>找出元凶是另一回事。标准工具是 <code>lsof +L1</code>，文档说明这种写法 <strong>会挑出名字已被删除却仍打开着的文件</strong>。只是这个环境里没有装 lsof，所以没能跑。作为替代，<code>/proc</code> 那一侧照常工作，内核加上的 <code>(deleted)</code> 标记清清楚楚地出来了。</p>
+
+                    <pre><code># 在本环境里执行过的 - 用 /proc 确认
+$ ls -l /proc/&lt;pid&gt;/fd | grep -i deleted
+lrwxrwxrwx 3 -&gt; /tmp/demo/big.log (deleted)
+
+# 在本环境里没能执行的 - lsof 未安装
+$ sudo lsof +L1                  # 只列链接数小于 1 的打开文件
+$ sudo lsof -nP +L1 /var         # 收窄到特定挂载点</code></pre>
+
+                    <div class="callout">
+                        <strong>注意</strong> - 进程无法重启时，用 <code>&gt; /proc/&lt;pid&gt;/fd/&lt;n&gt;</code> 截断文件描述符的做法流传很广。空间会立刻回来，但 <strong>号码挑错，那个进程打开着的另一个文件就会被整个清空。</strong> 无法撤销，也没有确认环节。只要还能重启，重启永远是更安全的那一边。
+                    </div>
+
+                    <ul>
+                        <li>制造这种局面最多的是 <strong>日志轮转的配置失误</strong>。移走或删掉文件之后，没有给进程发出重新打开的信号，进程就会继续往那个没有名字的旧文件里写。日志轮转悄悄失败的地方就在这里</li>
+                        <li>怎么定位占住文件的进程，本身不在本文范围内。本文只看到 <strong>空间为什么不回来</strong> 为止</li>
+                        <li><strong>磁盘用量不呈阶梯状下降的曲线</strong> 是这个原因的好信号。清理跑过了曲线却是平的，说明删掉的东西还开着</li>
+                        <li>重启的对象大多是写日志的那一侧。把日志写成文件的应用，以及读取该日志并转发的采集器，<strong>两边都</strong> 可能占着同一个文件</li>
+                    </ul>
+
+                    <h2 id="sec-7">原因 ③ 预留块 - 只有 root 看得见的余量</h2>
+
+                    <p>ext 系会把总块数的一部分 <strong>专留给特权进程</strong>。<code>tune2fs</code> 文档给出了两条理由，<strong>为了避免文件系统碎片化</strong>，以及 <strong>为了让非特权进程被拒绝写入之后系统守护进程仍能继续正常工作</strong>。默认值是 5%。</p>
+
+                    <p>于是就有了这样的场面。用应用账号写入失败，换成管理员登进去在同一个位置建文件却成功。两个人看着同一台服务器却得出彼此不同的结论，就是从这里来的。如果 <code>df</code> 的 Use% <strong>停在 95% 上下而不是 100%</strong>，写入却失败，那就值得怀疑这个原因。</p>
+
+                    <pre><code># 确认预留块 (ext2/3/4) - 本环境里没能执行
+$ sudo tune2fs -l /dev/sda1 | grep -iE 'block count|reserved'
+# Block count:              总块数
+# Reserved block count:     预留的块数
+# 两个值的比例就是预留比率。
+
+# 调整比率 - 可以改回来，但要慎重
+$ sudo tune2fs -m 1 /dev/sda1    # 5% -&gt; 1%</code></pre>
+
+                    <div class="callout">
+                        <strong>注意</strong> - 常能看到用 <code>tune2fs -m 0</code> 把预留完全取消的建议，但文档说明的那两个目的会一并消失。余量接近 0 时 <strong>会因为找不到连续的块而让碎片化急剧加剧</strong>，写日志的守护进程也跟着停下，于是失去 <strong>记录故障原因的手段</strong>。在已挂载的状态下指错了值，在改回来之前会一直生效。
+                    </div>
+
+                    <ul>
+                        <li>预留比率是 <strong>百分比</strong>。所以磁盘越大，被留出去的绝对量就越大。几 TB 的卷上，5% 就是相当可观的量</li>
+                        <li>在 <strong>纯数据卷</strong>，也就是系统守护进程不往上写日志的卷上，有理由把比率调低。不过留 1~2% 左右，而不是 0</li>
+                        <li>反过来，<code>/</code> 和 <code>/var</code> 上还是保持默认值为好。这里正是文档所说 <strong>守护进程必须继续工作的地方</strong></li>
+                        <li>XFS 没有同名的概念，用别的方式管理余量。<strong>不能把 ext 系的习惯照搬过去</strong></li>
+                    </ul>
+
+                    <h2 id="sec-8">小文件更占空间的原因</h2>
+
+                    <p>文件系统不按字节给空间，而是 <strong>按块</strong> 给。1 字节的文件也会整整领走一个块。剩下的部分别的文件用不了，这种浪费叫内部碎片。光听说法显得无足轻重，可一旦乘上数量，性质就变了。</p>
+
+                    <p>我实际量了一下。<code>du</code> 的 <code>--apparent-size</code> 报告 <strong>逻辑大小</strong>，默认行为报告 <strong>实际分配量</strong>。把两个值并排放着，差别一目了然。</p>
+
+                    <pre><code>$ du -b --apparent-size one_byte.txt b100.bin b4096.bin b4097.bin b1m.bin
+1        one_byte.txt
+100      b100.bin
+4096     b4096.bin
+4097     b4097.bin
+1048576  b1m.bin
+
+$ du --block-size=1 one_byte.txt b100.bin b4096.bin b4097.bin b1m.bin
+1024     one_byte.txt
+1024     b100.bin
+4096     b4096.bin
+8192     b4097.bin
+1048576  b1m.bin</code></pre>
+
+                    <p>最值得看的一行是 <code>b4097.bin</code>。逻辑大小 <strong>4,097 字节</strong>，实际分配却是 <strong>8,192 字节</strong>。就因为越过块边界一个字节，整整多贴上 4,096 字节。而 4,096 字节的文件恰好只用 4,096。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>逻辑大小</th><th>实际分配（实测）</th><th>浪费</th><th>倍数</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>1 B</td><td>1,024 B</td><td>1,023 B</td><td>1,024 倍</td></tr>
+                            <tr><td>100 B</td><td>1,024 B</td><td>924 B</td><td>约 10 倍</td></tr>
+                            <tr><td>4,096 B</td><td>4,096 B</td><td>0</td><td>1 倍</td></tr>
+                            <tr><td>4,097 B</td><td>8,192 B</td><td>4,095 B</td><td>约 2 倍</td></tr>
+                            <tr><td>1,048,576 B</td><td>1,048,576 B</td><td>0</td><td>1 倍</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>这里有一点要老实说明。1 字节文件的分配量出来是 <strong>1,024</strong> 而不是 4,096，是因为 NTFS 会把极小的文件一并存进元数据记录里。ext4 默认不用这项优化，所以 <strong>同样的实验预计会得出 4,096，但那个画面不在本文里。</strong> 相比之下，<code>b4097.bin</code> 在块边界上翻倍的行为，是所有按块分配的文件系统所共有的。</p>
+
+                    <p>乘上数量会怎样，我也量了。两万个 1 字节文件。</p>
+
+                    <pre><code>$ time ( for i in $(seq 1 20000); do printf 'x' &gt; "f$i"; done )
+real    0m25.766s
+
+$ ls -1 | wc -l
+20000
+
+$ du -sb --apparent-size .
+20000     .          # 逻辑合计 = 20,000 字节 (约 20KB)
+
+$ du -s --block-size=1 .
+24674304  .          # 实际占用 = 24,674,304 字节 (约 23.5MiB)</code></pre>
+
+                    <p>逻辑上的 20KB 实际占了 <strong>23.5MiB</strong>。约 <strong>1,233 倍</strong>。这个值里既有文件本身的分配量，也有为了装下两万个名字而变大的目录结构。<strong>目录也占空间</strong> 这个事实，在这里看得见了。</p>
+
+                    <ul>
+                        <li>在 ext4 上按 4KiB 块做同样的事，算术是这样的。<strong>100 万个 1 字节文件逻辑上是 1MB，实际是 4,096,000,000 字节，也就是约 3.8GiB</strong>。这个值是 <strong>按块大小算出来的，不是实测</strong>，而且不含目录结构</li>
+                        <li>所以在文件多的地方，<strong>容量和 inode 会同时</strong> 消耗。哪一边先见底，取决于文件大小的分布</li>
+                        <li>把小文件打包成一个才是根本对策。日志轮转后压缩，缓存设过期，归档要 <strong>按包而不是按单个文件</strong> 保存</li>
+                    </ul>
+
+                    <h2 id="sec-9">找出是什么吃掉的 - du 惯用法</h2>
+
+                    <p>确定了挂载点，也确认了确实是容量问题，接下来就是自上而下逐层收窄。惯用法有一条就够。</p>
+
+                    <pre><code>$ du -h -x --max-depth=1 . | sort -h
+1.0K    ./deleted_open
+1.0K    ./demo2
+24M     ./tiny
+25M     .
+
+# 大的排在下面，所以从最后一行往上读。
+# 在 Linux 上通常这样开始。
+$ sudo du -h -x --max-depth=1 / | sort -h</code></pre>
+
+                    <p>三个选项各司其职。<code>--max-depth=1</code> 只展示 <strong>一层</strong>。不给深度就会涌出几万行，根本读不了。<code>sort -h</code> 会把 <code>24M</code> 这类给人看的写法 <strong>按大小</strong> 排序。按字符串排序的话，<code>9K</code> 会排在 <code>24M</code> 后面。</p>
+
+                    <p>而 <code>-x</code> 是这条惯用法的核心。它是阻止 <strong>越到别的文件系统上去</strong> 的选项。去掉它再从 <code>/</code> 开始扫，就会一路跟进挂载的网络存储和容器层，时间要多花好几倍，<strong>而且和当前要找的文件系统无关的数字会混进结果里</strong>。</p>
+
+                    <p>不过这里也有要老实写下来的地方。在这个环境里，我没能造出 <code>-x</code> 真正挡住了什么的场面。</p>
+
+                    <pre><code>$ stat -c %d / /tmp .
+3927831023
+3927831023
+3927831023
+# 三个的设备 ID 相同 -&gt; 压根就没有让 -x 停下来的边界。
+# 只确认到选项被接受、结果相同为止。
+
+# 按文件数量收窄的版本 (inode 耗尽时)
+$ find . -xdev -type f -printf '%h\n' | sort | uniq -c | sort -rn | head -5
+  20000 ./tiny
+      5 .
+      1 ./demo2
+      1 ./deleted_open</code></pre>
+
+                    <ul>
+                        <li><code>sort -h</code> 是 GNU 扩展。在这个环境的帮助里确认了它以 <code>-h, --human-numeric-sort</code> 的形式实际存在，但 <strong>BSD 系或最小容器镜像里可能没有</strong>。那时就用 <code>du -k</code> 取出来再用 <code>sort -n</code></li>
+                        <li><code>du --inodes</code> 数的不是大小而是 <strong>条目数量</strong>。inode 耗尽时，把上面那条惯用法里的 <code>-h</code> 去掉换成它，就能照样用</li>
+                        <li><code>find</code> 会一个一个地扫文件，所以 <strong>在文件多的文件系统上会跑很久</strong>。在运行中的服务器上要顾及负载，先把范围收窄再开始</li>
+                        <li>结果 <strong>与合计对不上</strong> 就要怀疑原因②。用 <code>du</code> 怎么加都够不到 <code>df</code> 的用量，说明某处开着没有名字的文件</li>
+                    </ul>
+
+                    <h2 id="sec-10">诊断顺序 - 四个步骤</h2>
+
+                    <p>把前面的内容折成执行顺序，就是四个步骤。每一步的存在，都是为了 <strong>决定要不要进入下一步</strong>。之所以要守住顺序，是因为前面的步骤比后面的便宜得多。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>步骤</th><th>问的是什么</th><th>命令</th><th>如果是这样</th><th>下一步</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>1</td><td>是哪个挂载点</td><td><code>df -h &lt;失败的路径&gt;</code></td><td>那一行的 Use% 很低</td><td>你看错了路径。重新确认失败的路径</td></tr>
+                            <tr><td>2</td><td>是容量还是 inode</td><td><code>df -i &lt;失败的路径&gt;</code></td><td>只有 IUse% 是 100%</td><td>原因①。去找文件扎堆的目录</td></tr>
+                            <tr><td>3</td><td>与 <code>du</code> 对不上吗</td><td>把 <code>du -sh -x &lt;挂载点&gt;</code> 与 <code>df</code> 对照</td><td><code>du</code> 的合计小得多</td><td>原因②。找出占住的进程并重启</td></tr>
+                            <tr><td>4</td><td>是什么吃掉的</td><td><code>du -h -x --max-depth=1 | sort -h</code></td><td>能锁定较大的条目</td><td>一层一层往下重复</td></tr>
+                            <tr><td>+</td><td>是不是只有 root 能过</td><td>用普通账号和 root 各 <code>touch</code> 一次</td><td>只有 root 成功</td><td>原因③。去确认预留块</td></tr>
+                        </tbody>
+                    </table>
+
+                    <ul>
+                        <li>第 1 步和第 2 步 <strong>加起来两行</strong>，几乎没有负载。而只靠这两步就结束的情况实际上相当多</li>
+                        <li>跳过第 3 步，就会在第 4 步把时间耗光却什么也找不到。知道 <strong>存在 du 找不出元凶的情形</strong>，正是这张表的要点</li>
+                    </ul>
+
+                    <h2 id="sec-11">容器与云上会有哪些不同</h2>
+
+                    <p>同样的症状在容器里更让人犯迷糊。容器里的 <code>df</code> 回答的是 <strong>那个容器看得见的挂载</strong>，而真正满了的往往是宿主节点的磁盘。反过来也有节点余量充裕，只是容器可写层上的配额满了的情况。得先定下 <strong>是在哪一边敲的 df</strong>。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>情形</th><th>容易误以为的事</th><th>实际该看的地方</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>镜像层满了</td><td>卷还有余量，所以没事</td><td>可写层与卷是 <strong>不同的文件系统</strong></td></tr>
+                            <tr><td>停止的容器和旧镜像堆积了</td><td>只数正在运行的，也没多少</td><td>把停止的容器、未使用的镜像、构建缓存全部合算</td></tr>
+                            <tr><td>容器日志无限增长</td><td>应用没有留日志</td><td>是运行时把标准输出写成文件。确认大小上限的设置</td></tr>
+                            <tr><td>云上把磁盘扩容了却没变化</td><td>在控制台扩了就完事了</td><td>分区和文件系统 <strong>要分别扩</strong></td></tr>
+                            <tr><td>节点的 inode 满了</td><td>容量曲线是平的，所以没问题</td><td>镜像层就是一堆小文件。要单独监控 inode</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>最后一行尤其常中招。<code>resize2fs</code> 文档明确写着 <strong>本程序不会操作分区的大小</strong>。也就是说，扩了块设备之后要先扩分区，然后再扩文件系统。把这两步当成一步，就会出现控制台上容量涨了、服务器里却没变的状态。</p>
+
+                    <pre><code># 云磁盘扩容之后 - 是有顺序的 (本环境里没能执行)
+# ① 内核有没有看到新的大小
+lsblk
+
+# ② 扩展分区 (只在使用分区的配置里)
+sudo growpart /dev/sda 1
+
+# ③ 扩展文件系统
+sudo resize2fs /dev/sda1        # ext2/3/4
+sudo xfs_growfs /               # XFS 要给挂载点
+
+# 容器这边 - 按类别统计什么占了地方
+docker system df
+docker system df -v</code></pre>
+
+                    <ul>
+                        <li>叠加层方式在修改文件时会 <strong>先把原件复制到上层</strong> 再改。改大文件里的一行，也可能需要相当于该文件大小的额外空间</li>
+                        <li>在容器里删掉的文件 <strong>不会从下层消失</strong>。只是在上面盖一个删除标记，所以镜像大小不会变小</li>
+                        <li>清理命令有多方便就有多危险。存在 <strong>连未使用的卷也一起删掉的选项</strong>，而那些卷里可能装着数据</li>
+                        <li>整个节点满了的时候，调度器会 <strong>把 Pod 挤到别的节点上</strong>。症状先表现为重启而不是磁盘，原因就被发现得晚</li>
+                    </ul>
+
+                    <h2 id="sec-12">情况紧急时 - 可以删的和不能删的</h2>
+
+                    <p>服务停着的时候没有时间判断。所以需要 <strong>事先定好的清单</strong>。不过第一步不是删除。<strong>先确认有没有被占住的空间</strong> 才是第一步。如果是原因②，删什么都收不回来，不确认就开始删，只会白丢时间，留下无法撤销的删除。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>分类</th><th>对象</th><th>为什么</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>相对安全</td><td>轮转后压缩的旧日志</td><td>已经是关闭的文件。只要确认保留期限即可</td></tr>
+                            <tr><td>相对安全</td><td>包管理器缓存</td><td>可以重新下载。只花重装的时间</td></tr>
+                            <tr><td>相对安全</td><td>构建产物与临时目录</td><td>可以重新生成。但要确认 <strong>没有正在进行的构建</strong></td></tr>
+                            <tr><td>注意</td><td>核心转储</td><td>删掉也行，但那是 <strong>故障原因分析的材料</strong>。先移走</td></tr>
+                            <tr><td>绝对禁止</td><td>当前正打开的日志本体</td><td>空间回不来，只丢日志。还会制造出原因②</td></tr>
+                            <tr><td>绝对禁止</td><td>数据库文件、锁文件、套接字</td><td>会导致损坏或起不来</td></tr>
+                            <tr><td>绝对禁止</td><td>内容不明的目录</td><td>越急越是不看就删。无法撤销</td></tr>
+                        </tbody>
+                    </table>
+
+                    <div class="callout">
+                        <strong>注意</strong> - <code>rm -rf</code> 不会征求确认，也无法撤销。把路径做成变量来用，就会出 <strong>变量为空时从最上层开始删的事故</strong>。执行前先用同样的参数跑一次 <code>ls -d</code>，用眼睛确认对象，这个习惯很便宜。<code>truncate -s 0</code> 会留下文件把内容清空，所以能用在打开着的日志上，但 <strong>内容照样没了</strong>。有要留的东西就先移走。
+                    </div>
+
+                    <ul>
+                        <li>空间彻底为 0 时，<strong>删除这个动作本身也可能失败</strong>。要留日志或建临时文件的工具，这时是不工作的</li>
+                        <li>所以像 <code>truncate -s 0</code> 或 <code>: &gt; 文件</code> 这样 <strong>不创建新文件的清空方式</strong>，在这种局面下很有用</li>
+                        <li>把急火压住之后，一定要回头追原因。<strong>删掉就解决了，并不能解释它为什么会满。</strong> 同样的事会按同样的周期回来</li>
+                    </ul>
+
+                    <h2 id="sec-13">从源头上防住的办法</h2>
+
+                    <p>这个症状很多时候是因为少了一个监控项。容量几乎到处都在看，但 <strong>inode 使用率常常不在默认仪表盘上。</strong> 于是容量曲线平平的，故障却发生了。</p>
+
+                    <p>我做了一段只取出超阈值挂载点的脚本跑了跑，结果在这里出现了 <strong>常见惯用法真的出错的场面</strong>。这是值得记下来的失败，就原样搬过来。</p>
+
+                    <pre><code># 常用的版本 - 在本环境里给出了错误答案
+$ df -P | awk 'NR&gt;1 &amp;&amp; $5+0 &gt;= 80 {print $6, $5}'
+65% 347611880          # 值反过来了
+
+# 原因 - 设备名里有空格，字段错开了一位
+$ df -P | awk 'NR&gt;1 {print "NF=" NF "  $5=[" $5 "]  $6=[" $6 "]"}'
+NF=7  $5=[347583704]  $6=[65%]
+
+# 改好的版本 - 不数字段，而是指定着接收
+$ df --output=pcent,target | awk 'NR&gt;1 &amp;&amp; $1+0 &gt;= 60 {print "DISK", $2, $1}'
+DISK / 65%
+
+$ df --output=ipcent,target | awk 'NR&gt;1 &amp;&amp; $1+0 &gt;= 60 {print "INODE", $2, $1}'
+(无输出 - 这个文件系统不报告 inode 比率)</code></pre>
+
+                    <p>按字段号切 <code>df -P</code> 输出的做法，立足于 <strong>设备名或挂载点里没有空格这个假设</strong>。假设一破，它就悄悄读了别的列，条件式照样为真，于是 <strong>错误的告警看起来一切正常地发了出去。</strong> 用 <code>df --output=</code> 只接收需要的列，这个假设本身就不需要了。</p>
+
+                    <ul>
+                        <li><strong>把 inode 使用率加进监控项。</strong> 设成和容量一样的阈值就够了。这不是聊胜于无的程度，本文的原因①靠这一项就能全部预防</li>
+                        <li>日志轮转要把 <strong>保留份数和是否压缩</strong> 一起定。只把份数调大，容量没事而 inode 会满</li>
+                        <li>给临时文件挂上 <strong>过期清理</strong>。会话和缓存，写创建代码的人得连删除代码一起写好</li>
+                        <li>容器日志要明确 <strong>文件大小上限和保留份数</strong>。默认值是无限制的配置很常见</li>
+                        <li>告警按 <strong>剩余时间而不是剩余百分比</strong> 来看更好。知道一天涨几 GB，就能算出什么时候会满</li>
+                    </ul>
+
+                    <h2 id="sec-14">小结</h2>
+
+                    <p><code>No space left on device</code> 不是诊断，而是诊断的开始。它背后至少有四种情形，而 <strong>该做的事会因为是哪一种而完全相反</strong>。inode 满了，找大文件也没用；已删除却仍打开的文件是原因时，删得更多反而有害。</p>
+
+                    <p>所以要记的不是命令清单而是顺序。把失败的路径直接交给 <code>df</code>，用 <code>df -i</code> 分清是容量还是数量，把 <code>du</code> 的合计与 <code>df</code> 对上，然后才去找是什么吃掉的。<strong>第三步就是这个顺序的价值所在</strong>。在这里看到对不上，就能提前知道剩下的搜寻全是白费。</p>
+
+                    <p>还有，本文里实际量出来的两个数字值得记住。<strong>删掉的 1GiB 在杀掉进程之前只回来了 16 个块</strong>，以及 <strong>两万个 1 字节文件占了 23.5MiB</strong>。这两个数字，靠只看一次 <code>df</code> 的习惯绝对看不见。</p>
+
+                    <h2 id="sec-15">未能确认的部分</h2>
+
+                    <ul>
+                        <li>没能造出 <strong>inode 真的耗尽的画面</strong>。这个环境的 NTFS 不报告 inode 数量，所以 <code>df -i</code> 全都出 <code>-</code>。IUse% 为 100% 的输出不在本文里，取而代之的是用 <code>stat -f</code> 展示了 <strong>为什么会是空白</strong></li>
+                        <li><strong>没能跑 <code>lsof +L1</code>。</strong> 这个环境里没装 lsof。选项的含义在文档里确认过，同样目的的 <code>/proc/&lt;pid&gt;/fd</code> 那一侧则实际跑了，连 <code>(deleted)</code> 标记都确认到了</li>
+                        <li><strong><code>tune2fs</code>、<code>debugfs</code>、<code>resize2fs</code>、<code>xfs_growfs</code> 没能执行。</strong> 它们是 ext4/XFS 专用工具，而这个环境里没有对应的文件系统。预留块比率 5%、XFS 的 <code>maxpct</code> 默认值、<code>resize2fs</code> 不碰分区这几点，是 <strong>在官方 man 文档里确认的</strong></li>
+                        <li>没能直接测量 <strong>ext4 上 1 字节文件的分配量</strong>。这个环境里出来的是 1,024 字节，那是 NTFS 存放小文件的方式所致。按 4KiB 块得出的计算值，正文里已 <strong>标明是计算</strong></li>
+                        <li>没能造出 <strong><code>du -x</code> 在文件系统边界上停下的场面</strong>。<code>/</code>、<code>/tmp</code> 和工作目录的设备 ID 全都相同，没有可越的边界。只确认到选项被接受为止</li>
+                        <li><strong>btrfs 的 <code>df -i</code> 输出形式</strong> 未能确认。只确认了内核文档的功能清单里列有动态 inode 分配这一事实，那些数字该怎么读，本文没有涉及</li>
+                        <li><strong>容器与云那两节全部未执行</strong>。叠加层的行为、清理命令的输出、磁盘扩容的步骤，在这个环境里一个都没跑过。只写了命令的顺序和依据</li>
+                    </ul>
+
+                    <h2 id="sec-16">参考资料</h2>
+
+                    <ul>
+                        <li><a href="https://man7.org/linux/man-pages/man8/mke2fs.8.html" target="_blank" rel="noopener">mke2fs(8) - man7.org</a> - 预留块默认值是 5% 这一点，以及 <code>-i</code> 的 bytes-per-inode 比率 <strong>在文件系统创建之后无法更改</strong> 的警告</li>
+                        <li><a href="https://man7.org/linux/man-pages/man8/tune2fs.8.html" target="_blank" rel="noopener">tune2fs(8) - man7.org</a> - <code>-m</code> 选项的说明。里面写着预留块的两个理由是 <strong>避免碎片化</strong> 和 <strong>让系统守护进程在非特权进程被挡住之后仍能继续工作</strong></li>
+                        <li><a href="https://man7.org/linux/man-pages/man8/mkfs.xfs.8.html" target="_blank" rel="noopener">mkfs.xfs(8) - man7.org</a> - <code>maxpct</code> 的含义与按大小的默认值（1TB 以下 25%、50TB 以下 5%、再往上 1%），以及这个值可以用 <code>xfs_growfs</code> 修改的说明</li>
+                        <li><a href="https://man7.org/linux/man-pages/man8/xfs_growfs.8.html" target="_blank" rel="noopener">xfs_growfs(8) - man7.org</a> - 用 <code>-m</code> 重新指定可分配给 inode 的最大比率的选项说明</li>
+                        <li><a href="https://man7.org/linux/man-pages/man8/lsof.8.html" target="_blank" rel="noopener">lsof(8) - man7.org</a> - <code>+L</code> 后面给数字就只列出链接数小于它的文件，而 <code>+L1</code> 这种写法会挑出 <strong>名字已被删除却仍打开着的文件</strong> 的说明</li>
+                        <li><a href="https://man7.org/linux/man-pages/man8/resize2fs.8.html" target="_blank" rel="noopener">resize2fs(8) - man7.org</a> - <strong>本程序不会操作分区的大小</strong> 这一句。它是扩完磁盘之后必须分别扩展分区与文件系统的依据</li>
+                        <li><a href="https://docs.kernel.org/filesystems/btrfs.html" target="_blank" rel="noopener">BTRFS - The Linux Kernel documentation</a> - 功能清单里包含 <strong>动态 inode 分配</strong> 这一点</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>分享本文</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">返回列表</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/char_counter.html">字数统计</a></li>
+      <li><a href="../static/json_formatter.html">JSON 格式化工具</a></li>
+      <li><a href="../static/regex_tester.html">正则表达式测试器</a></li>
+      <li><a href="../static/jwt_decoder.html">JWT解码生成器 2026</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="git_credential_leak_prevention.html">远程 URL 里嵌着令牌 - git 凭据泄漏的地方</a></li>
+      <li><a href="git_gitignore_already_tracked.html">写进 .gitignore 了却还是一直被提交 - 已经在跟踪中的文件</a></li>
+      <li><a href="git_bisect_practical.html">git bisect - 用二分查找定位引入 Bug 的那次提交</a></li>
+      <li><a href="git_undo_decision_guide.html">git 撤销决策表 - reset、revert、restore、checkout 该用哪一个</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制！请粘贴到Threads应用中分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制！');});
+    });
+    </script>
+</body>
+</html>

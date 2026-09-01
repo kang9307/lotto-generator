@@ -1,0 +1,913 @@
+<!DOCTYPE html>
+<!--
+ * Tech blog post template
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="en">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>git bisect - Finding the Commit That Introduced a Bug by Binary Search</title>
+    <meta name="description" content="Narrowing 1,000 commits to 10 test runs. bisect run automation, the exit code contract, skip, terms and merge histories, all verified on git 2.48.1.">
+    <meta name="keywords" content="git bisect, git bisect run, git bisect skip, git bisect terms, git bisect reset, binary search, regression, exit code 125, first-parent, git blame, minimal reproduction, dev, infra, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/en/posts/git_bisect_practical.html">
+
+    <meta property="og:title" content="git bisect - Finding the Commit That Introduced a Bug by Binary Search">
+    <meta property="og:description" content="1,000 commits in 10 test runs. bisect run automation, the exit code contract, skip, terms and merge histories, with real output.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/en/posts/git_bisect_practical.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="en_US">
+    <meta property="article:published_time" content="2026-09-01">
+    <meta property="article:section" content="Dev &amp; Infra">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="git bisect - Finding the Commit That Introduced a Bug">
+    <meta name="twitter:description" content="1,000 commits narrowed to 10 test runs. Real output, and the exit code contract that decides whether the answer is right.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "git bisect - Finding the Commit That Introduced a Bug by Binary Search",
+      "alternativeHeadline": "1,000 commits in 10 test runs. bisect run automation and the exit code contract, shown with real output",
+      "datePublished": "2026-09-01",
+      "dateModified": "2026-09-01",
+      "inLanguage": "en-US",
+      "articleSection": "Dev & Infra",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "git bisect, git bisect run, git bisect skip, git bisect terms, binary search, regression, exit code 125, first-parent, git blame, minimal reproduction",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/en/posts/git_bisect_practical.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "How many commits can git bisect realistically handle?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "The number of tests grows with the logarithm of the range, so a larger range costs almost nothing extra. Building a repository of 1,000 commits, planting a defect in commit 674 and bisecting the entire history automatically makes the judgement script run exactly 10 times. Doubling the commit count adds a single test. The real limit is not the commit count but the duration of one test. In that same 1,000-commit search, a test that finished instantly took 3.7 seconds end to end, while adding a two second delay to the test pushed the same search to 24.0 seconds. Git itself only pays for ten checkouts; everything else is test time."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How should the exit codes of a git bisect run script be chosen?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Zero means good, anything from 1 to 127 except 125 means bad, and 125 means the commit cannot be judged and should be skipped. Anything 128 or above aborts the search. There are two traps. First, the timeout command returns 124 when it expires, and that value falls squarely inside the bad range, so a commit that was merely slow can be reported as the culprit. Converting a timeout into 125 avoids that. Second, when a script exits with 126 or 127, git re-runs the same command once on a known good commit during the first iteration only. If the same code comes back it concludes the script itself cannot be executed and stops with a bogus exit code message."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "What happens if you forget git bisect reset?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "You are left on a detached HEAD at the last commit that was tested. Nothing is lost, but a commit made in that state does not belong to any branch. Running git status says that a bisect is in progress, names the branch it started from, and tells you to run reset to get back. Files such as BISECT_START, BISECT_LOG and BISECT_TERMS inside the .git directory, plus references under refs/bisect/, mean the session is still live; reset removes all of them and returns you to the original branch. If you want to stay on the culprit commit instead, pass refs/bisect/bad to reset."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "What if some commits in the range cannot be built or tested?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Use skip on those commits, or have the judgement script exit 125 when running automatically. The catch is that skipping too much prevents the search from converging on a single answer. In a 20-commit repository, making the four commits around the defect unjudgeable caused git to report that only skipped commits were left, list five candidates and stop. In repositories where broad stretches do not build, the usual idiom is to return 125 from inside the script when the build fails, while accepting from the start that the result may be a handful of candidates rather than one commit."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Why not just use git blame?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "The two commands answer different questions. Blame reports which commit last touched a line; bisect reports when the behaviour changed. If a defect lands and a later commit reindents the same file, blame points at the formatting commit while bisect still identifies the real regression. Building exactly that repository and running both confirms it: blame attributes the key lines to the reindent, and bisect names the commit that changed the logic. Blame can be corrected with whitespace-ignoring or ignore-revision options, but when the problem is not on any single line and lives in the interaction of several files, blame cannot answer at all."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/git_bisect_practical.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/git_bisect_practical.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/git_bisect_practical.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/git_bisect_practical.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/git_bisect_practical.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "Home",
+      "item": "https://braindetox.kr/en/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "Dev & Infra",
+      "item": "https://braindetox.kr/en/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "git bisect - Finding the Commit That Introduced a Bug by Binary Search",
+      "item": "https://braindetox.kr/en/posts/git_bisect_practical.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="git bisect - Finding the Commit That Introduced a Bug by Binary Search">
+                <meta itemprop="datePublished" content="2026-09-01">
+                <meta itemprop="dateModified" content="2026-09-01">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="git bisect, git bisect run, git bisect skip, git bisect terms, binary search, regression, exit code 125, first-parent, git blame, minimal reproduction">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/en/posts/git_bisect_practical.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">git bisect - Finding the Commit That Introduced a Bug by Binary Search</h1>
+                    <h2 class="post-subtitle">1,000 commits in 10 test runs. Automating with bisect run, the exit code contract, skip, terms and merge histories, all with real output</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-01">2026-09-01</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">Dev &amp; Infra</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p><strong>It used to work and now it does not.</strong> A problem that starts with that sentence is not one where the cause is unknown; it is one where you do not know <em>where</em> to look. Something changed somewhere, and that somewhere sits among hundreds of commits. <code>git bisect</code> is the command that cuts that range in half, then in half again.</p>
+
+                    <p>The idea of binary search itself has been covered separately — that is the subject of <a href="ai_assisted_kernel_debugging.html">how a hard kernel bug gets narrowed down</a>. This piece narrows to the <strong>command git actually ships</strong>. What arguments it takes, what it prints, and where it gets things wrong.</p>
+
+                    <div class="callout">
+                        Every output below was produced by actually running the commands on <strong>git 2.48.1.windows.1</strong>, Windows 10 Pro (10.0.19045), Git Bash (GNU bash 5.2.37, MSYS2), as of September 2026. All experiments ran in freshly created repositories under a temporary directory, and <code>/tmp/demo</code> in the text is a neutral stand-in for that location. Anything that may differ on other platforms or shells is flagged where it comes up.
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>What this article covers</h3>
+                        <ol>
+                            <li><a href="#sec-1">What problem the tool solves</a></li>
+                            <li><a href="#sec-2">Building a repository to experiment on</a></li>
+                            <li><a href="#sec-3">The basic flow, one session end to end</a></li>
+                            <li><a href="#sec-4">Is 1,000 commits really 10 tests?</a></li>
+                            <li><a href="#sec-5">The length of one test decides the total</a></li>
+                            <li><a href="#sec-6">What happens if you forget bisect reset</a></li>
+                            <li><a href="#sec-7">bisect run, no human in the loop</a></li>
+                            <li><a href="#sec-8">The exit code contract</a></li>
+                            <li><a href="#sec-9">Writing a judgement script that works</a></li>
+                            <li><a href="#sec-10">bisect skip, commits that cannot be judged</a></li>
+                            <li><a href="#sec-11">bisect terms, when good and bad do not fit</a></li>
+                            <li><a href="#sec-12">Histories with merge commits</a></li>
+                            <li><a href="#sec-13">After you have the culprit</a></li>
+                            <li><a href="#sec-14">How this differs from git blame</a></li>
+                            <li><a href="#sec-15">When bisect is the wrong tool</a></li>
+                            <li><a href="#sec-16">Summary</a></li>
+                            <li><a href="#sec-17">What I could not verify</a></li>
+                            <li><a href="#sec-18">References</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">What problem the tool solves</h2>
+
+                    <p><code>git bisect</code> answers exactly one question. <strong>If it fails now and succeeded before, which commit in between changed it?</strong> Give it one commit that was fine and one that is broken, and git checks out a commit in the middle, a person or a script judges it, and the range halves again.</p>
+
+                    <p>The important part is that <strong>you do not need to know anything about the guilty commit</strong>. You only need a criterion. A performance regression, a log line that stopped appearing, a file that stops being produced — anything that can be phrased as a <em>test with a yes or no answer</em> qualifies. That makes this a fundamentally different activity from reading code and reasoning about causes. It is not inference. It is <strong>measurement</strong>.</p>
+
+                    <ul>
+                        <li>Three things you need — a <strong>broken commit</strong> (usually <code>HEAD</code>), a <strong>commit that was fine</strong> (a tag, a release, a commit from a few months back), and a <strong>test that reproduces</strong></li>
+                        <li>One thing you do not need — a hypothesis about the cause. Having one tends to make you look only there and miss the rest</li>
+                        <li>The search space is <strong>whole commits</strong>, not file diffs, which is why problems caused by the interaction of several files are still found</li>
+                        <li>The result is a single commit. If that commit is large you still have narrowing to do, but going from an entire history to one commit usually changes the shape of the problem</li>
+                    </ul>
+
+                    <h2 id="sec-2">Building a repository to experiment on</h2>
+
+                    <p>Descriptions only go so far, so the starting point is a repository built for the purpose: twenty commits. <code>total.sh</code> adds up the numbers it is given as arguments, and <code>check.sh</code> exits 0 when the result is right and 1 when it is wrong. The thirteenth commit rewrites <code>total.sh</code> to iterate by index and, in doing so, <strong>drops the last argument</strong>. Seven more unrelated commits pile on top of it.</p>
+
+                    <pre><code># inside /tmp/demo
+git init -b main
+
+cat &gt; total.sh &lt;&lt;'EOF'
+#!/bin/bash
+sum=0
+for n in "$@"; do
+  sum=$(( sum + n ))
+done
+echo "$sum"
+EOF
+
+cat &gt; check.sh &lt;&lt;'EOF'
+#!/bin/bash
+out=$(bash ./total.sh 1 2 3 4)
+if [ "$out" = "10" ]; then
+  exit 0
+else
+  echo "expected 10, got $out"
+  exit 1
+fi
+EOF
+</code></pre>
+
+                    <p>The finished history and the current state look like this. The defect is in <code>c13</code>, and the test fails at <code>c20</code>, which is <code>HEAD</code>.</p>
+
+                    <pre><code>$ git log --oneline
+f2ee06a c20: unrelated note 20
+5d4dea0 c19: unrelated note 19
+...
+f1fec3f c13: refactor total.sh to index-based loop
+4d711a9 c12: unrelated note 12
+...
+d6e191c c02: add check.sh
+a25093a c01: add total.sh
+
+$ bash ./check.sh; echo "exit=$?"
+expected 10, got 6
+exit=1
+</code></pre>
+
+                    <h2 id="sec-3">The basic flow, one session end to end</h2>
+
+                    <p>There are four moves. Open a session with <code>bisect start</code>, say that the present is broken with <code>bisect bad</code>, name a commit that was fine with <code>bisect good</code>. Git then checks out a commit in the middle. Test, answer <code>good</code> or <code>bad</code>, repeat, and leave with <code>bisect reset</code>.</p>
+
+                    <p>Taking <code>c02</code> as the good point and <code>c20</code> as the bad one leaves <strong>18 candidates</strong>, <code>c03</code> through <code>c20</code>. Here is that entire session, with nothing removed from either the commands or the output.</p>
+
+                    <pre><code>$ git bisect start
+status: waiting for both good and bad commits
+
+$ git bisect bad
+status: waiting for good commit(s), bad commit known
+
+$ git bisect good d6e191c
+Bisecting: 8 revisions left to test after this (roughly 3 steps)
+[f9194e697f22b03a4aae2ef437dfc2497846eb63] c11: unrelated note 11
+
+$ bash ./check.sh ; echo $?
+0
+$ git bisect good
+Bisecting: 4 revisions left to test after this (roughly 2 steps)
+[d21c4cae515e9a7c0cfcacc38374c8b127273674] c15: unrelated note 15
+
+$ bash ./check.sh ; echo $?
+expected 10, got 6
+1
+$ git bisect bad
+Bisecting: 1 revision left to test after this (roughly 1 step)
+[f1fec3fe55804001fae21aaf7b18a6914483662a] c13: refactor total.sh to index-based loop
+
+$ bash ./check.sh ; echo $?
+expected 10, got 6
+1
+$ git bisect bad
+Bisecting: 0 revisions left to test after this (roughly 0 steps)
+[4d711a957c98da7528cf727b1db40974a3f9d199] c12: unrelated note 12
+
+$ bash ./check.sh ; echo $?
+0
+$ git bisect good
+f1fec3fe55804001fae21aaf7b18a6914483662a is the first bad commit
+commit f1fec3fe55804001fae21aaf7b18a6914483662a
+Author: demo &lt;demo@example.invalid&gt;
+Date:   Tue Sep 1 21:57:42 2026 +0900
+
+    c13: refactor total.sh to index-based loop
+
+ total.sh | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+</code></pre>
+
+                    <p>The line to read is the <code>Bisecting:</code> one. It tells you <strong>how many remain once you answer this one</strong>. Eighteen dropped to 8, 4, 1, 0, and the test was run <strong>four times</strong>. Two arguments after <code>bisect start</code> collapse the <code>bad</code> and <code>good</code> lines into the first command, and the order is <strong>bad first</strong>.</p>
+
+                    <pre><code>$ git bisect start f2ee06a d6e191c
+Bisecting: 8 revisions left to test after this (roughly 3 steps)
+[f9194e697f22b03a4aae2ef437dfc2497846eb63] c11: unrelated note 11
+</code></pre>
+
+                    <h2 id="sec-4">Is 1,000 commits really 10 tests?</h2>
+
+                    <p>The arithmetic gets quoted often enough that it is worth measuring. A fresh repository of 1,000 commits, a configuration value broken at commit 674, and an automatic search across the entire history from the root commit to <code>HEAD</code>. Counting how many times the judgement script ran settles it.</p>
+
+                    <pre><code>$ git rev-list --count HEAD
+1000
+
+$ git bisect start HEAD $(git rev-list --max-parents=0 HEAD)
+$ git bisect run bash /tmp/bigtest.sh
+Bisecting: 249 revisions left to test after this (roughly 8 steps)
+Bisecting: 124 revisions left to test after this (roughly 7 steps)
+Bisecting: 62 revisions left to test after this (roughly 6 steps)
+...
+fe0dcdad953018ee006623208fdde398e98ea338 is the first bad commit
+    c0674
+bisect found first bad commit
+
+# number of times the judgement script ran
+10
+</code></pre>
+
+                    <p><strong>Exactly ten.</strong> The root commit was the good endpoint, so there were 999 candidates, and halving 999 repeatedly drops below one on the tenth step. The property that matters is not the absolute count but the <strong>rate of growth</strong>. Doubling the commits adds precisely one test.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Candidate commits</th><th>Tests needed</th><th>Note</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>18</td><td>4</td><td>Measured on the 20-commit repository above</td></tr>
+                            <tr><td>999</td><td>10</td><td>Measured on the 1,000-commit repository</td></tr>
+                            <tr><td>2,000</td><td>11</td><td>Twice the commits, one more test</td></tr>
+                            <tr><td>100,000</td><td>17</td><td>Even a large repository stays under twenty</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>The bottom two rows are not measurements; they extend the same rule. The point is that <strong>the commit count is almost never the bottleneck</strong>.</p>
+
+                    <h2 id="sec-5">The length of one test decides the total</h2>
+
+                    <p>So what is the bottleneck? The same 1,000-commit search was run twice: once with a test that finishes instantly, once with <code>sleep 2</code> added to make it deliberately slow. The answer was identical and so was the number of tests.</p>
+
+                    <pre><code>--- instant test, 999 commits
+tests run: 10
+wall time: 3693 ms
+
+--- same search, two seconds per test
+tests run: 10
+wall time: 24018 ms
+
+same answer? fe0dcdad... / fe0dcdad...
+</code></pre>
+
+                    <p>The 20.3 second gap is <strong>2 seconds x 10 runs</strong>. Git itself spent 3.7 seconds, the cost of ten checkouts. Almost all of the elapsed time is test time, and the formula is plain: <strong>total time is roughly one test duration multiplied by log₂ of the candidate count</strong>.</p>
+
+                    <p>That is why shrinking the test before starting a bisect pays more than anything else. A full suite that takes five minutes costs fifty minutes over ten runs; a minimal case that reproduces the problem in thirty seconds costs five. <strong>Build the minimal reproduction first is not a matter of taste, it is a tenfold arithmetic difference.</strong></p>
+
+                    <ul>
+                        <li>Run <strong>the one failing test</strong> instead of the whole suite. Most frameworks accept a single case by name</li>
+                        <li>If a build is required, make it incremental. A full rebuild each round multiplies straight through by ten</li>
+                        <li>Cut out anything that depends on the network or external services. Slow is one problem, but <strong>intermittent failure gives a wrong answer</strong></li>
+                        <li>Narrow the range where you can. Going from 999 candidates to 60 takes the run count from 10 down to 6</li>
+                    </ul>
+
+                    <h2 id="sec-6">What happens if you forget bisect reset</h2>
+
+                    <p>Leave the state alone after finding the culprit and you sit on a <strong>detached HEAD</strong>, standing on the last commit tested and attached to no branch. Git does say so, clearly.</p>
+
+                    <pre><code>$ git status
+HEAD detached at 4d711a9
+You are currently bisecting, started from branch 'main'.
+  (use "git bisect reset" to get back to the original branch)
+
+nothing to commit, working tree clean
+
+$ ls .git | grep -i bisect
+BISECT_ANCESTORS_OK
+BISECT_EXPECTED_REV
+BISECT_LOG
+BISECT_NAMES
+BISECT_START
+BISECT_TERMS
+
+$ ls .git/refs/bisect
+bad
+good-d6e191c941eb0f49e6ad6b88f546215ef538eecf
+</code></pre>
+
+                    <p>Absent-mindedly editing and committing here produces a commit that belongs to no branch. It can be recovered later through <code>reflog</code>, but there is no reason to go through that. The fastest way to tell whether a session is still live is to look for those <code>BISECT_*</code> files inside <code>.git</code>, and <code>reset</code> removes every one of them.</p>
+
+                    <pre><code>$ git bisect reset
+Previous HEAD position was 4d711a9 c12: unrelated note 12
+Switched to branch 'main'
+
+# when you want to stay on the culprit commit
+$ git bisect reset refs/bisect/bad
+HEAD is now at f1fec3f c13: refactor total.sh to index-based loop
+
+# clean up the session without moving off the current commit
+$ git bisect reset HEAD
+</code></pre>
+
+                    <p>One more thing: <strong>a dirty working tree will not let the session start.</strong> Files you are editing have to be committed or stashed. This is how it actually ends.</p>
+
+                    <pre><code>$ git status --short
+ M total.sh
+
+$ git bisect start f2ee06a d6e191c
+Bisecting: 8 revisions left to test after this (roughly 3 steps)
+error: Your local changes to the following files would be overwritten by checkout:
+	total.sh
+Please commit your changes or stash them before you switch branches.
+Aborting
+</code></pre>
+
+                    <h2 id="sec-7">bisect run, no human in the loop</h2>
+
+                    <p>This is where the command earns its place. Hand the judgement to a script and <code>git bisect run</code> repeats the checkout, the judgement and the next choice on its own. On exactly the repository from before, with no human involvement, it finishes in one line.</p>
+
+                    <pre><code>$ git bisect start f2ee06a d6e191c
+Bisecting: 8 revisions left to test after this (roughly 3 steps)
+[f9194e697f22b03a4aae2ef437dfc2497846eb63] c11: unrelated note 11
+
+$ git bisect run bash ./check.sh
+running 'bash' './check.sh'
+Bisecting: 4 revisions left to test after this (roughly 2 steps)
+[d21c4cae515e9a7c0cfcacc38374c8b127273674] c15: unrelated note 15
+running 'bash' './check.sh'
+expected 10, got 6
+Bisecting: 1 revision left to test after this (roughly 1 step)
+[f1fec3fe55804001fae21aaf7b18a6914483662a] c13: refactor total.sh to index-based loop
+running 'bash' './check.sh'
+expected 10, got 6
+Bisecting: 0 revisions left to test after this (roughly 0 steps)
+[4d711a957c98da7528cf727b1db40974a3f9d199] c12: unrelated note 12
+running 'bash' './check.sh'
+f1fec3fe55804001fae21aaf7b18a6914483662a is the first bad commit
+commit f1fec3fe55804001fae21aaf7b18a6914483662a
+Author: demo &lt;demo@example.invalid&gt;
+Date:   Tue Sep 1 21:57:42 2026 +0900
+
+    c13: refactor total.sh to index-based loop
+
+ total.sh | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+bisect found first bad commit
+</code></pre>
+
+                    <p>Same commit as the manual session, and two typed commands. Anything can follow <code>run</code> — <code>make</code>, <code>npm test</code>, <code>pytest -k some_case</code>, a shell script of your own. Arguments are fine too, and the script path is safer <strong>outside the repository being checked out</strong>, because older commits may not contain that file at all.</p>
+
+                    <h2 id="sec-8">The exit code contract</h2>
+
+                    <p>Automation lives or dies on the <strong>exit code</strong>. Get the contract wrong and the search quietly names the wrong commit. Pinning a script to each code in turn and running the search produces this.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Exit code</th><th>How git reads it</th><th>What actually happened</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>0</code></td><td>good / old</td><td>Everything marked good, so the bad endpoint itself was named the culprit</td></tr>
+                            <tr><td><code>1</code>–<code>124</code>, <code>126</code>, <code>127</code></td><td>bad / new</td><td><code>1</code>, <code>2</code> and <code>124</code> behaved identically, naming the oldest candidate</td></tr>
+                            <tr><td><code>125</code></td><td>cannot judge, skip</td><td>Skipping everything gives <code>We cannot bisect more!</code> then <code>bisect run cannot continue any more</code></td></tr>
+                            <tr><td><code>126</code> and <code>127</code> (first round)</td><td>script suspected unrunnable</td><td>Retried on a good commit, then stopped with <code>bogus exit code 127 for good revision</code></td></tr>
+                            <tr><td><code>128</code> and above</td><td>abort the search</td><td><code>bisect run failed: exit code 128 ... is &lt; 0 or &gt;= 128</code></td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>The documented contract is: zero is good, 1 to 127 except 125 is bad, and anything else aborts. Run <code>126</code> and <code>127</code> for real, though, and there is a layer the contract does not mention. Those two values are what POSIX shells use for <em>found but not executable</em> and <em>command not found</em>, so git — <strong>on the first round only</strong> — checks out a known good commit and runs the same command once more. If the same code comes back, it treats the script itself as broken and stops.</p>
+
+                    <pre><code>$ git bisect run bash /tmp/rc.sh      # script always exits 127
+running 'bash' '/tmp/rc.sh'
+[d6e191c941eb0f49e6ad6b88f546215ef538eecf] c02: add check.sh
+running 'bash' '/tmp/rc.sh'
+error: bogus exit code 127 for good revision
+[f9194e697f22b03a4aae2ef437dfc2497846eb63] c11: unrelated note 11
+</code></pre>
+
+                    <p>The middle lines show the detour to good commit <code>c02</code> and the return. This guard is why <strong>a typo in the script path rarely marks the whole range as broken</strong>. Conversely, when that message appears, do not start suspecting the code; check whether the script can be executed at all.</p>
+
+                    <p>The genuinely dangerous value is <code>124</code>. It is what you get when a test is cut short by a timeout, and the contract reads it as <strong>bad</strong>.</p>
+
+                    <pre><code>$ timeout 1 sleep 5 ; echo $?
+124
+</code></pre>
+
+                    <p>In other words, <strong>a commit that was merely slow is indistinguishable from one that genuinely failed.</strong> If you use a timeout, translating that value into cannot-judge is the accurate thing to do.</p>
+
+                    <h2 id="sec-9">Writing a judgement script that works</h2>
+
+                    <p>The first rule is that <strong>the test must reproduce</strong>. Binary search treats every judgement as truth and discards half the range on the strength of it. A single wrong answer can put the culprit in the discarded half, and the search will not report an error when that happens. It hands you <strong>one plausible commit, confidently.</strong></p>
+
+                    <p>To see that, a test that reports a false failure 30% of the time was run five times on the same repository. The correct answer is <code>c13</code> (<code>f1fec3f</code>).</p>
+
+                    <pre><code>--- intermittently failing test, 5 rounds
+round 1  f1fec3f...  (correct)
+round 2  f1fec3f...  (correct)
+round 3  f1fec3f...  (correct)
+round 4  f1fec3f...  (correct)
+round 5  9dc5458...  (c08 - wrong)
+
+--- deterministic test, 3 rounds
+f1fec3f...  f1fec3f...  f1fec3f...
+</code></pre>
+
+                    <p>One round in five named an unrelated commit, and nothing in that output marks it as wrong. Where intermittent failure is suspected, it is better to <strong>repeat the judgement and treat a single failure among the repeats as bad</strong>.</p>
+
+                    <p>The second rule is <strong>cleaning up side effects</strong>. Bisect only moves between commits, so untracked files survive. A stale build artefact left behind contaminates the next judgement.</p>
+
+                    <pre><code>$ echo "stale artifact" &gt; build.out    # untracked artefact
+$ git bisect good                       # move to a different commit
+$ cat build.out
+stale artifact
+</code></pre>
+
+                    <p>A usable skeleton looks like this. A failed build exits 125, a timeout also exits 125, and everything else passes the test result straight through.</p>
+
+                    <pre><code>#!/bin/bash
+# /tmp/judge.sh - keep it outside the repository
+set -u
+
+rm -rf ./build            # clear the previous round's artefacts
+make clean &gt;/dev/null 2&gt;&amp;1
+
+if ! make &gt;/dev/null 2&gt;&amp;1; then
+  exit 125                # cannot build - skip instead of judging
+fi
+
+timeout 60 ./run_one_test.sh
+rc=$?
+if [ "$rc" -eq 124 ]; then
+  exit 125                # do not let a timeout masquerade as a failure
+fi
+exit "$rc"
+</code></pre>
+
+                    <ul>
+                        <li>Keep the script <strong>outside the repository</strong>. Older commits do not contain it</li>
+                        <li>Handle the exit code <strong>explicitly</strong>. Letting the last command's code leak through rarely matches what you meant</li>
+                        <li>Clear artefacts, caches and temporary files every round. Anything left behind contaminates the next judgement</li>
+                        <li>Trim the output, but keep <strong>one line explaining the failure</strong>. Later you will only have the log to go on</li>
+                        <li><strong>Run it by hand on both endpoints first.</strong> The search is only valid if it fails on the bad end and passes on the good end</li>
+                    </ul>
+
+                    <h2 id="sec-10">bisect skip, commits that cannot be judged</h2>
+
+                    <p>When a commit inside the range does not build, there is nothing to judge. <code>git bisect skip</code> asks git to pick a nearby commit instead, and during an automatic run a script that exits <code>125</code> means the same thing.</p>
+
+                    <p>The catch is that if the skipped commits <strong>cluster around the answer</strong>, the result never narrows to one. Here is what happens when the four commits around the defect (<code>c11</code> to <code>c14</code>) are all made unjudgeable.</p>
+
+                    <pre><code>$ git bisect run bash /tmp/skipper.sh
+...
+There are only 'skip'ped commits left to test.
+The first bad commit could be any of:
+4d711a957c98da7528cf727b1db40974a3f9d199
+f1fec3fe55804001fae21aaf7b18a6914483662a
+71ed7e0a93f0b4029ba06d2d3cb95e019f141bb1
+f9194e697f22b03a4aae2ef437dfc2497846eb63
+d21c4cae515e9a7c0cfcacc38374c8b127273674
+We cannot bisect more!
+error: bisect run cannot continue any more
+</code></pre>
+
+                    <p>That is not a failure. Eighteen commits became <strong>five candidates</strong>, and five is a readable number. If you know in advance which stretch is unusable, range notation removes it in one go.</p>
+
+                    <pre><code>$ git bisect skip c10..c14
+Bisecting: 8 revisions left to test after this (roughly 3 steps)
+
+$ git bisect log | grep skip
+git bisect skip 71ed7e0a...   # c14
+git bisect skip f1fec3fe...   # c13
+git bisect skip 4d711a95...   # c12
+git bisect skip f9194e69...   # c11
+</code></pre>
+
+                    <p>The easy thing to get wrong here: <code>c10..c14</code> means <strong>everything after c10 up to and including c14</strong>. The starting point itself is excluded. To exclude it as well, name it separately, as in <code>git bisect skip c10 c10..c14</code>.</p>
+
+                    <h2 id="sec-11">bisect terms, when good and bad do not fit</h2>
+
+                    <p>What you are looking for is not always a bug. When you want the point where performance improved, or where a feature first appeared, calling one end the bad commit muddles the direction. The vocabulary can be changed. There are built-in aliases <code>old</code> and <code>new</code>, and you can also invent your own.</p>
+
+                    <pre><code>$ git bisect start --term-old=works --term-new=broken
+status: waiting for both good and bad commits
+
+$ git bisect broken f2ee06a
+status: waiting for good commit(s), bad commit known
+
+$ git bisect works d6e191c
+Bisecting: 8 revisions left to test after this (roughly 3 steps)
+[f9194e697f22b03a4aae2ef437dfc2497846eb63] c11: unrelated note 11
+
+$ git bisect terms
+Your current terms are works for the old state
+and broken for the new state.
+
+$ git bisect run bash ./check.sh
+...
+f1fec3fe55804001fae21aaf7b18a6914483662a is the first broken commit
+bisect found first bad commit
+</code></pre>
+
+                    <p>The result line changed to <code>first broken commit</code>. Only the closing summary line still says <code>first bad commit</code>, which is worth knowing if you intend to parse the output in a script. If you lose track of the current vocabulary mid-session, <code>git bisect terms</code> reports it.</p>
+
+                    <ul>
+                        <li><strong>Hunting a bug</strong> — the default <code>good</code> and <code>bad</code> are fine</li>
+                        <li><strong>Finding where a fix landed</strong> — <code>old</code> and <code>new</code>, with nothing called a bad commit</li>
+                        <li><strong>Performance regression</strong> — something like <code>--term-old=fast --term-new=slow</code> keeps the judgements straight</li>
+                        <li>Changing the terms does not change the algorithm. <strong>Only the words move</strong></li>
+                    </ul>
+
+                    <h2 id="sec-12">Histories with merge commits</h2>
+
+                    <p>By default, bisect treats <strong>merge commits and commits inside side branches as candidates too</strong>. To check that, here is a history where the defect landed inside a feature branch that was merged later.</p>
+
+                    <pre><code>$ git log --oneline --graph --all
+* 1f5a5ab m7: mainline work
+* dc8284c m6: mainline work
+*   36edf65 m5: merge feature
+|\
+| * fa26dce f4: feature polish
+| * 9c3c4da f3: rewrite total.sh (THE BUG)
+| * 13a2a60 f2: feature work
+| * efe0833 f1: feature start
+* | 0481885 m4: mainline work
+|/
+* 87b692a m3: mainline work
+* 2606564 m2: mainline work
+* 342914a m1: base
+</code></pre>
+
+                    <p>Searching the same repository two ways gives two different answers. Both are correct; they answer different questions.</p>
+
+                    <pre><code>--- default: walks into the side branch
+running 'bash' './check.sh'   (3 runs)
+9c3c4da9ba2ed3715032525e3699eeae971e583e is the first bad commit
+    f3: rewrite total.sh (THE BUG)
+
+--- --first-parent: mainline only
+$ git bisect start --first-parent HEAD 2606564
+running 'bash' './check.sh'   (3 runs)
+36edf65d0bd276c62c3fbae15ccab5a28196c39d is the first bad commit
+Merge: 0481885 fa26dce
+    m5: merge feature
+</code></pre>
+
+                    <p>The default search named <code>f3</code>, <strong>the commit that wrote the defect</strong>, while <code>--first-parent</code> named the merge commit <code>m5</code>, <strong>the point where the defect entered the mainline</strong>. Fixing the offending code needs the former; knowing which release first carried the problem needs the latter.</p>
+
+                    <p>There is a second case where <code>--first-parent</code> earns its keep: <strong>repositories where intermediate commits on side branches do not even build</strong>. If the habit is to commit broken work in progress and tidy up before merging, the default search keeps stalling on those commits. Restricted to the mainline, each commit is generally intact.</p>
+
+                    <h2 id="sec-13">After you have the culprit</h2>
+
+                    <p>One commit in hand is half the work done. Start by looking at what it changed.</p>
+
+                    <pre><code>$ git show --stat f1fec3f
+ total.sh | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+$ git log -p -1 f1fec3f
+diff --git a/total.sh b/total.sh
+@@ -1,7 +1,11 @@
+ #!/bin/bash
++# refactor: iterate by index
+ sum=0
+-for n in "$@"; do
+-  sum=$(( sum + n ))
++i=1
++while [ "$i" -lt "$#" ]; do
++  eval "v=\${$i}"
++  sum=$(( sum + v ))
++  i=$(( i + 1 ))
+ done
+ echo "$sum"
+</code></pre>
+
+                    <p>Here it is visible at a glance: the comparison should have been <code>-le</code> rather than <code>-lt</code>, which is why the last argument fell off. Real culprits are rarely that small, though. When the answer is a commit touching dozens of files, <strong>you have to narrow inside it</strong>. Bisect works in whole commits and cannot descend further, so start from the parent and add the changed files back one at a time.</p>
+
+                    <pre><code>$ git show --stat HEAD
+ alpha.conf | 1 +
+ beta.conf  | 1 +
+ delta.conf | 1 +
+ gamma.conf | 2 +-
+ 4 files changed, 4 insertions(+), 1 deletion(-)
+
+$ git checkout HEAD~1            # move to the parent
+$ for f in alpha.conf beta.conf delta.conf gamma.conf; do
+&gt;   git checkout main -- "$f"
+&gt;   bash ./check.sh; echo "  + $f -&gt; $?"
+&gt; done
+  + alpha.conf -&gt; 0
+  + beta.conf -&gt; 0
+  + delta.conf -&gt; 0
+  + gamma.conf -&gt; 1        &lt;-- breaks here
+</code></pre>
+
+                    <p>Down to a single file, and only that file's diff is left to read. If the file itself is large, the same trick applies at hunk level through <code>git checkout -p</code>. And when you want to work directly on the culprit, the <code>git bisect reset refs/bisect/bad</code> from earlier puts you there.</p>
+
+                    <h2 id="sec-14">How this differs from git blame</h2>
+
+                    <p>Both look like they answer when did this happen, but the questions differ. <strong><code>blame</code> names the commit that last touched a line</strong>; <strong><code>bisect</code> names the point where behaviour changed</strong>. They usually agree, and they diverge often enough to matter.</p>
+
+                    <p>Here is a repository where the defect landed in <code>b3</code> and a later commit <code>b5</code> changed <strong>only the indentation</strong> of the same file. Behaviour has been identical since <code>b3</code>.</p>
+
+                    <pre><code>$ git blame -- total.sh
+^4ff6d88 ... 2) sum=0
+75a65371 ... 3) i=1
+75a65371 ... 4) while [ "$i" -lt "$#" ]; do
+b44df25c ... 5)     eval "v=\${$i}"      &lt;-- b5 (formatting only)
+b44df25c ... 6)     sum=$(( sum + v ))
+b44df25c ... 7)     i=$(( i + 1 ))
+
+$ git bisect run bash ./check.sh
+75a65371be49176fd1a34827c369875cd78e8a1e is the first bad commit
+    b3: switch to an index loop
+</code></pre>
+
+                    <p><code>blame</code> attributed the three key lines to the formatting commit <code>b5</code>, while <code>bisect</code> named <code>b3</code>, which changed the logic. Blame can be corrected with whitespace-ignoring (<code>-w</code>) or by excluding a commit (<code>--ignore-rev</code>), and both options do restore <code>b3</code> here. Those neighbouring options are covered separately in <a href="git_history_commands_guide_2026.html">the git history commands that deserve more love</a>.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Situation</th><th>Right tool</th><th>Why</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>You want to know why a line was written this way</td><td><code>git blame</code></td><td>Gives the commit and message per line immediately</td></tr>
+                            <tr><td>You do not know when the behaviour changed</td><td><code>git bisect</code></td><td>You do not need to know which line is at fault</td></tr>
+                            <tr><td>The problem is a combination of several files</td><td><code>git bisect</code></td><td>Blame can only answer one line at a time</td></tr>
+                            <tr><td>You want to find when a string disappeared</td><td><code>git log -S</code></td><td>Filters commits by change in content</td></tr>
+                            <tr><td>You have the culprit and want to look inside</td><td><code>git show</code>, <code>log -p</code></td><td>Picks up where bisect left off</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2 id="sec-15">When bisect is the wrong tool</h2>
+
+                    <p>It does not fit every regression. Several conditions rule it out fairly clearly.</p>
+
+                    <ul>
+                        <li><strong>Repositories that do not build commit by commit</strong> — too many skips leave you with several candidates. Restrict to the mainline with <code>--first-parent</code>, or narrow between release tags first and search precisely inside that range</li>
+                        <li><strong>Environment-dependent bugs</strong> — a problem caused by a library version, kernel or container image is not in the code history at all. What needs bisecting there is the <em>environment</em>, not the code</li>
+                        <li><strong>Data-dependent bugs</strong> — if it only reproduces on particular records, that data has to be pinned first so the test reproduces. Running against live data makes the judgements wobble</li>
+                        <li><strong>Problems that degraded gradually</strong> — if performance dropped one percent per commit, there is no single commit where it changed. Forcing a bisect with a threshold only means the threshold picks the answer</li>
+                        <li><strong>Problems whose cause you already know</strong> — when a stack trace points at a file and a line, blame is far quicker. Bisect is the tool for when there is no thread to pull</li>
+                        <li><strong>Ranges whose history was rewritten by a rebase</strong> — if the commits were never actually built in that order, intermediate commits may not work in the first place</li>
+                    </ul>
+
+                    <p>There is also a trap specific to Windows. Bisect creates a reference with a <strong>long name</strong>, <code>refs/bisect/good-&lt;40 hex digits&gt;</code>. If the repository path is deep, that path crosses the 260-character limit and the session refuses to start. Varying only the path length gives this.</p>
+
+                    <pre><code>root=181  refpath=244  -&gt; fine
+root=192  refpath=255  -&gt; fine
+root=203  refpath=266  -&gt; error: update_ref failed for ref
+   'refs/bisect/good-27fe9984...': couldn't set
+   'refs/bisect/good-27fe9984...'
+</code></pre>
+
+                    <p>The message never mentions path length, which makes the cause hard to find. Turning on <code>core.longpaths=true</code> did not help for this reference. Moving the repository to a shallower path was the reliable fix. The problem does not occur on Linux or macOS.</p>
+
+                    <h2 id="sec-16">Summary</h2>
+
+                    <p>There is not much to memorise for daily use. Name the bad commit and the good commit, hand the judgement to a script, and <code>reset</code> when it is done. Three lines.</p>
+
+                    <pre><code>$ git bisect start &lt;bad commit&gt; &lt;good commit&gt;
+$ git bisect run /tmp/judge.sh
+$ git bisect reset
+</code></pre>
+
+                    <p>Everything else rides on <strong>the quality of the judgement script</strong>. A test that does not reproduce gives a wrong answer; a slow test multiplies that duration by ten; a carelessly leaked exit code turns a timeout into a defect. The search algorithm is finished work and needs nothing from you. The one thing a person has to prepare is <strong>a test that says worked or did not work without ever being wrong</strong>.</p>
+
+                    <p>So the real order of learning this command is not syntax. When a problem shows up, <strong>confirm both endpoints by hand</strong>, <strong>shrink the test to a minimal reproduction</strong>, and only then start <code>run</code>. Follow that order and most regressions come down to a single commit inside the time it takes to drink a coffee.</p>
+
+                    <h2 id="sec-17">What I could not verify</h2>
+
+                    <ul>
+                        <li>Every output came from a single environment, <strong>Windows plus Git Bash</strong>. Whether the wording of the messages or the propagation of exit codes is the same on Linux and macOS, or under other shells such as <code>dash</code> and <code>zsh</code>, was not checked</li>
+                        <li>The value <code>git bisect run</code> <strong>itself</strong> returns to the shell on an abort was not consistent. A script exiting 128 produced 128, while one exiting 129 produced 127, and no rule for that was established. Judging by the message rather than by that exit code is the safer habit</li>
+                        <li>The re-check behaviour for <code>126</code> and <code>127</code> is written up purely from <strong>observed output</strong>. The corresponding handling in the git source was not read</li>
+                        <li>The 1,000-commit measurement used a <strong>synthetic repository</strong>. In a large repository with tens of thousands of files, checkout costs rise and git's own share of the time may shift</li>
+                        <li><code>git bisect visualize</code> requires <code>gitk</code> and was not run. <code>--no-checkout</code> was confirmed to work, but its behaviour in a <strong>bare repository</strong> was not tested</li>
+                        <li>Why <code>core.longpaths</code> fails to help with the long path problem <strong>could not be determined</strong>, nor whether the reference file or the lock file is the one that trips the limit</li>
+                    </ul>
+
+                    <h2 id="sec-18">References</h2>
+
+                    <ul>
+                        <li><a href="https://git-scm.com/docs/git-bisect" target="_blank" rel="noopener">git-bisect(1), official Git documentation</a> — full subcommand syntax, the exit code contract, and the descriptions of <code>--first-parent</code> and <code>--no-checkout</code>. The contract section here was cross-checked against the copy of the same document shipped with Git 2.48.1</li>
+                        <li><a href="https://git-scm.com/docs/git-blame" target="_blank" rel="noopener">git-blame(1), official Git documentation</a> — <code>-w</code>, <code>--ignore-rev</code> and <code>--ignore-revs-file</code>, the options that filter out formatting commits</li>
+                        <li><a href="https://git-scm.com/book/en/v2/Git-Tools-Debugging-with-Git" target="_blank" rel="noopener">Pro Git, Debugging with Git</a> — the chapter that places <code>blame</code> and <code>bisect</code> side by side, and the standard account of how the two divide the work</li>
+                        <li><a href="ai_assisted_kernel_debugging.html">How a Hard Kernel Bug Gets Narrowed Down - Bisection, Minimal Reproduction, Instrumentation and the Role of Tools</a> — the strategy of binary search itself, and the work of building a minimal reproduction</li>
+                        <li><a href="git_history_commands_guide_2026.html">Git History Commands That Deserve More Love - Pickaxe, log -L, Bisect, and Reflog</a> — <code>log -S</code>, <code>log -L</code>, <code>blame --ignore-rev</code>, <code>reflog</code> and other neighbouring commands, organised by scenario</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>Share this post</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X (Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">Copy Link</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">Back to list</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Free tools you may find useful</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/code_image.html">Code Image Generator</a></li>
+      <li><a href="../static/char_counter.html">Character Counter</a></li>
+      <li><a href="../static/json_formatter.html">JSON Formatter</a></li>
+      <li><a href="../static/regex_tester.html">Regex Tester</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">See all tools &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Related Posts</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="text_diff_whitespace_guide.html">Filtering Out Whitespace-Only Diffs - So the Real Change Is Not Buried</a></li>
+      <li><a href="agent_behavior_spec.html">How Do You Grade a Long-Running Agent - What It Really Means to Write Behavior Down as a Spec</a></li>
+      <li><a href="vector_db_selection_criteria.html">What Should Vector Search Run On - Bolting It Onto Your Search Engine Versus Standing Up a Dedicated One</a></li>
+      <li><a href="bug_blindness.html">How a Defect Becomes the Way It Has Always Been - Why Familiar Bugs Stop Registering, and How to Make Them Visible Again</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('Link copied. Paste it into the Threads app to share.');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('Link copied!'); });
+    });
+    </script>
+</body>
+</html>

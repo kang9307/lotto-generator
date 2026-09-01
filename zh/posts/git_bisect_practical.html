@@ -1,0 +1,913 @@
+<!DOCTYPE html>
+<!--
+ * 技术博客文章模板
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>git bisect - 用二分查找定位引入 Bug 的那次提交</title>
+    <meta name="description" content="把1,000个提交收窄到10次测试的工具。bisect run 的自动化与退出码约定，skip、terms、合并历史，以及判定脚本的设计思路和常见陷阱，全部依据 git 2.48.1 环境里实际跑出来的输出和实测数值来整理。">
+    <meta name="keywords" content="git bisect, git bisect run, git bisect skip, git bisect terms, git bisect reset, 二分查找, 回归缺陷, 退出码 125, first-parent, git blame, 最小复现, 开发, 基础设施, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/git_bisect_practical.html">
+
+    <meta property="og:title" content="git bisect - 用二分查找定位引入 Bug 的那次提交">
+    <meta property="og:description" content="1,000个提交只用10次测试。bisect run 自动化与退出码约定，skip、terms、合并历史，全部用实际输出说明。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/git_bisect_practical.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-09-01">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="git bisect - 用二分查找定位引入 Bug 的那次提交">
+    <meta name="twitter:description" content="把1,000个提交收窄到10次测试。实际跑出来的输出，以及决定答案对错的退出码约定。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "git bisect - 用二分查找定位引入 Bug 的那次提交",
+      "alternativeHeadline": "1,000个提交只用10次测试。bisect run 自动化与退出码约定，全部用实际输出说明",
+      "datePublished": "2026-09-01",
+      "dateModified": "2026-09-01",
+      "inLanguage": "zh-CN",
+      "articleSection": "开发/基础设施",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "git bisect, git bisect run, git bisect skip, git bisect terms, 二分查找, 回归缺陷, 退出码 125, first-parent, git blame, 最小复现",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/git_bisect_practical.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "git bisect 在提交数量多到什么程度时还好用？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "测试次数按范围大小的对数增长，所以范围变大，负担几乎不增加。建一个有1,000个提交的仓库，在第674个提交里埋进一处缺陷，再让它自动搜索整个区间，判定脚本恰好执行10次。提交数翻一倍，测试也只多一次。真正的上限不是提交数，而是一次测试要花的时间。在同样的1,000提交搜索里，判定立刻结束时全程是3.7秒，给判定加上2秒之后就变成24.0秒。git 自身的开销只有10次检出，其余全是测试时间。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "git bisect run 的退出码该怎么定？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "0表示正常，除125以外的1到127表示有缺陷，125表示无法判定、需要跳过。128及以上会让搜索本身中断。这里有两个坑。第一，Linux 的 timeout 命令在超时的时候返回124，而这个值正好落在有缺陷的区间里，于是只是跑得慢而被掐断的提交可能被指认成真凶，所以把超时换成125更安全。第二，脚本以126或127结束时，git 只在第一轮会切到一个已知正常的提交上再跑一次同样的命令，如果那里也是同样的码，它就判定脚本本身无法执行并中断。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "忘了执行 git bisect reset 会怎样？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "会停在最后一次检查的提交上，处于分离头指针状态。数据不会丢，但在这种状态下提交，那次提交不属于任何分支。敲 git status 会告诉你当前正在二分查找、是从哪个分支开始的，并提示用 reset 回去。只要 .git 里还有 BISECT_START、BISECT_LOG、BISECT_TERMS 这类文件以及 refs/bisect/ 下的引用，会话就还活着；执行 reset 之后它们全部消失，并回到原来的分支。如果想直接留在肇事提交上，就给 reset 传 refs/bisect/bad 作为参数。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "区间中间有构建坏掉、无法判定的提交该怎么办？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "在那些提交上用 skip，如果是自动运行，就让判定脚本以125结束。只是跳过的提交一多，答案就收不到一个上。在一个20提交的仓库里，把缺陷前后的四个提交全部设为跳过之后，git 报告只剩下被跳过的提交，列出五个候选并宣告无法再继续。所以在构建坏掉的区段很宽的仓库里，惯用做法是在判定脚本内部于构建失败时返回125，同时从一开始就接受结果可能是若干个候选而不是一个提交。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "用 git blame 不行吗？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "这两个命令回答的是不同的问题。blame 说的是最后动过这一行的是哪次提交，bisect 说的是行为在哪个时点变了。缺陷进来之后，如果又有一次提交只改了那个文件的缩进，blame 会指向那次格式提交，而 bisect 仍然指向真正的回归提交。实际造一个这样的仓库来验证，blame 把关键几行归给格式提交，bisect 指出改了逻辑的那次提交。blame 这边可以用忽略空白的选项或指定要忽略的提交的选项做一定修正，但如果问题不在某一行上，而在多个文件的组合里，blame 根本给不出答案。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/git_bisect_practical.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/git_bisect_practical.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/git_bisect_practical.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/git_bisect_practical.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/git_bisect_practical.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "首页",
+      "item": "https://braindetox.kr/zh/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "开发/基础设施",
+      "item": "https://braindetox.kr/zh/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "git bisect - 用二分查找定位引入 Bug 的那次提交",
+      "item": "https://braindetox.kr/zh/posts/git_bisect_practical.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="git bisect - 用二分查找定位引入 Bug 的那次提交">
+                <meta itemprop="datePublished" content="2026-09-01">
+                <meta itemprop="dateModified" content="2026-09-01">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="git bisect, git bisect run, git bisect skip, git bisect terms, 二分查找, 回归缺陷, 退出码 125, first-parent, git blame, 最小复现">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/git_bisect_practical.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">git bisect - 用二分查找定位引入 Bug 的那次提交</h1>
+                    <h2 class="post-subtitle">1,000个提交只用10次测试。bisect run 自动化与退出码约定，skip、terms、合并历史，全部用实际输出说明</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-01">2026年9月1日</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">开发/基础设施</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p><strong>以前是好的，现在不行了。</strong> 以这句话开头的问题，并不是不知道原因，而是不知道该看<em>哪里</em>。代码在某处变了，而那个某处夹在几百次提交之间。<code>git bisect</code> 就是把那个区间一半一半切进去的命令。</p>
+
+                    <p>二分查找这个想法本身另外写过 — <a href="ai_assisted_kernel_debugging.html">内核 Bug 是怎样被一步步收窄的</a>讲的就是那件事。这篇只收窄到<strong>git 已经实现好的那个命令</strong>上。要给什么参数，会打印什么输出，以及在哪里容易出错。</p>
+
+                    <div class="callout">
+                        下面的输出全部是在 <strong>git 2.48.1.windows.1</strong>、Windows 10 Pro (10.0.19045)、Git Bash(GNU bash 5.2.37, MSYS2) 上实际执行得到的，时点为2026年9月。实验一律在临时目录里新建的仓库中进行，正文里的 <code>/tmp/demo</code> 只是指代那个位置的中性名字。在其他平台或其他 shell 上可能不同的地方，都会在出现时标注。
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>本文涵盖的内容</h3>
+                        <ol>
+                            <li><a href="#sec-1">它解决的是什么问题</a></li>
+                            <li><a href="#sec-2">造一个用来做实验的仓库</a></li>
+                            <li><a href="#sec-3">基本流程 - 把一个会话走完</a></li>
+                            <li><a href="#sec-4">1,000个提交真的只要10次测试吗</a></li>
+                            <li><a href="#sec-5">一次测试的时间决定总时间</a></li>
+                            <li><a href="#sec-6">忘了 bisect reset 会发生什么</a></li>
+                            <li><a href="#sec-7">bisect run - 不用人盯着也能跑完</a></li>
+                            <li><a href="#sec-8">退出码约定</a></li>
+                            <li><a href="#sec-9">把判定脚本写好的办法</a></li>
+                            <li><a href="#sec-10">bisect skip - 无法判定的提交</a></li>
+                            <li><a href="#sec-11">bisect terms - good/bad 不合适的时候</a></li>
+                            <li><a href="#sec-12">混有合并提交的历史</a></li>
+                            <li><a href="#sec-13">找到肇事提交之后</a></li>
+                            <li><a href="#sec-14">和 git blame 有什么不同</a></li>
+                            <li><a href="#sec-15">bisect 不合适的场合</a></li>
+                            <li><a href="#sec-16">小结</a></li>
+                            <li><a href="#sec-17">未能确认的部分</a></li>
+                            <li><a href="#sec-18">参考资料</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">它解决的是什么问题</h2>
+
+                    <p><code>git bisect</code> 回答的问题只有一个。<strong>如果现在失败、以前成功，那么是中间的哪次提交把它改了。</strong> 只要告诉它一个当时正常的提交和一个已经坏掉的提交，git 就会检出中间那次提交，由人或脚本判定，然后再砍掉一半。</p>
+
+                    <p>这里要紧的是<strong>不需要知道肇事提交的内容</strong>。有判定标准就够了。性能回归也好，某条日志不再打印也好，某个文件不再生成也好，只要是<em>能用是或否回答的测试</em>，就全都适用。所以这个工具和读代码推断原因的做法性质不同。它不是推断，是<strong>测量</strong>。</p>
+
+                    <ul>
+                        <li>需要三样东西 — <strong>坏掉的提交</strong>(多半是 <code>HEAD</code>)、<strong>当时正常的提交</strong>(标签、发布版本、几个月前的提交)、<strong>能复现的测试</strong></li>
+                        <li>不需要的东西 — 关于原因的假设。有了假设反而会只盯着那一侧而漏掉</li>
+                        <li>搜索的对象是<strong>整个区间的提交</strong>，不是文件的差异。所以横跨多个文件的相互作用问题也抓得到</li>
+                        <li>结果是一次提交。那次提交如果很大，还得再往里收窄，但从整段历史缩到一次提交，通常局面就已经变了</li>
+                    </ul>
+
+                    <h2 id="sec-2">造一个用来做实验的仓库</h2>
+
+                    <p>光说不容易有感觉，所以先造一个仓库再开始。是20个提交的。<code>total.sh</code> 把参数里收到的数字相加，<code>check.sh</code> 在结果正确时以0结束、错误时以1结束。在第13次提交里把 <code>total.sh</code> 改成按下标遍历，同时带进一个<strong>漏掉最后一个参数的缺陷</strong>。之后还会再堆上七个无关的提交。</p>
+
+                    <pre><code># 在 /tmp/demo 中
+git init -b main
+
+cat &gt; total.sh &lt;&lt;'EOF'
+#!/bin/bash
+sum=0
+for n in "$@"; do
+  sum=$(( sum + n ))
+done
+echo "$sum"
+EOF
+
+cat &gt; check.sh &lt;&lt;'EOF'
+#!/bin/bash
+out=$(bash ./total.sh 1 2 3 4)
+if [ "$out" = "10" ]; then
+  exit 0
+else
+  echo "expected 10, got $out"
+  exit 1
+fi
+EOF
+</code></pre>
+
+                    <p>做好的历史和当前状态是这样。缺陷在 <code>c13</code> 里，在作为 <code>HEAD</code> 的 <code>c20</code> 上测试失败。</p>
+
+                    <pre><code>$ git log --oneline
+f2ee06a c20: unrelated note 20
+5d4dea0 c19: unrelated note 19
+...
+f1fec3f c13: refactor total.sh to index-based loop
+4d711a9 c12: unrelated note 12
+...
+d6e191c c02: add check.sh
+a25093a c01: add total.sh
+
+$ bash ./check.sh; echo "exit=$?"
+expected 10, got 6
+exit=1
+</code></pre>
+
+                    <h2 id="sec-3">基本流程 - 把一个会话走完</h2>
+
+                    <p>顺序有四步。用 <code>bisect start</code> 开一个会话，用 <code>bisect bad</code> 告诉它现在是坏的，再用 <code>bisect good</code> 告诉它当时正常的提交。这样 git 就会替你检出中间那次提交。测试之后反复给 <code>good</code>/<code>bad</code>，结束时用 <code>bisect reset</code> 退出来。</p>
+
+                    <p>把正常点定为 <code>c02</code>、故障点定为 <code>c20</code>，候选就是从 <code>c03</code> 到 <code>c20</code> 共<strong>18个</strong>。下面是那个会话的全部，命令和输出一条都没删。</p>
+
+                    <pre><code>$ git bisect start
+status: waiting for both good and bad commits
+
+$ git bisect bad
+status: waiting for good commit(s), bad commit known
+
+$ git bisect good d6e191c
+Bisecting: 8 revisions left to test after this (roughly 3 steps)
+[f9194e697f22b03a4aae2ef437dfc2497846eb63] c11: unrelated note 11
+
+$ bash ./check.sh ; echo $?
+0
+$ git bisect good
+Bisecting: 4 revisions left to test after this (roughly 2 steps)
+[d21c4cae515e9a7c0cfcacc38374c8b127273674] c15: unrelated note 15
+
+$ bash ./check.sh ; echo $?
+expected 10, got 6
+1
+$ git bisect bad
+Bisecting: 1 revision left to test after this (roughly 1 step)
+[f1fec3fe55804001fae21aaf7b18a6914483662a] c13: refactor total.sh to index-based loop
+
+$ bash ./check.sh ; echo $?
+expected 10, got 6
+1
+$ git bisect bad
+Bisecting: 0 revisions left to test after this (roughly 0 steps)
+[4d711a957c98da7528cf727b1db40974a3f9d199] c12: unrelated note 12
+
+$ bash ./check.sh ; echo $?
+0
+$ git bisect good
+f1fec3fe55804001fae21aaf7b18a6914483662a is the first bad commit
+commit f1fec3fe55804001fae21aaf7b18a6914483662a
+Author: demo &lt;demo@example.invalid&gt;
+Date:   Tue Sep 1 21:57:42 2026 +0900
+
+    c13: refactor total.sh to index-based loop
+
+ total.sh | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+</code></pre>
+
+                    <p>阅读的要点在 <code>Bisecting:</code> 那一行。它告诉你<strong>做完这次判定还会剩几个</strong>。从18个减到8、4、1、0，测试做了<strong>四次</strong>。另外，在 <code>bisect start</code> 后面加两个参数，就能省掉 <code>bad</code> 和 <code>good</code> 两行。顺序是<strong>坏的在前</strong>。</p>
+
+                    <pre><code>$ git bisect start f2ee06a d6e191c
+Bisecting: 8 revisions left to test after this (roughly 3 steps)
+[f9194e697f22b03a4aae2ef437dfc2497846eb63] c11: unrelated note 11
+</code></pre>
+
+                    <h2 id="sec-4">1,000个提交真的只要10次测试吗</h2>
+
+                    <p>常被引用的那个算法，还是量一量比较好。新建一个1,000个提交的仓库，在第674次提交里弄坏一个配置值，然后从第一次提交到 <code>HEAD</code> 让它自动搜索整个区间。数一数判定脚本被执行了多少次就行。</p>
+
+                    <pre><code>$ git rev-list --count HEAD
+1000
+
+$ git bisect start HEAD $(git rev-list --max-parents=0 HEAD)
+$ git bisect run bash /tmp/bigtest.sh
+Bisecting: 249 revisions left to test after this (roughly 8 steps)
+Bisecting: 124 revisions left to test after this (roughly 7 steps)
+Bisecting: 62 revisions left to test after this (roughly 6 steps)
+...
+fe0dcdad953018ee006623208fdde398e98ea338 is the first bad commit
+    c0674
+bisect found first bad commit
+
+# 判定脚本被执行的次数
+10
+</code></pre>
+
+                    <p><strong>恰好10次</strong>。因为把第一次提交定为正常点，候选是999个，把999不断除以2，10次就落到1以下。这里要紧的性质不是绝对次数，而是<strong>增长的速度</strong>。提交数翻一倍，测试也只多一次。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>候选提交数</th><th>需要的测试次数</th><th>备注</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>18</td><td>4</td><td>在上面那个20提交的仓库上实测</td></tr>
+                            <tr><td>999</td><td>10</td><td>在1,000提交的仓库上实测</td></tr>
+                            <tr><td>2,000</td><td>11</td><td>提交翻倍也只多一次</td></tr>
+                            <tr><td>100,000</td><td>17</td><td>大型仓库也在二十次以内</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>表里下面两行不是实测，而是按同一规则往下推的值。要点是<strong>提交数几乎不会成为瓶颈</strong>。</p>
+
+                    <h2 id="sec-5">一次测试的时间决定总时间</h2>
+
+                    <p>那么瓶颈是什么。同样的1,000提交搜索跑了两遍。一遍用判定立刻结束的测试，一遍加上 <code>sleep 2</code> 故意做慢。答案一样，测试次数也一样。</p>
+
+                    <pre><code>--- 立即结束的测试，999个提交
+tests run: 10
+wall time: 3693 ms
+
+--- 同一次搜索，每次测试2秒
+tests run: 10
+wall time: 24018 ms
+
+答案相同? fe0dcdad... / fe0dcdad...
+</code></pre>
+
+                    <p>相差的20.3秒就是<strong>2秒 × 10次</strong>。git 花掉的时间只有10次检出的3.7秒。也就是说总耗时几乎全是测试时间，公式很简单。<strong>总时间 ≒ 一次测试的时间 × log₂(候选数)</strong>。</p>
+
+                    <p>所以在挂上 bisect 之前把测试变短，实际收益最大。整套测试要5分钟的话，10次就是50分钟；把复现问题的最小用例做出来缩到30秒，就变成5分钟。<strong>先做最小复现这条建议不是定性的劝告，而是十倍差距的算术</strong>。</p>
+
+                    <ul>
+                        <li>不跑整套，只跑<strong>失败的那一个测试</strong>。大多数框架都支持指定单个用例</li>
+                        <li>需要构建就让增量构建生效。每次都全量重建，那段时间会原样放大十倍</li>
+                        <li>依赖网络和外部服务的部分要切掉。慢固然是问题，但<strong>间歇性失败会让答案是错的</strong></li>
+                        <li>能收窄区间就收窄。把候选从999个减到60个，测试就从10次减到6次</li>
+                    </ul>
+
+                    <h2 id="sec-6">忘了 bisect reset 会发生什么</h2>
+
+                    <p>找到肇事提交之后如果就那么放着，会留在<strong>分离头指针</strong>状态。站在最后一次检查的提交上，不挂在任何分支下面。好在 git 会好心提醒。</p>
+
+                    <pre><code>$ git status
+HEAD detached at 4d711a9
+You are currently bisecting, started from branch 'main'.
+  (use "git bisect reset" to get back to the original branch)
+
+nothing to commit, working tree clean
+
+$ ls .git | grep -i bisect
+BISECT_ANCESTORS_OK
+BISECT_EXPECTED_REV
+BISECT_LOG
+BISECT_NAMES
+BISECT_START
+BISECT_TERMS
+
+$ ls .git/refs/bisect
+bad
+good-d6e191c941eb0f49e6ad6b88f546215ef538eecf
+</code></pre>
+
+                    <p>在这里随手改了代码再提交，那次提交不属于任何分支。以后虽然能用 <code>reflog</code> 找回来，但这是没必要经历的事。确认会话是否还活着最快的办法就是像上面那样看 <code>.git</code> 里有没有 <code>BISECT_*</code> 文件，<code>reset</code> 之后它们全都消失。</p>
+
+                    <pre><code>$ git bisect reset
+Previous HEAD position was 4d711a9 c12: unrelated note 12
+Switched to branch 'main'
+
+# 想直接停留在肇事提交上时
+$ git bisect reset refs/bisect/bad
+HEAD is now at f1fec3f c13: refactor total.sh to index-based loop
+
+# 不移动当前提交，只清理会话
+$ git bisect reset HEAD
+</code></pre>
+
+                    <p>另外补一句，<strong>工作树是脏的时候会话根本起不来。</strong> 必须把正在改的文件提交掉，或者用 <code>stash</code> 收走。实际上是这样结束的。</p>
+
+                    <pre><code>$ git status --short
+ M total.sh
+
+$ git bisect start f2ee06a d6e191c
+Bisecting: 8 revisions left to test after this (roughly 3 steps)
+error: Your local changes to the following files would be overwritten by checkout:
+	total.sh
+Please commit your changes or stash them before you switch branches.
+Aborting
+</code></pre>
+
+                    <h2 id="sec-7">bisect run - 不用人盯着也能跑完</h2>
+
+                    <p>从这里开始才是这个命令的本体。把判定交给脚本，<code>git bisect run</code> 就会自己反复做检出、判定和下一步的选择。在和前面完全相同的仓库里，不需要人介入，一行就结束。</p>
+
+                    <pre><code>$ git bisect start f2ee06a d6e191c
+Bisecting: 8 revisions left to test after this (roughly 3 steps)
+[f9194e697f22b03a4aae2ef437dfc2497846eb63] c11: unrelated note 11
+
+$ git bisect run bash ./check.sh
+running 'bash' './check.sh'
+Bisecting: 4 revisions left to test after this (roughly 2 steps)
+[d21c4cae515e9a7c0cfcacc38374c8b127273674] c15: unrelated note 15
+running 'bash' './check.sh'
+expected 10, got 6
+Bisecting: 1 revision left to test after this (roughly 1 step)
+[f1fec3fe55804001fae21aaf7b18a6914483662a] c13: refactor total.sh to index-based loop
+running 'bash' './check.sh'
+expected 10, got 6
+Bisecting: 0 revisions left to test after this (roughly 0 steps)
+[4d711a957c98da7528cf727b1db40974a3f9d199] c12: unrelated note 12
+running 'bash' './check.sh'
+f1fec3fe55804001fae21aaf7b18a6914483662a is the first bad commit
+commit f1fec3fe55804001fae21aaf7b18a6914483662a
+Author: demo &lt;demo@example.invalid&gt;
+Date:   Tue Sep 1 21:57:42 2026 +0900
+
+    c13: refactor total.sh to index-based loop
+
+ total.sh | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+bisect found first bad commit
+</code></pre>
+
+                    <p>指出的提交和手动会话完全一样，而人敲的命令只有两行。<code>run</code> 后面可以跟任何命令 — <code>make</code>、<code>npm test</code>、<code>pytest -k some_case</code>、自己写的 shell 脚本都行。带参数也可以，脚本的路径放在<strong>被检出的仓库之外</strong>更安全。放在仓库里面的话，旧的提交上可能没有那个文件。</p>
+
+                    <h2 id="sec-8">退出码约定</h2>
+
+                    <p>自动化的全部就是<strong>退出码</strong>。约定搞错了，它会悄悄指出错误的提交。把脚本固定成各个码分别跑一遍，结果整理如下。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>退出码</th><th>git 的解释</th><th>实际出现的情况</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>0</code></td><td>正常(good/old)</td><td>全部被标为正常，把坏的端点本身指成了肇事提交</td></tr>
+                            <tr><td><code>1</code> ~ <code>124</code>, <code>126</code>, <code>127</code></td><td>有缺陷(bad/new)</td><td><code>1</code>、<code>2</code>、<code>124</code> 行为相同。把区间最前面的提交指为肇事提交</td></tr>
+                            <tr><td><code>125</code></td><td>无法判定 - 跳过</td><td>全部跳过时先是 <code>We cannot bisect more!</code>，然后是 <code>bisect run cannot continue any more</code></td></tr>
+                            <tr><td><code>126</code> · <code>127</code> (第一轮)</td><td>疑似脚本执行失败</td><td>在正常提交上重试之后以 <code>bogus exit code 127 for good revision</code> 中断</td></tr>
+                            <tr><td><code>128</code> 以上</td><td>中断搜索</td><td><code>bisect run failed: exit code 128 ... is &lt; 0 or &gt;= 128</code></td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>文档上的约定是「0为正常，除125以外的1到127为有缺陷，其余的码中断」。可是把 <code>126</code>、<code>127</code> 真跑一遍，会发现比文档多出一层。这两个值是 POSIX shell 用于<em>无法执行</em>和<em>命令不存在</em>的值，所以 git <strong>只在第一轮</strong>会检出一个已知正常的提交，把同样的命令再跑一次。那里也出同样的码，它就认为脚本本身有问题而停下。</p>
+
+                    <pre><code>$ git bisect run bash /tmp/rc.sh      # 脚本始终以127结束
+running 'bash' '/tmp/rc.sh'
+[d6e191c941eb0f49e6ad6b88f546215ef538eecf] c02: add check.sh
+running 'bash' '/tmp/rc.sh'
+error: bogus exit code 127 for good revision
+[f9194e697f22b03a4aae2ef437dfc2497846eb63] c11: unrelated note 11
+</code></pre>
+
+                    <p>中间那行能看出它切到正常提交 <code>c02</code> 之后又切回原位的痕迹。有了这道保险，<strong>因为脚本路径打错而把整个区间标成有缺陷的事故</strong>大体上能被挡住。反过来，出现这条消息时不该怀疑代码，而要先看脚本能不能执行。</p>
+
+                    <p>最危险的值是 <code>124</code>。它是给测试加超时时会出现的值，而按约定会被读成<strong>有缺陷</strong>。</p>
+
+                    <pre><code>$ timeout 1 sleep 5 ; echo $?
+124
+</code></pre>
+
+                    <p>也就是说<strong>因为慢而被掐断的提交和真正失败的提交分不开。</strong> 要用超时的话，把那个值换成无法判定更准确。</p>
+
+                    <h2 id="sec-9">把判定脚本写好的办法</h2>
+
+                    <p>第一条规则是<strong>必须是能复现的测试</strong>。二分查找把每次判定都当成真话，然后整整丢掉一半。判定只要错一次，肇事提交就可能在被丢掉的那一半里，而那时搜索不会报告任何错误。<strong>它会自信满满地给出一个看起来很像的提交。</strong></p>
+
+                    <p>为了确认这一点，做了一个有30%概率给出假失败的测试，在同一个仓库上跑了五遍。正确答案是 <code>c13</code>(<code>f1fec3f</code>)。</p>
+
+                    <pre><code>--- 间歇性失败的测试，5轮
+round 1  f1fec3f...  (正确)
+round 2  f1fec3f...  (正确)
+round 3  f1fec3f...  (正确)
+round 4  f1fec3f...  (正确)
+round 5  9dc5458...  (c08 - 错误)
+
+--- 确定性的测试，3轮
+f1fec3f...  f1fec3f...  f1fec3f...
+</code></pre>
+
+                    <p>五次里有一次指了一个毫不相干的提交。而且只看那份输出，哪里也没有标明它是错的。怀疑有间歇性失败时，更好的做法是把判定<strong>重复多次，只要失败一次就当作有缺陷</strong>。</p>
+
+                    <p>第二条是<strong>清理副作用</strong>。bisect 只是在提交之间来回走，未被跟踪的文件会原样留下。旧的构建产物留着，下一次提交的判定就会被污染。</p>
+
+                    <pre><code>$ echo "stale artifact" &gt; build.out    # 未被跟踪的产物
+$ git bisect good                       # 移动到其他提交
+$ cat build.out
+stale artifact
+</code></pre>
+
+                    <p>实战里能用的骨架是这样。构建失败给 <code>125</code>，超时也给 <code>125</code>，其余把测试结果原样返回。</p>
+
+                    <pre><code>#!/bin/bash
+# /tmp/judge.sh - 放在仓库之外
+set -u
+
+rm -rf ./build            # 清理上一轮的产物
+make clean &gt;/dev/null 2&gt;&amp;1
+
+if ! make &gt;/dev/null 2&gt;&amp;1; then
+  exit 125                # 无法构建 - 不判定，跳过
+fi
+
+timeout 60 ./run_one_test.sh
+rc=$?
+if [ "$rc" -eq 124 ]; then
+  exit 125                # 避免把超时误判为缺陷
+fi
+exit "$rc"
+</code></pre>
+
+                    <ul>
+                        <li>脚本放在<strong>仓库之外</strong>。旧的提交上没有那个文件</li>
+                        <li><strong>显式地</strong>处理退出码。让最后一条命令的码漏出去，就会和本意不同</li>
+                        <li>产物、缓存、临时文件每一轮都清掉。留着会污染下一次判定</li>
+                        <li>标准输出可以少打，但<strong>失败原因那一行</strong>要留。之后只能靠日志来判断</li>
+                        <li>先<strong>在两个端点上手动跑一遍。</strong> 坏端点失败、好端点成功，搜索才成立</li>
+                    </ul>
+
+                    <h2 id="sec-10">bisect skip - 无法判定的提交</h2>
+
+                    <p>区间里有构建坏掉的提交就没法判定。这时用 <code>git bisect skip</code>，git 会替你另选附近的提交。如果在自动运行中，脚本以 <code>125</code> 结束就是同样的意思。</p>
+
+                    <p>只是被跳过的提交<strong>要是扎堆在答案附近</strong>，结果就收不到一个上。下面是把缺陷前后的四个提交(<code>c11</code>～<code>c14</code>)全部设为跳过之后跑出的结果。</p>
+
+                    <pre><code>$ git bisect run bash /tmp/skipper.sh
+...
+There are only 'skip'ped commits left to test.
+The first bad commit could be any of:
+4d711a957c98da7528cf727b1db40974a3f9d199
+f1fec3fe55804001fae21aaf7b18a6914483662a
+71ed7e0a93f0b4029ba06d2d3cb95e019f141bb1
+f9194e697f22b03a4aae2ef437dfc2497846eb63
+d21c4cae515e9a7c0cfcacc38374c8b127273674
+We cannot bisect more!
+error: bisect run cannot continue any more
+</code></pre>
+
+                    <p>这不该当成失败。18个提交减到了<strong>5个候选</strong>，这五个是能用手看完的量。事先就知道哪一段没法用的话，也可以用范围写法一次性排除。</p>
+
+                    <pre><code>$ git bisect skip c10..c14
+Bisecting: 8 revisions left to test after this (roughly 3 steps)
+
+$ git bisect log | grep skip
+git bisect skip 71ed7e0a...   # c14
+git bisect skip f1fec3fe...   # c13
+git bisect skip 4d711a95...   # c12
+git bisect skip f9194e69...   # c11
+</code></pre>
+
+                    <p>这里容易绊住的地方 — <code>c10..c14</code> 指的是 <strong>c10 之后到 c14 为止</strong>。起点本身不包含在内。要连起点一起排除，就得像 <code>git bisect skip c10 c10..c14</code> 这样另外写出来。</p>
+
+                    <h2 id="sec-11">bisect terms - good/bad 不合适的时候</h2>
+
+                    <p>要找的东西未必总是 bug。找性能变好的时点，或某个功能最初进来的时点时，「坏的提交」这个说法会把方向搞混。这时可以换掉术语。内置的别名有 <code>old</code>/<code>new</code>，也可以自己起名。</p>
+
+                    <pre><code>$ git bisect start --term-old=works --term-new=broken
+status: waiting for both good and bad commits
+
+$ git bisect broken f2ee06a
+status: waiting for good commit(s), bad commit known
+
+$ git bisect works d6e191c
+Bisecting: 8 revisions left to test after this (roughly 3 steps)
+[f9194e697f22b03a4aae2ef437dfc2497846eb63] c11: unrelated note 11
+
+$ git bisect terms
+Your current terms are works for the old state
+and broken for the new state.
+
+$ git bisect run bash ./check.sh
+...
+f1fec3fe55804001fae21aaf7b18a6914483662a is the first broken commit
+bisect found first bad commit
+</code></pre>
+
+                    <p>结果那一行变成了 <code>first broken commit</code>。只有最后的汇总行依然是 <code>first bad commit</code>，如果打算用脚本解析输出，这个差别值得知道。会话中途忘了当前用的是什么术语，就用 <code>git bisect terms</code> 确认。</p>
+
+                    <ul>
+                        <li><strong>找 bug 的时候</strong> — 默认的 <code>good</code>/<code>bad</code> 就够</li>
+                        <li><strong>找修复是什么时候进来的</strong> — 用 <code>old</code>/<code>new</code>。不必称之为「坏的提交」</li>
+                        <li><strong>性能回归</strong> — 像 <code>--term-old=fast --term-new=slow</code> 这样起好名字，判定时就不会搞混</li>
+                        <li>换了术语，算法还是一样的。<strong>变的只是说法</strong></li>
+                    </ul>
+
+                    <h2 id="sec-12">混有合并提交的历史</h2>
+
+                    <p>在默认行为下，bisect 把<strong>合并提交，以及侧分支里的提交，全都当作候选。</strong> 造了一个缺陷在功能分支里进来、那个分支之后被合并的历史来确认。</p>
+
+                    <pre><code>$ git log --oneline --graph --all
+* 1f5a5ab m7: mainline work
+* dc8284c m6: mainline work
+*   36edf65 m5: merge feature
+|\
+| * fa26dce f4: feature polish
+| * 9c3c4da f3: rewrite total.sh (THE BUG)
+| * 13a2a60 f2: feature work
+| * efe0833 f1: feature start
+* | 0481885 m4: mainline work
+|/
+* 87b692a m3: mainline work
+* 2606564 m2: mainline work
+* 342914a m1: base
+</code></pre>
+
+                    <p>同一个仓库用两种方式搜索，答案不一样。两个都是对的答案，只是问的问题不同。</p>
+
+                    <pre><code>--- 默认：会进入侧分支内部
+running 'bash' './check.sh'   (3次)
+9c3c4da9ba2ed3715032525e3699eeae971e583e is the first bad commit
+    f3: rewrite total.sh (THE BUG)
+
+--- --first-parent：只看主线
+$ git bisect start --first-parent HEAD 2606564
+running 'bash' './check.sh'   (3次)
+36edf65d0bd276c62c3fbae15ccab5a28196c39d is the first bad commit
+Merge: 0481885 fa26dce
+    m5: merge feature
+</code></pre>
+
+                    <p>默认的搜索指出的是<strong>写下缺陷的那次提交</strong> <code>f3</code>，<code>--first-parent</code> 指出的是<strong>缺陷进入主线的地点</strong>，也就是合并提交 <code>m5</code>。要改原因代码就需要前者，要知道从哪个发布版本开始有问题就需要后者。</p>
+
+                    <p><code>--first-parent</code> 还有一种特别有用的场合。<strong>侧分支中间的提交连构建都过不了的仓库</strong>。如果开发过程中就带着坏的状态提交、临合并前才整理，默认的搜索会在那些坏掉的提交上一直卡住。只看主线的话，每次提交大体上都是完整的。</p>
+
+                    <h2 id="sec-13">找到肇事提交之后</h2>
+
+                    <p>得到一次提交，就已经完成了一半。先看那次提交改了什么。</p>
+
+                    <pre><code>$ git show --stat f1fec3f
+ total.sh | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+$ git log -p -1 f1fec3f
+diff --git a/total.sh b/total.sh
+@@ -1,7 +1,11 @@
+ #!/bin/bash
++# refactor: iterate by index
+ sum=0
+-for n in "$@"; do
+-  sum=$(( sum + n ))
++i=1
++while [ "$i" -lt "$#" ]; do
++  eval "v=\${$i}"
++  sum=$(( sum + v ))
++  i=$(( i + 1 ))
+ done
+ echo "$sum"
+</code></pre>
+
+                    <p>这里一眼就看得出来。本该是 <code>-le</code> 的地方写成了 <code>-lt</code>，所以最后一个参数被落下了。可实战中的肇事提交多半没这么小。要是出来一次动了几十个文件的提交，就得<strong>在那里面再收窄</strong>。bisect 以提交为单位，进不到里面去，所以从父提交开始，把改动过的文件一个个叠上去测试。</p>
+
+                    <pre><code>$ git show --stat HEAD
+ alpha.conf | 1 +
+ beta.conf  | 1 +
+ delta.conf | 1 +
+ gamma.conf | 2 +-
+ 4 files changed, 4 insertions(+), 1 deletion(-)
+
+$ git checkout HEAD~1            # 移动到父提交
+$ for f in alpha.conf beta.conf delta.conf gamma.conf; do
+&gt;   git checkout main -- "$f"
+&gt;   bash ./check.sh; echo "  + $f -&gt; $?"
+&gt; done
+  + alpha.conf -&gt; 0
+  + beta.conf -&gt; 0
+  + delta.conf -&gt; 0
+  + gamma.conf -&gt; 1        &lt;-- 这里坏掉
+</code></pre>
+
+                    <p>收窄到一个文件，只看那个文件的改动就行。文件本身要是也很大，把同样的办法用 <code>git checkout -p</code> 套到块级别就好。另外，想直接在肇事提交上干活，前面看过的 <code>git bisect reset refs/bisect/bad</code> 会把你带到那个位置。</p>
+
+                    <h2 id="sec-14">和 git blame 有什么不同</h2>
+
+                    <p>两个看起来都在回答「什么时候变成这样的」，但问题不同。<strong><code>blame</code> 说的是最后动过这一行的提交</strong>，<strong><code>bisect</code> 说的是行为改变的时点</strong>。多数时候它们指向同一处，但分岔的情况也很常见。</p>
+
+                    <p>造了一个仓库，缺陷在 <code>b3</code> 进来，之后 <code>b5</code> 只改了同一个文件的<strong>缩进</strong>。从 <code>b3</code> 起行为一直没变。</p>
+
+                    <pre><code>$ git blame -- total.sh
+^4ff6d88 ... 2) sum=0
+75a65371 ... 3) i=1
+75a65371 ... 4) while [ "$i" -lt "$#" ]; do
+b44df25c ... 5)     eval "v=\${$i}"      &lt;-- b5(只改了格式的提交)
+b44df25c ... 6)     sum=$(( sum + v ))
+b44df25c ... 7)     i=$(( i + 1 ))
+
+$ git bisect run bash ./check.sh
+75a65371be49176fd1a34827c369875cd78e8a1e is the first bad commit
+    b3: switch to an index loop
+</code></pre>
+
+                    <p><code>blame</code> 把关键的三行归给了格式提交 <code>b5</code>，<code>bisect</code> 指出的是改了逻辑的 <code>b3</code>。blame 这边也能用忽略空白(<code>-w</code>)或排除特定提交(<code>--ignore-rev</code>)来修正，实际上这两个选项都能把结果拉回 <code>b3</code>。这一带的选项在<a href="git_history_commands_guide_2026.html">被低估的 Git 历史命令</a>那篇里另外讲过。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>场景</th><th>合适的工具</th><th>理由</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>想知道这一行为什么这么写</td><td><code>git blame</code></td><td>按行直接给出提交和提交信息</td></tr>
+                            <tr><td>不知道行为是从什么时候起变了</td><td><code>git bisect</code></td><td>不需要知道是哪一行有问题</td></tr>
+                            <tr><td>问题出在多个文件的组合上</td><td><code>git bisect</code></td><td>blame 只能一行一行地回答</td></tr>
+                            <tr><td>要找这个字符串是什么时候消失的</td><td><code>git log -S</code></td><td>按内容变化筛出提交</td></tr>
+                            <tr><td>已知肇事提交，想看它内部</td><td><code>git show</code> · <code>log -p</code></td><td>接着 bisect 的结果往下用</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2 id="sec-15">bisect 不合适的场合</h2>
+
+                    <p>它并不是所有回归都能用。有几种明确不合适的条件。</p>
+
+                    <ul>
+                        <li><strong>按提交粒度构建不过的仓库</strong> — 要跳过的提交太多，最后会剩下好几个候选。可以用 <code>--first-parent</code> 只看主线，或者先在发布标签之间收窄，再对那一段做精细搜索</li>
+                        <li><strong>依赖环境的缺陷</strong> — 库的版本、内核、容器镜像变了而产生的问题，不在代码历史里面。这时要二分查找的不是代码，而是<em>环境</em></li>
+                        <li><strong>依赖数据的缺陷</strong> — 只在特定记录上复现的话，得先把那份数据固定下来，让测试变得可复现。直接用生产数据，判定会摇摆</li>
+                        <li><strong>逐渐变差的问题</strong> — 性能每次提交差1%的话，根本不存在「变了的那一次提交」。定个阈值硬做二分，也只是那个阈值在决定答案</li>
+                        <li><strong>已经知道原因的问题</strong> — 栈跟踪已经指向文件和行号的话，blame 快得多。bisect 是没有线索时用的工具</li>
+                        <li><strong>历史被 rebase 重写过的区段</strong> — 那些提交实际上从未按那个顺序被构建过，中间的提交可能本来就跑不起来</li>
+                    </ul>
+
+                    <p>还有一个只对 Windows 用户成立的坑。bisect 会创建一个叫 <code>refs/bisect/good-&lt;40位哈希&gt;</code> 的<strong>长名字引用</strong>。仓库路径一深，这个路径就会超过260字符的限制，会话起不来。只改变路径长度做验证，结果是这样。</p>
+
+                    <pre><code>root=181  refpath=244  -&gt; 正常
+root=192  refpath=255  -&gt; 正常
+root=203  refpath=266  -&gt; error: update_ref failed for ref
+   'refs/bisect/good-27fe9984...': couldn't set
+   'refs/bisect/good-27fe9984...'
+</code></pre>
+
+                    <p>消息里不会说这是路径的问题，所以原因很难找。打开 <code>core.longpaths=true</code> 对这个引用也不起作用。把仓库挪到浅一点的路径上最稳妥。在 Linux 和 macOS 上不会出现这个问题。</p>
+
+                    <h2 id="sec-16">小结</h2>
+
+                    <p>归拢起来，实战中要记的东西不多。给出坏的提交和好的提交，把判定交给脚本，结束后 <code>reset</code>。三行。</p>
+
+                    <pre><code>$ git bisect start &lt;坏的提交&gt; &lt;好的提交&gt;
+$ git bisect run /tmp/judge.sh
+$ git bisect reset
+</code></pre>
+
+                    <p>其余全都取决于<strong>判定脚本的质量</strong>。测试不能复现，答案就是错的；测试慢，那段时间会变成十倍；退出码随手一漏，超时就摇身变成缺陷。搜索算法早就做好了，没有可动的地方。人这边要准备的只有一样，<strong>一个能把「成了/没成」一次都不说错的测试</strong>。</p>
+
+                    <p>所以真正学会这个命令的顺序不是语法。碰上问题先<strong>手动确认两个端点</strong>，把测试<strong>缩成最小复现</strong>，然后才挂上 <code>run</code>。守住这个顺序，大部分回归都能在一杯咖啡的工夫里收窄到一次提交。</p>
+
+                    <h2 id="sec-17">未能确认的部分</h2>
+
+                    <ul>
+                        <li>所有输出都只在 <strong>Windows + Git Bash</strong> 这一个环境里取得。在 Linux、macOS，以及 <code>dash</code>、<code>zsh</code> 这类其他 shell 上，消息措辞或退出码的传递是否相同，没有确认</li>
+                        <li>搜索中断时 <code>git bisect run</code> <strong>本身</strong>返回给 shell 的值并不固定。脚本以128结束时出128，以129结束时出127，规律没能弄清。判断还是靠消息而不是靠退出码更安全</li>
+                        <li><code>126</code>、<code>127</code> 的重试行为只按<strong>观测到的输出</strong>写。没有直接到 git 源码里确认对应的处理</li>
+                        <li>1,000个提交的实测用的是<strong>合成仓库</strong>。在有几万个文件的大型仓库里，检出成本会变大，git 自身耗时的占比可能不同</li>
+                        <li><code>git bisect visualize</code> 需要 <code>gitk</code>，没有运行。<code>--no-checkout</code> 确认过可用，但在<strong>裸仓库</strong>里的行为没有试</li>
+                        <li>长路径失败时 <code>core.longpaths</code> 为什么不起作用，<strong>未能确认原因。</strong> 是引用文件的路径还是锁文件卡住了，也没能确定</li>
+                    </ul>
+
+                    <h2 id="sec-18">参考资料</h2>
+
+                    <ul>
+                        <li><a href="https://git-scm.com/docs/git-bisect" target="_blank" rel="noopener">git-bisect(1) - Git 官方文档</a> — 全部子命令的语法、退出码约定，以及 <code>--first-parent</code>、<code>--no-checkout</code> 的说明。本文关于约定的部分，和 Git 2.48.1 随附的同一份文档做过核对</li>
+                        <li><a href="https://git-scm.com/docs/git-blame" target="_blank" rel="noopener">git-blame(1) - Git 官方文档</a> — <code>-w</code>、<code>--ignore-rev</code>、<code>--ignore-revs-file</code> 等把格式提交过滤掉的选项</li>
+                        <li><a href="https://git-scm.com/book/en/v2/Git-Tools-Debugging-with-Git" target="_blank" rel="noopener">Pro Git - Debugging with Git</a> — 把 <code>blame</code> 和 <code>bisect</code> 并排放在一起的一章。关于两个工具如何分工的标准说明</li>
+                        <li><a href="ai_assisted_kernel_debugging.html">内核 Bug 是怎样被一步步收窄的 - 二分查找、最小复现、埋点，以及工具的那一份</a> — 二分查找这个策略本身，以及做出最小复现的过程</li>
+                        <li><a href="git_history_commands_guide_2026.html">被低估的 Git 历史命令 - pickaxe、log -L、bisect、reflog</a> — <code>log -S</code>、<code>log -L</code>、<code>blame --ignore-rev</code>、<code>reflog</code> 等相邻命令按场景整理的一篇</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>分享本文</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">返回列表</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/code_image.html">代码图片生成器</a></li>
+      <li><a href="../static/char_counter.html">字数统计</a></li>
+      <li><a href="../static/json_formatter.html">JSON 格式化工具</a></li>
+      <li><a href="../static/regex_tester.html">正则表达式测试器</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="text_diff_whitespace_guide.html">过滤只改了空白的 diff - 别让真正的改动被埋没</a></li>
+      <li><a href="agent_behavior_spec.html">长时间运行的智能体该拿什么来打分 - 把行为写成规格这个想法的实质</a></li>
+      <li><a href="vector_db_selection_criteria.html">向量检索该建在什么之上 - 加在现有搜索引擎上与另立专用引擎</a></li>
+      <li><a href="bug_blindness.html">「本来就这样」是怎么形成的 - 缺陷沉入背景的过程，以及让它重新可见的办法</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制！请粘贴到Threads应用中分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制！');});
+    });
+    </script>
+</body>
+</html>

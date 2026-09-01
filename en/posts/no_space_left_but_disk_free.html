@@ -1,0 +1,774 @@
+<!DOCTYPE html>
+<!--
+ * Tech blog post template
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="en">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>No space left on device While the Disk Is Not Full - Inodes and Open Files</title>
+    <meta name="description" content="df says there is room but the write fails. Inode exhaustion, deleted-but-open files, reserved blocks and the wrong mount, told apart with real output.">
+    <meta name="keywords" content="No space left on device, ENOSPC, inode exhaustion, df -i, du, lsof, deleted open files, reserved blocks, tune2fs, ext4, XFS, btrfs, block size, internal fragmentation, resize2fs, dev, infra, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/en/posts/no_space_left_but_disk_free.html">
+
+    <meta property="og:title" content="No space left on device While the Disk Is Not Full - Inodes and Open Files">
+    <meta property="og:description" content="One symptom, four causes. How to check which mount it is, whether it is capacity or inodes, and whether df and du disagree - in that order.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/en/posts/no_space_left_but_disk_free.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="en_US">
+    <meta property="article:published_time" content="2026-09-01">
+    <meta property="article:section" content="Dev &amp; Infra">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="No space left on device While the Disk Is Not Full">
+    <meta name="twitter:description" content="Four reasons a write fails while space remains, and the order in which you separate them.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "No space left on device While the Disk Is Not Full - Inodes and Open Files",
+      "alternativeHeadline": "One symptom, four causes - how to separate those four in the right order",
+      "datePublished": "2026-09-01",
+      "dateModified": "2026-09-01",
+      "inLanguage": "en-US",
+      "articleSection": "Dev & Infra",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "No space left on device, ENOSPC, inode exhaustion, df -i, du, deleted open files, reserved blocks, tune2fs, ext4, XFS, btrfs, block size, resize2fs",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/en/posts/no_space_left_but_disk_free.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "Why does No space left on device appear when df says there is room?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "ENOSPC is only one signal, the kernel saying it cannot accept this write, and there are at least four situations behind it. The first is that the file count limit, the inodes, is full rather than the capacity, which you check with df -i. The second is that something was deleted while a process still holds it open, so the space was never returned, and df and du disagree. The third is the reserved blocks ext4 sets aside by default, which makes the filesystem look full to ordinary users only. The fourth is that the thing that actually filled up is a different filesystem. So do not stop at df -h. Pass the failing path to df directly and start by confirming which device that path is really attached to."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Why does space not come back after I delete a file?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "rm is not a command that erases data. It is unlink, which removes one name from a directory. If even one process still has that file open, a reference remains after the link count reaches zero, so the kernel does not return the blocks. In Git Bash a 1GiB file was created, held open with tail and then deleted, and right after rm only 16 of 262,147 blocks came back while du already reported 1.0K, disagreeing with df. Killing that process returned 262,143 blocks at once. The fix is not to delete the file again but to restart the process holding it or to close that file descriptor."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Can inodes be increased when they run out?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "It depends on the filesystem. On ext4 the inode count is fixed at mkfs time, and the mke2fs documentation states about the bytes-per-inode ratio that it cannot be changed after the filesystem is created, so the value should be chosen carefully. In other words, once inodes are full on ext4 there is no option to add more; you either reduce the number of files or rebuild the filesystem. XFS allocates inodes dynamically and its maximum percentage, maxpct, can be changed with xfs_growfs. For btrfs the kernel documentation lists dynamic inode allocation among its features, so the very notion of a fixed limit is different."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Why do many small files consume more space than their size?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "A filesystem hands out space in blocks, so a file occupies a multiple of the block size rather than its logical size. Measuring a 4,097 byte file gives a logical size of 4,097 but an actual allocation of 8,192 bytes. One byte pulls in a whole extra block. In a measured run with 20,000 one-byte files the logical total was 20,000 bytes while the actual footprint was 24,674,304 bytes, about 1,233 times larger. Where file counts are high, capacity and inodes drain together, so both have to be watched."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "In an emergency, what is safe to delete first?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "The safest first move is not deleting anything but checking for space that is being held. If deleted-but-open files are the cause, no amount of deleting reclaims anything. Safe targets are compressed rotated logs, package manager caches, build output and clearly stale temporary files. By contrast, deleting a log file that is currently open gives back no space and loses the log. Leave database files, lock files, sockets and directories whose contents you do not know alone. rm -rf and truncate cannot be undone, so read the path with your own eyes before running them."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/no_space_left_but_disk_free.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/no_space_left_but_disk_free.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/no_space_left_but_disk_free.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/no_space_left_but_disk_free.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/no_space_left_but_disk_free.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "Home",
+      "item": "https://braindetox.kr/en/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "Dev & Infra",
+      "item": "https://braindetox.kr/en/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "No space left on device While the Disk Is Not Full - Inodes and Open Files",
+      "item": "https://braindetox.kr/en/posts/no_space_left_but_disk_free.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="No space left on device While the Disk Is Not Full - Inodes and Open Files">
+                <meta itemprop="datePublished" content="2026-09-01">
+                <meta itemprop="dateModified" content="2026-09-01">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="No space left on device, ENOSPC, inode exhaustion, df -i, du, deleted open files, reserved blocks, tune2fs, ext4, XFS, btrfs, block size, resize2fs">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/en/posts/no_space_left_but_disk_free.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">No space left on device While the Disk Is Not Full - Inodes and Open Files</h1>
+                    <h2 class="post-subtitle">One symptom, four causes - how to separate those four in the right order</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-01">September 1, 2026</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">Dev &amp; Infra</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>An alert says the service cannot write its log, so you log in to the server. Out of habit you type <code>df -h</code>. More than thirty percent is free. And yet a single <code>touch</code> in that same shell comes back with <strong>No space left on device</strong>. There is one reason most of the time gets wasted at this moment: <strong>you think df is lying</strong>.</p>
+
+                    <p>df does not lie. It simply <strong>does not answer what it was not asked.</strong> Ask about capacity and it answers about capacity; ask about the root and it answers about the root. If the real reason the write failed is not capacity, or not the root, then df's answer stays perfectly accurate and perfectly useless. This piece pulls apart the four places where that mismatch is created, and sets out the order that gets you finished fastest.</p>
+
+                    <nav class="post-toc">
+                        <h3>What this article covers</h3>
+                        <ol>
+                            <li><a href="#sec-1">One symptom, four causes</a></li>
+                            <li><a href="#sec-2">The environment behind these outputs, and what was verified</a></li>
+                            <li><a href="#sec-3">Ask this first - is it really that filesystem</a></li>
+                            <li><a href="#sec-4">Cause ① inode exhaustion - space left, count used up</a></li>
+                            <li><a href="#sec-5">When inodes are decided - ext4 · XFS · btrfs</a></li>
+                            <li><a href="#sec-6">Cause ② deleted but still open</a></li>
+                            <li><a href="#sec-7">Cause ③ reserved blocks - room only root can see</a></li>
+                            <li><a href="#sec-8">Why small files eat more space</a></li>
+                            <li><a href="#sec-9">Finding what ate it - the du idiom</a></li>
+                            <li><a href="#sec-10">The diagnostic order - four steps</a></li>
+                            <li><a href="#sec-11">What changes in containers and the cloud</a></li>
+                            <li><a href="#sec-12">In a hurry - what is safe to delete and what is not</a></li>
+                            <li><a href="#sec-13">Preventing it in the first place</a></li>
+                            <li><a href="#sec-14">Wrap-up</a></li>
+                            <li><a href="#sec-15">What I could not verify</a></li>
+                            <li><a href="#sec-16">References</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">One symptom, four causes</h2>
+
+                    <p><code>ENOSPC</code> is one signal, the kernel telling an application that <strong>it cannot accept this write</strong>. One signal does not mean one situation. In human terms it is like a fever: the fever itself is not a diagnosis, it is a sign that diagnosis should begin. In practice, though, people often jump straight from <code>ENOSPC</code> to <strong>finding things to delete</strong>, and when the cause is not capacity, all of that work is wasted.</p>
+
+                    <p>There are four places to separate. The right-hand column of the table below, the <strong>distinguishing signal</strong>, is the substance of this article. Memorise the two left columns only and you will still get the order wrong.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Cause</th><th>What is actually full</th><th>Command to check</th><th>Distinguishing signal</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>① inode exhaustion</td><td>The file count limit</td><td><code>df -i</code></td><td>Use% is low but only IUse% is 100%</td></tr>
+                            <tr><td>② deleted but open</td><td>Blocks that were never returned</td><td><code>lsof +L1</code> · <code>/proc/&lt;pid&gt;/fd</code></td><td><code>df</code> is full, the <code>du</code> total is far smaller</td></tr>
+                            <tr><td>③ reserved blocks</td><td>The share set aside for root only</td><td><code>tune2fs -l</code></td><td>Ordinary accounts fail, root succeeds</td></tr>
+                            <tr><td>④ a different mount</td><td>A filesystem you never looked at</td><td><code>df -h &lt;path&gt;</code></td><td>Root has room, only that path is at 100%</td></tr>
+                        </tbody>
+                    </table>
+
+                    <ul>
+                        <li>① and ④ each take <strong>a single line to check</strong>. That is why putting them at the front saves the most time</li>
+                        <li>② only shows itself when you look at <code>df</code> and <code>du</code> <strong>together</strong>. Look at one alone and you will never see it</li>
+                        <li>③ is rare, but it creates the strange situation where <strong>two people on the same server get different results</strong>, and that eats hours</li>
+                    </ul>
+
+                    <h2 id="sec-2">The environment behind these outputs, and what was verified</h2>
+
+                    <p>The subject of this article is Linux servers, but the environment that actually produced the output pasted here is <strong>Git Bash on Windows 10</strong>. I state this up front not to look modest, but because the reader needs to be able to tell <strong>which output can be trusted as is and which output is simply not here</strong>.</p>
+
+                    <pre><code>$ bash --version | head -1
+GNU bash, version 5.2.37(1)-release (x86_64-pc-msys)
+
+$ uname -a
+MINGW64_NT-10.0-19045 3.5.7-882031da.x86_64 2025-01-30 11:14 UTC x86_64 Msys
+
+$ df --version | head -1
+df (GNU coreutils) 8.32</code></pre>
+
+                    <p>coreutils here is GNU 8.32, the same as on Linux, so <strong>the option behaviour and the arithmetic</strong> of <code>df</code>, <code>du</code>, <code>stat</code> and <code>sort</code> are identical. The only thing that differs is that the filesystem underneath is NTFS, and as you will see, that difference actually helps in understanding inodes.</p>
+
+                    <ul>
+                        <li><strong>Actually run</strong> - <code>df -h</code>, <code>df -i</code>, <code>df --output</code>, <code>stat -f</code>, <code>stat -c</code>, various <code>du</code> combinations, <code>find -printf</code>, and <strong>the entire deleted-but-open reproduction</strong></li>
+                        <li><strong>Could not be run</strong> - <code>lsof +L1</code> (lsof itself is absent in this environment), <code>tune2fs</code>, <code>debugfs</code>, <code>resize2fs</code> (ext4 only), and everything about container overlays</li>
+                        <li><strong>Not invented</strong> - not one line of output from a command that could not be run appears in this article. Only the commands and <strong>how to read them</strong> are written down</li>
+                        <li><strong>Edited</strong> - only user paths in the output were shortened to <code>/tmp/demo</code> and <code>&lt;user&gt;</code>. <strong>Not a single number was changed</strong></li>
+                        <li>The block size is reported as <strong>4,096 bytes</strong> in this environment. Every block calculation in this article uses that value</li>
+                        <li>Other shells (dash, zsh) and BSD-style <code>df</code> and <code>du</code> use different option names and output formats. The commands below assume <strong>GNU coreutils</strong></li>
+                    </ul>
+
+                    <h2 id="sec-3">Ask this first - is it really that filesystem</h2>
+
+                    <p>In order of execution this comes first. It is number ④ on the cause list, but <strong>it is the cheapest thing to check</strong>. Type <code>df -h</code> with no argument and you get a list of mounts, and the human eye usually stops at the root line on top. If the path that failed sits on a different filesystem, its line is somewhere further down the screen.</p>
+
+                    <p>The fix is to <strong>hand the path to df directly</strong>. Even this environment reports the same physical disk as two different mounts.</p>
+
+                    <pre><code>$ df -h . /
+Filesystem                        Size  Used Avail Use% Mounted on
+C:/Users/&lt;user&gt;/&lt;temp&gt;  931G  600G  332G  65% /tmp
+C:/Program Files/Git                931G  600G  332G  65% /
+
+# The point - the current directory is attached to /tmp, not to /.
+# It is the same on Linux. Give the failing path to df directly.
+$ df -h /var/log</code></pre>
+
+                    <p>On Linux servers the places where this trap is sprung most often are well known. The list below is the typical layout in which <strong>a write fails even though the root has room</strong>.</p>
+
+                    <ul>
+                        <li>Layouts where <code>/var</code> is a separate partition - logs and package caches pile up here, so it fills long before the root does</li>
+                        <li><code>/boot</code> - usually sized in the hundreds of megabytes, so a few kernel packages are enough to fill it. The symptom appears as <strong>a failed kernel update</strong>, which does not look like a disk problem</li>
+                        <li>Layouts where <code>/tmp</code> is <code>tmpfs</code> - it uses memory, so it fills independently of the real disk. Reboot and it disappears, taking the evidence with it</li>
+                        <li>Inside a container - the writable layer and a mounted volume are <strong>different filesystems</strong>. The write fails when the layer fills, even if the volume has room</li>
+                        <li>Paths where a bind mount or NFS overlaps - the path string looks like the same tree, but the device is different</li>
+                    </ul>
+
+                    <h2 id="sec-4">Cause ① inode exhaustion - space left, count used up</h2>
+
+                    <p>A filesystem does not only store data; it separately manages <strong>a metadata entry for every single file</strong>. The structure holding the owner, the permissions, the timestamps and the location of the actual data blocks is the inode. The file name is not in there. Names are held by directories, and a directory is <strong>a list pairing names with inode numbers</strong>. Because of this structure several names can point at one inode, and that is a hard link.</p>
+
+                    <p>What matters is that <strong>the number of these entries can have a limit</strong>. Once the limit is reached, no new file can be created no matter how many blocks remain. Checking it is one line, <code>df -i</code>. And in this environment that command answers like this.</p>
+
+                    <pre><code>$ df -i .
+Filesystem                       Inodes IUsed IFree IUse% Mounted on
+C:/Users/&lt;user&gt;/&lt;temp&gt;    -     -     -     - /tmp
+
+$ stat -f .
+  File: "."
+    ID: ea1df1ef00000000 Namelen: 255     Type: UNKNOWN
+Block size: 4096       Fundamental block size: 4096
+Blocks: Total: 244041727  Free: 86972107   Available: 86972107
+Inodes: Total: 18446744073709551615 Free: -1</code></pre>
+
+                    <p>Everything is <code>-</code>. And <code>stat -f</code> shows why. The <strong>18,446,744,073,709,551,615</strong> reported as the inode total is the maximum value of an unsigned 64-bit integer, that is, <strong>a sentinel meaning there is no limit</strong>, and Free is <code>-1</code>. NTFS has no fixed inode table like ext4, so there is no number to report in the first place.</p>
+
+                    <p>Those blanks are not a failure; they are <strong>a screen showing the most important fact directly</strong>. An inode limit is not a universal property of filesystems but <strong>a design choice that differs per implementation</strong>. That is why a response that works on an ext4 server does not carry over to an XFS server. Here is what the screen looks like on Linux with real numbers filled in, and what to type next.</p>
+
+                    <pre><code># ① which mount has run out of inodes
+df -i
+
+# ② directories where files are concentrated inside that mount (coarse first pass)
+du --inodes -x -d 2 /var 2&gt;/dev/null | sort -n | tail -20
+
+# ③ counting files per directory directly (older environments without du --inodes)
+find /var -xdev -type f -printf '%h\n' 2&gt;/dev/null \
+  | sort | uniq -c | sort -rn | head -20
+
+# The three lines above could not be run in this environment.
+# NTFS does not report an inode count, so ① comes back blank.</code></pre>
+
+                    <p>The places where small files pile up by the million are fairly predictable. Below are the typical spots where <strong>the capacity graph shows nothing at all while inodes quietly fill up</strong>.</p>
+
+                    <ul>
+                        <li><strong>Session files</strong> - without expiry cleanup you get one file per visitor, each a few hundred bytes</li>
+                        <li><strong>Mail queues and Maildir</strong> - one message is one file. When delivery is blocked, the queue stays behind as raw file count</li>
+                        <li><strong>Cache shards</strong> - caches that split a hash into directories swell twice over, because <strong>directories consume inodes too</strong></li>
+                        <li><strong>Log fragments</strong> - a short rotation interval with a large retention count leaves compressed copies lying around. Each is small, but the count is what decides the outcome</li>
+                        <li><strong>Dependency directories</strong> - a package tree created once per build environment grows to hundreds of thousands of files</li>
+                    </ul>
+
+                    <h2 id="sec-5">When inodes are decided - ext4 · XFS · btrfs</h2>
+
+                    <p>This is where they diverge. The <code>mke2fs</code> documentation is blunt about the <code>-i</code> option, the number of bytes assigned per inode: <strong>this ratio cannot be changed after the filesystem is created, so choose the value carefully</strong>. The same document also states that the default reserved block percentage is five percent.</p>
+
+                    <p>That one sentence carries weight in practice. <strong>Once inodes are full on ext4, there is no option to increase them.</strong> You either reduce the file count or move the data and rebuild the filesystem. That is a fact you do not want to learn in the middle of an incident, so it is better decided while designing the storage.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Filesystem</th><th>How inodes are assigned</th><th>Can it be increased later</th><th>What that means in practice</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>ext4</td><td>Count fixed at mkfs time. Set by <code>-i</code> ratio or <code>-N</code> count</td><td>No. The documentation explicitly says it cannot be changed</td><td>If you know there will be many small files, lower the ratio <strong>when creating it</strong></td></tr>
+                            <tr><td>XFS</td><td>Dynamic allocation. Only the ceiling is managed, via <code>maxpct</code></td><td>Yes. Change the ceiling with <code>xfs_growfs -m</code></td><td>Even after exhaustion there is room to raise the ceiling and buy time</td></tr>
+                            <tr><td>btrfs</td><td>The kernel documentation lists <strong>dynamic inode allocation</strong> among its features</td><td>The very notion of a fixed limit is different</td><td>Do not read the numbers from <code>df -i</code> with ext4 meanings</td></tr>
+                        </tbody>
+                    </table>
+
+                    <ul>
+                        <li>The default for XFS <code>maxpct</code> varies with filesystem size. Per the documentation it is <strong>25 percent below 1TB, 5 percent below 50TB and 1 percent above that</strong></li>
+                        <li>Setting <code>maxpct</code> to 0 can effectively let the whole filesystem become inode blocks, the documentation says. That <strong>releases the ceiling, and it also removes the mechanism protecting data space</strong></li>
+                        <li>So IUse% from <code>df -i</code> is <strong>a number you cannot read without knowing the filesystem type</strong>. The same 90 percent is an alarm on ext4 and material for deciding whether to raise the ceiling on XFS</li>
+                    </ul>
+
+                    <h2 id="sec-6">Cause ② deleted but still open</h2>
+
+                    <p><code>rm</code> is not a command that erases data. It is <strong>unlink, which removes one name from a directory</strong>. Even when every name is gone and the link count reaches zero, the kernel does not return the blocks <strong>as long as one process still has that file open</strong>. The space comes back only at the moment the last reference is closed.</p>
+
+                    <p>This behaviour is not a defect but a safeguard defined by POSIX. It prevents a process from breaking because a file vanished while it was being read. The problem is that at this point <strong>the observation tools give different answers</strong>. <code>df</code> reads the filesystem's block accounting, so it counts the held space as <strong>in use</strong>. <code>du</code> walks directories and counts files, so <strong>a file with no name is invisible to it</strong>. Hence the disagreement.</p>
+
+                    <p>It reproduced exactly in this environment. A 1GiB file was created, held with <code>tail -f</code>, deleted, and the free block count was read at each step. Below is the actual output.</p>
+
+                    <pre><code>$ cd /tmp/demo
+$ free() { stat -f -c %f .; }          # free block count (1 block = 4096 bytes)
+
+STEP 0  empty directory      free blocks: 86970141
+$ head -c 1073741824 /dev/zero &gt; big.log
+STEP 1  1GiB created         free blocks: 86707994   du -sh: 1.0G
+$ ( tail -f big.log &gt; /dev/null &amp; )
+STEP 2  tail holds it open
+$ rm big.log
+STEP 3  right after rm       free blocks: 86708010   du -sh: 1.0K
+STEP 3b 2 seconds later      free blocks: 86708010
+$ kill &lt;pid of tail&gt;
+STEP 4  after the process exits  free blocks: 86970153</code></pre>
+
+                    <p>Read the numbers as they are. Creating the file consumed <strong>262,147 blocks</strong>. Multiply by 4,096 bytes and you get roughly 1.0GiB, which matches what was created. Yet right after <code>rm</code>, only <strong>16 blocks</strong> came back. Deleting 1GiB returned 64KiB, which is effectively zero. Meanwhile <code>du</code> at the same moment already answers <strong>1.0K</strong>. This is where <strong>the 1GiB gap between df and du</strong> gets created.</p>
+
+                    <p>And when the process was killed, <strong>262,143 blocks</strong> came back all at once. What deleted the file was <code>rm</code>, but what returned the space was <code>kill</code>. These two lines are the evidence behind the claim that <strong>the fix is not to delete the file again but to make the holder let go</strong>.</p>
+
+                    <p>Finding the culprit is a separate problem. The standard tool is <code>lsof +L1</code>, and the documentation explains that this form <strong>selects files that are open while their name has been deleted</strong>. lsof is not installed in this environment, however, so it could not be run. The <code>/proc</code> side worked as expected, and the <code>(deleted)</code> marker the kernel attaches came out clearly.</p>
+
+                    <pre><code># What was run in this environment - checking via /proc
+$ ls -l /proc/&lt;pid&gt;/fd | grep -i deleted
+lrwxrwxrwx 3 -&gt; /tmp/demo/big.log (deleted)
+
+# What could not be run in this environment - lsof is not installed
+$ sudo lsof +L1                  # only open files with a link count below 1
+$ sudo lsof -nP +L1 /var         # narrowing to a specific mount</code></pre>
+
+                    <div class="callout">
+                        <strong>Caution</strong> - when a process cannot be restarted, truncating the file descriptor with <code>&gt; /proc/&lt;pid&gt;/fd/&lt;n&gt;</code> is a widely known trick. The space returns immediately, but <strong>pick the wrong number and another file that process has open is emptied entirely.</strong> It cannot be undone and there is no confirmation step. If a restart is possible, a restart is always the safer side.
+                    </div>
+
+                    <ul>
+                        <li>What creates this situation most often is <strong>a mistake in log rotation settings</strong>. If the process is not signalled to reopen after the file is moved or deleted, it keeps writing to the old, nameless file.This is where log rotation fails silently</li>
+                        <li>Pinning down the holding process is outside this article. Here we go only as far as <strong>why the space does not come back</strong></li>
+                        <li><strong>A disk usage graph that does not step down</strong> is a good sign of this cause. If you ran a cleanup and the graph stays flat, what you deleted is still open</li>
+                        <li>The restart target is usually whatever writes logs. The application that writes logs to a file and the collector that reads and ships them can <strong>both</strong> be holding the same file</li>
+                    </ul>
+
+                    <h2 id="sec-7">Cause ③ reserved blocks - room only root can see</h2>
+
+                    <p>The ext family sets aside a portion of the total blocks <strong>for privileged processes only</strong>. The <code>tune2fs</code> documentation gives two reasons for it: <strong>to avoid filesystem fragmentation</strong>, and <strong>to allow system daemons to keep functioning correctly after non-privileged processes are prevented from writing</strong>. The default is five percent.</p>
+
+                    <p>So this scene gets created. Writing fails under the application account, but log in as the administrator and creating a file in the same place succeeds. This is where two people looking at the same server reach different conclusions. If writes fail while <code>df</code> Use% <strong>sits around 95 percent instead of 100</strong>, this cause is worth suspecting.</p>
+
+                    <pre><code># Checking reserved blocks (ext2/3/4) - could not be run in this environment
+$ sudo tune2fs -l /dev/sda1 | grep -iE 'block count|reserved'
+# Block count:              total number of blocks
+# Reserved block count:     number of reserved blocks
+# The ratio between the two is the reserved percentage.
+
+# Adjusting the ratio - reversible, but do it carefully
+$ sudo tune2fs -m 1 /dev/sda1    # 5% -&gt; 1%</code></pre>
+
+                    <div class="callout">
+                        <strong>Caution</strong> - the advice to remove the reservation entirely with <code>tune2fs -m 0</code> appears often, but both purposes stated in the documentation disappear with it. As free space approaches zero, <strong>contiguous blocks become impossible to find and fragmentation accelerates sharply</strong>, and the daemons that write logs stop along with everything else, costing you <strong>the means to record why the incident happened</strong>. Specify it wrongly on a mounted filesystem and it stays applied until you reverse it.
+                    </div>
+
+                    <ul>
+                        <li>The reserved ratio is <strong>a percentage</strong>. So the absolute amount set aside grows as the disk grows. On a multi-terabyte volume, five percent is a considerable amount</li>
+                        <li>On <strong>data-only volumes</strong>, that is, volumes where no system daemon writes logs, there is a case for lowering the ratio. But leave one to two percent rather than zero</li>
+                        <li>Conversely, on <code>/</code> and <code>/var</code> it is better to leave the default alone. These are exactly <strong>the places where the daemons have to keep running</strong>, as the documentation puts it</li>
+                        <li>XFS has no concept by the same name and manages free space differently. <strong>Do not carry ext-family habits over to it</strong></li>
+                    </ul>
+
+                    <h2 id="sec-8">Why small files eat more space</h2>
+
+                    <p>A filesystem does not hand out space by the byte; it hands it out <strong>in blocks</strong>. A one-byte file receives a whole block. The remainder cannot be used by another file, and this waste is called internal fragmentation. Described in words it sounds trivial, but the character of it changes the moment it is multiplied by a count.</p>
+
+                    <p>I measured it. <code>du</code> with <code>--apparent-size</code> reports <strong>the logical size</strong>, while the default behaviour reports <strong>the actual allocation</strong>. Put the two side by side and the difference is plain.</p>
+
+                    <pre><code>$ du -b --apparent-size one_byte.txt b100.bin b4096.bin b4097.bin b1m.bin
+1        one_byte.txt
+100      b100.bin
+4096     b4096.bin
+4097     b4097.bin
+1048576  b1m.bin
+
+$ du --block-size=1 one_byte.txt b100.bin b4096.bin b4097.bin b1m.bin
+1024     one_byte.txt
+1024     b100.bin
+4096     b4096.bin
+8192     b4097.bin
+1048576  b1m.bin</code></pre>
+
+                    <p>The line to look at is <code>b4097.bin</code>. A logical size of <strong>4,097 bytes</strong> with an actual allocation of <strong>8,192 bytes</strong>. Crossing a block boundary by one byte pulls in another full 4,096 bytes. The 4,096-byte file, meanwhile, uses exactly 4,096.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Logical size</th><th>Actual allocation (measured)</th><th>Waste</th><th>Multiple</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>1 B</td><td>1,024 B</td><td>1,023 B</td><td>1,024x</td></tr>
+                            <tr><td>100 B</td><td>1,024 B</td><td>924 B</td><td>about 10x</td></tr>
+                            <tr><td>4,096 B</td><td>4,096 B</td><td>0</td><td>1x</td></tr>
+                            <tr><td>4,097 B</td><td>8,192 B</td><td>4,095 B</td><td>about 2x</td></tr>
+                            <tr><td>1,048,576 B</td><td>1,048,576 B</td><td>0</td><td>1x</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>One thing has to be stated honestly here. The one-byte file was allocated <strong>1,024</strong> rather than 4,096 because NTFS stores very small files inside the metadata record itself. ext4 does not use this optimisation by default, so <strong>the same experiment would be expected to give 4,096 there, but that screen is not in this article.</strong> The doubling at the block boundary in <code>b4097.bin</code>, by contrast, is common to any filesystem that allocates in blocks.</p>
+
+                    <p>I also measured what happens when you multiply by count. Twenty thousand one-byte files.</p>
+
+                    <pre><code>$ time ( for i in $(seq 1 20000); do printf 'x' &gt; "f$i"; done )
+real    0m25.766s
+
+$ ls -1 | wc -l
+20000
+
+$ du -sb --apparent-size .
+20000     .          # logical total = 20,000 bytes (about 20KB)
+
+$ du -s --block-size=1 .
+24674304  .          # actual footprint = 24,674,304 bytes (about 23.5MiB)</code></pre>
+
+                    <p>A logical 20KB occupies <strong>23.5MiB</strong> in reality. About <strong>1,233 times</strong>. That figure includes both the allocation of the files themselves and the directory structure that grew to hold twenty thousand names. The fact that <strong>directories use space too</strong> becomes visible right here.</p>
+
+                    <ul>
+                        <li>Do the same thing on ext4 with 4KiB blocks and the arithmetic goes like this. <strong>A million one-byte files are a logical 1MB and an actual 4,096,000,000 bytes, roughly 3.8GiB.</strong> That value is <strong>a calculation from the block size, not a measurement</strong>, and it excludes the directory structure</li>
+                        <li>So in places with many files, <strong>capacity and inodes drain at the same time</strong>. Which one hits bottom first depends on the file size distribution</li>
+                        <li>Bundling small files into one is the fundamental response. Compress logs after rotation, put expiry on caches, and keep archives <strong>as bundles rather than individual files</strong></li>
+                    </ul>
+
+                    <h2 id="sec-9">Finding what ate it - the du idiom</h2>
+
+                    <p>Once the mount is identified and it is confirmed that this really is a capacity problem, the next job is narrowing down from the top. One idiom is enough.</p>
+
+                    <pre><code>$ du -h -x --max-depth=1 . | sort -h
+1.0K    ./deleted_open
+1.0K    ./demo2
+24M     ./tiny
+25M     .
+
+# The big items come last, so read from the bottom line up.
+# On Linux you usually start like this.
+$ sudo du -h -x --max-depth=1 / | sort -h</code></pre>
+
+                    <p>Each of the three options does a job. <code>--max-depth=1</code> shows <strong>only one level</strong>. Without a depth you get tens of thousands of lines, which is unreadable. <code>sort -h</code> orders human-readable notation such as <code>24M</code> <strong>by size</strong>. Under string sorting, <code>9K</code> comes after <code>24M</code>.</p>
+
+                    <p>And <code>-x</code> is the heart of this idiom. It is the option that stops it <strong>from crossing into another filesystem</strong>. Leave it out while sweeping from <code>/</code> and it will follow mounted network storage and container layers, taking several times as long and <strong>mixing numbers unrelated to the filesystem you are investigating into the result</strong>.</p>
+
+                    <p>Here too something has to be recorded honestly. In this environment I could not produce a scene where <code>-x</code> actually stopped anything.</p>
+
+                    <pre><code>$ stat -c %d / /tmp .
+3927831023
+3927831023
+3927831023
+# All three have the same device ID -&gt; there is no boundary for -x to stop at.
+# All that was confirmed is that the option is accepted and the result is the same.
+
+# The file-count version (when inodes are exhausted)
+$ find . -xdev -type f -printf '%h\n' | sort | uniq -c | sort -rn | head -5
+  20000 ./tiny
+      5 .
+      1 ./demo2
+      1 ./deleted_open</code></pre>
+
+                    <ul>
+                        <li><code>sort -h</code> is a GNU extension. Its help text in this environment confirms it exists as <code>-h, --human-numeric-sort</code>, but <strong>it may be absent on BSD systems or in minimal container images</strong>. There, extract with <code>du -k</code> and use <code>sort -n</code></li>
+                        <li><code>du --inodes</code> counts <strong>entries</strong> rather than size. When inodes are exhausted, drop <code>-h</code> from the idiom above and swap in this option and it works unchanged</li>
+                        <li><code>find</code> walks files one by one, so <strong>it takes a long time on filesystems with many files</strong>. On a production server, allow for the load and start with a narrow scope</li>
+                        <li>If the result <strong>does not match the total</strong>, suspect cause ②. If no amount of adding with <code>du</code> reaches the usage reported by <code>df</code>, a nameless file is open somewhere</li>
+                    </ul>
+
+                    <h2 id="sec-10">The diagnostic order - four steps</h2>
+
+                    <p>Folding all of the above into an order of execution gives four steps. Each step exists <strong>to decide whether to go on to the next one</strong>. The reason for keeping the order is that the earlier steps are overwhelmingly cheaper than the later ones.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Step</th><th>What it asks</th><th>Command</th><th>If it comes out like this</th><th>Next</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>1</td><td>Which mount is it</td><td><code>df -h &lt;failing path&gt;</code></td><td>Use% on that line is low</td><td>You were looking at the wrong path. Recheck the failing path</td></tr>
+                            <tr><td>2</td><td>Capacity or inodes</td><td><code>df -i &lt;failing path&gt;</code></td><td>Only IUse% is 100%</td><td>Cause ①. Find the directories where files are concentrated</td></tr>
+                            <tr><td>3</td><td>Does <code>du</code> disagree</td><td>Compare <code>du -sh -x &lt;mount&gt;</code> against <code>df</code></td><td>The <code>du</code> total is far smaller</td><td>Cause ②. Find the holding process and restart it</td></tr>
+                            <tr><td>4</td><td>What ate it</td><td><code>du -h -x --max-depth=1 | sort -h</code></td><td>A large item is identified</td><td>Descend one level at a time and repeat</td></tr>
+                            <tr><td>+</td><td>Does it only work as root</td><td><code>touch</code> as an ordinary account and as root</td><td>Only root succeeds</td><td>Cause ③. Check the reserved blocks</td></tr>
+                        </tbody>
+                    </table>
+
+                    <ul>
+                        <li>Steps 1 and 2 are <strong>two lines together</strong> and impose essentially no load. And a fair number of cases really do end with just those two</li>
+                        <li>Skip step 3 and you will burn all your time on step 4 and still find nothing. Knowing that <strong>a situation exists in which du cannot find the culprit</strong> is the point of this table</li>
+                    </ul>
+
+                    <h2 id="sec-11">What changes in containers and the cloud</h2>
+
+                    <p>The same symptom is more confusing inside a container. <code>df</code> inside a container answers about <strong>the mounts that container can see</strong>, while what actually filled up is often the host node's disk. The reverse also happens: the node has plenty of room and only the limit on the container's writable layer is full. You have to settle <strong>where you ran df</strong> first.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Situation</th><th>Easy thing to get wrong</th><th>Where to actually look</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>The image layer is full</td><td>The volume has room, so it is fine</td><td>The writable layer is <strong>a different filesystem</strong> from the volume</td></tr>
+                            <tr><td>Stopped containers and old images have piled up</td><td>Count only the running ones and it is not much</td><td>Add up stopped containers, unused images and the build cache together</td></tr>
+                            <tr><td>Container logs grow without bound</td><td>The application does not write logs</td><td>The runtime writes standard output to a file. Check the size limit setting</td></tr>
+                            <tr><td>The cloud disk was enlarged but nothing changed</td><td>It was enlarged in the console, so that is done</td><td>The partition and the filesystem <strong>have to be grown separately</strong></td></tr>
+                            <tr><td>The node has run out of inodes</td><td>The capacity graph is flat, so there is no problem</td><td>Image layers are masses of small files. Monitor inodes separately</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>The last row catches people especially often. The <code>resize2fs</code> documentation states plainly that <strong>this program does not manipulate the size of partitions</strong>. In other words, if you enlarged the block device, expand the partition first and then expand the filesystem. Mistake those two steps for one and you get a state where the console shows more capacity while the server sees none of it.</p>
+
+                    <pre><code># After expanding a cloud disk - there is an order (could not be run in this environment)
+# ① has the kernel seen the new size
+lsblk
+
+# ② expand the partition (only in layouts that use partitions)
+sudo growpart /dev/sda 1
+
+# ③ expand the filesystem
+sudo resize2fs /dev/sda1        # ext2/3/4
+sudo xfs_growfs /               # XFS takes the mount point
+
+# Container side - totals by category of what is taking up room
+docker system df
+docker system df -v</code></pre>
+
+                    <ul>
+                        <li>Overlay schemes modify a file by <strong>copying the original up to the upper layer</strong> first. Changing one line of a large file can require as much extra space as the file's size</li>
+                        <li>A file deleted inside a container <strong>does not disappear from the lower layer</strong>. Only a deletion marker is laid on top, so the image size does not shrink</li>
+                        <li>Cleanup commands are as dangerous as they are convenient. There are <strong>options that also delete unused volumes</strong>, and those volumes may contain data</li>
+                        <li>When a whole node fills up, the scheduler <strong>pushes pods off to other nodes</strong>. The symptom surfaces as restarts rather than disk, so the cause is identified late</li>
+                    </ul>
+
+                    <h2 id="sec-12">In a hurry - what is safe to delete and what is not</h2>
+
+                    <p>When the service is down there is no time to deliberate. That is why <strong>a list decided in advance</strong> is needed. But the first move is not deleting. The first move is <strong>checking whether space is being held</strong>. If it is cause ②, nothing you delete is reclaimed, so starting to delete without checking only loses time and leaves irreversible deletions behind.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Class</th><th>Target</th><th>Why</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Relatively safe</td><td>Old logs compressed after rotation</td><td>Already closed files. You only need to check the retention period</td></tr>
+                            <tr><td>Relatively safe</td><td>Package manager caches</td><td>They can be downloaded again. It only costs reinstall time</td></tr>
+                            <tr><td>Relatively safe</td><td>Build output and temporary directories</td><td>Regenerable. But check <strong>that no build is in progress</strong></td></tr>
+                            <tr><td>Caution</td><td>Core dumps</td><td>Deletable, but they are <strong>material for incident analysis</strong>. Move them first</td></tr>
+                            <tr><td>Never</td><td>A log file that is currently open</td><td>The space does not come back and the log is lost. It creates cause ②</td></tr>
+                            <tr><td>Never</td><td>Database files, lock files, sockets</td><td>It leads to corruption or a service that will not start</td></tr>
+                            <tr><td>Never</td><td>Directories whose contents you do not know</td><td>The more urgent it is, the more people delete without checking. It cannot be undone</td></tr>
+                        </tbody>
+                    </table>
+
+                    <div class="callout">
+                        <strong>Caution</strong> - <code>rm -rf</code> asks for no confirmation and cannot be undone. Build the path out of a variable and you get <strong>the accident where an empty variable deletes from the top down</strong>. Running <code>ls -d</code> with the same argument first, to see the targets with your own eyes, is a cheap habit. <code>truncate -s 0</code> empties a file while leaving it in place, so it works on an open log, but <strong>the contents are gone all the same</strong>. If there is anything worth keeping, move it first.
+                    </div>
+
+                    <ul>
+                        <li>When free space is truly zero, <strong>the act of deleting can itself fail</strong>. Tools that write a log or create a temporary file will not work at that point</li>
+                        <li>That is why <strong>emptying without creating a new file</strong>, as with <code>truncate -s 0</code> or <code>: &gt; file</code>, is useful in this situation</li>
+                        <li>Once the fire is out, always go back over the cause. <strong>Having fixed it by deleting does not explain why it filled up.</strong> The same thing returns on the same cycle</li>
+                    </ul>
+
+                    <h2 id="sec-13">Preventing it in the first place</h2>
+
+                    <p>This symptom often arises because one monitoring item is missing. Capacity is watched almost everywhere, but <strong>inode usage is commonly absent from the default dashboard.</strong> So the incident happens while the capacity graph stays flat.</p>
+
+                    <p>I built a snippet that pulls out only the mounts over a threshold and ran it, and this is where <strong>a common idiom actually turned out to be wrong</strong>. It is a failure worth recording, so here it is as it happened.</p>
+
+                    <pre><code># The common version - it gave a wrong answer in this environment
+$ df -P | awk 'NR&gt;1 &amp;&amp; $5+0 &gt;= 80 {print $6, $5}'
+65% 347611880          # the values came out reversed
+
+# Why - the device name contains a space, so the fields shifted by one
+$ df -P | awk 'NR&gt;1 {print "NF=" NF "  $5=[" $5 "]  $6=[" $6 "]"}'
+NF=7  $5=[347583704]  $6=[65%]
+
+# The fixed version - do not count fields, name them
+$ df --output=pcent,target | awk 'NR&gt;1 &amp;&amp; $1+0 &gt;= 60 {print "DISK", $2, $1}'
+DISK / 65%
+
+$ df --output=ipcent,target | awk 'NR&gt;1 &amp;&amp; $1+0 &gt;= 60 {print "INODE", $2, $1}'
+(no output - this filesystem does not report an inode percentage)</code></pre>
+
+                    <p>Cutting <code>df -P</code> output by field number rests on <strong>the assumption that no device name or mount point contains a space</strong>. Break that assumption and it silently reads a different column, the condition still evaluates true, and <strong>a wrong alert goes out looking perfectly normal.</strong> Take only the columns you need with <code>df --output=</code> and the assumption is no longer needed at all.</p>
+
+                    <ul>
+                        <li><strong>Add inode usage to the monitoring items.</strong> The same threshold as capacity is enough. This is not merely better than nothing: cause ① in this article is prevented entirely by this one item</li>
+                        <li>For log rotation, decide <strong>the retention count and the compression setting</strong> together. Set only the count high and capacity is fine while inodes fill</li>
+                        <li>Put <strong>expiry cleanup</strong> on temporary files. Sessions and caches need the code that deletes them as much as the code that creates them</li>
+                        <li>For container logs, specify <strong>a file size limit and a retention count</strong>. Layouts where the default is unlimited are common</li>
+                        <li>Alerts are better read as <strong>time remaining rather than percent remaining</strong>. Knowing that it grows by a few GB a day lets you calculate when it will fill</li>
+                    </ul>
+
+                    <h2 id="sec-14">Wrap-up</h2>
+
+                    <p><code>No space left on device</code> is not a diagnosis but the start of one. Behind it lie at least four situations, and <strong>what you should do is the exact opposite</strong> depending on which one it is. If inodes are full, hunting for large files is useless; if deleted-but-open files are the cause, deleting more does harm.</p>
+
+                    <p>So what to memorise is not a list of commands but an order. Hand the failing path to <code>df</code> directly, split capacity from count with <code>df -i</code>, reconcile the <code>du</code> total against <code>df</code>, and only then go looking for what ate it. <strong>The third step is what this order is worth</strong>. If the gap shows up there, you know in advance that all remaining searching would be wasted.</p>
+
+                    <p>And the two numbers actually measured in this article are worth remembering. <strong>A deleted 1GiB returned only 16 blocks until the process was killed</strong>, and <strong>twenty thousand one-byte files occupied 23.5MiB</strong>. Neither number is ever visible to the habit of looking at <code>df</code> once.</p>
+
+                    <h2 id="sec-15">What I could not verify</h2>
+
+                    <ul>
+                        <li>I could not produce <strong>a screen with inodes actually exhausted</strong>. The NTFS in this environment does not report an inode count, so <code>df -i</code> comes back all <code>-</code>. There is no output with IUse% at 100 percent in this article; instead <code>stat -f</code> was used to show <strong>why the blanks appear</strong></li>
+                        <li><strong>I could not run <code>lsof +L1</code>.</strong> lsof is not installed in this environment. The meaning of the option was confirmed in the documentation, and the <code>/proc/&lt;pid&gt;/fd</code> route for the same purpose was actually run, down to confirming the <code>(deleted)</code> marker</li>
+                        <li><strong><code>tune2fs</code>, <code>debugfs</code>, <code>resize2fs</code> and <code>xfs_growfs</code> could not be run.</strong> They are ext4/XFS-only tools and there is no such filesystem in this environment. The five percent reserved block ratio, the XFS <code>maxpct</code> defaults and the fact that <code>resize2fs</code> does not touch partitions were <strong>confirmed in the official man pages</strong></li>
+                        <li>I could not directly measure <strong>the allocation of a one-byte file on ext4</strong>. It came out as 1,024 bytes in this environment, which is due to how NTFS stores small files. The figure calculated for 4KiB blocks is <strong>labelled as a calculation</strong> in the body</li>
+                        <li>I could not produce <strong>a scene where <code>du -x</code> stops at a filesystem boundary</strong>. <code>/</code>, <code>/tmp</code> and the working directory all had the same device ID, so there was no boundary to cross. All that was confirmed is that the option is accepted</li>
+                        <li><strong>The shape of <code>df -i</code> output on btrfs</strong> could not be verified. All that was confirmed is that the kernel documentation lists dynamic inode allocation among its features, and how to read those numbers is not covered here</li>
+                        <li><strong>The container and cloud sections were not run at all.</strong> Overlay behaviour, the output of cleanup commands, the disk expansion procedure - none of it was run in this environment. Only the order of the commands and the reasoning behind them are written down</li>
+                    </ul>
+
+                    <h2 id="sec-16">References</h2>
+
+                    <ul>
+                        <li><a href="https://man7.org/linux/man-pages/man8/mke2fs.8.html" target="_blank" rel="noopener">mke2fs(8) - man7.org</a> - the default reserved block percentage of five, and the warning that the bytes-per-inode ratio of <code>-i</code> <strong>cannot be changed after the filesystem is created</strong></li>
+                        <li><a href="https://man7.org/linux/man-pages/man8/tune2fs.8.html" target="_blank" rel="noopener">tune2fs(8) - man7.org</a> - the description of the <code>-m</code> option. It states that the two reasons for reserving blocks are <strong>avoiding fragmentation</strong> and <strong>letting system daemons keep functioning after non-privileged processes are blocked</strong></li>
+                        <li><a href="https://man7.org/linux/man-pages/man8/mkfs.xfs.8.html" target="_blank" rel="noopener">mkfs.xfs(8) - man7.org</a> - the meaning of <code>maxpct</code> and its defaults by size (25% below 1TB, 5% below 50TB, 1% above), and the note that this value can be changed with <code>xfs_growfs</code></li>
+                        <li><a href="https://man7.org/linux/man-pages/man8/xfs_growfs.8.html" target="_blank" rel="noopener">xfs_growfs(8) - man7.org</a> - the option description for <code>-m</code>, which sets a new maximum percentage of space allocatable to inodes</li>
+                        <li><a href="https://man7.org/linux/man-pages/man8/lsof.8.html" target="_blank" rel="noopener">lsof(8) - man7.org</a> - the explanation that a number after <code>+L</code> lists only files with a link count below it, and that the <code>+L1</code> form selects <strong>files that are open while their name has been deleted</strong></li>
+                        <li><a href="https://man7.org/linux/man-pages/man8/resize2fs.8.html" target="_blank" rel="noopener">resize2fs(8) - man7.org</a> - the sentence that <strong>this program does not manipulate the size of partitions</strong>. The basis for expanding the partition and the filesystem separately after enlarging a disk</li>
+                        <li><a href="https://docs.kernel.org/filesystems/btrfs.html" target="_blank" rel="noopener">BTRFS - The Linux Kernel documentation</a> - that <strong>dynamic inode allocation</strong> is included in the feature list</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>Share this article</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">Copy Link</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">Back to list</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Free tools you may find useful</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/char_counter.html">Character Counter</a></li>
+      <li><a href="../static/json_formatter.html">JSON Formatter</a></li>
+      <li><a href="../static/regex_tester.html">Regex Tester</a></li>
+      <li><a href="../static/jwt_decoder.html">JWT Decoder Generator 2026</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">See all tools &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Related Posts</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="git_credential_leak_prevention.html">The Token Is Sitting in Your Remote URL - Where Git Credentials Leak</a></li>
+      <li><a href="git_gitignore_already_tracked.html">You Added It to .gitignore and It Still Shows Up - The File Is Already Tracked</a></li>
+      <li><a href="git_bisect_practical.html">git bisect - Finding the Commit That Introduced a Bug by Binary Search</a></li>
+      <li><a href="git_undo_decision_guide.html">The Git Undo Decision Table - When to Use reset, revert, restore or checkout</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('Link copied! Paste it in the Threads app to share.');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('Link copied!'); });
+    });
+    </script>
+</body>
+</html>

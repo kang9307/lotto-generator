@@ -1,0 +1,774 @@
+<!DOCTYPE html>
+<!--
+ * 技術ブログ記事テンプレート
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ja">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ディスクは空いているのに No space left on device - inode と開いたままのファイル</title>
+    <meta name="description" content="df には空きがあるのに書き込みが失敗する。inode 枯渇、削除済みだが開いたままのファイル、予約ブロック、別のマウントという四つの原因を実際のコマンド出力で切り分ける方法と、どの順に確認すれば最も早く終わるのかをまとめた。">
+    <meta name="keywords" content="No space left on device, ENOSPC, inode 枯渇, df -i, du, lsof, 削除済みの開いたファイル, 予約ブロック, tune2fs, ext4, XFS, btrfs, ブロックサイズ, 内部断片化, resize2fs, 開発, インフラ, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/ja/posts/no_space_left_but_disk_free.html">
+
+    <meta property="og:title" content="ディスクは空いているのに No space left on device - inode と開いたままのファイル">
+    <meta property="og:description" content="症状は一つでも原因は四つある。どのマウントなのか、容量なのか inode なのか、df と du が食い違っていないかを順に確かめる方法。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/ja/posts/no_space_left_but_disk_free.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ja_JP">
+    <meta property="article:published_time" content="2026-09-01">
+    <meta property="article:section" content="開発・インフラ">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="ディスクは空いているのに No space left on device">
+    <meta name="twitter:description" content="容量が残っているのに書き込みが失敗する四つの理由と、それを順に切り分ける診断手順。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "ディスクは空いているのに No space left on device - inode と開いたままのファイル",
+      "alternativeHeadline": "症状は一つでも原因は四つある。その四つを順に切り分ける方法",
+      "datePublished": "2026-09-01",
+      "dateModified": "2026-09-01",
+      "inLanguage": "ja-JP",
+      "articleSection": "開発・インフラ",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "No space left on device, ENOSPC, inode 枯渇, df -i, du, 削除済みの開いたファイル, 予約ブロック, tune2fs, ext4, XFS, btrfs, ブロックサイズ, resize2fs",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/ja/posts/no_space_left_but_disk_free.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "df には空きがあるのに、なぜ No space left on device が出るのですか。",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "ENOSPC はカーネルがこの書き込みを受け付けられないと伝える一つの信号にすぎず、その背後の事情は少なくとも四つあります。一つ目は容量ではなくファイル数の上限である inode が埋まった場合で、df -i で確認します。二つ目は削除したのにプロセスがつかんでいて領域が返っていない場合で、df と du が食い違います。三つ目は ext4 が既定で取り置く予約ブロックのために、一般ユーザーにだけ満杯に見える場合です。四つ目は、実際に埋まっているのが別のファイルシステムである場合です。したがって df -h だけを見るのではなく、df -h のうしろに失敗したパスを直接付けて、そのパスが実際にどの装置に付いているのかから確認する必要があります。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "ファイルを削除したのに、なぜ領域が戻らないのですか。",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "rm はデータを消す命令ではなく、ディレクトリから名前を一つ外す unlink です。そのファイルを開いたままのプロセスが一つでも残っていれば、リンク数が 0 になっても参照が残るため、カーネルはブロックを返しません。Git Bash で 1GiB のファイルを作り、tail でつかんだまま削除してみた結果、rm 直後に戻った空きブロックは 262,147 個のうち 16 個だけで、du はすでに 1.0K に減って df と食い違いました。そのプロセスを終了させると 262,143 ブロックが一度に戻りました。解決はファイルをもう一度消すことではなく、つかんでいるプロセスを再起動するか、そのファイル記述子を切ることです。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "inode が足りなくなったら増やせますか。",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "ファイルシステムの種類によって異なります。ext4 は mkfs の時点で inode 数が固定され、mke2fs の文書は bytes-per-inode 比率について、ファイルシステムが作られたあとはこの比率を変更できないので値を慎重に決めるようにと明記しています。つまり ext4 で inode が埋まった場合に増やす選択肢はなく、ファイル数を減らすか、ファイルシステムを作り直すしかありません。XFS は inode を動的に割り当て、最大比率である maxpct を xfs_growfs で変更できます。btrfs はカーネル文書が機能一覧に動的 inode 割り当てを挙げているため、固定上限という概念そのものが異なります。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "小さなファイルが多いと、なぜ容量がより減るのですか。",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "ファイルシステムはブロック単位で領域を割り当てるため、論理的な大きさではなくブロックの倍数だけ場所を取ります。4,097 バイトのファイルを作って測ると、論理サイズは 4,097 ですが実際の割り当ては 8,192 バイトです。1 バイトのためにブロックが丸ごと一つ余計に付きます。1 バイトのファイルを 2 万個作った実測では、論理合計が 20,000 バイトなのに実際の占有は 24,674,304 バイト、約 1,233 倍でした。ファイル数が多い場所では容量と inode が同時に減っていくので、両方を見る必要があります。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "急いでいるとき、何から消せば安全ですか。",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "最も安全な一手は消すことではなく、つかまれている領域があるかを確認することです。削除済みだが開いたままのファイルが原因なら、いくら消しても回収されません。消してよいのはローテート後に圧縮された古いログ、パッケージ管理者のキャッシュ、ビルド成果物、明らかに古い一時ファイルです。逆に、いま開いているログ本体を rm で消すと領域は戻らず、ログだけを失います。データベースファイル、ロックファイル、ソケット、中身の分からないディレクトリには触れません。rm -rf と truncate は取り消せないので、実行前にパスを目で読み直します。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/no_space_left_but_disk_free.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/no_space_left_but_disk_free.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/no_space_left_but_disk_free.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/no_space_left_but_disk_free.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/no_space_left_but_disk_free.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "ホーム",
+      "item": "https://braindetox.kr/ja/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "開発・インフラ",
+      "item": "https://braindetox.kr/ja/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "ディスクは空いているのに No space left on device - inode と開いたままのファイル",
+      "item": "https://braindetox.kr/ja/posts/no_space_left_but_disk_free.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="ディスクは空いているのに No space left on device - inode と開いたままのファイル">
+                <meta itemprop="datePublished" content="2026-09-01">
+                <meta itemprop="dateModified" content="2026-09-01">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="No space left on device, ENOSPC, inode 枯渇, df -i, du, 削除済みの開いたファイル, 予約ブロック, tune2fs, ext4, XFS, btrfs, ブロックサイズ, resize2fs">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/ja/posts/no_space_left_but_disk_free.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">ディスクは空いているのに No space left on device - inode と開いたままのファイル</h1>
+                    <h2 class="post-subtitle">症状は一つでも原因は四つある。その四つを順に切り分ける方法</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-01">2026年9月1日</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">開発・インフラ</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>サービスがログを書けないという通知を受けてサーバーに入る。習慣どおり <code>df -h</code> を打つ。空きは 30 パーセント以上残っている。ところが同じシェルで <code>touch</code> を一度打つだけで <strong>No space left on device</strong> が返ってくる。この瞬間に時間の大半が浪費される理由は一つだ。<strong>df が嘘をついていると考えるから</strong>である。</p>
+
+                    <p>df は嘘をつかない。ただ<strong>訊かれていないことには答えない</strong>だけだ。容量を訊けば容量を答え、ルートを訊けばルートを答える。書き込みが失敗した本当の理由が容量でないか、ルートでないなら、df の答えは正確なまま役に立たない。この記事では、その食い違いが生まれる四つの場所を切り分け、どの順に当たれば最も早く終わるのかを整理する。</p>
+
+                    <nav class="post-toc">
+                        <h3>この記事で扱うこと</h3>
+                        <ol>
+                            <li><a href="#sec-1">症状は一つ、原因は四つ</a></li>
+                            <li><a href="#sec-2">この記事の実行環境と検証の範囲</a></li>
+                            <li><a href="#sec-3">まず訊くこと - 本当にそのファイルシステムか</a></li>
+                            <li><a href="#sec-4">原因 ① inode 枯渇 - 容量は残っているのに個数が埋まった</a></li>
+                            <li><a href="#sec-5">inode はいつ決まるのか - ext4 ・ XFS ・ btrfs</a></li>
+                            <li><a href="#sec-6">原因 ② 削除したのに開いたままのファイル</a></li>
+                            <li><a href="#sec-7">原因 ③ 予約ブロック - root にだけ見える空き</a></li>
+                            <li><a href="#sec-8">小さなファイルが領域をより食う理由</a></li>
+                            <li><a href="#sec-9">何が食ったのかを探す - du の定型句</a></li>
+                            <li><a href="#sec-10">診断の順序 - 四段階</a></li>
+                            <li><a href="#sec-11">コンテナとクラウドで変わること</a></li>
+                            <li><a href="#sec-12">急ぐとき - 消してよいものと駄目なもの</a></li>
+                            <li><a href="#sec-13">そもそも防ぐ方法</a></li>
+                            <li><a href="#sec-14">まとめ</a></li>
+                            <li><a href="#sec-15">確認できなかったこと</a></li>
+                            <li><a href="#sec-16">参考資料</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">症状は一つ、原因は四つ</h2>
+
+                    <p><code>ENOSPC</code> は、カーネルがアプリケーションに <strong>この書き込みは受け付けられない</strong> と伝える一つの信号だ。信号が一つだからといって事情が一つとは限らない。人間でいえば熱が出るのと同じで、熱そのものは診断ではなく診断を始めよという合図だ。ところが現場では <code>ENOSPC</code> を見た途端に <strong>消せるものを探す</strong> 作業へ移ることが多く、原因が容量でないときその作業はすべて無駄になる。</p>
+
+                    <p>切り分けるべき場所は四つだ。次の表の右端の列、すなわち <strong>区別できる信号</strong> がこの記事の実質的な中身である。左の二列だけ覚えても、順序はやはり組み立てられない。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>原因</th><th>実際に埋まったもの</th><th>確認コマンド</th><th>区別できる信号</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>① inode 枯渇</td><td>ファイル数の上限</td><td><code>df -i</code></td><td>Use% は低いのに IUse% だけ 100%</td></tr>
+                            <tr><td>② 削除済みだが開いたファイル</td><td>返されていないブロック</td><td><code>lsof +L1</code> ・ <code>/proc/&lt;pid&gt;/fd</code></td><td><code>df</code> は満杯、<code>du</code> の合計ははるかに小さい</td></tr>
+                            <tr><td>③ 予約ブロック</td><td>root 専用に取り置かれた分</td><td><code>tune2fs -l</code></td><td>一般アカウントだけ失敗し、root は成功する</td></tr>
+                            <tr><td>④ 別のマウント</td><td>自分が見ていないファイルシステム</td><td><code>df -h &lt;パス&gt;</code></td><td>ルートには空きがあり、そのパスだけ 100%</td></tr>
+                        </tbody>
+                    </table>
+
+                    <ul>
+                        <li>①と④は <strong>確認がそれぞれ一行</strong> だ。だからこの二つを先頭に置くのが最も時間を節約する</li>
+                        <li>②は <code>df</code> と <code>du</code> を <strong>一緒に見て初めて</strong> 表に出る。片方だけ見ていては永遠に見えない</li>
+                        <li>③はまれだが、<strong>同じサーバーを見ている人によって結果が違う</strong> という奇妙な状況を作り、時間を長く食う</li>
+                    </ul>
+
+                    <h2 id="sec-2">この記事の実行環境と検証の範囲</h2>
+
+                    <p>この記事の主題は Linux サーバーだが、ここに貼った出力を実際に生み出した環境は <strong>Windows 10 上の Git Bash</strong> だ。これを先に明かす理由は謙虚に見せるためではなく、<strong>どの出力はそのまま信じてよく、どの出力はここに無いのか</strong> を読者が区別できる必要があるからだ。</p>
+
+                    <pre><code>$ bash --version | head -1
+GNU bash, version 5.2.37(1)-release (x86_64-pc-msys)
+
+$ uname -a
+MINGW64_NT-10.0-19045 3.5.7-882031da.x86_64 2025-01-30 11:14 UTC x86_64 Msys
+
+$ df --version | head -1
+df (GNU coreutils) 8.32</code></pre>
+
+                    <p>coreutils は Linux と同じ GNU 8.32 なので、<code>df</code>・<code>du</code>・<code>stat</code>・<code>sort</code> の <strong>オプションの挙動と計算方法は同一</strong> だ。異なるのはその下のファイルシステムが NTFS だという点だけで、あとで見るとおり、その違い自体がむしろ inode を理解する助けになる。</p>
+
+                    <ul>
+                        <li><strong>実際に走らせたもの</strong> - <code>df -h</code>、<code>df -i</code>、<code>df --output</code>、<code>stat -f</code>、<code>stat -c</code>、<code>du</code> の各種組み合わせ、<code>find -printf</code>、そして <strong>削除済みだが開いたファイルの再現一式</strong></li>
+                        <li><strong>走らせられなかったもの</strong> - <code>lsof +L1</code>(この環境に lsof 自体が無い)、<code>tune2fs</code>・<code>debugfs</code>・<code>resize2fs</code>(ext4 専用)、コンテナのオーバーレイ関連すべて</li>
+                        <li><strong>作り話をしていないもの</strong> - 走らせられなかったコマンドの出力は、この記事に一行も無い。コマンドと <strong>読み方</strong> だけを書いた</li>
+                        <li><strong>手を入れたもの</strong> - 出力に出たユーザーのパスだけを <code>/tmp/demo</code> と <code>&lt;user&gt;</code> に縮めて書いた。<strong>数字は一つも直していない</strong></li>
+                        <li>ブロックサイズはこの環境で <strong>4,096 バイト</strong> と報告される。この記事のブロック計算はすべてこの値が基準だ</li>
+                        <li>他のシェル(dash・zsh)や BSD 系の <code>df</code>・<code>du</code> ではオプション名と出力形式が異なる。以下のコマンドは <strong>GNU coreutils 基準</strong> だ</li>
+                    </ul>
+
+                    <h2 id="sec-3">まず訊くこと - 本当にそのファイルシステムか</h2>
+
+                    <p>順序としてはこれが一番目だ。原因の一覧では④番だが、<strong>確認が最も安いから</strong> である。<code>df -h</code> を引数なしで打つとマウントの一覧が出るが、人の目はたいてい一番上のルートの行で止まる。実際に失敗したパスが別のファイルシステムに付いていれば、その行は画面の下のどこかにある。</p>
+
+                    <p>直す方法は <strong>df にパスを直接与えること</strong> だ。この環境でも、同じ物理ディスクを二つの別々のマウントとして報告する。</p>
+
+                    <pre><code>$ df -h . /
+Filesystem                        Size  Used Avail Use% Mounted on
+C:/Users/&lt;user&gt;/&lt;temp&gt;  931G  600G  332G  65% /tmp
+C:/Program Files/Git                931G  600G  332G  65% /
+
+# 要点 - 現在のディレクトリは / ではなく /tmp に付いている。
+# Linux でも同じだ。失敗したパスを df に直接与える。
+$ df -h /var/log</code></pre>
+
+                    <p>Linux サーバーでこの落とし穴に最もよく掛かる場所は決まっている。次の一覧は <strong>ルートに空きがあるのに書き込みが失敗する</strong> 典型的な配置だ。</p>
+
+                    <ul>
+                        <li><code>/var</code> が別パーティションの構成 - ログとパッケージのキャッシュがここに積もるので、ルートよりはるかに早く埋まる</li>
+                        <li><code>/boot</code> - たいてい数百 MB で切られているので、カーネルのパッケージが数個積もるだけで埋まる。症状が <strong>カーネル更新の失敗</strong> として現れ、ディスクの問題に見えない</li>
+                        <li><code>/tmp</code> が <code>tmpfs</code> の構成 - メモリを使うので実際のディスクとは無関係に埋まる。再起動すると消えて原因が蒸発する</li>
+                        <li>コンテナの中 - 書き込み可能レイヤーとマウントされたボリュームは <strong>互いに別のファイルシステム</strong> だ。ボリュームに空きがあってもレイヤーが埋まれば失敗する</li>
+                        <li>バインドマウントや NFS が重なったパス - パスの文字列だけ見ると同じツリーのようだが、装置が違う</li>
+                    </ul>
+
+                    <h2 id="sec-4">原因 ① inode 枯渇 - 容量は残っているのに個数が埋まった</h2>
+
+                    <p>ファイルシステムはデータだけを保存するのではなく、<strong>ファイル一つ一つに対するメタデータ項目</strong> も別に管理する。所有者、権限、時刻、そして実際のデータブロックがどこにあるかを収めた構造が inode だ。ファイル名はここに無い。名前はディレクトリが持っており、ディレクトリは <strong>名前と inode 番号を組にした一覧</strong> だ。この構造のおかげで一つの inode に複数の名前を付けられ、それがハードリンクである。</p>
+
+                    <p>重要なのは <strong>この項目の個数に上限があり得る</strong> という点だ。上限が埋まると、ブロックがいくら残っていても新しいファイルは作れない。確認は <code>df -i</code> の一行だ。ところがこの環境で、そのコマンドはこう答える。</p>
+
+                    <pre><code>$ df -i .
+Filesystem                       Inodes IUsed IFree IUse% Mounted on
+C:/Users/&lt;user&gt;/&lt;temp&gt;    -     -     -     - /tmp
+
+$ stat -f .
+  File: "."
+    ID: ea1df1ef00000000 Namelen: 255     Type: UNKNOWN
+Block size: 4096       Fundamental block size: 4096
+Blocks: Total: 244041727  Free: 86972107   Available: 86972107
+Inodes: Total: 18446744073709551615 Free: -1</code></pre>
+
+                    <p>すべて <code>-</code> だ。そして <code>stat -f</code> がその理由を見せてくれる。inode の総数として報告された <strong>18,446,744,073,709,551,615</strong> は符号なし 64 ビット整数の最大値、すなわち <strong>上限が無いという意味の表示値</strong> であり、Free は <code>-1</code> だ。NTFS には ext4 のような固定 inode テーブルが無いので、報告すべき数字そのものが無い。</p>
+
+                    <p>この空欄は失敗ではなく、<strong>最も重要な事実をそのまま見せている画面</strong> だ。inode の上限はファイルシステムの普遍的な性質ではなく、<strong>実装ごとに異なる設計上の選択</strong> である。だから ext4 のサーバーで通じる対応が、XFS のサーバーではそのまま通じない。Linux で実際の数字が埋まった画面と、そのとき続けて打つコマンドはこうだ。</p>
+
+                    <pre><code># ① どのマウントの inode が埋まったのか
+df -i
+
+# ② そのマウントの中でファイルが集中しているディレクトリ (まず粗く見る)
+du --inodes -x -d 2 /var 2&gt;/dev/null | sort -n | tail -20
+
+# ③ ディレクトリ別のファイル数を直接数える (du --inodes が無い古い環境)
+find /var -xdev -type f -printf '%h\n' 2&gt;/dev/null \
+  | sort | uniq -c | sort -rn | head -20
+
+# 上の三行はこの環境では実行できなかった。
+# NTFS が inode 数を報告せず、①が空欄になるためだ。</code></pre>
+
+                    <p>小さなファイルが数百万個ずつ積もる場所はおおむね決まっている。次は <strong>容量のグラフには何の変化も無いのに inode だけが静かに満ちていく</strong> 典型的な位置だ。</p>
+
+                    <ul>
+                        <li><strong>セッションファイル</strong> - 期限切れの掃除を仕掛けていないと訪問者の数だけファイルが積もり、それぞれは数百バイトだ</li>
+                        <li><strong>メールキューと Maildir</strong> - メッセージ一通がファイル一つだ。送信が止まればキューがそのまま個数として残る</li>
+                        <li><strong>キャッシュの断片</strong> - ハッシュをディレクトリに分けるキャッシュは、<strong>ディレクトリも inode を使う</strong> という点で二倍に膨らむ</li>
+                        <li><strong>ログの断片</strong> - ローテートの周期が短く保管個数が大きいと、圧縮版が残り続ける。それぞれは小さいが、個数で勝負が決まる</li>
+                        <li><strong>依存関係のディレクトリ</strong> - ビルド環境ごとに一つずつ作られるパッケージのツリーは、ファイル数だけで数十万の単位に増える</li>
+                    </ul>
+
+                    <h2 id="sec-5">inode はいつ決まるのか - ext4 ・ XFS ・ btrfs</h2>
+
+                    <p>ここで分かれる。<code>mke2fs</code> の文書は <code>-i</code> オプション、すなわち inode 一つあたり何バイトを割り当てるかについてこう釘を刺す。<strong>ファイルシステムが作られたあとはこの比率を変更できないので、値を慎重に決めよ</strong> ということだ。予約ブロックの比率の既定値が 5 パーセントだというのも同じ文書にある。</p>
+
+                    <p>この一文が実務で意味するところは重い。<strong>ext4 で inode が埋まったなら、増やす選択肢は無い。</strong> ファイル数を減らすか、データを移してファイルシステムを作り直すかだけだ。障害の真っ最中に知るには遅すぎる事実なので、ストレージを設計するときにあらかじめ決めておくほうがよい。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>ファイルシステム</th><th>inode の割り当て方式</th><th>あとで増やせるか</th><th>実務で意味すること</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>ext4</td><td>mkfs の時点で個数が固定。<code>-i</code> 比率または <code>-N</code> 個数で指定</td><td>不可。文書が明示的に変更不可と書いている</td><td>小さなファイルが多いと分かっているなら <strong>作るとき</strong> に比率を下げておく</td></tr>
+                            <tr><td>XFS</td><td>動的割り当て。上限だけを <code>maxpct</code> で管理</td><td>可能。<code>xfs_growfs -m</code> で上限を変更</td><td>枯渇しても上限を上げて時間を稼ぐ余地がある</td></tr>
+                            <tr><td>btrfs</td><td>カーネル文書の機能一覧に <strong>動的 inode 割り当て</strong> が挙がっている</td><td>固定上限という概念そのものが異なる</td><td><code>df -i</code> の数字を ext4 と同じ意味で読んではいけない</td></tr>
+                        </tbody>
+                    </table>
+
+                    <ul>
+                        <li>XFS の <code>maxpct</code> の既定値はファイルシステムの大きさによって異なる。文書によれば <strong>1TB 未満は 25 パーセント、50TB 未満は 5 パーセント、それ以上は 1 パーセント</strong> だ</li>
+                        <li><code>maxpct</code> を 0 にすると事実上ファイルシステム全体が inode ブロックになり得ると文書は書いている。<strong>上限を外すということであり、同時にデータ領域を守る仕掛けが無くなるということ</strong> でもある</li>
+                        <li>だから <code>df -i</code> の IUse% は <strong>ファイルシステムの種類を知らないと読めない数字</strong> だ。同じ 90 パーセントでも、ext4 では警報、XFS では上限を上げるかを判断する材料になる</li>
+                    </ul>
+
+                    <h2 id="sec-6">原因 ② 削除したのに開いたままのファイル</h2>
+
+                    <p><code>rm</code> はデータを消す命令ではない。<strong>ディレクトリから名前を一つ外す unlink</strong> だ。名前がすべて消えてリンク数が 0 になっても、そのファイルを <strong>開いたままのプロセスが一つでも残っていれば</strong> カーネルはブロックを返さない。最後の参照が閉じられる瞬間になって初めて領域が戻る。</p>
+
+                    <p>この挙動自体は欠陥ではなく、POSIX が定めた安全装置だ。読んでいる途中にファイルが消えてプロセスが壊れることを防いでくれる。問題は、このとき <strong>観測の道具が互いに異なる答えを返す</strong> ことだ。<code>df</code> はファイルシステムのブロックの帳簿を読むので、つかまれた領域を <strong>使用中</strong> と見る。<code>du</code> はディレクトリを歩き回ってファイルを数えるので、<strong>名前の無いファイルはそもそも見えない</strong>。だから二つが食い違う。</p>
+
+                    <p>この環境でそのまま再現された。1GiB のファイルを作り、<code>tail -f</code> でつかんだまま消し、空きブロック数を段階ごとに読んだ。以下は実際の出力だ。</p>
+
+                    <pre><code>$ cd /tmp/demo
+$ free() { stat -f -c %f .; }          # 空きブロック数 (1 ブロック = 4096 バイト)
+
+STEP 0  空のディレクトリ       空きブロック: 86970141
+$ head -c 1073741824 /dev/zero &gt; big.log
+STEP 1  1GiB 作成              空きブロック: 86707994   du -sh: 1.0G
+$ ( tail -f big.log &gt; /dev/null &amp; )
+STEP 2  tail がつかんでいる
+$ rm big.log
+STEP 3  rm 直後                空きブロック: 86708010   du -sh: 1.0K
+STEP 3b 2 秒後                 空きブロック: 86708010
+$ kill &lt;tail の pid&gt;
+STEP 4  プロセス終了後         空きブロック: 86970153</code></pre>
+
+                    <p>数字をそのまま読むとこうだ。ファイルを作るとき <strong>262,147 ブロック</strong> が減った。4,096 バイトを掛けると約 1.0GiB で、作った大きさと合う。ところが <code>rm</code> の直後に戻ったのは <strong>16 ブロック</strong> だけだ。1GiB を消して 64KiB が戻ったのだから事実上 0 である。一方、同じ時点で <code>du</code> はすでに <strong>1.0K</strong> と答える。<strong>df と du が 1GiB 分だけ食い違った状態</strong> がここで作られる。</p>
+
+                    <p>そしてプロセスを終了させると <strong>262,143 ブロック</strong> が一度に戻った。消したのは <code>rm</code> だったが、領域を返したのは <code>kill</code> だった。<strong>解決はファイルをもう一度消すことではなく、つかんでいる側に放させること</strong> だという言葉の根拠が、この二行である。</p>
+
+                    <p>犯人を探すのは別の問題だ。標準の道具は <code>lsof +L1</code> で、文書はこの形が <strong>名前が消えたまま開いているファイルを選ぶ</strong> と説明している。ただしこの環境には lsof が入っていないので走らせられなかった。代わりに <code>/proc</code> のほうはそのまま動き、カーネルが付ける <code>(deleted)</code> の表示がはっきり出た。</p>
+
+                    <pre><code># この環境で実行したもの - /proc で確認
+$ ls -l /proc/&lt;pid&gt;/fd | grep -i deleted
+lrwxrwxrwx 3 -&gt; /tmp/demo/big.log (deleted)
+
+# この環境で実行できなかったもの - lsof が未インストール
+$ sudo lsof +L1                  # リンク数が 1 未満の開いたファイルだけ
+$ sudo lsof -nP +L1 /var         # 特定のマウントに絞る</code></pre>
+
+                    <div class="callout">
+                        <strong>注意</strong> - プロセスを再起動できないとき、<code>&gt; /proc/&lt;pid&gt;/fd/&lt;n&gt;</code> でファイル記述子を切り詰める方法が広く知られている。領域はすぐ戻るが、<strong>番号を選び間違えるとそのプロセスが開いている別のファイルが丸ごと空になる。</strong> 取り消せず、確認の手順も無い。再起動が可能なら、再起動が常に安全な側だ。
+                    </div>
+
+                    <ul>
+                        <li>この状況を最も多く作るのは <strong>ログローテーションの設定ミス</strong> だ。ファイルを移すか消したあとにプロセスへ開き直せという信号を送らなければ、プロセスは名前の無い古いファイルに書き続ける。ログローテーションが静かに失敗するのはここだ</li>
+                        <li>つかんでいるプロセスを特定する手順そのものはこの記事の範囲外だ。ここでは <strong>領域が戻らない理由</strong> までを見る</li>
+                        <li><strong>ディスク使用量が階段状に減らないグラフ</strong> はこの原因のよい信号だ。整理作業を回したのにグラフが平らなら、消したものがまだ開いている</li>
+                        <li>再起動の対象はたいていログを書く側だ。ログをファイルに残すアプリケーションと、そのログを読んで転送する収集器の <strong>両方とも</strong> が同じファイルをつかんでいることがある</li>
+                    </ul>
+
+                    <h2 id="sec-7">原因 ③ 予約ブロック - root にだけ見える空き</h2>
+
+                    <p>ext 系は全体のブロックの一部を <strong>特権プロセス専用</strong> に取り置く。<code>tune2fs</code> の文書はその理由を二つ挙げている。<strong>ファイルシステムの断片化を避けるため</strong>、そして <strong>非特権プロセスが書き込みを拒まれたあとでもシステムデーモンが正常に動作し続けられるようにするため</strong> だ。既定値は 5 パーセントである。</p>
+
+                    <p>だからこういう場面が生まれる。アプリケーションのアカウントでは書き込みが失敗するのに、管理者で入って同じ場所にファイルを作ると成功する。二人が同じサーバーを見ながら互いに違う結論を出す状況が、ここで生じる。<code>df</code> の Use% が <strong>100 パーセントではなく 95 パーセント前後で止まっているのに</strong> 書き込みが失敗するなら、この原因を疑う価値がある。</p>
+
+                    <pre><code># 予約ブロックの確認 (ext2/3/4) - この環境では実行できなかった
+$ sudo tune2fs -l /dev/sda1 | grep -iE 'block count|reserved'
+# Block count:              全体のブロック数
+# Reserved block count:     予約されたブロック数
+# 二つの値の比率がそのまま予約比率だ。
+
+# 比率の調整 - 戻せるが慎重に
+$ sudo tune2fs -m 1 /dev/sda1    # 5% -&gt; 1%</code></pre>
+
+                    <div class="callout">
+                        <strong>注意</strong> - <code>tune2fs -m 0</code> で予約を完全に無くすという助言をよく見かけるが、文書が明かした二つの目的がともに消える。空きが 0 に近づくと <strong>連続したブロックを見つけられず断片化が急激に進み</strong>、ログを書くデーモンまで一緒に止まって <strong>障害の原因を記録する手段</strong> を失う。マウントされた状態で誤って指定すると、戻すまでそのまま適用される。
+                    </div>
+
+                    <ul>
+                        <li>予約比率は <strong>パーセント</strong> だ。だからディスクが大きくなるほど取り置かれる絶対量が大きくなる。数 TB のボリュームで 5 パーセントはかなりの量になる</li>
+                        <li><strong>データ専用のボリューム</strong>、すなわちシステムデーモンがログを書かないボリュームでは比率を下げる根拠がある。ただし 0 ではなく 1〜2 パーセント程度は残す</li>
+                        <li>逆に <code>/</code> と <code>/var</code> では既定値をそのままにしておくほうがよい。ここがまさに文書の言う <strong>デーモンが動き続けねばならない場所</strong> だ</li>
+                        <li>XFS には同じ名前の概念が無く、別の方式で空きを管理する。<strong>ext 系の習慣をそのまま持ち込んではいけない</strong></li>
+                    </ul>
+
+                    <h2 id="sec-8">小さなファイルが領域をより食う理由</h2>
+
+                    <p>ファイルシステムはバイト単位で領域を与えず、<strong>ブロック単位</strong> で与える。1 バイトのファイルもブロックを一つ丸ごと受け取る。余った部分は他のファイルが使えず、この無駄を内部断片化と呼ぶ。言葉だけ聞くと些細に見えるが、個数が掛かった瞬間に性格が変わる。</p>
+
+                    <p>実際に測ってみた。<code>du</code> の <code>--apparent-size</code> は <strong>論理的な大きさ</strong> を、既定の挙動は <strong>実際の割り当て量</strong> を報告する。二つの値を並べれば差がそのまま見える。</p>
+
+                    <pre><code>$ du -b --apparent-size one_byte.txt b100.bin b4096.bin b4097.bin b1m.bin
+1        one_byte.txt
+100      b100.bin
+4096     b4096.bin
+4097     b4097.bin
+1048576  b1m.bin
+
+$ du --block-size=1 one_byte.txt b100.bin b4096.bin b4097.bin b1m.bin
+1024     one_byte.txt
+1024     b100.bin
+4096     b4096.bin
+8192     b4097.bin
+1048576  b1m.bin</code></pre>
+
+                    <p>最も注目すべき行は <code>b4097.bin</code> だ。論理サイズ <strong>4,097 バイト</strong> に対して実際の割り当ては <strong>8,192 バイト</strong>。ブロックの境界を 1 バイト越えたという理由で 4,096 バイトが丸ごと余計に付いた。4,096 バイトのファイルはきっかり 4,096 を使うというのに。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>論理サイズ</th><th>実際の割り当て(測定)</th><th>無駄</th><th>倍数</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>1 B</td><td>1,024 B</td><td>1,023 B</td><td>1,024 倍</td></tr>
+                            <tr><td>100 B</td><td>1,024 B</td><td>924 B</td><td>約 10 倍</td></tr>
+                            <tr><td>4,096 B</td><td>4,096 B</td><td>0</td><td>1 倍</td></tr>
+                            <tr><td>4,097 B</td><td>8,192 B</td><td>4,095 B</td><td>約 2 倍</td></tr>
+                            <tr><td>1,048,576 B</td><td>1,048,576 B</td><td>0</td><td>1 倍</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>ここで一つ正直に断っておくことがある。1 バイトのファイルの割り当てが 4,096 ではなく <strong>1,024</strong> と出たのは、NTFS がごく小さなファイルをメタデータのレコードの中に一緒に保存するからだ。ext4 はこの最適化を既定では使わないので <strong>同じ実験では 4,096 が出ると予想されるが、その画面はこの記事には無い。</strong> 一方、ブロックの境界で二倍に跳ねる <code>b4097.bin</code> の挙動は、ブロック単位の割り当てを使うファイルシステムに共通だ。</p>
+
+                    <p>個数を掛けるとどうなるかも測ってみた。1 バイトのファイル 2 万個だ。</p>
+
+                    <pre><code>$ time ( for i in $(seq 1 20000); do printf 'x' &gt; "f$i"; done )
+real    0m25.766s
+
+$ ls -1 | wc -l
+20000
+
+$ du -sb --apparent-size .
+20000     .          # 論理合計 = 20,000 バイト (約 20KB)
+
+$ du -s --block-size=1 .
+24674304  .          # 実際の占有 = 24,674,304 バイト (約 23.5MiB)</code></pre>
+
+                    <p>論理 20KB が実際には <strong>23.5MiB</strong> を占める。約 <strong>1,233 倍</strong> だ。この値にはファイル自体の割り当て分と、2 万個の名前を収めるために大きくなったディレクトリ構造が一緒に入っている。<strong>ディレクトリも領域を使う</strong> という事実が、ここで目に見える。</p>
+
+                    <ul>
+                        <li>ext4 で 4KiB ブロックにして同じことをすると、算数はこうなる。<strong>1 バイトのファイル 100 万個は論理 1MB、実際には 4,096,000,000 バイトすなわち約 3.8GiB</strong> だ。この値は <strong>測定ではなくブロックサイズによる計算</strong> であり、ディレクトリ構造を除いた値だ</li>
+                        <li>だからファイルの多い場所では <strong>容量と inode が同時に</strong> 減っていく。どちらが先に底を突くかはファイルサイズの分布次第だ</li>
+                        <li>小さなファイルをまとめて一つにするのが根本的な対応だ。ログはローテート後に圧縮し、キャッシュには期限を設け、アーカイブは <strong>個別のファイルではなくまとまり</strong> で保管する</li>
+                    </ul>
+
+                    <h2 id="sec-9">何が食ったのかを探す - du の定型句</h2>
+
+                    <p>マウントを特定し、容量の問題で間違いないところまで確認できたら、次は上から下へ絞り込んでいく作業だ。定型句は一つあれば足りる。</p>
+
+                    <pre><code>$ du -h -x --max-depth=1 . | sort -h
+1.0K    ./deleted_open
+1.0K    ./demo2
+24M     ./tiny
+25M     .
+
+# 大きいものが下に来るので、最後の行から読む。
+# Linux では普通こう始める。
+$ sudo du -h -x --max-depth=1 / | sort -h</code></pre>
+
+                    <p>三つのオプションがそれぞれ仕事をする。<code>--max-depth=1</code> は <strong>一段階だけ</strong> 見せる。深さを与えないと数万行が流れ出て読めない。<code>sort -h</code> は <code>24M</code> のような人が読む表記を <strong>大きさの順に</strong> 並べる。文字列の並べ替えでは <code>9K</code> が <code>24M</code> より後ろに来る。</p>
+
+                    <p>そして <code>-x</code> がこの定型句の核心だ。<strong>別のファイルシステムへ渡らないように</strong> 止めるオプションである。これを外して <code>/</code> から舐めると、マウントされたネットワークストレージやコンテナのレイヤーまで追って入っていき、時間は何倍もかかり、<strong>いま探しているファイルシステムと無関係な数字が結果に混ざる</strong>。</p>
+
+                    <p>ただしここでも正直に書いておくことがある。この環境では <code>-x</code> が実際に何かを止める場面を作れなかった。</p>
+
+                    <pre><code>$ stat -c %d / /tmp .
+3927831023
+3927831023
+3927831023
+# 三つとも同じ装置 ID -&gt; -x が止まる境界がそもそも無い。
+# オプションが受け付けられ、結果が同じであることまでを確認した。
+
+# ファイル数で絞る版 (inode 枯渇のとき)
+$ find . -xdev -type f -printf '%h\n' | sort | uniq -c | sort -rn | head -5
+  20000 ./tiny
+      5 .
+      1 ./demo2
+      1 ./deleted_open</code></pre>
+
+                    <ul>
+                        <li><code>sort -h</code> は GNU の拡張だ。この環境のヘルプに <code>-h, --human-numeric-sort</code> として実在することを確認したが、<strong>BSD 系や最小構成のコンテナイメージには無いことがある</strong>。そのときは <code>du -k</code> で取り出して <code>sort -n</code> を使う</li>
+                        <li><code>du --inodes</code> は大きさではなく <strong>項目の個数</strong> を数える。inode 枯渇のときは、上の定型句から <code>-h</code> だけ外してこれに替えればそのまま使える</li>
+                        <li><code>find</code> はファイルを一つ一つ舐めるので、<strong>ファイルの多いファイルシステムでは時間がかかる</strong>。稼働中のサーバーでは負荷を見込んで範囲を絞って始める</li>
+                        <li>結果が <strong>合計と合わなければ</strong> 原因②を疑う。<code>du</code> でいくら足しても <code>df</code> の使用量に届かないなら、名前の無いファイルがどこかで開いている</li>
+                    </ul>
+
+                    <h2 id="sec-10">診断の順序 - 四段階</h2>
+
+                    <p>ここまでの内容を実行の順序に畳むと四段階になる。各段階は <strong>次の段階へ進むかどうかを決める</strong> ためにある。順序を守る理由は、前の段階が後の段階より圧倒的に安いからだ。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>段階</th><th>何を訊くか</th><th>コマンド</th><th>こう出たら</th><th>次</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>1</td><td>どのマウントか</td><td><code>df -h &lt;失敗したパス&gt;</code></td><td>その行の Use% が低い</td><td>別のパスを見誤っていた。失敗したパスを確認し直す</td></tr>
+                            <tr><td>2</td><td>容量か inode か</td><td><code>df -i &lt;失敗したパス&gt;</code></td><td>IUse% だけ 100%</td><td>原因①。ファイルが集中したディレクトリを探す</td></tr>
+                            <tr><td>3</td><td><code>du</code> と食い違うか</td><td><code>du -sh -x &lt;マウント&gt;</code> を <code>df</code> と照合</td><td><code>du</code> の合計がはるかに小さい</td><td>原因②。つかんでいるプロセスを探して再起動</td></tr>
+                            <tr><td>4</td><td>何が食ったか</td><td><code>du -h -x --max-depth=1 | sort -h</code></td><td>大きい項目が特定される</td><td>一段階ずつ下りながら繰り返す</td></tr>
+                            <tr><td>+</td><td>root だけ通るか</td><td>一般アカウントと root でそれぞれ <code>touch</code></td><td>root だけ成功する</td><td>原因③。予約ブロックを確認</td></tr>
+                        </tbody>
+                    </table>
+
+                    <ul>
+                        <li>1 段階と 2 段階は <strong>合わせて二行</strong> で、負荷は事実上無い。ところがこの二つだけで終わる場合が実際にかなり多い</li>
+                        <li>3 段階を飛ばすと、4 段階で時間を使い切っても何も見つけられない。<strong>du が犯人を見つけられない状況</strong> が存在すると知っていることが、この表の要点だ</li>
+                    </ul>
+
+                    <h2 id="sec-11">コンテナとクラウドで変わること</h2>
+
+                    <p>同じ症状がコンテナの中ではもっと紛らわしい。コンテナの中の <code>df</code> は <strong>そのコンテナが見ているマウント</strong> を答えるが、実際に埋まっているのはホストノードのディスクである場合が多い。逆にノードには空きが余っているのに、コンテナの書き込み可能レイヤーに掛かった上限だけが埋まっている場合もある。<strong>どちら側で df を打ったのか</strong> をまず決める必要がある。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>状況</th><th>勘違いしやすいこと</th><th>実際に見るべき場所</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>イメージレイヤーが埋まった</td><td>ボリュームに空きがあるから大丈夫だ</td><td>書き込み可能レイヤーはボリュームとは <strong>別のファイルシステム</strong> だ</td></tr>
+                            <tr><td>停止したコンテナと古いイメージが積もった</td><td>稼働中のものだけ数えれば大した量ではない</td><td>停止したコンテナ、未使用のイメージ、ビルドキャッシュをすべて合算する</td></tr>
+                            <tr><td>コンテナのログが無限に育つ</td><td>アプリケーションがログを残していない</td><td>ランタイムが標準出力をファイルに積む。サイズ上限の設定を確認</td></tr>
+                            <tr><td>クラウドのディスクを増やしたのに変わらない</td><td>コンソールで増やしたのだから終わりだ</td><td>パーティションとファイルシステムは <strong>別々に広げねばならない</strong></td></tr>
+                            <tr><td>ノードの inode が埋まった</td><td>容量のグラフが平らだから問題ない</td><td>イメージレイヤーは小さなファイルの塊だ。inode を別に監視する</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>最後の行は特によく掛かる。<code>resize2fs</code> の文書は <strong>このプログラムはパーティションの大きさを操作しない</strong> と明記している。すなわちブロック装置を増やしたなら、まずパーティションを拡張し、そのあとにファイルシステムを拡張しなければならない。この二段階を一つと取り違えると、コンソールでは容量が増えたのにサーバーの中では変わらないままという状態になる。</p>
+
+                    <pre><code># クラウドのディスク拡張後 - 順序がある (この環境では実行できなかった)
+# ① カーネルが新しい大きさを見たか
+lsblk
+
+# ② パーティションの拡張 (パーティションを使う構成のときだけ)
+sudo growpart /dev/sda 1
+
+# ③ ファイルシステムの拡張
+sudo resize2fs /dev/sda1        # ext2/3/4
+sudo xfs_growfs /               # XFS はマウントポイントを与える
+
+# コンテナ側 - 何が場所を取っているかを種類別に合計
+docker system df
+docker system df -v</code></pre>
+
+                    <ul>
+                        <li>オーバーレイ方式はファイルを修正するとき <strong>原本を上のレイヤーへ複写してから</strong> 直す。大きなファイルの一行を直しても、そのファイルの大きさだけ領域が余計に必要になり得る</li>
+                        <li>コンテナの中で消したファイルは <strong>下のレイヤーからは消えない</strong>。削除の印が上に載るだけなので、イメージの大きさは減らない</li>
+                        <li>整理コマンドは便利な分だけ危険だ。<strong>使っていないボリュームまで一緒に消すオプション</strong> があり、そのボリュームにデータが入っていることがある</li>
+                        <li>ノード全体が埋まった状況では、スケジューラが <strong>ポッドを他のノードへ押し出す</strong>。症状がディスクではなく再起動として先に現れ、原因の特定が遅れる</li>
+                    </ul>
+
+                    <h2 id="sec-12">急ぐとき - 消してよいものと駄目なもの</h2>
+
+                    <p>サービスが止まっていると判断する時間が無い。だから <strong>あらかじめ決めておいた一覧</strong> が必要だ。ただし最初の一手は消すことではない。<strong>つかまれた領域があるかをまず確認すること</strong> が最初の一手だ。原因②なら何を消しても回収されないので、確認せずに消し始めると時間だけを失い、取り消せない削除だけが残る。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>区分</th><th>対象</th><th>なぜ</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>比較的安全</td><td>ローテート後に圧縮された古いログ</td><td>すでに閉じられたファイルだ。保管期間だけ確認すればよい</td></tr>
+                            <tr><td>比較的安全</td><td>パッケージ管理者のキャッシュ</td><td>また落としてこられる。再インストールの時間だけで済む</td></tr>
+                            <tr><td>比較的安全</td><td>ビルド成果物と一時ディレクトリ</td><td>再生成が可能。ただし <strong>進行中のビルドが無いか</strong> を確認</td></tr>
+                            <tr><td>注意</td><td>コアダンプ</td><td>消してもよいが <strong>障害原因の分析資料</strong> だ。先に移す</td></tr>
+                            <tr><td>絶対禁止</td><td>いま開いているログ本体</td><td>領域は戻らずログだけを失う。原因②を作る</td></tr>
+                            <tr><td>絶対禁止</td><td>データベースファイル・ロックファイル・ソケット</td><td>破損や起動不能につながる</td></tr>
+                            <tr><td>絶対禁止</td><td>中身の分からないディレクトリ</td><td>急ぐときほど確認せずに消す。取り消せない</td></tr>
+                        </tbody>
+                    </table>
+
+                    <div class="callout">
+                        <strong>注意</strong> - <code>rm -rf</code> は確認を求めず、取り消せない。パスを変数にして使うと <strong>変数が空のときに最上位から消す事故</strong> が起きる。実行前に同じ引数で <code>ls -d</code> を先に回し、対象を目で確認する習慣は安上がりだ。<code>truncate -s 0</code> はファイルを残したまま空にするので開いているログにも使えるが、<strong>中身はそのまま消える</strong>。移すべき値があるなら先に移す。
+                    </div>
+
+                    <ul>
+                        <li>空きが完全に 0 だと <strong>消す作業自体が失敗</strong> し得る。ログを残したり一時ファイルを作ったりする道具は、このとき動作しない</li>
+                        <li>だから <code>truncate -s 0</code> や <code>: &gt; ファイル</code> のように <strong>新しいファイルを作らない空にし方</strong> が、この状況では役に立つ</li>
+                        <li>急場をしのいだあとは必ず原因を辿り直す。<strong>消して解決したということは、なぜ埋まったのかを説明しない。</strong> 同じことが同じ周期で戻ってくる</li>
+                    </ul>
+
+                    <h2 id="sec-13">そもそも防ぐ方法</h2>
+
+                    <p>この症状は監視項目が一つ抜けているために起きることが多い。容量はほとんどの場所で見ているが、<strong>inode の使用率は既定のダッシュボードに無いことがよくある。</strong> だから容量のグラフが平らなまま障害になる。</p>
+
+                    <p>しきい値を超えたマウントだけを取り出すスニペットを一つ作って回してみたところ、ここで <strong>よくある定型句が実際に間違う場面</strong> が出た。記録しておく価値のある失敗なので、そのまま写す。</p>
+
+                    <pre><code># よく使われる版 - この環境では誤答を出した
+$ df -P | awk 'NR&gt;1 &amp;&amp; $5+0 &gt;= 80 {print $6, $5}'
+65% 347611880          # 値が逆さまに出た
+
+# 理由 - 装置名に空白があってフィールドが一つずれた
+$ df -P | awk 'NR&gt;1 {print "NF=" NF "  $5=[" $5 "]  $6=[" $6 "]"}'
+NF=7  $5=[347583704]  $6=[65%]
+
+# 直した版 - フィールドを数えず、指定して受け取る
+$ df --output=pcent,target | awk 'NR&gt;1 &amp;&amp; $1+0 &gt;= 60 {print "DISK", $2, $1}'
+DISK / 65%
+
+$ df --output=ipcent,target | awk 'NR&gt;1 &amp;&amp; $1+0 &gt;= 60 {print "INODE", $2, $1}'
+(出力なし - このファイルシステムが inode の比率を報告しない)</code></pre>
+
+                    <p><code>df -P</code> の出力をフィールド番号で切る方式は、<strong>装置名やマウントポイントに空白が無いという仮定</strong> の上に立っている。その仮定が崩れると静かに別の列を読み、条件式はそのまま真になって <strong>間違った警報が正常のように流れる。</strong> <code>df --output=</code> で必要な列だけ受け取れば、この仮定そのものが要らなくなる。</p>
+
+                    <ul>
+                        <li><strong>inode の使用率を監視項目に追加する。</strong> 容量と同じしきい値にしておけば十分だ。無いよりましという水準ではなく、この記事の原因①はこれ一つで全部予防できる</li>
+                        <li>ログのローテーションは <strong>保管個数と圧縮の有無</strong> を一緒に決める。個数だけ大きく取ると容量は平気でも inode が埋まる</li>
+                        <li>一時ファイルには <strong>期限切れの掃除</strong> を仕掛ける。セッションとキャッシュは、作るコードが消すコードまで持っていなければならない</li>
+                        <li>コンテナのログには <strong>ファイルサイズの上限と保管個数</strong> を明示する。既定値が無制限の構成がよくある</li>
+                        <li>警報は <strong>残りのパーセントではなく残りの時間</strong> で見るほうがよい。一日に何 GB ずつ増えているかが分かれば、いつ埋まるかを計算できる</li>
+                    </ul>
+
+                    <h2 id="sec-14">まとめ</h2>
+
+                    <p><code>No space left on device</code> は診断ではなく診断の始まりだ。その背後には少なくとも四つの事情があり、どれなのかによって <strong>やるべきことが正反対</strong> になる。inode が埋まっているなら大きなファイルを探しても無駄だし、消したのに開いたままのファイルが原因なら、もっと消すことが害になる。</p>
+
+                    <p>だから覚えるべきはコマンドの一覧ではなく順序だ。失敗したパスを <code>df</code> に直接与え、<code>df -i</code> で容量か個数かを分け、<code>du</code> の合計を <code>df</code> と突き合わせ、そのあとで初めて何が食ったのかを探す。<strong>三番目の段階がこの順序の値打ち</strong> だ。ここで食い違いが見えれば、残りの探索がすべて無駄だと前もって分かる。</p>
+
+                    <p>そして、この記事で実際に測った数字二つは覚えておく価値がある。<strong>消した 1GiB がプロセスを殺すまで 16 ブロックしか戻らなかった</strong> こと、そして <strong>1 バイトのファイル 2 万個が 23.5MiB を占めた</strong> ことだ。どちらも <code>df</code> を一度だけ見る習慣では絶対に見えない数字である。</p>
+
+                    <h2 id="sec-15">確認できなかったこと</h2>
+
+                    <ul>
+                        <li><strong>inode が実際に枯渇した画面</strong> を作れなかった。この環境の NTFS は inode 数を報告しないので <code>df -i</code> がすべて <code>-</code> で出る。IUse% が 100 パーセントの出力はこの記事には無く、代わりに <strong>なぜ空欄が出るのか</strong> を <code>stat -f</code> で見せた</li>
+                        <li><strong><code>lsof +L1</code> を走らせられなかった。</strong> この環境に lsof が入っていない。オプションの意味は文書で確認し、同じ目的の <code>/proc/&lt;pid&gt;/fd</code> のほうは実際に走らせて <code>(deleted)</code> の表示まで確認した</li>
+                        <li><strong><code>tune2fs</code>・<code>debugfs</code>・<code>resize2fs</code>・<code>xfs_growfs</code> は実行できなかった。</strong> ext4/XFS 専用の道具であり、この環境に対象のファイルシステムが無い。予約ブロック比率 5 パーセント、XFS の <code>maxpct</code> の既定値、<code>resize2fs</code> がパーティションに触れないという点は <strong>公式の man 文書で確認</strong> した</li>
+                        <li><strong>ext4 での 1 バイトのファイルの割り当て量</strong> を直接測れなかった。この環境では 1,024 バイトと出たが、これは NTFS の小型ファイルの保存方式によるものだ。4KiB ブロック基準の計算値は本文に <strong>計算だと明かして</strong> 書いた</li>
+                        <li><strong><code>du -x</code> がファイルシステムの境界で止まる場面</strong> を作れなかった。<code>/</code>・<code>/tmp</code>・作業ディレクトリの装置 ID がすべて同じで、渡る境界が無かった。オプションが受け付けられることまでを確認した</li>
+                        <li><strong>btrfs の <code>df -i</code> の出力形式</strong> は確認できなかった。カーネル文書の機能一覧に動的 inode 割り当てが挙がっているという事実だけを確認し、その数字をどう読むべきかはこの記事では扱っていない</li>
+                        <li><strong>コンテナとクラウドの節はすべて未実行</strong> だ。オーバーレイの挙動、整理コマンドの出力、ディスク拡張の手順のうち、この環境で走らせたものは一つも無い。コマンドの順序と根拠だけを書いた</li>
+                    </ul>
+
+                    <h2 id="sec-16">参考資料</h2>
+
+                    <ul>
+                        <li><a href="https://man7.org/linux/man-pages/man8/mke2fs.8.html" target="_blank" rel="noopener">mke2fs(8) - man7.org</a> - 予約ブロックの既定値が 5 パーセントだということ、そして <code>-i</code> の bytes-per-inode 比率は <strong>ファイルシステムの作成後には変更できない</strong> という警告</li>
+                        <li><a href="https://man7.org/linux/man-pages/man8/tune2fs.8.html" target="_blank" rel="noopener">tune2fs(8) - man7.org</a> - <code>-m</code> オプションの説明。ブロックを予約する二つの理由が <strong>断片化の回避</strong> と <strong>非特権プロセスが止められたあともシステムデーモンが動作し続けられるようにすること</strong> だと書かれている</li>
+                        <li><a href="https://man7.org/linux/man-pages/man8/mkfs.xfs.8.html" target="_blank" rel="noopener">mkfs.xfs(8) - man7.org</a> - <code>maxpct</code> の意味と大きさ別の既定値(1TB 未満 25%、50TB 未満 5%、それ以上 1%)、そしてこの値を <code>xfs_growfs</code> で変更できるという説明</li>
+                        <li><a href="https://man7.org/linux/man-pages/man8/xfs_growfs.8.html" target="_blank" rel="noopener">xfs_growfs(8) - man7.org</a> - <code>-m</code> で inode に割り当て可能な最大比率を新たに指定するというオプションの説明</li>
+                        <li><a href="https://man7.org/linux/man-pages/man8/lsof.8.html" target="_blank" rel="noopener">lsof(8) - man7.org</a> - <code>+L</code> のうしろに数字を与えるとリンク数がそれより小さいファイルだけを列挙し、<code>+L1</code> の形は <strong>名前が消えたまま開いているファイル</strong> を選ぶという説明</li>
+                        <li><a href="https://man7.org/linux/man-pages/man8/resize2fs.8.html" target="_blank" rel="noopener">resize2fs(8) - man7.org</a> - <strong>このプログラムはパーティションの大きさを操作しない</strong> という一文。ディスクを増やしたあとパーティションとファイルシステムを別々に拡張しなければならない根拠</li>
+                        <li><a href="https://docs.kernel.org/filesystems/btrfs.html" target="_blank" rel="noopener">BTRFS - The Linux Kernel documentation</a> - 機能一覧に <strong>動的 inode 割り当て</strong> が含まれているということ</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>この記事をシェア</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">スレッズ</button>
+                        <button id="link-copy" class="share-btn link-btn">リンクをコピー</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">一覧に戻る</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">一緒に使うと便利な無料ツール</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/char_counter.html">文字数カウント</a></li>
+      <li><a href="../static/json_formatter.html">JSON フォーマッター</a></li>
+      <li><a href="../static/regex_tester.html">正規表現テスター</a></li>
+      <li><a href="../static/jwt_decoder.html">JWTデコーダー・生成器 2026</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">すべてのツールを見る &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">関連記事</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="git_credential_leak_prevention.html">リモートURLにトークンが埋まっている - git の資格情報が漏れる場所</a></li>
+      <li><a href="git_gitignore_already_tracked.html">.gitignore に入れたのにコミットされ続ける - すでに追跡中のファイル</a></li>
+      <li><a href="git_bisect_practical.html">git bisect - バグが入り込んだコミットを二分探索で見つける</a></li>
+      <li><a href="git_undo_decision_guide.html">git 取り消し判断表 - reset・revert・restore・checkout のどれを使うか</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('リンクがコピーされました。Threadsアプリに貼り付けてシェアしてください！');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('リンクがコピーされました！'); });
+    });
+    </script>
+</body>
+</html>

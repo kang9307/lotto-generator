@@ -1,0 +1,791 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ko">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>디스크는 안 찼는데 No space left on device - inode와 열린 파일</title>
+    <meta name="description" content="df 는 여유가 있다는데 쓰기는 실패한다. inode 고갈, 지웠지만 열려 있는 파일, 예약 블록, 엉뚱한 마운트 네 가지를 실제 명령 출력과 함께 갈라 보고, 어느 것부터 짚어야 하는지 진단 순서로 정리했다.">
+    <meta name="keywords" content="No space left on device, ENOSPC, inode 고갈, df -i, du, lsof, 삭제된 열린 파일, 예약 블록, tune2fs, ext4, XFS, btrfs, 블록 크기, 내부 단편화, resize2fs, 개발, 인프라, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/posts/no_space_left_but_disk_free.html">
+
+    <meta property="og:title" content="디스크는 안 찼는데 No space left on device - inode와 열린 파일">
+    <meta property="og:description" content="증상은 하나인데 원인은 넷이다. 어느 마운트인지, 용량인지 inode 인지, df 와 du 가 어긋나는지를 순서대로 짚는 법.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/posts/no_space_left_but_disk_free.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ko_KR">
+    <meta property="article:published_time" content="2026-09-01">
+    <meta property="article:section" content="개발/인프라">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="디스크는 안 찼는데 No space left on device">
+    <meta name="twitter:description" content="용량이 남았는데 쓰기가 실패하는 네 가지 이유와, 그것을 순서대로 갈라내는 진단 절차.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "디스크는 안 찼는데 No space left on device - inode와 열린 파일",
+      "alternativeHeadline": "증상은 하나인데 원인은 넷이다. 그 넷을 순서대로 갈라내는 법",
+      "datePublished": "2026-09-01",
+      "dateModified": "2026-09-01",
+      "inLanguage": "ko-KR",
+      "articleSection": "개발/인프라",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "No space left on device, ENOSPC, inode 고갈, df -i, du, 삭제된 열린 파일, 예약 블록, tune2fs, ext4, XFS, btrfs, 블록 크기, resize2fs",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/posts/no_space_left_but_disk_free.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "df 는 여유가 있다는데 왜 No space left on device 가 뜨는가?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "ENOSPC 는 커널이 이 쓰기를 받을 수 없다고 말하는 한 가지 신호일 뿐이고, 그 뒤의 사정은 최소 네 가지다. 첫째는 용량이 아니라 파일 개수 한도인 inode 가 찬 경우로 df -i 로 확인한다. 둘째는 지웠지만 프로세스가 붙잡고 있어 공간이 반환되지 않은 경우로 df 와 du 가 어긋난다. 셋째는 ext4 가 기본으로 떼어 두는 예약 블록 때문에 일반 사용자에게만 가득 차 보이는 경우다. 넷째는 정작 찬 것이 다른 파일시스템인 경우다. 그래서 df -h 만 보지 말고 df -h 뒤에 실패한 경로를 직접 붙여, 그 경로가 실제로 어느 장치에 붙어 있는지부터 확인해야 한다."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "파일을 지웠는데 왜 공간이 돌아오지 않는가?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "rm 은 데이터를 지우는 명령이 아니라 디렉터리에서 이름 하나를 떼어 내는 unlink 다. 그 파일을 열어 둔 프로세스가 하나라도 남아 있으면 링크 수가 0 이 되어도 참조가 남아 있으므로 커널은 블록을 반환하지 않는다. Git Bash 에서 1GiB 파일을 만들고 tail 로 붙잡은 채 지워 본 결과, rm 직후 여유 블록은 262,147 개 가운데 16 개만 돌아왔고 du 는 이미 1.0K 로 줄어 df 와 어긋났다. 그 프로세스를 종료하자 262,143 블록이 한꺼번에 돌아왔다. 해결은 파일을 다시 지우는 것이 아니라 붙잡은 프로세스를 재시작하거나 그 파일 서술자를 끊는 것이다."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "inode 가 부족하면 늘릴 수 있는가?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "파일시스템 종류에 따라 다르다. ext4 는 mkfs 시점에 inode 수가 고정되고, mke2fs 문서는 bytes-per-inode 비율에 대해 파일시스템이 만들어진 뒤에는 이 비율을 바꿀 수 없으니 값을 신중히 정하라고 명시한다. 즉 ext4 에서 inode 가 찼다면 늘리는 선택지는 없고, 파일 개수를 줄이거나 파일시스템을 다시 만드는 것뿐이다. XFS 는 inode 를 동적으로 할당하며 최대 비율 maxpct 를 xfs_growfs 로 바꿀 수 있다. btrfs 는 커널 문서가 기능 목록에 동적 inode 할당을 올려 두고 있어 고정 한도라는 개념 자체가 다르다."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "작은 파일이 많으면 왜 용량이 더 줄어드는가?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "파일시스템은 블록 단위로 공간을 떼어 주기 때문에 논리적 크기가 아니라 블록의 배수만큼 자리를 차지한다. 4,097 바이트짜리 파일을 만들어 재 보면 논리 크기는 4,097 이지만 실제 할당은 8,192 바이트다. 한 바이트 때문에 블록 하나가 통째로 더 붙는다. 1 바이트 파일 2만 개를 만든 실측에서는 논리 합계가 20,000 바이트인데 실제 점유는 24,674,304 바이트로 약 1,233 배였다. 파일 개수가 많은 자리에서는 용량과 inode 가 같이 소진되므로 둘 다 봐야 한다."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "급할 때 무엇부터 지워야 안전한가?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "가장 안전한 첫 수는 지우는 것이 아니라 붙잡힌 공간을 확인하는 것이다. 삭제됐지만 열려 있는 파일이 원인이면 아무리 지워도 회수되지 않는다. 지워도 되는 쪽은 회전된 로그 압축본, 패키지 관리자 캐시, 빌드 산출물, 명백히 오래된 임시 파일이다. 반대로 현재 열려 있는 로그 본체를 rm 으로 지우면 공간은 돌아오지 않고 로그만 잃는다. 데이터베이스 파일, 잠금 파일, 소켓, 내용을 모르는 디렉터리는 건드리지 않는다. rm -rf 와 truncate 는 되돌릴 수 없으므로 경로를 실행 전에 눈으로 다시 읽는다."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <script src="https://t1.kakaocdn.net/kakao_js_sdk/2.4.0/kakao.min.js" crossorigin="anonymous" defer></script>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/no_space_left_but_disk_free.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/no_space_left_but_disk_free.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/no_space_left_but_disk_free.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/no_space_left_but_disk_free.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/no_space_left_but_disk_free.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "홈",
+      "item": "https://braindetox.kr/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "개발/인프라",
+      "item": "https://braindetox.kr/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "디스크는 안 찼는데 No space left on device - inode와 열린 파일",
+      "item": "https://braindetox.kr/posts/no_space_left_but_disk_free.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="디스크는 안 찼는데 No space left on device - inode와 열린 파일">
+                <meta itemprop="datePublished" content="2026-09-01">
+                <meta itemprop="dateModified" content="2026-09-01">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="No space left on device, ENOSPC, inode 고갈, df -i, du, 삭제된 열린 파일, 예약 블록, tune2fs, ext4, XFS, btrfs, 블록 크기, resize2fs">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/posts/no_space_left_but_disk_free.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">디스크는 안 찼는데 No space left on device - inode와 열린 파일</h1>
+                    <h2 class="post-subtitle">증상은 하나인데 원인은 넷이다. 그 넷을 순서대로 갈라내는 법</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-01">2026-09-01</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">개발/인프라</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>서비스가 로그를 못 쓴다는 알림을 받고 서버에 들어간다. 습관대로 <code>df -h</code> 를 친다. 여유가 30퍼센트 넘게 남아 있다. 그런데 같은 셸에서 <code>touch</code> 한 번만 해도 <strong>No space left on device</strong> 가 돌아온다. 이 순간 대부분의 시간이 낭비되는 이유는 하나다. <strong>df 가 거짓말을 하고 있다고 생각하기 때문</strong>이다.</p>
+
+                    <p>df 는 거짓말을 하지 않는다. 다만 <strong>묻지 않은 것에는 답하지 않는다.</strong> 용량을 물으면 용량을 답하고, 루트를 물으면 루트를 답한다. 쓰기가 실패한 진짜 이유가 용량이 아니거나 루트가 아니면 df 의 답은 정확한 채로 쓸모가 없다. 이 글은 그 어긋남이 생기는 네 가지 자리를 갈라 놓고, 어느 순서로 짚어야 가장 빨리 끝나는지를 정리한다.</p>
+
+                    <nav class="post-toc">
+                        <h3>이 글에서 다루는 것</h3>
+                        <ol>
+                            <li><a href="#sec-1">증상은 하나, 원인은 넷</a></li>
+                            <li><a href="#sec-2">이 글의 실행 환경과 검증 범위</a></li>
+                            <li><a href="#sec-3">먼저 물을 것 - 정말 그 파일시스템인가</a></li>
+                            <li><a href="#sec-4">원인 ① inode 고갈 - 용량은 남았는데 개수가 찼다</a></li>
+                            <li><a href="#sec-5">inode 는 언제 정해지는가 - ext4 · XFS · btrfs</a></li>
+                            <li><a href="#sec-6">원인 ② 지웠는데 열려 있는 파일</a></li>
+                            <li><a href="#sec-7">원인 ③ 예약 블록 - root 에게만 보이는 여유</a></li>
+                            <li><a href="#sec-8">작은 파일이 공간을 더 먹는 이유</a></li>
+                            <li><a href="#sec-9">무엇이 먹었는지 찾기 - du 관용구</a></li>
+                            <li><a href="#sec-10">진단 순서 - 네 단계</a></li>
+                            <li><a href="#sec-11">컨테이너와 클라우드에서 달라지는 것</a></li>
+                            <li><a href="#sec-12">급할 때 - 지워도 되는 것과 안 되는 것</a></li>
+                            <li><a href="#sec-13">애초에 막는 법</a></li>
+                            <li><a href="#sec-14">정리</a></li>
+                            <li><a href="#sec-15">확인하지 못한 것</a></li>
+                            <li><a href="#sec-16">참고 자료</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">증상은 하나, 원인은 넷</h2>
+
+                    <p><code>ENOSPC</code> 는 커널이 응용 프로그램에게 <strong>이 쓰기를 받아 줄 수 없다</strong>고 말하는 한 가지 신호다. 신호가 하나라고 해서 사정이 하나인 것은 아니다. 사람으로 치면 열이 나는 것과 같아서, 열 자체는 진단이 아니라 진단을 시작하라는 표시다. 그런데 현장에서는 <code>ENOSPC</code> 를 보자마자 곧바로 <strong>지울 것 찾기</strong>로 넘어가는 일이 잦고, 원인이 용량이 아닐 때 그 작업은 전부 헛수고가 된다.</p>
+
+                    <p>갈라야 할 자리는 넷이다. 아래 표의 오른쪽 열, 즉 <strong>구분되는 신호</strong>가 이 글의 실질적인 내용이다. 왼쪽 두 열만 외우면 여전히 순서를 못 잡는다.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>원인</th><th>실제로 찬 것</th><th>확인 명령</th><th>구분되는 신호</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>① inode 고갈</td><td>파일 개수 한도</td><td><code>df -i</code></td><td>Use% 는 낮은데 IUse% 만 100%</td></tr>
+                            <tr><td>② 삭제됐지만 열린 파일</td><td>반환되지 않은 블록</td><td><code>lsof +L1</code> · <code>/proc/&lt;pid&gt;/fd</code></td><td><code>df</code> 는 가득, <code>du</code> 합계는 훨씬 작다</td></tr>
+                            <tr><td>③ 예약 블록</td><td>root 전용으로 떼어 둔 몫</td><td><code>tune2fs -l</code></td><td>일반 계정만 실패, root 는 성공</td></tr>
+                            <tr><td>④ 다른 마운트</td><td>내가 안 본 파일시스템</td><td><code>df -h &lt;경로&gt;</code></td><td>루트는 여유, 해당 경로만 100%</td></tr>
+                        </tbody>
+                    </table>
+
+                    <ul>
+                        <li>①과 ④는 <strong>확인이 각각 한 줄</strong>이다. 그래서 이 둘을 맨 앞에 두는 것이 시간을 가장 많이 아낀다</li>
+                        <li>②는 <code>df</code> 와 <code>du</code> 를 <strong>같이 봐야만</strong> 드러난다. 하나만 보면 영원히 안 보인다</li>
+                        <li>③은 드물지만 <strong>같은 서버에서 사람마다 결과가 다른</strong> 기묘한 상황을 만들어 오래 잡아먹는다</li>
+                    </ul>
+
+                    <h2 id="sec-2">이 글의 실행 환경과 검증 범위</h2>
+
+                    <p>이 글의 주제는 리눅스 서버인데, 여기 붙은 출력을 실제로 만들어 낸 환경은 <strong>Windows 10 위의 Git Bash</strong> 다. 이 사실을 먼저 밝히는 이유는 겸손해 보이기 위해서가 아니라, <strong>어떤 출력은 그대로 믿어도 되고 어떤 출력은 여기 없는지</strong>를 독자가 구분할 수 있어야 하기 때문이다.</p>
+
+                    <pre><code>$ bash --version | head -1
+GNU bash, version 5.2.37(1)-release (x86_64-pc-msys)
+
+$ uname -a
+MINGW64_NT-10.0-19045 3.5.7-882031da.x86_64 2025-01-30 11:14 UTC x86_64 Msys
+
+$ df --version | head -1
+df (GNU coreutils) 8.32</code></pre>
+
+                    <p>coreutils 는 리눅스와 같은 GNU 8.32 이므로 <code>df</code>·<code>du</code>·<code>stat</code>·<code>sort</code> 의 <strong>옵션 동작과 계산 방식은 동일</strong>하다. 다르게 나오는 것은 그 아래 파일시스템이 NTFS 라는 점뿐이고, 뒤에서 보겠지만 그 차이 자체가 inode 를 이해하는 데 오히려 도움이 된다.</p>
+
+                    <ul>
+                        <li><strong>실제로 돌린 것</strong> - <code>df -h</code>, <code>df -i</code>, <code>df --output</code>, <code>stat -f</code>, <code>stat -c</code>, <code>du</code> 각종 조합, <code>find -printf</code>, 그리고 <strong>삭제됐지만 열린 파일 재현 전체</strong></li>
+                        <li><strong>돌리지 못한 것</strong> - <code>lsof +L1</code>(이 환경에 lsof 자체가 없다), <code>tune2fs</code>·<code>debugfs</code>·<code>resize2fs</code>(ext4 전용), 컨테이너 오버레이 관련 전부</li>
+                        <li><strong>지어내지 않은 것</strong> - 돌리지 못한 명령의 출력은 이 글에 한 줄도 없다. 명령과 <strong>읽는 법</strong>만 적었다</li>
+                        <li><strong>손댄 것</strong> - 출력에 나온 사용자 경로만 <code>/tmp/demo</code> 와 <code>&lt;user&gt;</code> 로 줄여 적었다. <strong>숫자는 하나도 고치지 않았다</strong></li>
+                        <li>블록 크기는 이 환경에서 <strong>4,096 바이트</strong>로 보고된다. 이 글의 블록 계산은 전부 이 값 기준이다</li>
+                        <li>다른 셸(dash·zsh)이나 BSD 계열 <code>df</code>·<code>du</code> 에서는 옵션 이름과 출력 형식이 다르다. 아래 명령들은 <strong>GNU coreutils 기준</strong>이다</li>
+                    </ul>
+
+                    <h2 id="sec-3">먼저 물을 것 - 정말 그 파일시스템인가</h2>
+
+                    <p>순서상 이것이 첫 번째다. 원인 목록에서는 ④번이지만 <strong>확인이 가장 싸기 때문</strong>이다. <code>df -h</code> 를 인자 없이 치면 마운트 목록이 나오고, 사람의 눈은 대개 맨 위 루트 줄에서 멈춘다. 정작 실패한 경로가 다른 파일시스템에 붙어 있으면 그 줄은 화면 아래 어딘가에 있다.</p>
+
+                    <p>고치는 방법은 <strong>df 에 경로를 직접 주는 것</strong>이다. 이 환경에서도 같은 물리 디스크를 두 개의 다른 마운트로 보고한다.</p>
+
+                    <pre><code>$ df -h . /
+Filesystem                        Size  Used Avail Use% Mounted on
+C:/Users/&lt;user&gt;/&lt;temp&gt;  931G  600G  332G  65% /tmp
+C:/Program Files/Git                931G  600G  332G  65% /
+
+# 요점 - 현재 디렉터리는 / 가 아니라 /tmp 에 붙어 있다.
+# 리눅스에서도 똑같다. 실패한 경로를 df 에 직접 준다.
+$ df -h /var/log</code></pre>
+
+                    <p>리눅스 서버에서 이 함정이 가장 자주 걸리는 자리는 정해져 있다. 아래 목록은 <strong>루트에 여유가 있는데도 쓰기가 실패</strong>하는 전형적인 배치다.</p>
+
+                    <ul>
+                        <li><code>/var</code> 가 별도 파티션인 구성 - 로그와 패키지 캐시가 여기 쌓이므로 루트보다 훨씬 먼저 찬다</li>
+                        <li><code>/boot</code> - 대체로 수백 MB 로 잡혀 있어 커널 패키지 몇 개만 쌓여도 찬다. 증상이 <strong>커널 업데이트 실패</strong>로 나타나 디스크 문제로 안 보인다</li>
+                        <li><code>/tmp</code> 가 <code>tmpfs</code> 인 구성 - 메모리를 쓰므로 실제 디스크와 무관하게 찬다. 재부팅하면 사라져 원인이 증발한다</li>
+                        <li>컨테이너 안 - 쓰기 가능 레이어와 마운트된 볼륨은 <strong>서로 다른 파일시스템</strong>이다. 볼륨에 여유가 있어도 레이어가 차면 실패한다</li>
+                        <li>바인드 마운트나 NFS 가 겹친 경로 - 경로 문자열만 보면 같은 트리 같지만 장치가 다르다</li>
+                    </ul>
+
+                    <h2 id="sec-4">원인 ① inode 고갈 - 용량은 남았는데 개수가 찼다</h2>
+
+                    <p>파일시스템은 데이터만 저장하는 것이 아니라 <strong>파일 하나하나에 대한 메타데이터 항목</strong>도 따로 관리한다. 소유자, 권한, 시각, 그리고 실제 데이터 블록이 어디 있는지를 담은 구조가 inode 다. 파일 이름은 여기 없다. 이름은 디렉터리가 들고 있고, 디렉터리는 <strong>이름과 inode 번호를 짝지은 목록</strong>이다. 이 구조 때문에 하나의 inode 에 여러 이름이 붙을 수 있고, 그것이 하드링크다.</p>
+
+                    <p>중요한 것은 <strong>이 항목의 개수에 한도가 있을 수 있다</strong>는 점이다. 한도가 차면 블록이 아무리 남아 있어도 새 파일을 만들 수 없다. 확인은 <code>df -i</code> 한 줄이다. 그런데 이 환경에서 그 명령은 이렇게 답한다.</p>
+
+                    <pre><code>$ df -i .
+Filesystem                       Inodes IUsed IFree IUse% Mounted on
+C:/Users/&lt;user&gt;/&lt;temp&gt;    -     -     -     - /tmp
+
+$ stat -f .
+  File: "."
+    ID: ea1df1ef00000000 Namelen: 255     Type: UNKNOWN
+Block size: 4096       Fundamental block size: 4096
+Blocks: Total: 244041727  Free: 86972107   Available: 86972107
+Inodes: Total: 18446744073709551615 Free: -1</code></pre>
+
+                    <p>전부 <code>-</code> 다. 그리고 <code>stat -f</code> 는 그 이유를 보여 준다. inode 총계로 보고된 <strong>18,446,744,073,709,551,615</strong> 는 부호 없는 64비트 정수의 최댓값, 즉 <strong>한도가 없다는 뜻의 표시값</strong>이고 Free 는 <code>-1</code> 이다. NTFS 에는 ext4 같은 고정 inode 테이블이 없으므로 보고할 숫자 자체가 없는 것이다.</p>
+
+                    <p>이 빈칸은 실패가 아니라 <strong>가장 중요한 사실을 그대로 보여 주는 화면</strong>이다. inode 한도는 파일시스템의 보편적 속성이 아니라 <strong>구현마다 다른 설계 선택</strong>이다. 그래서 ext4 서버에서 통하는 대응이 XFS 서버에서 그대로 통하지 않는다. 리눅스에서 실제 숫자가 채워진 화면과, 그때 이어서 칠 명령은 이렇다.</p>
+
+                    <pre><code># ① 어느 마운트의 inode 가 찼는지
+df -i
+
+# ② 그 마운트 안에서 파일이 몰린 디렉터리 (한 번에 크게 보기)
+du --inodes -x -d 2 /var 2&gt;/dev/null | sort -n | tail -20
+
+# ③ 디렉터리별 파일 개수를 직접 세기 (du --inodes 가 없는 옛 환경)
+find /var -xdev -type f -printf '%h\n' 2&gt;/dev/null \
+  | sort | uniq -c | sort -rn | head -20
+
+# 위 세 줄은 이 환경에서 실행하지 못했다.
+# NTFS 가 inode 수를 보고하지 않아 ①이 빈칸이기 때문이다.</code></pre>
+
+                    <p>작은 파일이 수백만 개씩 쌓이는 자리는 대체로 정해져 있다. 아래는 <strong>용량 그래프에는 아무 변화도 없는데 inode 만 조용히 차오르는</strong> 전형적인 위치다.</p>
+
+                    <ul>
+                        <li><strong>세션 파일</strong> - 만료 정리를 걸어 두지 않으면 방문자 수만큼 파일이 쌓이고 각각은 수백 바이트다</li>
+                        <li><strong>메일 큐와 Maildir</strong> - 메시지 하나가 파일 하나다. 발송이 막히면 큐가 그대로 개수로 남는다</li>
+                        <li><strong>캐시 조각</strong> - 해시를 디렉터리로 쪼개는 캐시는 <strong>디렉터리도 inode 를 쓴다</strong>는 점 때문에 두 배로 불어난다</li>
+                        <li><strong>로그 조각</strong> - 회전 주기가 짧고 보관 개수가 크면 압축본이 계속 남는다. 각각은 작지만 개수로 승부가 난다</li>
+                        <li><strong>의존성 디렉터리</strong> - 빌드 환경마다 하나씩 만들어지는 패키지 트리는 파일 수만 수십만 단위로 늘어난다</li>
+                    </ul>
+
+                    <h2 id="sec-5">inode 는 언제 정해지는가 - ext4 · XFS · btrfs</h2>
+
+                    <p>여기서 갈린다. <code>mke2fs</code> 문서는 <code>-i</code> 옵션, 즉 inode 하나당 몇 바이트를 배정할지에 대해 이렇게 못 박는다. <strong>파일시스템이 만들어진 뒤에는 이 비율을 바꿀 수 없으니 값을 신중히 정하라</strong>는 것이다. 예약 블록 비율의 기본값이 5퍼센트라는 것도 같은 문서에 있다.</p>
+
+                    <p>이 한 문장이 실무에서 뜻하는 바는 무겁다. <strong>ext4 에서 inode 가 찼다면 늘리는 선택지는 없다.</strong> 파일 개수를 줄이거나, 데이터를 옮기고 파일시스템을 다시 만드는 것뿐이다. 장애 한복판에서 알게 되기에는 늦은 사실이라, 스토리지를 설계할 때 미리 정해 두는 편이 낫다.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>파일시스템</th><th>inode 배정 방식</th><th>나중에 늘릴 수 있는가</th><th>실무에서 뜻하는 것</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>ext4</td><td>mkfs 시점에 개수 고정. <code>-i</code> 비율 또는 <code>-N</code> 개수로 지정</td><td>불가. 문서가 명시적으로 변경 불가라고 적는다</td><td>작은 파일이 많을 것을 알면 <strong>만들 때</strong> 비율을 낮춰 둔다</td></tr>
+                            <tr><td>XFS</td><td>동적 할당. 상한만 <code>maxpct</code> 로 관리</td><td>가능. <code>xfs_growfs -m</code> 으로 상한 변경</td><td>고갈이 나도 상한을 올려 시간을 벌 여지가 있다</td></tr>
+                            <tr><td>btrfs</td><td>커널 문서 기능 목록에 <strong>동적 inode 할당</strong>이 올라 있다</td><td>고정 한도라는 개념 자체가 다르다</td><td><code>df -i</code> 의 숫자를 ext4 와 같은 뜻으로 읽으면 안 된다</td></tr>
+                        </tbody>
+                    </table>
+
+                    <ul>
+                        <li>XFS 의 <code>maxpct</code> 기본값은 파일시스템 크기에 따라 다르다. 문서 기준으로 <strong>1TB 미만 25퍼센트, 50TB 미만 5퍼센트, 그 이상 1퍼센트</strong> 다</li>
+                        <li><code>maxpct</code> 를 0 으로 두면 사실상 파일시스템 전체가 inode 블록이 될 수 있다고 문서는 적는다. <strong>상한을 푸는 것이지 데이터 공간을 지켜 주는 장치가 사라지는 것</strong>이기도 하다</li>
+                        <li>그래서 <code>df -i</code> 의 IUse% 는 <strong>파일시스템 종류를 알아야 읽을 수 있는 숫자</strong>다. 같은 90퍼센트라도 ext4 에서는 경보, XFS 에서는 상한을 올릴지 판단할 재료다</li>
+                    </ul>
+
+                    <h2 id="sec-6">원인 ② 지웠는데 열려 있는 파일</h2>
+
+                    <p><code>rm</code> 은 데이터를 지우는 명령이 아니다. <strong>디렉터리에서 이름 하나를 떼어 내는 unlink</strong> 다. 이름이 전부 사라져 링크 수가 0 이 되어도, 그 파일을 <strong>열어 둔 프로세스가 하나라도 남아 있으면</strong> 커널은 블록을 반환하지 않는다. 마지막 참조가 닫히는 순간에야 공간이 돌아온다.</p>
+
+                    <p>이 동작 자체는 결함이 아니라 POSIX 가 정한 안전장치다. 읽는 도중에 파일이 사라져 프로세스가 깨지는 일을 막아 준다. 문제는 이때 <strong>관측 도구가 서로 다른 답을 준다</strong>는 것이다. <code>df</code> 는 파일시스템의 블록 계정을 읽으므로 붙잡힌 공간을 <strong>사용 중</strong>으로 본다. <code>du</code> 는 디렉터리를 걸어 다니며 파일을 세므로 <strong>이름이 없는 파일은 아예 못 본다</strong>. 그래서 둘이 어긋난다.</p>
+
+                    <p>이 환경에서 그대로 재현됐다. 1GiB 파일을 만들고, <code>tail -f</code> 로 붙잡은 채 지우고, 여유 블록 수를 단계마다 읽었다. 아래는 실제 출력이다.</p>
+
+                    <pre><code>$ cd /tmp/demo
+$ free() { stat -f -c %f .; }          # 여유 블록 수 (1블록 = 4096바이트)
+
+STEP 0  빈 디렉터리          여유 블록: 86970141
+$ head -c 1073741824 /dev/zero &gt; big.log
+STEP 1  1GiB 생성            여유 블록: 86707994   du -sh: 1.0G
+$ ( tail -f big.log &gt; /dev/null &amp; )
+STEP 2  tail 이 붙잡음
+$ rm big.log
+STEP 3  rm 직후              여유 블록: 86708010   du -sh: 1.0K
+STEP 3b 2초 뒤               여유 블록: 86708010
+$ kill &lt;tail 의 pid&gt;
+STEP 4  프로세스 종료 후     여유 블록: 86970153</code></pre>
+
+                    <p>숫자를 그대로 읽으면 이렇다. 파일을 만들 때 <strong>262,147 블록</strong>이 줄었다. 4,096 바이트를 곱하면 약 1.0GiB 로, 만든 크기와 맞는다. 그런데 <code>rm</code> 직후 돌아온 것은 <strong>16 블록</strong>뿐이다. 1GiB 를 지웠는데 64KiB 가 돌아온 것이니 사실상 0 이다. 반면 같은 시점에 <code>du</code> 는 이미 <strong>1.0K</strong> 를 답한다. <strong>df 와 du 가 1GiB 만큼 어긋난 상태</strong>가 여기서 만들어진다.</p>
+
+                    <p>그리고 프로세스를 종료하자 <strong>262,143 블록</strong>이 한꺼번에 돌아왔다. 지운 것은 <code>rm</code> 이었지만 공간을 반환한 것은 <code>kill</code> 이었다. <strong>해결은 파일을 또 지우는 것이 아니라 붙잡은 쪽을 놓게 만드는 것</strong>이라는 말의 근거가 이 두 줄이다.</p>
+
+                    <p>범인을 찾는 것은 별개의 문제다. 표준 도구는 <code>lsof +L1</code> 인데, 문서는 이 형태가 <strong>이름이 지워진 채 열려 있는 파일을 고른다</strong>고 설명한다. 다만 이 환경에는 lsof 가 설치돼 있지 않아 돌리지 못했다. 대신 <code>/proc</code> 쪽은 그대로 동작했고, 커널이 붙여 주는 <code>(deleted)</code> 표시가 선명하게 나왔다.</p>
+
+                    <pre><code># 이 환경에서 실행한 것 - /proc 으로 확인
+$ ls -l /proc/&lt;pid&gt;/fd | grep -i deleted
+lrwxrwxrwx 3 -&gt; /tmp/demo/big.log (deleted)
+
+# 이 환경에서 실행하지 못한 것 - lsof 미설치
+$ sudo lsof +L1                  # 링크 수가 1 미만인 열린 파일만
+$ sudo lsof -nP +L1 /var         # 특정 마운트로 좁히기</code></pre>
+
+                    <div class="callout">
+                        <strong>주의</strong> - 프로세스를 재시작할 수 없어 <code>&gt; /proc/&lt;pid&gt;/fd/&lt;n&gt;</code> 로 파일 서술자를 절단하는 방법이 널리 알려져 있다. 공간은 즉시 돌아오지만 <strong>번호를 잘못 고르면 그 프로세스가 열어 둔 다른 파일이 통째로 비워진다.</strong> 되돌릴 수 없고 확인 절차도 없다. 재시작이 가능하면 재시작이 언제나 안전한 쪽이다.
+                    </div>
+
+                    <ul>
+                        <li>이 상황을 가장 많이 만드는 것은 <strong>로그 회전 설정 실수</strong>다. 파일을 옮기거나 지운 뒤 프로세스에게 다시 열라는 신호를 주지 않으면, 프로세스는 이름 없는 옛 파일에 계속 쓴다.로그 회전이 조용히 실패하는 자리가 여기다</li>
+                        <li>붙잡은 프로세스를 특정하는 절차 자체는 이 글의 범위 밖이다. 여기서는 <strong>공간이 안 도는 이유</strong>까지만 본다</li>
+                        <li><strong>디스크 사용량이 계단처럼 줄지 않는 그래프</strong>는 이 원인의 좋은 신호다. 정리 작업을 돌렸는데 그래프가 평평하면 지운 것이 아직 열려 있다</li>
+                        <li>재시작 대상은 대체로 로그를 쓰는 쪽이다. 로그를 파일로 남기는 응용 프로그램, 그리고 그 로그를 읽어 전송하는 수집기 <strong>양쪽 모두</strong>가 같은 파일을 붙잡고 있을 수 있다</li>
+                    </ul>
+
+                    <h2 id="sec-7">원인 ③ 예약 블록 - root 에게만 보이는 여유</h2>
+
+                    <p>ext 계열은 전체 블록의 일부를 <strong>특권 프로세스 전용</strong>으로 떼어 둔다. <code>tune2fs</code> 문서는 그 이유를 두 가지로 적는다. <strong>파일시스템 단편화를 피하기 위해서</strong>, 그리고 <strong>비특권 프로세스가 쓰기를 거부당한 뒤에도 시스템 데몬이 계속 정상 동작할 수 있게 하기 위해서</strong>다. 기본값은 5퍼센트다.</p>
+
+                    <p>그래서 이런 장면이 만들어진다. 애플리케이션 계정으로는 쓰기가 실패하는데, 관리자로 들어가 같은 위치에 파일을 만들면 성공한다. 두 사람이 같은 서버를 보면서 서로 다른 결론을 내는 상황이 여기서 생긴다. <code>df</code> 의 Use% 가 <strong>100퍼센트가 아니라 95퍼센트 언저리에서 멈춰 있는데</strong> 쓰기가 실패한다면 이 원인을 의심할 만하다.</p>
+
+                    <pre><code># 예약 블록 확인 (ext2/3/4) - 이 환경에서는 실행하지 못했다
+$ sudo tune2fs -l /dev/sda1 | grep -iE 'block count|reserved'
+# Block count:              전체 블록 수
+# Reserved block count:     예약된 블록 수
+# 두 값의 비율이 곧 예약 비율이다.
+
+# 비율 조정 - 되돌릴 수 있지만 신중히
+$ sudo tune2fs -m 1 /dev/sda1    # 5% -&gt; 1%</code></pre>
+
+                    <div class="callout">
+                        <strong>주의</strong> - <code>tune2fs -m 0</code> 으로 예약을 완전히 없애는 조언이 자주 보이지만, 문서가 밝힌 두 가지 목적이 함께 사라진다. 여유가 0 에 가까워지면 <strong>연속된 블록을 찾지 못해 단편화가 급격히 진행</strong>되고, 로그를 쓰는 데몬까지 함께 멈춰 <strong>장애 원인을 기록할 수단</strong>을 잃는다. 마운트된 상태에서 잘못 지정하면 되돌리기 전까지 그대로 적용된다.
+                    </div>
+
+                    <ul>
+                        <li>예약 비율은 <strong>퍼센트</strong>다. 그래서 디스크가 커질수록 떼어 내는 절대량이 커진다. 수 TB 볼륨에서 5퍼센트는 상당한 양이 된다</li>
+                        <li><strong>데이터 전용 볼륨</strong>, 즉 시스템 데몬이 로그를 쓰지 않는 볼륨에서는 비율을 낮출 근거가 있다. 다만 0 이 아니라 1~2퍼센트 정도로 남긴다</li>
+                        <li>반대로 <code>/</code> 와 <code>/var</code> 에서는 기본값을 그대로 두는 편이 낫다. 여기가 바로 문서가 말한 <strong>데몬이 계속 동작해야 하는 자리</strong>다</li>
+                        <li>XFS 에는 같은 이름의 개념이 없고 다른 방식으로 여유를 관리한다. <strong>ext 계열의 습관을 그대로 옮기면 안 된다</strong></li>
+                    </ul>
+
+                    <h2 id="sec-8">작은 파일이 공간을 더 먹는 이유</h2>
+
+                    <p>파일시스템은 바이트 단위로 공간을 주지 않고 <strong>블록 단위</strong>로 준다. 1 바이트짜리 파일도 블록 하나를 통째로 받는다. 남는 부분은 다른 파일이 쓸 수 없고, 이 낭비를 내부 단편화라고 부른다. 말로만 들으면 사소해 보이지만 개수가 곱해지는 순간 성격이 달라진다.</p>
+
+                    <p>실제로 재 봤다. <code>du</code> 의 <code>--apparent-size</code> 는 <strong>논리적 크기</strong>를, 기본 동작은 <strong>실제 할당량</strong>을 보고한다. 두 값을 나란히 놓으면 차이가 그대로 보인다.</p>
+
+                    <pre><code>$ du -b --apparent-size one_byte.txt b100.bin b4096.bin b4097.bin b1m.bin
+1        one_byte.txt
+100      b100.bin
+4096     b4096.bin
+4097     b4097.bin
+1048576  b1m.bin
+
+$ du --block-size=1 one_byte.txt b100.bin b4096.bin b4097.bin b1m.bin
+1024     one_byte.txt
+1024     b100.bin
+4096     b4096.bin
+8192     b4097.bin
+1048576  b1m.bin</code></pre>
+
+                    <p>가장 눈여겨볼 줄은 <code>b4097.bin</code> 이다. 논리 크기 <strong>4,097 바이트</strong>에 실제 할당은 <strong>8,192 바이트</strong>다. 블록 경계를 한 바이트 넘겼다는 이유로 4,096 바이트가 통째로 더 붙었다. 4,096 바이트 파일은 정확히 4,096 을 쓰는데 말이다.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>논리 크기</th><th>실제 할당(측정)</th><th>낭비</th><th>배수</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>1 B</td><td>1,024 B</td><td>1,023 B</td><td>1,024배</td></tr>
+                            <tr><td>100 B</td><td>1,024 B</td><td>924 B</td><td>약 10배</td></tr>
+                            <tr><td>4,096 B</td><td>4,096 B</td><td>0</td><td>1배</td></tr>
+                            <tr><td>4,097 B</td><td>8,192 B</td><td>4,095 B</td><td>약 2배</td></tr>
+                            <tr><td>1,048,576 B</td><td>1,048,576 B</td><td>0</td><td>1배</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>여기서 하나 정직하게 짚을 것이 있다. 1 바이트 파일의 할당이 4,096 이 아니라 <strong>1,024</strong> 로 나온 것은 NTFS 가 아주 작은 파일을 메타데이터 레코드 안에 함께 저장하기 때문이다. ext4 는 이 최적화를 기본으로 쓰지 않으므로 <strong>같은 실험에서 4,096 이 나올 것으로 예상되지만, 그 화면은 이 글에 없다.</strong> 반면 블록 경계에서 두 배로 뛰는 <code>b4097.bin</code> 의 동작은 블록 단위 할당을 쓰는 파일시스템에 공통이다.</p>
+
+                    <p>개수를 곱하면 어떻게 되는지도 재 봤다. 1 바이트 파일 2만 개다.</p>
+
+                    <pre><code>$ time ( for i in $(seq 1 20000); do printf 'x' &gt; "f$i"; done )
+real    0m25.766s
+
+$ ls -1 | wc -l
+20000
+
+$ du -sb --apparent-size .
+20000     .          # 논리 합계 = 20,000 바이트 (약 20KB)
+
+$ du -s --block-size=1 .
+24674304  .          # 실제 점유 = 24,674,304 바이트 (약 23.5MiB)</code></pre>
+
+                    <p>논리 20KB 가 실제로는 <strong>23.5MiB</strong> 를 차지한다. 약 <strong>1,233배</strong>다. 이 값에는 파일 자체의 할당분과 2만 개의 이름을 담느라 커진 디렉터리 구조가 함께 들어 있다. <strong>디렉터리도 공간을 쓴다</strong>는 사실이 여기서 눈에 보인다.</p>
+
+                    <ul>
+                        <li>ext4 에서 4KiB 블록으로 같은 일을 하면 산수는 이렇게 된다. <strong>1 바이트 파일 100만 개는 논리 1MB, 실제로는 4,096,000,000 바이트 즉 약 3.8GiB</strong> 다. 이 값은 <strong>측정이 아니라 블록 크기로 한 계산</strong>이며 디렉터리 구조는 뺀 값이다</li>
+                        <li>그래서 파일이 많은 자리에서는 <strong>용량과 inode 가 동시에</strong> 소진된다. 어느 쪽이 먼저 바닥나는지는 파일 크기 분포에 달렸다</li>
+                        <li>작은 파일을 묶어 하나로 만드는 것이 근본 대응이다. 로그는 회전 후 압축하고, 캐시는 만료를 걸고, 아카이브는 <strong>개별 파일이 아니라 묶음</strong>으로 보관한다</li>
+                    </ul>
+
+                    <h2 id="sec-9">무엇이 먹었는지 찾기 - du 관용구</h2>
+
+                    <p>마운트를 특정하고 용량 문제가 맞다는 것까지 확인했으면, 그다음은 위에서 아래로 좁혀 내려가는 일이다. 관용구는 하나면 충분하다.</p>
+
+                    <pre><code>$ du -h -x --max-depth=1 . | sort -h
+1.0K    ./deleted_open
+1.0K    ./demo2
+24M     ./tiny
+25M     .
+
+# 큰 것이 아래로 오므로 마지막 줄부터 읽는다.
+# 리눅스에서는 보통 이렇게 시작한다.
+$ sudo du -h -x --max-depth=1 / | sort -h</code></pre>
+
+                    <p>세 옵션이 각각 일을 한다. <code>--max-depth=1</code> 은 <strong>한 단계만</strong> 보여 준다. 깊이를 주지 않으면 수만 줄이 쏟아져 읽을 수 없다. <code>sort -h</code> 는 <code>24M</code> 같은 사람이 읽는 표기를 <strong>크기 순으로</strong> 정렬한다. 문자열 정렬로는 <code>9K</code> 가 <code>24M</code> 보다 뒤에 온다.</p>
+
+                    <p>그리고 <code>-x</code> 가 이 관용구의 핵심이다. <strong>다른 파일시스템으로 넘어가지 않게</strong> 막는 옵션이다. 이것을 빼고 <code>/</code> 부터 훑으면 마운트된 네트워크 저장소나 컨테이너 레이어까지 따라 들어가서, 시간은 몇 배로 걸리고 <strong>지금 찾는 파일시스템과 무관한 숫자가 결과에 섞인다</strong>.</p>
+
+                    <p>다만 여기서도 정직하게 적어 둘 것이 있다. 이 환경에서는 <code>-x</code> 가 실제로 무언가를 막는 장면을 만들지 못했다.</p>
+
+                    <pre><code>$ stat -c %d / /tmp .
+3927831023
+3927831023
+3927831023
+# 셋 다 같은 장치 ID -&gt; -x 가 멈출 경계가 애초에 없다.
+# 옵션이 받아들여지고 결과가 같다는 것까지만 확인했다.
+
+# 파일 개수로 좁히는 판 (inode 고갈일 때)
+$ find . -xdev -type f -printf '%h\n' | sort | uniq -c | sort -rn | head -5
+  20000 ./tiny
+      5 .
+      1 ./demo2
+      1 ./deleted_open</code></pre>
+
+                    <ul>
+                        <li><code>sort -h</code> 는 GNU 확장이다. 이 환경의 도움말에 <code>-h, --human-numeric-sort</code> 로 실재함을 확인했지만, <strong>BSD 계열이나 최소 컨테이너 이미지에는 없을 수 있다</strong>. 그때는 <code>du -k</code> 로 뽑아 <code>sort -n</code> 을 쓴다</li>
+                        <li><code>du --inodes</code> 는 크기가 아니라 <strong>항목 개수</strong>를 센다. inode 고갈일 때 위 관용구에서 <code>-h</code> 만 빼고 이것으로 바꾸면 그대로 쓸 수 있다</li>
+                        <li><code>find</code> 는 파일을 하나하나 훑으므로 <strong>파일이 많은 파일시스템에서 오래 걸린다</strong>. 운영 중 서버에서는 부하를 감안해 범위를 좁혀 시작한다</li>
+                        <li>결과가 <strong>합계와 맞지 않으면</strong> 원인 ②를 의심한다. <code>du</code> 로 아무리 더해도 <code>df</code> 의 사용량에 못 미치면 이름 없는 파일이 어딘가에 열려 있는 것이다</li>
+                    </ul>
+
+                    <h2 id="sec-10">진단 순서 - 네 단계</h2>
+
+                    <p>지금까지의 내용을 실행 순서로 접으면 네 단계다. 각 단계는 <strong>다음 단계로 갈지 말지를 결정</strong>하기 위해 있다. 순서를 지키는 이유는 앞 단계가 뒤 단계보다 압도적으로 싸기 때문이다.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>단계</th><th>무엇을 묻는가</th><th>명령</th><th>이렇게 나오면</th><th>다음</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>1</td><td>어느 마운트인가</td><td><code>df -h &lt;실패한 경로&gt;</code></td><td>그 줄의 Use% 가 낮다</td><td>다른 경로를 잘못 보고 있었다. 실패한 경로를 다시 확인</td></tr>
+                            <tr><td>2</td><td>용량인가 inode 인가</td><td><code>df -i &lt;실패한 경로&gt;</code></td><td>IUse% 만 100%</td><td>원인 ①. 파일이 몰린 디렉터리를 찾는다</td></tr>
+                            <tr><td>3</td><td><code>du</code> 와 어긋나는가</td><td><code>du -sh -x &lt;마운트&gt;</code> 를 <code>df</code> 와 대조</td><td><code>du</code> 합계가 훨씬 작다</td><td>원인 ②. 붙잡은 프로세스를 찾아 재시작</td></tr>
+                            <tr><td>4</td><td>무엇이 먹었나</td><td><code>du -h -x --max-depth=1 | sort -h</code></td><td>큰 항목이 특정된다</td><td>한 단계씩 내려가며 반복</td></tr>
+                            <tr><td>+</td><td>root 만 되는가</td><td>일반 계정과 root 로 각각 <code>touch</code></td><td>root 만 성공</td><td>원인 ③. 예약 블록을 확인</td></tr>
+                        </tbody>
+                    </table>
+
+                    <ul>
+                        <li>1단계와 2단계는 <strong>합쳐서 두 줄</strong>이고 부하가 사실상 없다. 그런데 이 둘만으로 끝나는 경우가 실제로 상당수다</li>
+                        <li>3단계를 건너뛰면 4단계에서 시간을 다 쓰고도 아무것도 못 찾는다. <strong>du 가 범인을 못 찾는 상황</strong>이 존재한다는 것을 아는 것이 이 표의 요점이다</li>
+                    </ul>
+
+                    <h2 id="sec-11">컨테이너와 클라우드에서 달라지는 것</h2>
+
+                    <p>같은 증상이 컨테이너 안에서는 더 헷갈린다. 컨테이너 안의 <code>df</code> 는 <strong>그 컨테이너가 보는 마운트</strong>를 답하는데, 실제로 찬 것은 호스트 노드의 디스크인 경우가 많다. 반대로 노드는 여유가 넘치는데 컨테이너의 쓰기 가능 레이어에 걸린 한도만 찬 경우도 있다. <strong>어느 쪽에서 df 를 쳤는지</strong>를 먼저 정해야 한다.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>상황</th><th>착각하기 쉬운 것</th><th>실제로 봐야 할 곳</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>이미지 레이어가 찼다</td><td>볼륨에 여유가 있으니 괜찮다</td><td>쓰기 가능 레이어는 볼륨과 <strong>다른 파일시스템</strong>이다</td></tr>
+                            <tr><td>중지된 컨테이너와 옛 이미지가 쌓였다</td><td>실행 중인 것만 세면 얼마 안 된다</td><td>중지된 컨테이너·미사용 이미지·빌드 캐시를 전부 합산</td></tr>
+                            <tr><td>컨테이너 로그가 무한히 자란다</td><td>애플리케이션이 로그를 안 남긴다</td><td>런타임이 표준 출력을 파일로 적재한다. 크기 상한 설정 확인</td></tr>
+                            <tr><td>클라우드 디스크를 늘렸는데 그대로다</td><td>콘솔에서 늘렸으니 끝났다</td><td>파티션과 파일시스템은 <strong>따로 늘려야 한다</strong></td></tr>
+                            <tr><td>노드의 inode 가 찼다</td><td>용량 그래프가 평평하니 문제없다</td><td>이미지 레이어는 작은 파일 덩어리다. inode 를 따로 감시</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>마지막 줄은 특히 자주 걸린다. <code>resize2fs</code> 문서는 <strong>이 프로그램은 파티션의 크기를 조작하지 않는다</strong>고 명시한다. 즉 블록 장치를 늘렸다면 파티션을 먼저 확장하고, 그다음에 파일시스템을 확장해야 한다. 이 두 단계를 하나로 착각하면 콘솔에서는 용량이 늘었는데 서버 안에서는 그대로인 상태가 된다.</p>
+
+                    <pre><code># 클라우드 디스크 확장 후 - 순서가 있다 (이 환경에서 실행하지 못했다)
+# ① 커널이 새 크기를 봤는지
+lsblk
+
+# ② 파티션 확장 (파티션을 쓰는 구성일 때만)
+sudo growpart /dev/sda 1
+
+# ③ 파일시스템 확장
+sudo resize2fs /dev/sda1        # ext2/3/4
+sudo xfs_growfs /               # XFS 는 마운트 지점을 준다
+
+# 컨테이너 쪽 - 무엇이 자리를 차지하는지 종류별 합계
+docker system df
+docker system df -v</code></pre>
+
+                    <ul>
+                        <li>오버레이 방식은 파일을 수정할 때 <strong>원본을 위쪽 레이어로 복사한 뒤</strong> 고친다. 큰 파일 한 줄을 고쳐도 그 파일 크기만큼 공간이 더 필요할 수 있다</li>
+                        <li>컨테이너 안에서 지운 파일은 <strong>아래 레이어에서 사라지지 않는다</strong>. 삭제 표시만 위에 얹히므로 이미지 크기는 줄지 않는다</li>
+                        <li>정리 명령은 편리한 만큼 위험하다. <strong>사용하지 않는 볼륨까지 함께 지우는 옵션</strong>이 있고, 그 볼륨에 데이터가 들어 있을 수 있다</li>
+                        <li>노드 전체가 찬 상황에서는 스케줄러가 <strong>파드를 다른 노드로 밀어낸다</strong>. 증상이 디스크가 아니라 재기동으로 먼저 나타나 원인이 늦게 잡힌다</li>
+                    </ul>
+
+                    <h2 id="sec-12">급할 때 - 지워도 되는 것과 안 되는 것</h2>
+
+                    <p>서비스가 멈춰 있으면 판단할 시간이 없다. 그래서 <strong>미리 정해 둔 목록</strong>이 필요하다. 다만 첫 수는 지우는 것이 아니다. <strong>붙잡힌 공간이 있는지 먼저 확인하는 것</strong>이 첫 수다. 원인 ②라면 무엇을 지워도 회수되지 않으므로, 확인 없이 지우기 시작하면 시간만 잃고 되돌릴 수 없는 삭제만 남는다.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>구분</th><th>대상</th><th>왜</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>비교적 안전</td><td>회전 후 압축된 옛 로그</td><td>이미 닫힌 파일이다. 보관 기간만 확인하면 된다</td></tr>
+                            <tr><td>비교적 안전</td><td>패키지 관리자 캐시</td><td>다시 내려받을 수 있다. 재설치 시간만 든다</td></tr>
+                            <tr><td>비교적 안전</td><td>빌드 산출물과 임시 디렉터리</td><td>재생성 가능. 단 <strong>진행 중인 빌드가 없는지</strong> 확인</td></tr>
+                            <tr><td>주의</td><td>코어 덤프</td><td>지워도 되지만 <strong>장애 원인 분석 자료</strong>다. 먼저 옮긴다</td></tr>
+                            <tr><td>절대 금지</td><td>지금 열려 있는 로그 본체</td><td>공간은 안 돌아오고 로그만 잃는다. 원인 ② 를 만든다</td></tr>
+                            <tr><td>절대 금지</td><td>데이터베이스 파일·잠금 파일·소켓</td><td>손상이나 기동 불능으로 이어진다</td></tr>
+                            <tr><td>절대 금지</td><td>내용을 모르는 디렉터리</td><td>급할수록 확인하지 않고 지운다. 되돌릴 수 없다</td></tr>
+                        </tbody>
+                    </table>
+
+                    <div class="callout">
+                        <strong>주의</strong> - <code>rm -rf</code> 는 확인을 묻지 않고 되돌릴 수 없다. 경로를 변수로 만들어 쓰면 <strong>변수가 비었을 때 최상위부터 지우는 사고</strong>가 난다. 실행 전에 같은 인자로 <code>ls -d</code> 를 먼저 돌려 대상을 눈으로 확인하는 습관이 값싸다. <code>truncate -s 0</code> 은 파일을 남긴 채 비우므로 열려 있는 로그에 쓸 수 있지만, <strong>내용은 그대로 사라진다</strong>. 옮길 값이 있으면 먼저 옮긴다.
+                    </div>
+
+                    <ul>
+                        <li>공간이 완전히 0 이면 <strong>지우는 작업 자체가 실패</strong>할 수 있다. 로그를 남기거나 임시 파일을 만드는 도구는 이때 동작하지 않는다</li>
+                        <li>그래서 <code>truncate -s 0</code> 이나 <code>: &gt; 파일</code> 처럼 <strong>새 파일을 만들지 않는 비우기</strong>가 이 상황에서 유용하다</li>
+                        <li>급한 불을 끈 뒤에는 반드시 원인을 되짚는다. <strong>지워서 해결됐다는 것은 왜 찼는지를 설명하지 않는다.</strong> 같은 일이 같은 주기로 돌아온다</li>
+                    </ul>
+
+                    <h2 id="sec-13">애초에 막는 법</h2>
+
+                    <p>이 증상은 감시 항목이 하나 빠져 있어서 생기는 경우가 많다. 용량은 거의 모든 곳에서 보고 있지만 <strong>inode 사용률은 기본 대시보드에 없는 일이 흔하다.</strong> 그래서 용량 그래프가 평평한 채로 장애가 난다.</p>
+
+                    <p>임계 초과 마운트만 뽑는 스니펫을 하나 만들어 돌려 봤는데, 여기서 <strong>흔한 관용구가 실제로 틀리는 장면</strong>이 나왔다. 기록해 둘 만한 실패라 그대로 옮긴다.</p>
+
+                    <pre><code># 흔히 쓰는 판 - 이 환경에서 오답을 냈다
+$ df -P | awk 'NR&gt;1 &amp;&amp; $5+0 &gt;= 80 {print $6, $5}'
+65% 347611880          # 값이 뒤집혀 나왔다
+
+# 이유 - 장치 이름에 공백이 있어 필드가 하나 밀렸다
+$ df -P | awk 'NR&gt;1 {print "NF=" NF "  $5=[" $5 "]  $6=[" $6 "]"}'
+NF=7  $5=[347583704]  $6=[65%]
+
+# 고친 판 - 필드를 세지 말고 지정해서 받는다
+$ df --output=pcent,target | awk 'NR&gt;1 &amp;&amp; $1+0 &gt;= 60 {print "DISK", $2, $1}'
+DISK / 65%
+
+$ df --output=ipcent,target | awk 'NR&gt;1 &amp;&amp; $1+0 &gt;= 60 {print "INODE", $2, $1}'
+(출력 없음 - 이 파일시스템이 inode 비율을 보고하지 않는다)</code></pre>
+
+                    <p><code>df -P</code> 의 출력을 필드 번호로 자르는 방식은 <strong>장치 이름이나 마운트 지점에 공백이 없다는 가정</strong> 위에 서 있다. 그 가정이 깨지면 조용히 다른 열을 읽고, 조건식은 그대로 참이 되어 <strong>틀린 경보가 정상처럼 나간다.</strong> <code>df --output=</code> 으로 필요한 열만 받으면 이 가정 자체가 필요 없어진다.</p>
+
+                    <ul>
+                        <li><strong>inode 사용률을 감시 항목에 추가한다.</strong> 용량과 같은 임계로 두면 충분하다. 없는 것보다 낫다는 수준이 아니라, 이 글의 원인 ①은 이것 하나로 전부 예방된다</li>
+                        <li>로그 회전은 <strong>보관 개수와 압축 여부</strong>를 같이 정한다. 개수만 크게 잡으면 용량은 괜찮은데 inode 가 찬다</li>
+                        <li>임시 파일에는 <strong>만료 정리</strong>를 건다. 세션과 캐시는 만드는 코드가 지우는 코드까지 갖고 있어야 한다</li>
+                        <li>컨테이너 로그에는 <strong>파일 크기 상한과 보관 개수</strong>를 명시한다. 기본값이 무제한인 구성이 흔하다</li>
+                        <li>경보는 <strong>남은 퍼센트가 아니라 남은 시간</strong>으로 보는 편이 낫다. 하루에 몇 GB 씩 늘고 있는지를 알면 언제 찰지를 계산할 수 있다</li>
+                    </ul>
+
+                    <h2 id="sec-14">정리</h2>
+
+                    <p><code>No space left on device</code> 는 진단이 아니라 진단의 시작이다. 그 뒤에는 최소 네 가지 사정이 있고, 어느 것인지에 따라 <strong>해야 할 일이 정반대</strong>가 된다. inode 가 찼으면 큰 파일을 찾아도 소용없고, 지워도 열려 있는 파일이 원인이면 더 지우는 것이 해가 된다.</p>
+
+                    <p>그래서 외울 것은 명령 목록이 아니라 순서다. 실패한 경로를 <code>df</code> 에 직접 주고, <code>df -i</code> 로 용량인지 개수인지 가르고, <code>du</code> 합계를 <code>df</code> 와 맞춰 보고, 그다음에야 무엇이 먹었는지 찾는다. <strong>세 번째 단계가 이 순서의 값어치</strong>다. 여기서 어긋남이 보이면 나머지 탐색이 전부 헛수고라는 것을 미리 알 수 있다.</p>
+
+                    <p>그리고 이 글에서 실제로 재 본 숫자 두 개는 기억해 둘 만하다. <strong>지운 1GiB 가 프로세스를 죽이기 전까지 16 블록만 돌아왔다</strong>는 것, 그리고 <strong>1 바이트 파일 2만 개가 23.5MiB 를 차지했다</strong>는 것이다. 둘 다 <code>df</code> 를 한 번만 보는 습관으로는 절대 보이지 않는 숫자다.</p>
+
+                    <h2 id="sec-15">확인하지 못한 것</h2>
+
+                    <ul>
+                        <li><strong>inode 가 실제로 고갈된 화면</strong>을 만들지 못했다. 이 환경의 NTFS 는 inode 수를 보고하지 않아 <code>df -i</code> 가 전부 <code>-</code> 로 나온다. IUse% 가 100퍼센트인 출력은 이 글에 없고, 대신 <strong>왜 빈칸이 나오는지</strong>를 <code>stat -f</code> 로 보였다</li>
+                        <li><strong><code>lsof +L1</code> 을 돌리지 못했다.</strong> 이 환경에 lsof 가 설치돼 있지 않다. 옵션의 의미는 문서에서 확인했고, 같은 목적의 <code>/proc/&lt;pid&gt;/fd</code> 쪽은 실제로 돌려 <code>(deleted)</code> 표시까지 확인했다</li>
+                        <li><strong><code>tune2fs</code>·<code>debugfs</code>·<code>resize2fs</code>·<code>xfs_growfs</code> 는 실행하지 못했다.</strong> ext4/XFS 전용 도구이고 이 환경에 대상 파일시스템이 없다. 예약 블록 비율 5퍼센트, XFS 의 <code>maxpct</code> 기본값, <code>resize2fs</code> 가 파티션을 건드리지 않는다는 점은 <strong>공식 man 문서에서 확인</strong>했다</li>
+                        <li><strong>ext4 에서 1 바이트 파일의 할당량</strong>을 직접 재지 못했다. 이 환경에서는 1,024 바이트로 나왔고 이는 NTFS 의 소형 파일 저장 방식 때문이다. 4KiB 블록 기준 계산값은 본문에 <strong>계산이라고 밝혀</strong> 적었다</li>
+                        <li><strong><code>du -x</code> 가 파일시스템 경계에서 멈추는 장면</strong>을 만들지 못했다. <code>/</code>·<code>/tmp</code>·작업 디렉터리의 장치 ID 가 모두 같아 넘어갈 경계가 없었다. 옵션이 받아들여진다는 것까지만 확인했다</li>
+                        <li><strong>btrfs 의 <code>df -i</code> 출력 형태</strong>는 확인하지 못했다. 커널 문서 기능 목록에 동적 inode 할당이 올라 있다는 사실만 확인했고, 그 숫자를 어떻게 읽어야 하는지는 이 글에서 다루지 않았다</li>
+                        <li><strong>컨테이너와 클라우드 절은 전부 미실행</strong>이다. 오버레이 동작, 정리 명령의 출력, 디스크 확장 절차 중 이 환경에서 돌린 것은 하나도 없다. 명령의 순서와 근거만 적었다</li>
+                    </ul>
+
+                    <h2 id="sec-16">참고 자료</h2>
+
+                    <ul>
+                        <li><a href="https://man7.org/linux/man-pages/man8/mke2fs.8.html" target="_blank" rel="noopener">mke2fs(8) - man7.org</a> - 예약 블록 기본값이 5퍼센트라는 것, 그리고 <code>-i</code> 의 bytes-per-inode 비율은 <strong>파일시스템 생성 후 바꿀 수 없다</strong>는 경고</li>
+                        <li><a href="https://man7.org/linux/man-pages/man8/tune2fs.8.html" target="_blank" rel="noopener">tune2fs(8) - man7.org</a> - <code>-m</code> 옵션 설명. 블록을 예약하는 두 가지 이유가 <strong>단편화 회피</strong>와 <strong>비특권 프로세스가 막힌 뒤에도 시스템 데몬이 계속 동작하게 하는 것</strong>이라고 적혀 있다</li>
+                        <li><a href="https://man7.org/linux/man-pages/man8/mkfs.xfs.8.html" target="_blank" rel="noopener">mkfs.xfs(8) - man7.org</a> - <code>maxpct</code> 의 뜻과 크기별 기본값(1TB 미만 25%, 50TB 미만 5%, 그 이상 1%), 그리고 이 값을 <code>xfs_growfs</code> 로 바꿀 수 있다는 설명</li>
+                        <li><a href="https://man7.org/linux/man-pages/man8/xfs_growfs.8.html" target="_blank" rel="noopener">xfs_growfs(8) - man7.org</a> - <code>-m</code> 으로 inode 로 할당 가능한 최대 비율을 새로 지정한다는 옵션 설명</li>
+                        <li><a href="https://man7.org/linux/man-pages/man8/lsof.8.html" target="_blank" rel="noopener">lsof(8) - man7.org</a> - <code>+L</code> 뒤에 숫자를 주면 링크 수가 그보다 작은 파일만 나열하며, <code>+L1</code> 형태는 <strong>이름이 지워진 채 열려 있는 파일</strong>을 고른다는 설명</li>
+                        <li><a href="https://man7.org/linux/man-pages/man8/resize2fs.8.html" target="_blank" rel="noopener">resize2fs(8) - man7.org</a> - <strong>이 프로그램은 파티션의 크기를 조작하지 않는다</strong>는 문장. 디스크를 늘린 뒤 파티션과 파일시스템을 따로 확장해야 하는 근거</li>
+                        <li><a href="https://docs.kernel.org/filesystems/btrfs.html" target="_blank" rel="noopener">BTRFS - The Linux Kernel documentation</a> - 기능 목록에 <strong>동적 inode 할당</strong>이 포함돼 있다는 것</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>이 글 공유하기</h3>
+                    <div class="social-share">
+                        <button id="kakao-share" class="share-btn kakao-btn"><img src="https://developers.kakao.com/assets/img/about/logos/kakaolink/kakaolink_btn_small.png" alt="카카오톡" loading="lazy" decoding="async" width="34" height="35">카카오톡</button>
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(트위터)</button>
+                        <button id="threads-share" class="share-btn threads-btn">쓰레드</button>
+                        <button id="link-copy" class="share-btn link-btn">링크 복사</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">목록으로 돌아가기</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">함께 쓰면 좋은 무료 도구</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/char_counter.html">글자수 세기</a></li>
+      <li><a href="../static/json_formatter.html">JSON 포맷터</a></li>
+      <li><a href="../static/regex_tester.html">정규식 테스트기</a></li>
+      <li><a href="../static/jwt_decoder.html">JWT 디코더·생성기 2026</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">전체 도구 보기 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">관련 글</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="git_credential_leak_prevention.html">원격 URL에 토큰이 박혀 있다 - git 자격증명이 새는 자리</a></li>
+      <li><a href="git_gitignore_already_tracked.html">.gitignore에 넣었는데 계속 올라간다 - 이미 추적 중인 파일</a></li>
+      <li><a href="git_bisect_practical.html">git bisect - 버그가 들어온 커밋을 이분 탐색으로 찾기</a></li>
+      <li><a href="git_undo_decision_guide.html">git 되돌리기 결정표 - reset·revert·restore·checkout 중 무엇을 쓸 것인가</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const kakaoShareBtn = document.getElementById('kakao-share');
+        if (kakaoShareBtn) {
+            kakaoShareBtn.addEventListener('click', function() {
+                if (!window.Kakao) return;
+                if (!window.Kakao.isInitialized()) window.Kakao.init('e06d0ee93e450a11bc6451d46e09cd88');
+                if (window.Kakao.Share) {
+                    window.Kakao.Share.sendDefault({
+                        objectType: 'feed',
+                        content: { title: document.title, description: document.querySelector('meta[name="description"]')?.content || '', imageUrl: 'https://braindetox.kr/site_logo.png', link: { mobileWebUrl: location.href, webUrl: location.href } },
+                        buttons: [{ title: '웹으로 보기', link: { mobileWebUrl: location.href, webUrl: location.href } }]
+                    });
+                }
+            });
+        }
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('링크가 복사되었습니다. 쓰레드 앱에 붙여넣기하여 공유하세요!');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('링크가 복사되었습니다!'); });
+    });
+    </script>
+</body>
+</html>

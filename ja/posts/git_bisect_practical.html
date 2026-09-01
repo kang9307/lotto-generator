@@ -1,0 +1,913 @@
+<!DOCTYPE html>
+<!--
+ * 技術ブログ記事テンプレート
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ja">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>git bisect - バグが入り込んだコミットを二分探索で見つける</title>
+    <meta name="description" content="コミット1,000個をテスト10回に絞り込む道具。bisect run の自動化と終了コードの規約、skip・terms・マージ履歴・判定スクリプトの設計まで、git 2.48.1 の環境で実際に動かした出力だけで整理した。">
+    <meta name="keywords" content="git bisect, git bisect run, git bisect skip, git bisect terms, git bisect reset, 二分探索, リグレッション, 終了コード 125, first-parent, git blame, 最小再現, 開発, インフラ, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/ja/posts/git_bisect_practical.html">
+
+    <meta property="og:title" content="git bisect - バグが入り込んだコミットを二分探索で見つける">
+    <meta property="og:description" content="コミット1,000個をテスト10回で。bisect run の自動化と終了コードの規約、skip・terms・マージ履歴まで実際の出力で。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/ja/posts/git_bisect_practical.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ja_JP">
+    <meta property="article:published_time" content="2026-09-01">
+    <meta property="article:section" content="開発・インフラ">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="git bisect - バグが入り込んだコミットを二分探索で見つける">
+    <meta name="twitter:description" content="コミット1,000個をテスト10回に絞る。実際に動かした出力と終了コードの規約。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "git bisect - バグが入り込んだコミットを二分探索で見つける",
+      "alternativeHeadline": "コミット1,000個をテスト10回で。bisect run の自動化と終了コードの規約を実際の出力で",
+      "datePublished": "2026-09-01",
+      "dateModified": "2026-09-01",
+      "inLanguage": "ja-JP",
+      "articleSection": "開発・インフラ",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "git bisect, git bisect run, git bisect skip, git bisect terms, 二分探索, リグレッション, 終了コード 125, first-parent, git blame, 最小再現",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/ja/posts/git_bisect_practical.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "git bisect はコミットが何個まで使えるのか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "テスト回数は範囲の大きさの対数で増えるため、範囲が大きくなっても負担はほとんど増えない。コミット1,000個のリポジトリを作り、674番目のコミットに不具合を仕込んで全区間を自動探索させると、判定スクリプトはちょうど10回実行される。コミットを2倍にしてもテストは1回増えるだけである。実際の限界はコミット数ではなく、テスト1回にかかる時間だ。同じ1,000コミットの探索で、判定が即座に終わる場合は全体が3.7秒であり、判定に2秒を入れると24.0秒になった。git 自体のコストはチェックアウト10回分だけで、残りはすべてテスト時間である。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "git bisect run の終了コードはどう決めるべきか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "0なら正常、125を除く1～127なら不具合あり、125は判定不能でスキップである。128以上だと探索そのものが中断される。落とし穴が二つある。第一に、Linux の timeout コマンドは時間切れになると124を返すが、この値は不具合ありの範囲に入る。テストが遅くて打ち切られたコミットが真犯人として指摘されうるので、タイムアウトは125に変換しておくほうが安全だ。第二に、スクリプトが126や127で終わると、git は初回に限り既知の正常コミットで同じコマンドをもう一度走らせ、そこでも同じコードが出ればスクリプト自体が実行不能だと判断して中断する。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "git bisect reset を忘れるとどうなるのか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "最後に検査したコミットで detached HEAD のまま残る。データが消えることはないが、その状態でコミットするとどのブランチにも属さない。git status を打つと、現在二分探索中であること、どのブランチから始めたか、reset で戻るようにという案内が一緒に出る。.git の中に BISECT_START、BISECT_LOG、BISECT_TERMS などのファイルと refs/bisect/ 以下の参照が残っていればセッションは生きており、reset を実行するとすべて消えて元のブランチに戻る。犯人コミットの上にそのまま留まりたければ reset に refs/bisect/bad を引数として渡す。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "途中にビルドが壊れて判定できないコミットがあるときはどうするのか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "そのコミットでは skip を使うか、自動化中なら判定スクリプトが125で終わるようにする。ただしスキップしたコミットが増えると答えが一つに絞られない。20コミットのリポジトリで不具合の前後4コミットをすべてスキップさせると、git はスキップされたコミットだけが残ったと知らせ、候補5個を並べてこれ以上進めないと終了した。したがってビルドが壊れる区間が広いリポジトリでは、判定スクリプトの中でビルド失敗時に125を返す定型句を使いつつ、候補が複数残る可能性を最初から見込んでおくほうがよい。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "git blame では駄目なのか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "二つのコマンドは別の問いに答える。blame はこの行を最後に触ったコミットは何かを述べ、bisect は動作がどの時点で変わったかを述べる。不具合が入った後にそのファイルのインデントだけを直したコミットがもう一つ入ると、blame はその書式コミットを指すが、bisect は依然として本当のリグレッションコミットを指す。実際にそういうリポジトリを作って確認すると、blame は書式コミットを、bisect はロジックを変えたコミットをそれぞれ指す。blame 側は空白無視オプションや無視するコミットを指定するオプションである程度補正できるが、問題が特定の行になく複数ファイルの組み合わせにある場合、blame はそもそも答えを出せない。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/git_bisect_practical.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/git_bisect_practical.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/git_bisect_practical.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/git_bisect_practical.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/git_bisect_practical.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "ホーム",
+      "item": "https://braindetox.kr/ja/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "開発・インフラ",
+      "item": "https://braindetox.kr/ja/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "git bisect - バグが入り込んだコミットを二分探索で見つける",
+      "item": "https://braindetox.kr/ja/posts/git_bisect_practical.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="git bisect - バグが入り込んだコミットを二分探索で見つける">
+                <meta itemprop="datePublished" content="2026-09-01">
+                <meta itemprop="dateModified" content="2026-09-01">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="git bisect, git bisect run, git bisect skip, git bisect terms, 二分探索, リグレッション, 終了コード 125, first-parent, git blame, 最小再現">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/ja/posts/git_bisect_practical.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">git bisect - バグが入り込んだコミットを二分探索で見つける</h1>
+                    <h2 class="post-subtitle">コミット1,000個をテスト10回で。bisect run の自動化と終了コードの規約、skip・terms・マージ履歴まで実際の出力で</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-01">2026年9月1日</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">開発・インフラ</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p><strong>前は動いていたのに今は動かない。</strong> この一文で始まる問題は、原因が分からないのではなく<em>どこ</em>を見ればよいのか分からないのだ。コードはどこかで変わっており、そのどこかは数百個のコミットの間にある。<code>git bisect</code> はその区間を半分ずつ切り込んでいく命令である。</p>
+
+                    <p>二分探索という発想そのものは別に扱ったことがある — <a href="ai_assisted_kernel_debugging.html">カーネルのバグはどう絞り込まれるのか</a>のほうがその話だ。この記事はその発想を<strong>git が実装しておいた命令</strong>だけに絞る。どんな引数を与え、どんな出力が出て、どこで間違えるのか、である。</p>
+
+                    <div class="callout">
+                        以下の出力はすべて <strong>git 2.48.1.windows.1</strong> · Windows 10 Pro (10.0.19045) · Git Bash(GNU bash 5.2.37, MSYS2) で実際に実行して得たものである。2026年9月時点。実験はすべて一時ディレクトリに新しく作ったリポジトリで行い、本文の <code>/tmp/demo</code> はその場所を指す中立的な名前である。他のプラットフォームやシェルで変わりうる箇所はその都度示した。
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>この記事で扱うこと</h3>
+                        <ol>
+                            <li><a href="#sec-1">何を解く道具なのか</a></li>
+                            <li><a href="#sec-2">実験用リポジトリを作る</a></li>
+                            <li><a href="#sec-3">基本の流れ - セッション一つを最後まで</a></li>
+                            <li><a href="#sec-4">コミット1,000個は本当にテスト10回なのか</a></li>
+                            <li><a href="#sec-5">テスト1回の時間が総時間を決める</a></li>
+                            <li><a href="#sec-6">bisect reset を忘れると起きること</a></li>
+                            <li><a href="#sec-7">bisect run - 人がいなくても最後まで回る</a></li>
+                            <li><a href="#sec-8">終了コードの規約</a></li>
+                            <li><a href="#sec-9">判定スクリプトをうまく書く方法</a></li>
+                            <li><a href="#sec-10">bisect skip - 判定できないコミット</a></li>
+                            <li><a href="#sec-11">bisect terms - good/bad が合わないとき</a></li>
+                            <li><a href="#sec-12">マージコミットが混じった履歴</a></li>
+                            <li><a href="#sec-13">犯人を見つけた後</a></li>
+                            <li><a href="#sec-14">git blame と何が違うのか</a></li>
+                            <li><a href="#sec-15">bisect が合わない場合</a></li>
+                            <li><a href="#sec-16">まとめ</a></li>
+                            <li><a href="#sec-17">確認できなかったこと</a></li>
+                            <li><a href="#sec-18">参考資料</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">何を解く道具なのか</h2>
+
+                    <p><code>git bisect</code> が答える問いは一つだ。<strong>今は失敗し以前は成功していたなら、その間のどのコミットで変わったのか。</strong> 正常だったコミット一つと壊れたコミット一つを教えるだけで、git がその間の中間コミットをチェックアウトしてくれ、人かスクリプトが判定し、また半分に減らす。</p>
+
+                    <p>ここで重要なのは<strong>犯人コミットの中身を知らなくてよい</strong>という点である。判定基準さえあればよい。性能のリグレッションでも、特定のログが出なくなったことでも、あるファイルが作られなくなったことでも、<em>はい/いいえで答えられるテスト</em>ならすべて対象だ。だからこの道具は、コードを読んで原因を推論するやり方とは性格が違う。推論ではなく<strong>測定</strong>である。</p>
+
+                    <ul>
+                        <li>必要なもの三つ — <strong>壊れたコミット</strong>(たいてい <code>HEAD</code>)、<strong>正常だったコミット</strong>(タグ・リリース・数か月前のコミット)、<strong>再現するテスト</strong></li>
+                        <li>なくてよいもの — 原因についての仮説。むしろ仮説があるとそちらばかり見て見落とす</li>
+                        <li>探索の対象は<strong>区間全体のコミット</strong>であってファイルの差分ではない。だから複数ファイルにまたがる相互作用の問題も捕まる</li>
+                        <li>結果はコミット一つである。そのコミットが大きければまた絞り込む必要があるが、履歴全体から一つのコミットまで減っただけでもたいてい局面が変わる</li>
+                    </ul>
+
+                    <h2 id="sec-2">実験用リポジトリを作る</h2>
+
+                    <p>説明だけでは掴めないので、リポジトリを一つ作ってから始める。コミット20個のものだ。<code>total.sh</code> は引数で受け取った数を足し、<code>check.sh</code> はその結果が合っていれば0で、違っていれば1で終わる。13番目のコミットで <code>total.sh</code> をインデックス走査に変えながら<strong>最後の引数を落とす不具合</strong>が入る。その後も無関係なコミットが七つ積み上がる。</p>
+
+                    <pre><code># /tmp/demo で
+git init -b main
+
+cat &gt; total.sh &lt;&lt;'EOF'
+#!/bin/bash
+sum=0
+for n in "$@"; do
+  sum=$(( sum + n ))
+done
+echo "$sum"
+EOF
+
+cat &gt; check.sh &lt;&lt;'EOF'
+#!/bin/bash
+out=$(bash ./total.sh 1 2 3 4)
+if [ "$out" = "10" ]; then
+  exit 0
+else
+  echo "expected 10, got $out"
+  exit 1
+fi
+EOF
+</code></pre>
+
+                    <p>出来上がった履歴と現在の状態はこうである。不具合は <code>c13</code> にあり、<code>HEAD</code> である <code>c20</code> でテストは失敗する。</p>
+
+                    <pre><code>$ git log --oneline
+f2ee06a c20: unrelated note 20
+5d4dea0 c19: unrelated note 19
+...
+f1fec3f c13: refactor total.sh to index-based loop
+4d711a9 c12: unrelated note 12
+...
+d6e191c c02: add check.sh
+a25093a c01: add total.sh
+
+$ bash ./check.sh; echo "exit=$?"
+expected 10, got 6
+exit=1
+</code></pre>
+
+                    <h2 id="sec-3">基本の流れ - セッション一つを最後まで</h2>
+
+                    <p>順序は四つだ。<code>bisect start</code> でセッションを開き、今が壊れていると <code>bisect bad</code> で伝え、正常だったコミットを <code>bisect good</code> で伝える。すると git が中間コミットをチェックアウトしてくれる。テストして <code>good</code>/<code>bad</code> を繰り返し、終わったら <code>bisect reset</code> で抜ける。</p>
+
+                    <p>正常な地点を <code>c02</code>、故障の地点を <code>c20</code> とすると候補は <code>c03</code> から <code>c20</code> まで<strong>18個</strong>である。以下がそのセッション全体だ。命令と出力を一つも省いていない。</p>
+
+                    <pre><code>$ git bisect start
+status: waiting for both good and bad commits
+
+$ git bisect bad
+status: waiting for good commit(s), bad commit known
+
+$ git bisect good d6e191c
+Bisecting: 8 revisions left to test after this (roughly 3 steps)
+[f9194e697f22b03a4aae2ef437dfc2497846eb63] c11: unrelated note 11
+
+$ bash ./check.sh ; echo $?
+0
+$ git bisect good
+Bisecting: 4 revisions left to test after this (roughly 2 steps)
+[d21c4cae515e9a7c0cfcacc38374c8b127273674] c15: unrelated note 15
+
+$ bash ./check.sh ; echo $?
+expected 10, got 6
+1
+$ git bisect bad
+Bisecting: 1 revision left to test after this (roughly 1 step)
+[f1fec3fe55804001fae21aaf7b18a6914483662a] c13: refactor total.sh to index-based loop
+
+$ bash ./check.sh ; echo $?
+expected 10, got 6
+1
+$ git bisect bad
+Bisecting: 0 revisions left to test after this (roughly 0 steps)
+[4d711a957c98da7528cf727b1db40974a3f9d199] c12: unrelated note 12
+
+$ bash ./check.sh ; echo $?
+0
+$ git bisect good
+f1fec3fe55804001fae21aaf7b18a6914483662a is the first bad commit
+commit f1fec3fe55804001fae21aaf7b18a6914483662a
+Author: demo &lt;demo@example.invalid&gt;
+Date:   Tue Sep 1 21:57:42 2026 +0900
+
+    c13: refactor total.sh to index-based loop
+
+ total.sh | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+</code></pre>
+
+                    <p>読み方の要領は <code>Bisecting:</code> の行だ。<strong>今回の判定を終えると何個残るか</strong>を教えてくれる。18個から8、4、1、0へ減り、テストは<strong>四回</strong>した。そして <code>bisect start</code> の後ろに引数を二つ付ければ <code>bad</code>・<code>good</code> の二行を省ける。順序は<strong>悪いほうが先</strong>である。</p>
+
+                    <pre><code>$ git bisect start f2ee06a d6e191c
+Bisecting: 8 revisions left to test after this (roughly 3 steps)
+[f9194e697f22b03a4aae2ef437dfc2497846eb63] c11: unrelated note 11
+</code></pre>
+
+                    <h2 id="sec-4">コミット1,000個は本当にテスト10回なのか</h2>
+
+                    <p>よく引用される計算が正しいのか測ってみるほうがよい。コミット1,000個のリポジトリを新しく作り、674番目のコミットで設定値を一つ壊してから、最初のコミットから <code>HEAD</code> まで全区間を自動探索させた。判定スクリプトが何回実行されたかを数えればよい。</p>
+
+                    <pre><code>$ git rev-list --count HEAD
+1000
+
+$ git bisect start HEAD $(git rev-list --max-parents=0 HEAD)
+$ git bisect run bash /tmp/bigtest.sh
+Bisecting: 249 revisions left to test after this (roughly 8 steps)
+Bisecting: 124 revisions left to test after this (roughly 7 steps)
+Bisecting: 62 revisions left to test after this (roughly 6 steps)
+...
+fe0dcdad953018ee006623208fdde398e98ea338 is the first bad commit
+    c0674
+bisect found first bad commit
+
+# 判定スクリプトが実行された回数
+10
+</code></pre>
+
+                    <p><strong>ちょうど10回</strong>である。最初のコミットを正常な地点としたので候補は999個であり、999を2で割り続ければ10回で1を下回る。ここで重要な性質は絶対回数ではなく<strong>増える速さ</strong>だ。コミットを2倍にしてもテストはきっかり1回しか増えない。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>候補コミット数</th><th>必要なテスト回数</th><th>備考</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>18</td><td>4</td><td>上の20コミットのリポジトリで実測</td></tr>
+                            <tr><td>999</td><td>10</td><td>1,000コミットのリポジトリで実測</td></tr>
+                            <tr><td>2,000</td><td>11</td><td>コミットが2倍でも1回しか増えない</td></tr>
+                            <tr><td>100,000</td><td>17</td><td>大規模リポジトリでも20回未満</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>表の下二行は実測ではなく同じ規則を延長した値である。要点は<strong>コミット数がボトルネックになることはほとんどない</strong>ということだ。</p>
+
+                    <h2 id="sec-5">テスト1回の時間が総時間を決める</h2>
+
+                    <p>ではボトルネックは何か。同じ1,000コミットの探索を二回回した。一度は判定が即座に終わるテストで、一度は <code>sleep 2</code> を入れてわざと遅くしたテストで行った。答えは同じで、テスト回数も同じだった。</p>
+
+                    <pre><code>--- 即座に終わるテスト、999コミット
+tests run: 10
+wall time: 3693 ms
+
+--- 同じ探索、テスト1回あたり2秒
+tests run: 10
+wall time: 24018 ms
+
+同じ答え? fe0dcdad... / fe0dcdad...
+</code></pre>
+
+                    <p>差の20.3秒は<strong>2秒 × 10回</strong>である。git が使った時間はチェックアウト10回分の3.7秒だけだった。つまり総所要はほぼすべてテスト時間であり、公式は単純だ。<strong>総時間 ≒ テスト1回の時間 × log₂(候補数)</strong>。</p>
+
+                    <p>だから bisect をかける前にテストを短くすることが実質的に最大の利益になる。テストスイート全体が5分なら10回で50分だが、問題を再現する最小ケースを作って30秒に減らせば5分になる。<strong>最小再現を先に作れという助言は定性的な勧めではなく10倍差の算数</strong>である。</p>
+
+                    <ul>
+                        <li>スイート全体の代わりに<strong>失敗するテスト一つ</strong>だけを回す。フレームワークの大半が単一ケースの指定に対応している</li>
+                        <li>ビルドが必要ならインクリメンタルビルドが効くようにする。毎回フルリビルドがかかるとその時間がそのまま10倍になる</li>
+                        <li>ネットワークや外部サービスに依存する部分は切り離す。遅いことも問題だが<strong>間欠的に失敗すると答えが間違う</strong></li>
+                        <li>区間を狭められるなら狭める。候補を999個から60個に減らせばテストは10回から6回に減る</li>
+                    </ul>
+
+                    <h2 id="sec-6">bisect reset を忘れると起きること</h2>
+
+                    <p>犯人を見つけた直後の状態をそのままにしておくと <strong>detached HEAD</strong> のまま残る。最後に検査したコミットの上に立っており、どのブランチにも付いていない。幸い git が親切に知らせてくれる。</p>
+
+                    <pre><code>$ git status
+HEAD detached at 4d711a9
+You are currently bisecting, started from branch 'main'.
+  (use "git bisect reset" to get back to the original branch)
+
+nothing to commit, working tree clean
+
+$ ls .git | grep -i bisect
+BISECT_ANCESTORS_OK
+BISECT_EXPECTED_REV
+BISECT_LOG
+BISECT_NAMES
+BISECT_START
+BISECT_TERMS
+
+$ ls .git/refs/bisect
+bad
+good-d6e191c941eb0f49e6ad6b88f546215ef538eecf
+</code></pre>
+
+                    <p>ここで何気なくコードを直してコミットすると、そのコミットはどのブランチにも属さない。後で <code>reflog</code> で探すことはできるが、経験する必要のない出来事だ。セッションが生きているか確認する最も速い方法は上のように <code>.git</code> の中に <code>BISECT_*</code> ファイルがあるか見ることで、<code>reset</code> すればすべて消える。</p>
+
+                    <pre><code>$ git bisect reset
+Previous HEAD position was 4d711a9 c12: unrelated note 12
+Switched to branch 'main'
+
+# 犯人コミットにそのまま留まりたいとき
+$ git bisect reset refs/bisect/bad
+HEAD is now at f1fec3f c13: refactor total.sh to index-based loop
+
+# 今のコミットから動かずセッションだけ片づける
+$ git bisect reset HEAD
+</code></pre>
+
+                    <p>付け加えると、<strong>作業ツリーが汚れているとセッションは始まらない。</strong> 修正中のファイルをコミットするか <code>stash</code> で片づける必要がある。実際にこう終わる。</p>
+
+                    <pre><code>$ git status --short
+ M total.sh
+
+$ git bisect start f2ee06a d6e191c
+Bisecting: 8 revisions left to test after this (roughly 3 steps)
+error: Your local changes to the following files would be overwritten by checkout:
+	total.sh
+Please commit your changes or stash them before you switch branches.
+Aborting
+</code></pre>
+
+                    <h2 id="sec-7">bisect run - 人がいなくても最後まで回る</h2>
+
+                    <p>ここからがこの命令の本体である。判定をスクリプトに渡せば <code>git bisect run</code> がチェックアウトと判定と次の選択を自分で繰り返す。前のセッションとまったく同じリポジトリで、人の介入なしに一行で終わる。</p>
+
+                    <pre><code>$ git bisect start f2ee06a d6e191c
+Bisecting: 8 revisions left to test after this (roughly 3 steps)
+[f9194e697f22b03a4aae2ef437dfc2497846eb63] c11: unrelated note 11
+
+$ git bisect run bash ./check.sh
+running 'bash' './check.sh'
+Bisecting: 4 revisions left to test after this (roughly 2 steps)
+[d21c4cae515e9a7c0cfcacc38374c8b127273674] c15: unrelated note 15
+running 'bash' './check.sh'
+expected 10, got 6
+Bisecting: 1 revision left to test after this (roughly 1 step)
+[f1fec3fe55804001fae21aaf7b18a6914483662a] c13: refactor total.sh to index-based loop
+running 'bash' './check.sh'
+expected 10, got 6
+Bisecting: 0 revisions left to test after this (roughly 0 steps)
+[4d711a957c98da7528cf727b1db40974a3f9d199] c12: unrelated note 12
+running 'bash' './check.sh'
+f1fec3fe55804001fae21aaf7b18a6914483662a is the first bad commit
+commit f1fec3fe55804001fae21aaf7b18a6914483662a
+Author: demo &lt;demo@example.invalid&gt;
+Date:   Tue Sep 1 21:57:42 2026 +0900
+
+    c13: refactor total.sh to index-based loop
+
+ total.sh | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+bisect found first bad commit
+</code></pre>
+
+                    <p>手動セッションとまったく同じコミットを指し、人が打った命令は二行だ。<code>run</code> の後ろにはどんな命令でも来られる — <code>make</code>、<code>npm test</code>、<code>pytest -k some_case</code>、自作のシェルスクリプトすべて可能である。引数を付けてもよく、スクリプトのパスは<strong>チェックアウトされるリポジトリの外</strong>に置くほうが安全だ。リポジトリの中に置くと古いコミットにはそのファイルがないことがある。</p>
+
+                    <h2 id="sec-8">終了コードの規約</h2>
+
+                    <p>自動化のすべては<strong>終了コード</strong>である。規約を取り違えると静かに間違ったコミットを指す。スクリプトを各コードに固定して回してみた結果をまとめるとこうなる。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>終了コード</th><th>git の解釈</th><th>実際に出たもの</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>0</code></td><td>正常(good/old)</td><td>すべて正常と表示され、悪い端点そのものを犯人として指した</td></tr>
+                            <tr><td><code>1</code> ~ <code>124</code>, <code>126</code>, <code>127</code></td><td>不具合(bad/new)</td><td><code>1</code>・<code>2</code>・<code>124</code> は同じ挙動。区間の先頭コミットを犯人として指す</td></tr>
+                            <tr><td><code>125</code></td><td>判定不能 - スキップ</td><td>すべてスキップすると <code>We cannot bisect more!</code> の後に <code>bisect run cannot continue any more</code></td></tr>
+                            <tr><td><code>126</code> · <code>127</code> (初回)</td><td>スクリプト実行失敗の疑い</td><td>正常コミットで再試行した後 <code>bogus exit code 127 for good revision</code> で中断</td></tr>
+                            <tr><td><code>128</code> 以上</td><td>探索中断</td><td><code>bisect run failed: exit code 128 ... is &lt; 0 or &gt;= 128</code></td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>文書上の規約は「0なら正常、125を除く1～127なら不具合、それ以外のコードは中断」である。ところが <code>126</code>・<code>127</code> を実際に回してみると文書よりもう一枚ある。この二つの値は POSIX シェルが<em>実行不能</em>・<em>コマンドが見つからない</em>に使う値なので、git は<strong>初回に限り</strong>既知の正常コミットへチェックアウトして同じ命令をもう一度回してみる。そこでも同じコードが出れば、スクリプト自体が間違っていると見て止まる。</p>
+
+                    <pre><code>$ git bisect run bash /tmp/rc.sh      # スクリプトが常に127で終わる
+running 'bash' '/tmp/rc.sh'
+[d6e191c941eb0f49e6ad6b88f546215ef538eecf] c02: add check.sh
+running 'bash' '/tmp/rc.sh'
+error: bogus exit code 127 for good revision
+[f9194e697f22b03a4aae2ef437dfc2497846eb63] c11: unrelated note 11
+</code></pre>
+
+                    <p>真ん中の行で正常コミット <code>c02</code> へ移ってから元に戻った痕跡が見える。この安全装置のおかげで<strong>スクリプトのパスの打ち間違いで全区間が不具合と表示される事故</strong>はおおむね防げる。逆にこのメッセージが出たらコードを疑うのではなく、スクリプトが実行可能かどうかから見る。</p>
+
+                    <p>最も危険な値は <code>124</code> だ。テストにタイムアウトをかけたときに出る値だが、規約上は<strong>不具合あり</strong>と読まれる。</p>
+
+                    <pre><code>$ timeout 1 sleep 5 ; echo $?
+124
+</code></pre>
+
+                    <p>つまり<strong>遅くて打ち切られたコミットと本当に失敗したコミットが区別されない。</strong> タイムアウトを使うならその値を判定不能に変えておくほうが正確である。</p>
+
+                    <h2 id="sec-9">判定スクリプトをうまく書く方法</h2>
+
+                    <p>第一の規則は<strong>再現するテストでなければならない</strong>ということだ。二分探索は各判定を真実として信じ、その半分をまるごと捨てる。判定が一度でも間違えば捨てられた半分の中に犯人がいることがあり、そのとき探索は誤りを知らせない。<strong>もっともらしいコミット一つを自信たっぷりに差し出す。</strong></p>
+
+                    <p>確かめるため、30%の確率で偽の失敗を出すテストを作って同じリポジトリで五回回した。正解は <code>c13</code>(<code>f1fec3f</code>) である。</p>
+
+                    <pre><code>--- 間欠的に失敗するテスト、5回
+round 1  f1fec3f...  (正しい)
+round 2  f1fec3f...  (正しい)
+round 3  f1fec3f...  (正しい)
+round 4  f1fec3f...  (正しい)
+round 5  9dc5458...  (c08 - 誤り)
+
+--- 決定的なテスト、3回
+f1fec3f...  f1fec3f...  f1fec3f...
+</code></pre>
+
+                    <p>五回のうち一回がまったく別のコミットを指した。しかもその出力だけを見ても間違いだという印はどこにもない。間欠的な失敗が疑われるなら、判定を<strong>何度も繰り返して一度でも失敗したら不具合</strong>として扱うほうがよい。</p>
+
+                    <p>第二は<strong>副作用の片づけ</strong>だ。bisect はコミットを行き来するだけなので、追跡されないファイルはそのまま残る。古いビルド成果物が残っていると次のコミットの判定が汚染される。</p>
+
+                    <pre><code>$ echo "stale artifact" &gt; build.out    # 追跡されない成果物
+$ git bisect good                       # 別のコミットへ移動
+$ cat build.out
+stale artifact
+</code></pre>
+
+                    <p>実務で使える骨格はこうである。ビルド失敗は <code>125</code>、タイムアウトも <code>125</code>、それ以外はテスト結果をそのまま返す。</p>
+
+                    <pre><code>#!/bin/bash
+# /tmp/judge.sh - リポジトリの外に置く
+set -u
+
+rm -rf ./build            # 前回の成果物を片づける
+make clean &gt;/dev/null 2&gt;&amp;1
+
+if ! make &gt;/dev/null 2&gt;&amp;1; then
+  exit 125                # ビルド不可 - 判定せずスキップする
+fi
+
+timeout 60 ./run_one_test.sh
+rc=$?
+if [ "$rc" -eq 124 ]; then
+  exit 125                # タイムアウトを不具合と誤解しないように
+fi
+exit "$rc"
+</code></pre>
+
+                    <ul>
+                        <li>スクリプトは<strong>リポジトリの外</strong>に置く。古いコミットにはそのファイルがない</li>
+                        <li>終了コードを<strong>明示的に</strong>扱う。最後の命令のコードが漏れ出ると意図と変わる</li>
+                        <li>成果物・キャッシュ・一時ファイルは毎回片づける。残ると次の判定が汚染される</li>
+                        <li>標準出力は減らしてよいが<strong>失敗理由の一行</strong>は残す。後からログだけを見て判断することになる</li>
+                        <li>まず<strong>両端点で手で回してみる。</strong> 悪い端点で失敗し、良い端点で成功してこそ探索が成立する</li>
+                    </ul>
+
+                    <h2 id="sec-10">bisect skip - 判定できないコミット</h2>
+
+                    <p>区間の中にビルドが壊れたコミットがあると判定できない。そういうときに <code>git bisect skip</code> を使えば、git が近くの別のコミットを代わりに選んでくれる。自動実行中ならスクリプトが <code>125</code> で終われば同じ意味になる。</p>
+
+                    <p>ただしスキップしたコミットが<strong>答えの近くに固まると</strong>結果が一つに絞られない。不具合の前後4コミット(<code>c11</code>～<code>c14</code>)をすべてスキップさせて回した結果だ。</p>
+
+                    <pre><code>$ git bisect run bash /tmp/skipper.sh
+...
+There are only 'skip'ped commits left to test.
+The first bad commit could be any of:
+4d711a957c98da7528cf727b1db40974a3f9d199
+f1fec3fe55804001fae21aaf7b18a6914483662a
+71ed7e0a93f0b4029ba06d2d3cb95e019f141bb1
+f9194e697f22b03a4aae2ef437dfc2497846eb63
+d21c4cae515e9a7c0cfcacc38374c8b127273674
+We cannot bisect more!
+error: bisect run cannot continue any more
+</code></pre>
+
+                    <p>失敗と見るようなことではない。コミット18個が<strong>候補5個</strong>に減り、その五つは手で見られる量だ。使えない区間をあらかじめ知っているなら、範囲表記で一度に外すこともできる。</p>
+
+                    <pre><code>$ git bisect skip c10..c14
+Bisecting: 8 revisions left to test after this (roughly 3 steps)
+
+$ git bisect log | grep skip
+git bisect skip 71ed7e0a...   # c14
+git bisect skip f1fec3fe...   # c13
+git bisect skip 4d711a95...   # c12
+git bisect skip f9194e69...   # c11
+</code></pre>
+
+                    <p>ここで引っかかりやすい箇所 — <code>c10..c14</code> は <strong>c10 の次から c14 まで</strong>である。始点そのものは外れる。始点まで外すには <code>git bisect skip c10 c10..c14</code> のように別に書いてやる。</p>
+
+                    <h2 id="sec-11">bisect terms - good/bad が合わないとき</h2>
+
+                    <p>探すものが常にバグとは限らない。性能がよくなった時点や、ある機能が最初に入った時点を探すとき、「悪いコミット」という言い方は方向を混乱させる。このとき用語を変えられる。組み込みの別名 <code>old</code>/<code>new</code> があり、自分で名付けることもできる。</p>
+
+                    <pre><code>$ git bisect start --term-old=works --term-new=broken
+status: waiting for both good and bad commits
+
+$ git bisect broken f2ee06a
+status: waiting for good commit(s), bad commit known
+
+$ git bisect works d6e191c
+Bisecting: 8 revisions left to test after this (roughly 3 steps)
+[f9194e697f22b03a4aae2ef437dfc2497846eb63] c11: unrelated note 11
+
+$ git bisect terms
+Your current terms are works for the old state
+and broken for the new state.
+
+$ git bisect run bash ./check.sh
+...
+f1fec3fe55804001fae21aaf7b18a6914483662a is the first broken commit
+bisect found first bad commit
+</code></pre>
+
+                    <p>結果の行が <code>first broken commit</code> に変わった。最後の要約行だけは依然として <code>first bad commit</code> であり、スクリプトで出力をパースするつもりなら知っておく価値のある違いだ。セッションの途中で今の用語が何か忘れたら <code>git bisect terms</code> で確認する。</p>
+
+                    <ul>
+                        <li><strong>バグを探すとき</strong> — 既定の <code>good</code>/<code>bad</code> で十分だ</li>
+                        <li><strong>修正が入った時点を探すとき</strong> — <code>old</code>/<code>new</code>。「悪いコミット」と呼ばなくてよい</li>
+                        <li><strong>性能のリグレッション</strong> — <code>--term-old=fast --term-new=slow</code> のように名付けておくと判定のとき混乱しない</li>
+                        <li>用語を変えてもアルゴリズムは同じだ。<strong>言い方だけが変わる</strong></li>
+                    </ul>
+
+                    <h2 id="sec-12">マージコミットが混じった履歴</h2>
+
+                    <p>既定の動作で bisect は<strong>マージコミットも、枝の中のコミットもすべて候補と見る。</strong> 不具合が機能ブランチの中で入り、そのブランチが後でマージされた履歴を作って確認した。</p>
+
+                    <pre><code>$ git log --oneline --graph --all
+* 1f5a5ab m7: mainline work
+* dc8284c m6: mainline work
+*   36edf65 m5: merge feature
+|\
+| * fa26dce f4: feature polish
+| * 9c3c4da f3: rewrite total.sh (THE BUG)
+| * 13a2a60 f2: feature work
+| * efe0833 f1: feature start
+* | 0481885 m4: mainline work
+|/
+* 87b692a m3: mainline work
+* 2606564 m2: mainline work
+* 342914a m1: base
+</code></pre>
+
+                    <p>同じリポジトリを二つの方式で探索すると答えが違って出る。どちらも正しい答えであり、問うている質問が違う。</p>
+
+                    <pre><code>--- 既定: 枝の中まで入る
+running 'bash' './check.sh'   (3回)
+9c3c4da9ba2ed3715032525e3699eeae971e583e is the first bad commit
+    f3: rewrite total.sh (THE BUG)
+
+--- --first-parent: 本流だけを見る
+$ git bisect start --first-parent HEAD 2606564
+running 'bash' './check.sh'   (3回)
+36edf65d0bd276c62c3fbae15ccab5a28196c39d is the first bad commit
+Merge: 0481885 fa26dce
+    m5: merge feature
+</code></pre>
+
+                    <p>既定の探索は<strong>不具合を書いたコミット</strong>である <code>f3</code> を、<code>--first-parent</code> は<strong>不具合が本流に入った地点</strong>であるマージコミット <code>m5</code> を指した。原因のコードを直すには前者が必要で、どのリリースから問題があったのかを知るには後者が必要である。</p>
+
+                    <p><code>--first-parent</code> が特に有用な場合がもう一つある。<strong>枝の途中のコミットがビルドすらできないリポジトリ</strong>だ。開発中は壊れたままコミットし、マージの直前に整える方式なら、既定の探索はその壊れたコミットで詰まり続ける。本流だけを見れば各コミットはおおむね無事である。</p>
+
+                    <h2 id="sec-13">犯人を見つけた後</h2>
+
+                    <p>コミット一つが出たなら半分は終わりだ。まずそのコミットが何を変えたのかを見る。</p>
+
+                    <pre><code>$ git show --stat f1fec3f
+ total.sh | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+$ git log -p -1 f1fec3f
+diff --git a/total.sh b/total.sh
+@@ -1,7 +1,11 @@
+ #!/bin/bash
++# refactor: iterate by index
+ sum=0
+-for n in "$@"; do
+-  sum=$(( sum + n ))
++i=1
++while [ "$i" -lt "$#" ]; do
++  eval "v=\${$i}"
++  sum=$(( sum + v ))
++  i=$(( i + 1 ))
+ done
+ echo "$sum"
+</code></pre>
+
+                    <p>ここでは一目で見える。<code>-lt</code> であるべきところが <code>-le</code> であるべきだったので、最後の引数が抜けた。ところが実務の犯人コミットはたいていこれほど小さくない。ファイルを数十個触ったコミットが出てきたら<strong>その中でまた絞り込む</strong>必要がある。bisect はコミット単位なので中には入れない。親から始めて、変更されたファイルを一つずつ載せながらテストする。</p>
+
+                    <pre><code>$ git show --stat HEAD
+ alpha.conf | 1 +
+ beta.conf  | 1 +
+ delta.conf | 1 +
+ gamma.conf | 2 +-
+ 4 files changed, 4 insertions(+), 1 deletion(-)
+
+$ git checkout HEAD~1            # 親へ移動
+$ for f in alpha.conf beta.conf delta.conf gamma.conf; do
+&gt;   git checkout main -- "$f"
+&gt;   bash ./check.sh; echo "  + $f -&gt; $?"
+&gt; done
+  + alpha.conf -&gt; 0
+  + beta.conf -&gt; 0
+  + delta.conf -&gt; 0
+  + gamma.conf -&gt; 1        &lt;-- ここで壊れる
+</code></pre>
+
+                    <p>ファイル一つに絞られ、そのファイルの差分だけを見ればよい。ファイルの中でも大きいなら、同じ要領を <code>git checkout -p</code> でハンク単位に適用すればよい。そして犯人コミットの上ですぐ作業したければ、先に見た <code>git bisect reset refs/bisect/bad</code> がその場所へ連れて行ってくれる。</p>
+
+                    <h2 id="sec-14">git blame と何が違うのか</h2>
+
+                    <p>どちらも「いつこうなったのか」に答えるように見えるが問いが違う。<strong><code>blame</code> はこの行を最後に触ったコミット</strong>を述べ、<strong><code>bisect</code> は動作が変わった時点</strong>を述べる。たいていは同じ場所を指すが、分かれる場合がよくある。</p>
+
+                    <p>不具合が <code>b3</code> で入り、その後 <code>b5</code> で同じファイルを<strong>インデントだけ</strong>直したリポジトリを作った。動作は <code>b3</code> 以降ずっと同じである。</p>
+
+                    <pre><code>$ git blame -- total.sh
+^4ff6d88 ... 2) sum=0
+75a65371 ... 3) i=1
+75a65371 ... 4) while [ "$i" -lt "$#" ]; do
+b44df25c ... 5)     eval "v=\${$i}"      &lt;-- b5(書式だけ直したコミット)
+b44df25c ... 6)     sum=$(( sum + v ))
+b44df25c ... 7)     i=$(( i + 1 ))
+
+$ git bisect run bash ./check.sh
+75a65371be49176fd1a34827c369875cd78e8a1e is the first bad commit
+    b3: switch to an index loop
+</code></pre>
+
+                    <p><code>blame</code> は核心の三行を書式コミット <code>b5</code> に返し、<code>bisect</code> はロジックを変えた <code>b3</code> を指した。blame 側も空白無視(<code>-w</code>)や特定コミットの除外(<code>--ignore-rev</code>)で補正でき、実際に両オプションとも <code>b3</code> に戻してくれる。この周辺のオプションは<a href="git_history_commands_guide_2026.html">もっと使うべき Git 履歴コマンド</a>のほうで別に扱った。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>状況</th><th>合う道具</th><th>理由</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>この行がなぜこう書かれたのか知りたい</td><td><code>git blame</code></td><td>行単位でコミットとメッセージをすぐくれる</td></tr>
+                            <tr><td>動作がいつから変わったのか分からない</td><td><code>git bisect</code></td><td>どの行が問題か知らなくてよい</td></tr>
+                            <tr><td>問題の箇所が複数ファイルの組み合わせだ</td><td><code>git bisect</code></td><td>blame は一行ずつしか答えられない</td></tr>
+                            <tr><td>この文字列がいつ消えたのか探す</td><td><code>git log -S</code></td><td>内容の変化でコミットを絞り込む</td></tr>
+                            <tr><td>犯人コミットが分かりその中を見たい</td><td><code>git show</code> · <code>log -p</code></td><td>bisect の結果を受けて続けて使う</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2 id="sec-15">bisect が合わない場合</h2>
+
+                    <p>すべてのリグレッションに使えるわけではない。合わない条件がいくつかはっきりある。</p>
+
+                    <ul>
+                        <li><strong>コミット単位でビルドが通らないリポジトリ</strong> — スキップするコミットが多くなりすぎると候補が複数のまま終わる。<code>--first-parent</code> で本流だけを見るか、リリースタグ同士でまず絞ってからその区間だけ精密に探索する</li>
+                        <li><strong>環境依存のバグ</strong> — ライブラリのバージョン・カーネル・コンテナイメージが変わって生じた問題はコードの履歴の中にない。このときはコードではなく<em>環境</em>を二分探索しなければならない</li>
+                        <li><strong>データ依存のバグ</strong> — 特定のレコードでしか再現しないなら、テストが再現可能になるようそのデータを先に固定する必要がある。本番データをそのまま使うと判定が揺れる</li>
+                        <li><strong>徐々に悪くなった問題</strong> — 性能が毎コミット1%ずつ悪くなったなら「変わった一つのコミット」が存在しない。閾値を決めて無理やり二分しても、その閾値が答えを決めるだけだ</li>
+                        <li><strong>すでに原因が分かっている問題</strong> — スタックトレースがファイルと行を指しているなら blame のほうがずっと速い。bisect は手がかりがないときの道具である</li>
+                        <li><strong>履歴がリベースで書き直された区間</strong> — コミットが実際にその順序でビルドされたことがなければ、中間のコミットがそもそも動作しないことがある</li>
+                    </ul>
+
+                    <p>Windows 利用者にだけ当てはまる落とし穴も一つある。bisect は <code>refs/bisect/good-&lt;40桁のハッシュ&gt;</code> という<strong>長い名前の参照</strong>を作る。リポジトリのパスが深いとこのパスが260文字の制限を超えてセッションが始まらない。パスの長さだけを変えながら確認した結果がこれである。</p>
+
+                    <pre><code>root=181  refpath=244  -&gt; 正常
+root=192  refpath=255  -&gt; 正常
+root=203  refpath=266  -&gt; error: update_ref failed for ref
+   'refs/bisect/good-27fe9984...': couldn't set
+   'refs/bisect/good-27fe9984...'
+</code></pre>
+
+                    <p>メッセージがパスの問題だと言ってくれないので原因を見つけにくい。<code>core.longpaths=true</code> を有効にしてもこの参照には効かなかった。リポジトリを浅いパスへ移すのが最も確実だった。Linux・macOS では出ない問題である。</p>
+
+                    <h2 id="sec-16">まとめ</h2>
+
+                    <p>まとめると実務で覚えることは多くない。悪いコミットと良いコミットを与え、判定をスクリプトに渡し、終わったら <code>reset</code> する。三行だ。</p>
+
+                    <pre><code>$ git bisect start &lt;悪いコミット&gt; &lt;良いコミット&gt;
+$ git bisect run /tmp/judge.sh
+$ git bisect reset
+</code></pre>
+
+                    <p>残りはすべて<strong>判定スクリプトの品質</strong>にかかっている。テストが再現しなければ答えが間違い、テストが遅ければその時間が10倍になり、終了コードを雑に流せばタイムアウトが不具合に化ける。探索アルゴリズムはすでに完成しており手を入れるところがない。人が用意する側は<strong>「動いた/動かなかった」を一度も間違えずに言ってくれるテスト</strong>一つだけである。</p>
+
+                    <p>だからこの命令を身につける実際の順序は文法ではない。問題に出会ったらまず<strong>両端点を手で確認</strong>し、テストを<strong>最小再現に減らし</strong>、それから <code>run</code> をかける。この順序を守れば、たいていのリグレッションはコーヒー一杯のうちにコミット一つまで絞られる。</p>
+
+                    <h2 id="sec-17">確認できなかったこと</h2>
+
+                    <ul>
+                        <li>すべての出力は <strong>Windows + Git Bash</strong> という一つの環境でのみ得た。Linux・macOS、そして <code>dash</code>・<code>zsh</code> のような他のシェルでメッセージの文言や終了コードの伝達が同じかは確認していない</li>
+                        <li>探索中断時に <code>git bisect run</code> <strong>自体</strong>がシェルへ返す値は一定ではなかった。スクリプトが128で終われば128、129で終われば127が出たが、規則は突き止められなかった。判断は終了コードではなくメッセージで行うほうが安全だ</li>
+                        <li><code>126</code>・<code>127</code> の再確認の挙動は<strong>観測した出力</strong>だけで書いた。git のソースで該当の処理を直接確認してはいない</li>
+                        <li>コミット1,000個の実測は<strong>合成リポジトリ</strong>である。ファイルが数万個ある大規模リポジトリではチェックアウトのコストが大きくなり、git 自体の時間の比重が変わりうる</li>
+                        <li><code>git bisect visualize</code> は <code>gitk</code> が必要で実行しなかった。<code>--no-checkout</code> は動作を確認したが<strong>ベアリポジトリ</strong>での動作は試していない</li>
+                        <li>長いパスの失敗で <code>core.longpaths</code> がなぜ効かないのかは<strong>原因を確認できなかった。</strong> 参照ファイルのパスとロックファイルのどちらが引っかかるのかも特定できなかった</li>
+                    </ul>
+
+                    <h2 id="sec-18">参考資料</h2>
+
+                    <ul>
+                        <li><a href="https://git-scm.com/docs/git-bisect" target="_blank" rel="noopener">git-bisect(1) - Git 公式ドキュメント</a> — サブコマンド全体の文法、終了コードの規約、<code>--first-parent</code>・<code>--no-checkout</code> の説明。この記事の規約の部分は Git 2.48.1 に同梱された同じドキュメントと突き合わせた</li>
+                        <li><a href="https://git-scm.com/docs/git-blame" target="_blank" rel="noopener">git-blame(1) - Git 公式ドキュメント</a> — <code>-w</code>・<code>--ignore-rev</code>・<code>--ignore-revs-file</code> など書式コミットを除外するオプション</li>
+                        <li><a href="https://git-scm.com/book/en/v2/Git-Tools-Debugging-with-Git" target="_blank" rel="noopener">Pro Git - Debugging with Git</a> — <code>blame</code> と <code>bisect</code> を並べた章。二つの道具の役割の分担についての標準的な説明</li>
+                        <li><a href="ai_assisted_kernel_debugging.html">カーネルのバグはどう絞り込まれるのか - 二分探索・最小再現・計測、そして道具の担当分</a> — 二分探索という戦略そのものと、最小再現を作る過程</li>
+                        <li><a href="git_history_commands_guide_2026.html">もっと使うべき Git 履歴コマンド - pickaxe・log -L・bisect・reflog</a> — <code>log -S</code>・<code>log -L</code>・<code>blame --ignore-rev</code>・<code>reflog</code> など隣接する命令をシナリオ別に整理した記事</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>この記事をシェア</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">スレッズ</button>
+                        <button id="link-copy" class="share-btn link-btn">リンクをコピー</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">一覧に戻る</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">一緒に使うと便利な無料ツール</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/code_image.html">コード画像ジェネレーター</a></li>
+      <li><a href="../static/char_counter.html">文字数カウント</a></li>
+      <li><a href="../static/json_formatter.html">JSON フォーマッター</a></li>
+      <li><a href="../static/regex_tester.html">正規表現テスター</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">すべてのツールを見る &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">関連記事</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="text_diff_whitespace_guide.html">空白だけ変わった diff を取り除く方法 - 本当の変更が埋もれないように</a></li>
+      <li><a href="agent_behavior_spec.html">長く走るエージェントを何で採点するのか - 行動を仕様として書くという発想の実体</a></li>
+      <li><a href="vector_db_selection_criteria.html">ベクトル検索を何の上に載せるか - 既存の検索エンジンに載せる道と専用エンジンを立てる道</a></li>
+      <li><a href="bug_blindness.html">「元からそういうものです」はどこで作られるのか - 欠陥が背景に沈む過程と、もう一度見えるようにする方法</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('リンクがコピーされました。Threadsアプリに貼り付けてシェアしてください！');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('リンクがコピーされました！'); });
+    });
+    </script>
+</body>
+</html>
