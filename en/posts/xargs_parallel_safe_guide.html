@@ -1,0 +1,913 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="en">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>xargs -P Parallel Execution - Why Output Interleaves and How to Stop It</title>
+    <meta name="description" content="Parallel xargs scrambles output, and the culprit is the stdio buffer in front of the pipe, not PIPE_BUF. Measured: lines hold at 1023 bytes, break at 1024.">
+    <meta name="keywords" content="xargs, xargs -P, parallel execution, PIPE_BUF, stdbuf, interleaved output, shell scripting, GNU findutils, exit codes, idempotency, concurrency, dev, infra, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/en/posts/xargs_parallel_safe_guide.html">
+
+    <meta property="og:title" content="xargs -P Parallel Execution - Why Output Interleaves and How to Stop It">
+    <meta property="og:description" content="A 1023-byte line survives, a 1024-byte line breaks. What to look at before you reach for PIPE_BUF, measured by running it.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/en/posts/xargs_parallel_safe_guide.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="en_US">
+    <meta property="article:published_time" content="2026-09-01">
+    <meta property="article:section" content="Dev &amp; Infra">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Using xargs -P Without Scrambling Your Output">
+    <meta name="twitter:description" content="The cause is the buffer, not the pipe. Why the boundary sits at 1024 bytes.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "xargs -P Parallel Execution - Why Output Interleaves and How to Stop It",
+      "alternativeHeadline": "The boundary sits at 1024 bytes. The stdio buffer gets there before PIPE_BUF does",
+      "datePublished": "2026-09-01",
+      "dateModified": "2026-09-01",
+      "inLanguage": "en-US",
+      "articleSection": "Dev & Infra",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "xargs, xargs -P, parallel execution, PIPE_BUF, stdbuf, interleaved output, shell scripting, GNU findutils, exit codes, idempotency",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/en/posts/xargs_parallel_safe_guide.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "I added xargs -P but nothing runs in parallel. Why?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "-P only sets the maximum number of child processes allowed to run at once. How many children get created is decided by -n, -L and -I. If you give none of those, xargs packs as many arguments as the command-line buffer allows into a single invocation, so only one or two children ever appear, and then -P has nothing to run in parallel. Feeding 10,000 lines through -P8 with no -n produced exactly 4 child processes here; adding -n100 produced 100. When parallelism seems absent, counting invocations is faster than tuning -P."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Is PIPE_BUF the reason parallel output gets interleaved?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "In most cases the stdio buffer one layer above causes the damage first. PIPE_BUF is the kernel-side guarantee that a single write() call will not be split; how many write() calls a line takes is decided by the standard I/O library sitting on top. In these measurements a 1023-character line never broke, and breakage started the moment the line reached 1024 characters. That boundary matched the stdio buffer attached to the pipe, not the PIPE_BUF value. Once the buffer fills and flushes mid-line, the line goes out as two write() calls and another process slips in between them."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Does stdbuf fix interleaved output?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "It depends entirely on which mode you pick, and the two modes go in opposite directions. Line buffering with stdbuf -oL makes each line leave as exactly one write(), and across ten runs it produced zero broken lines. Turning buffering off with stdbuf -o0 made things dramatically worse: between 252 and 467 broken lines out of 800. With no buffer, the body and the newline go out as separate write() calls. One more limit worth knowing is that stdbuf does not apply to shell builtins. With a bash builtin printf as the worker, adding -oL did not change the measurement at all."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "What exit code does xargs return when a child fails?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Never the child's own code. If a child exits with anything from 1 to 125, xargs finishes the remaining work and then returns 123. If a child exits with 255, xargs stops right there and returns 124. A child killed by a signal gives 125, and a command that cannot be found gives 127. When a run under -P mixes a child exiting 1 with a child exiting 255, the abort wins and 124 is reported. The exit code never tells you which item failed, so it is better to have the worker record failed inputs to a file itself."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Should I just set -P to the number of cores?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "It depends on what the work is doing. Sixteen CPU-bound jobs on eight cores took 1.38 seconds at -P8, then 1.36 and 1.35 seconds at -P16 and -P32, which is flat within noise. Past the core count there is nothing left to gain. Thirty-two jobs that only wait went from 2.60 seconds at -P8 down to 1.80 seconds at -P16, so wait-dominated work keeps paying well beyond the core count. When the other side is an external API or shared storage, its limit is the real ceiling, and when a single job is shorter than the cost of creating a process, parallelism buys almost nothing."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/xargs_parallel_safe_guide.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/xargs_parallel_safe_guide.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/xargs_parallel_safe_guide.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/xargs_parallel_safe_guide.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/xargs_parallel_safe_guide.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "Home",
+      "item": "https://braindetox.kr/en/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "Dev & Infra",
+      "item": "https://braindetox.kr/en/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "xargs -P Parallel Execution - Why Output Interleaves and How to Stop It",
+      "item": "https://braindetox.kr/en/posts/xargs_parallel_safe_guide.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="xargs -P Parallel Execution - Why Output Interleaves and How to Stop It">
+                <meta itemprop="datePublished" content="2026-09-01">
+                <meta itemprop="dateModified" content="2026-09-01">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="xargs, xargs -P, parallel execution, PIPE_BUF, stdbuf, interleaved output, shell scripting, GNU findutils, exit codes, idempotency">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/en/posts/xargs_parallel_safe_guide.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">xargs -P Parallel Execution - Why Output Interleaves and How to Stop It</h1>
+                    <h2 class="post-subtitle">A 1023-character line survives, a 1024-character line breaks. What to look at before PIPE_BUF</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-01">2026-09-01</span>
+                        <span class="post-category" itemprop="articleSection">Dev &amp; Infra</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p><code>xargs -P</code> is the cheapest way to add parallelism. Drop one option into the middle of a pipeline and you are done, with nothing new to install. And then almost every time, the same thing happens. <strong>The log goes strange.</strong> Lines are cut in half, output from two jobs is welded together inside one line, and some lines look like they vanished entirely.</p>
+
+                    <p>The word that comes up most often to explain this is <code>PIPE_BUF</code>. It is not wrong, but reproduce it and <strong>the boundary where things start breaking does not match that value.</strong> This is a record of going and finding that boundary. Every example below is output from an actual run, pasted as it came.</p>
+
+                    <div class="callout">
+                        These results were measured on the single environment described below. Buffer sizes and atomicity boundaries vary with the C library implementation and the kernel, so <strong>do not carry these numbers over as constants for another environment.</strong> A minimal script for checking the same things yourself is included in the article.
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>What this article covers</h3>
+                        <ol>
+                            <li><a href="#sec-1">The environment this ran on</a></li>
+                            <li><a href="#sec-2">What -P actually does</a></li>
+                            <li><a href="#sec-3">Where -P buys you nothing</a></li>
+                            <li><a href="#sec-4">-n, -L and -I count different things</a></li>
+                            <li><a href="#sec-5">Finding the boundary where output breaks</a></li>
+                            <li><a href="#sec-6">How large can a single write() safely be</a></li>
+                            <li><a href="#sec-7">Pipes and files behave differently</a></li>
+                            <li><a href="#sec-8">Four ways to keep output intact</a></li>
+                            <li><a href="#sec-9">Unbroken is not the same as ordered</a></li>
+                            <li><a href="#sec-10">Exit codes - what keeps going and what stops</a></li>
+                            <li><a href="#sec-11">Filenames with spaces belong to the sibling article</a></li>
+                            <li><a href="#sec-12">Choosing the concurrency level</a></li>
+                            <li><a href="#sec-13">Before you reach for -P 0</a></li>
+                            <li><a href="#sec-14">What is left behind after an interrupt</a></li>
+                            <li><a href="#sec-15">Checking the same things on your own box</a></li>
+                            <li><a href="#sec-16">When to use something other than xargs -P</a></li>
+                            <li><a href="#sec-17">What I Could Not Verify</a></li>
+                            <li><a href="#sec-18">References</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">The environment this ran on</h2>
+
+                    <p>Every output below came from Git Bash on Windows 10, which means MSYS2. That matters. <strong>An MSYS2 pipe is not a Linux kernel pipe but an emulation layered on Windows</strong>, and as you will see later the atomicity boundary lands somewhere different from Linux. Every place that difference shows up is flagged.</p>
+
+                    <pre><code>$ bash --version | head -1
+GNU bash, version 5.2.37(1)-release (x86_64-pc-msys)
+
+$ xargs --version | head -1
+xargs (GNU findutils) 4.10.0
+
+$ uname -s
+MINGW64_NT-10.0-19045
+
+$ nproc
+8
+
+$ getconf PIPE_BUF /tmp
+4096</code></pre>
+
+                    <p>The tool is <strong>GNU findutils 4.10.0</strong>. <code>-P</code> is a GNU extension rather than POSIX, so BSD-family and busybox builds may behave differently. This box had no GNU parallel, no <code>flock</code> and no <code>make</code>, so for those tools I only describe <strong>what they do</strong>.</p>
+
+                    <h2 id="sec-2">What -P actually does</h2>
+
+                    <p><code>-P N</code> sets <strong>the maximum number of child processes allowed to be alive at once</strong>. Nothing more, nothing less. It says nothing about how the work gets split or how many children get created. Eight one-second jobs make that concrete.</p>
+
+                    <pre><code># 8 jobs, one second each. Serial:
+$ time (seq 1 8 | xargs -I{} sh -c 'sleep 1; echo done {}')
+real    0m9.448s
+
+# Same jobs, up to 4 at a time
+$ time (seq 1 8 | xargs -P4 -I{} sh -c 'sleep 1; echo done {}')
+real    0m2.517s</code></pre>
+
+                    <p>9.45 seconds became 2.52. Eight jobs split into two batches of four is a shade over two seconds in theory, and the remaining half second is what creating processes costs. The catch is that <strong>the conditions under which this picture holds are narrow</strong>.</p>
+
+                    <h2 id="sec-3">Where -P buys you nothing</h2>
+
+                    <p>By default <code>xargs</code> <strong>packs as many arguments as it can into a single invocation</strong>, pushing until it hits the command-line length limit. So unless you separately tell it to split, only one child is ever created, and no value of <code>-P</code> gives it anything to run in parallel.</p>
+
+                    <pre><code># -P8 alone, with no -n
+$ seq 1 8 | xargs -P8 sh -c 'echo "PID=$$ args=$*"; sleep 1' sh
+PID=1751 args=1 2 3 4 5 6 7 8
+real    0m1.233s
+
+# Add -n1 and it finally splits into 8
+$ seq 1 8 | xargs -P8 -n1 sh -c 'echo "PID=$$ args=$*"; sleep 1' sh
+PID=1755 args=1
+PID=1756 args=2
+PID=1757 args=3
+PID=1758 args=4
+PID=1759 args=5
+PID=1760 args=6
+PID=1761 args=7
+PID=1762 args=8
+real    0m1.543s
+
+# -n2 gives 4
+$ seq 1 8 | xargs -P8 -n2 sh -c 'echo "PID=$$ args=$*"; sleep 1' sh
+PID=1766 args=1 2
+PID=1767 args=3 4
+PID=1768 args=5 6
+PID=1769 args=7 8</code></pre>
+
+                    <p>The first run has exactly one PID. One child started and took all eight arguments. <code>-P8</code> did nothing at all. The bigger the input, the better this trap hides.</p>
+
+                    <pre><code># 10,000 inputs through -P8 with no -n. Count the children that actually started
+$ seq 1 10000 | xargs -P8 sh -c 'echo x' sh | wc -l
+4
+
+# With -n100
+$ seq 1 10000 | xargs -P8 -n100 sh -c 'echo x' sh | wc -l
+100
+
+$ xargs --show-limits &lt; /dev/null
+POSIX upper limit on argument length (this system): 23857
+Maximum length of command we could actually use: 17762
+Size of command buffer we are actually using: 23857
+Maximum parallelism (--max-procs must be no greater): 2147483647</code></pre>
+
+                    <p>Ten thousand items in, four children out. It was allowed up to eight but <strong>there were only four things to start.</strong> Raising <code>-P</code> when parallelism seems missing is usually wasted effort. Have each child print one line and count with <code>wc -l</code>, as above, and you have an answer in seconds.</p>
+
+                    <ul>
+                        <li><code>-P</code> is a ceiling, not a splitting instruction. <strong>Splitting is what <code>-n</code>, <code>-L</code> and <code>-I</code> do</strong></li>
+                        <li>With none of the three, arguments get packed until the command-line buffer fills. On this box that buffer was 23,857 bytes</li>
+                        <li>So when the input is small or the arguments are short, <strong>ending up with a single child is common</strong></li>
+                        <li>Conversely, reaching for <code>-n1</code> out of habit means that for light work <strong>creation cost eats the entire gain</strong></li>
+                        <li>Counting invocations is step one, before you touch <code>-P</code> at all</li>
+                    </ul>
+
+                    <h2 id="sec-4">-n, -L and -I count different things</h2>
+
+                    <p>All three split, but <strong>the unit they count differs.</strong> <code>-n</code> counts arguments, <code>-L</code> counts input lines, and <code>-I</code> drops a whole line into the replacement string. Input with two words per line makes the difference obvious.</p>
+
+                    <pre><code>$ printf 'a b\nc d\ne f\ng h\n' &gt; lines.txt
+
+$ xargs -n2 echo "batch:" &lt; lines.txt
+batch: a b
+batch: c d
+batch: e f
+batch: g h
+
+$ xargs -L2 echo "batch:" &lt; lines.txt
+batch: a b c d
+batch: e f g h
+
+$ xargs -I@ echo "batch: [@]" &lt; lines.txt
+batch: [a b]
+batch: [c d]
+batch: [e f]
+batch: [g h]
+
+$ xargs -n2 -I@ echo "batch: [@]" &lt; lines.txt
+xargs: warning: options --max-args and --replace/-I/-i are mutually exclusive,
+ignoring previous --max-args value
+batch: [a b]
+batch: [c d]
+batch: [e f]
+batch: [g h]</code></pre>
+
+                    <p>That last run matters. Give <code>-n</code> and <code>-I</code> together and <strong>it warns and throws <code>-n</code> away.</strong> The same happens with <code>-L</code> and <code>-I</code>, because <code>-I</code> pins processing to one line at a time. The commonly seen <code>xargs -n1 -P8 -I{}</code> combination is one where <code>-n1</code> is silently discarded.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Option</th><th>Unit counted</th><th>Character in parallel use</th><th>Cannot combine with</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>-n N</code></td><td>argument count</td><td>Groups N at a time, ignoring line boundaries. Use it to tune batch size and cut process creation cost</td><td><code>-I</code>, <code>-L</code></td></tr>
+                            <tr><td><code>-L N</code></td><td>input line count</td><td>Groups while respecting line boundaries. Safe when one line is one record</td><td><code>-I</code>, <code>-n</code></td></tr>
+                            <tr><td><code>-I R</code></td><td>a whole line</td><td>Inserts the whole line at position R. The only choice when argument position matters</td><td><code>-n</code>, <code>-L</code></td></tr>
+                            <tr><td>none of them</td><td>until the buffer fills</td><td>So few children get created that <code>-P</code> is powerless</td><td>-</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2 id="sec-5">Finding the boundary where output breaks</h2>
+
+                    <p>Now the main event. Interleaving is probabilistic, so <strong>one clean run does not mean you are safe.</strong> To make it reproducible, a machine has to be able to judge whether a line broke. Have each worker emit lines made of one repeated character and it becomes simple: any line containing two different characters is a broken line.</p>
+
+                    <pre><code>#!/usr/bin/env bash
+# mix.sh &lt;line length&gt;
+# 8 workers each print a line of L copies of their own character, 100 times.
+# Two different characters in one line means write() was split.
+export L=${1:-1500}
+printf '%s\n' a b c d e f g h |
+xargs -P8 -n1 bash -c '
+  line=$(printf "%${L}s" "" | tr " " "$1")
+  for i in $(seq 1 100); do printf "%s\n" "$line"; done
+' _</code></pre>
+
+                    <pre><code>#!/usr/bin/env bash
+# check.sh &lt;line length&gt; — read stdin and count the broken lines
+awk -v L="${1:-1500}" '
+  { total++
+    if (length($0) != L) { bad++; next }
+    f = substr($0,1,1)
+    for (i = 2; i &lt;= length($0); i++)
+      if (substr($0,i,1) != f) { bad++; break }
+  }
+  END { printf "%d lines, %d broken\n", total, bad+0 }'</code></pre>
+
+                    <p>Run it across a range of line lengths and the boundary is sharp.</p>
+
+                    <pre><code>$ for L in 200 1023 1024 1500 8000; do
+    printf "L=%-6s " "$L"; ./mix.sh "$L" | ./check.sh "$L"
+  done
+L=200    800 lines, 0 broken
+L=1023   800 lines, 0 broken
+L=1024   800 lines, 68 broken
+L=1500   800 lines, 216 broken
+L=8000   800 lines, 666 broken</code></pre>
+
+                    <p><strong>Nothing breaks up to 1023 characters, and breakage starts the instant the line hits 1024.</strong> That number does not match the 4096 that <code>getconf</code> reported for <code>PIPE_BUF</code>. Counting the newline, a 1024-character line is 1025 bytes. So the boundary is <strong>the point where a 1024-byte buffer fills and gets flushed once</strong>. It was not the kernel's pipe that cut the line first, but the standard I/O library above it.</p>
+
+                    <p>The sequence goes like this. Call <code>printf</code> and the characters do not go straight to the pipe; they <strong>pile up in a userspace buffer.</strong> When that buffer fills, <code>write()</code> is called once. If a line is longer than the buffer, it goes out in two or more pieces, and another process gets a gap to slip into. <code>PIPE_BUF</code> is the next story after that.</p>
+
+                    <h2 id="sec-6">How large can a single write() safely be</h2>
+
+                    <p>Which raises the question of what happens if you <strong>really do send it as one <code>write()</code></strong>. That means bypassing the buffer, so <code>dd</code> is the tool: it reads <code>bs</code> bytes and writes that chunk in one go.</p>
+
+                    <pre><code>#!/usr/bin/env bash
+# Send a pre-built line with dd as a single write(), skipping the stdio buffer.
+export L=${1:-8000}
+for ch in a b c d e f g h; do
+  printf "%${L}s" "" | tr ' ' "$ch"  &gt;  "line.$ch"
+  printf '\n'                        &gt;&gt; "line.$ch"
+done
+export SZ=$((L+1))
+printf '%s\n' a b c d e f g h |
+xargs -P8 -n1 bash -c '
+  for i in $(seq 1 40); do dd if="line.$1" bs=$SZ count=1 status=none; done
+' _</code></pre>
+
+                    <pre><code>L=8000    320 lines, 0 broken
+L=16000   320 lines, 0 broken
+L=32000   320 lines, 0 broken
+L=63000   320 lines, 0 broken
+L=65535   320 lines, 0 broken
+L=65536   320 lines, 277 broken
+L=200000  320 lines, 306 broken</code></pre>
+
+                    <p>Clean through 65,535 characters, falling apart at 65,536. Add the newline and <strong>the boundary is exactly 64 KiB</strong> — not the 4096 reported as <code>PIPE_BUF</code>. 64 KiB is how much this platform's pipe can hold, and a <code>write()</code> larger than that cannot land in one piece, so it blocks partway through and another process slips into the gap.</p>
+
+                    <p>Measurement and specification have to be kept apart here. <strong>What POSIX guarantees is only a <code>write()</code> of <code>PIPE_BUF</code> or less</strong>; anything larger may be split without violating the standard. The result above is an observation that this MSYS2 environment happens to be more generous than the spec requires, <strong>not a licence to exceed 4096 anywhere else.</strong> I did not run the same measurement on real Linux.</p>
+
+                    <ul>
+                        <li>The line you can safely lean on is <code>PIPE_BUF</code> or below — <strong>4096 bytes</strong> on this box, and a value you should check with <code>getconf</code> yourself</li>
+                        <li>But <strong>the stdio buffer cuts the line before you ever reach it.</strong> The measured boundary was 1024 bytes</li>
+                        <li>So the working criterion is not <code>PIPE_BUF</code> but <strong>「is each line leaving as a single <code>write()</code>」</strong></li>
+                        <li>Short lines satisfy both conditions for free. That is why keeping a log line under 200 characters pays off especially well under parallelism</li>
+                    </ul>
+
+                    <h2 id="sec-7">Pipes and files behave differently</h2>
+
+                    <p>The same command <strong>gives different results depending on whether output goes into a pipe or is redirected to a file.</strong> Five runs of each.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Line length</th><th>Into a pipe (broken lines out of 800, 5 runs)</th><th>Appended to a file with <code>&gt;&gt;</code> (5 runs)</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>1023 chars</td><td>0 · 0 · 0 · 0 · 0</td><td>0 · 0 · 0 · 0 · 0</td></tr>
+                            <tr><td>1024 chars</td><td>177 · 68 · 0 · 80 · 142</td><td>20 · 2 · 10 · 0 · 6</td></tr>
+                            <tr><td>1500 chars</td><td>226 · 124 · 300 · 250 · 153</td><td>0 · 0 · 0 · 2 · 0</td></tr>
+                            <tr><td>8000 chars</td><td>698 · 653 · 664 · 621 · 617</td><td>42 · 126 · 228 · 242 · 111</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>At 1500 characters the pipe loses 100 to 300 lines out of 800 while the file is nearly clean. The reason is the same as the previous section: <strong>the stdio buffer attached to a file is larger than the one attached to a pipe.</strong> On this box the file-side boundary sat near 4096 bytes, so a 1500-character line fits inside one <code>write()</code>. At 8000 the file gives way too.</p>
+
+                    <p><code>O_APPEND</code>, which <code>&gt;&gt;</code> opens with, guarantees that <strong>every <code>write()</code> lands at the end of the file</strong>. Two processes never overwrite each other's territory. But that is where the guarantee stops. <strong>If a line goes out in two pieces, nothing prevents another fragment from landing between them.</strong> The 8000-character row above is that result.</p>
+
+                    <p>The single zero the pipe recorded in the 1024 row is not something to wave off either. <strong>Five runs under identical conditions, and one came out clean.</strong> This is exactly why interleaving must not be filed away as 「cannot reproduce it, so there is no problem」.</p>
+
+                    <h2 id="sec-8">Four ways to keep output intact</h2>
+
+                    <p>There are broadly four remedies. I measured each, standardising on 1500-character lines — a length that reliably breaks in a pipe.</p>
+
+                    <h3>1. Give each worker its own file and merge afterwards</h3>
+
+                    <p>The surest one. Nothing contends over the same fd, so the atomicity problem disappears.</p>
+
+                    <pre><code># Each worker writes its own file, then they are concatenated in name order
+d=$(mktemp -d); export d
+printf '%s\n' a b c d e f g h |
+xargs -P8 -n1 bash -c '
+  line=$(printf "%1500s" "" | tr " " "$1")
+  for i in $(seq 1 100); do printf "%s\n" "$line"; done &gt; "$d/$1.out"
+' _
+cat "$d"/*.out
+rm -rf "$d"</code></pre>
+
+                    <p>Ten repetitions produced <strong>not a single broken line.</strong> The cost is one file per job, which gets awkward at tens of thousands of jobs. findutils 4.7 and later has an option for exactly this.</p>
+
+                    <pre><code># Create one file per concurrency slot rather than per job
+d=$(mktemp -d); export d
+printf '%s\n' a b c d e f g h |
+xargs -P4 -n1 --process-slot-var=SLOT bash -c '
+  line=$(printf "%1500s" "" | tr " " "$1")
+  for i in $(seq 1 100); do printf "%s\n" "$line"; done &gt;&gt; "$d/slot$SLOT.out"
+' _
+cat "$d"/*.out; rm -rf "$d"</code></pre>
+
+                    <p><code>--process-slot-var</code> hands each child a slot number from 0 up to just below the <code>-P</code> value, as an environment variable. Slots are reused as children finish, so the file count is pinned to the concurrency level. Zero broken lines across five runs.</p>
+
+                    <h3>2. Change the buffering with stdbuf</h3>
+
+                    <p>This is where the traps are thickest. With <code>awk</code> as the worker and only the buffering changed, ten runs each.</p>
+
+                    <pre><code>$ P='BEGIN{l=sprintf("%1500s",""); gsub(/ /,c,l); for(i=0;i&lt;100;i++) print l}'
+
+# As-is (awk default buffering)
+$ printf '%s\n' a b c d e f g h | xargs -P8 -I@ awk -v c=@ "$P" | ./check.sh 1500
+   6  0  18  0  3  9  9  0  9  6
+
+# Buffering off
+$ ... | xargs -P8 -I@ stdbuf -o0 awk -v c=@ "$P" | ./check.sh 1500
+   418  264  467  310  299  262  324  278  252  298
+
+# Line buffered
+$ ... | xargs -P8 -I@ stdbuf -oL awk -v c=@ "$P" | ./check.sh 1500
+   0  0  0  0  0  0  0  0  0  0</code></pre>
+
+                    <p><strong><code>stdbuf -o0</code> makes it dramatically worse.</strong> That runs against intuition. Turning off buffering sounds safe because output leaves immediately, but in practice the body and the newline <strong>go out as separate <code>write()</code> calls</strong>, opening the very gap you were trying to close. <code>-oL</code>, by contrast, sends each line in exactly one call, and all ten runs were zero.</p>
+
+                    <p>The limits are just as clear. <strong><code>stdbuf</code> does not apply to shell builtins.</strong> With a <code>bash</code> builtin <code>printf</code> as the worker I tried <code>-oL</code> and the numbers were no different from leaving it alone. It equally fails to reach programs that configure their own buffering.</p>
+
+                    <h3>3. Assemble one line and emit it once</h3>
+
+                    <p>Instead of dribbling out many lines, have the worker <strong>accumulate its result into a string and print once at the end</strong>; that is safe as long as the string stays under the buffer. Dropping the line length to 120 characters in the earlier measurement gave zero across all ten runs. The value here is that <strong>you control the line-length ceiling yourself.</strong> It is unusable when output volume cannot be predicted.</p>
+
+                    <h3>4. Hand it to a purpose-built tool</h3>
+
+                    <p>GNU parallel has <code>--line-buffer</code> and <code>--keep-order</code>. The first tidies child output into whole lines, the second makes results emerge in input order. <strong>GNU parallel was not installed on this box, so I could not verify the behaviour by running it.</strong> I note only that such a tool exists.</p>
+
+                    <p>Serialising output with <code>flock</code> is another commonly cited approach. This box had no <code>flock</code>, and <strong>not knowing that, I nearly recorded a result of 「0 broken lines」.</strong> Written as <code>flock 9 &amp;&amp; printf ...</code>, <code>flock</code> failed with 127, everything after <code>&amp;&amp;</code> never ran, and with zero lines of output there were of course zero broken lines. When measuring whether a remedy works, <strong>always check that the output line count matches what you expect.</strong></p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Remedy</th><th>Measured at 1500 chars</th><th>Cost</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Per-worker temp file, then merge</td><td>0 across 10 runs</td><td>One file per job. Needs cleanup code</td></tr>
+                            <tr><td><code>--process-slot-var</code> per-slot files</td><td>0 across 5 runs</td><td>findutils 4.7+. Order is scrambled within a slot</td></tr>
+                            <tr><td><code>stdbuf -oL</code></td><td>0 across 10 runs</td><td>No effect on builtins or self-buffering programs</td></tr>
+                            <tr><td><code>stdbuf -o0</code></td><td>252-467 (worse)</td><td>Do not use it</td></tr>
+                            <tr><td>Keep lines short (120 chars)</td><td>0 across 10 runs</td><td>Only where output volume is controllable</td></tr>
+                            <tr><td>Untouched (bash builtin printf)</td><td>320-505</td><td>-</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2 id="sec-9">Unbroken is not the same as ordered</h2>
+
+                    <p>Even with intact lines, <strong>ordering is a separate problem.</strong> Running in parallel means whatever finishes first comes out first, and when job durations vary the output order changes every time.</p>
+
+                    <pre><code># Input is 1 through 8, job durations are random
+$ seq 1 8 | xargs -P8 -n1 bash -c 'sleep 0.$((RANDOM%9)); printf "%s " "$1"' _
+4 7 6 3 1 8 2 5
+1 5 4 3 8 2 6 7
+3 6 1 4 8 2 7 5
+
+# Per-worker files merged in name order, always input order
+1 2 3 4 5 6 7 8
+1 2 3 4 5 6 7 8
+1 2 3 4 5 6 7 8</code></pre>
+
+                    <p>Three runs, three different orders. That is not a defect, it is the definition of parallelism. <strong>If you need order, you need a separate stage that produces it.</strong> Putting a sortable key in the filename and merging by name at the end, as above, is the simplest way, and the temp-file remedy from earlier doubles as an ordering guarantee.</p>
+
+                    <ul>
+                        <li>Name files with <strong>zero-padded numbers</strong> like <code>001</code> and <code>002</code> so that <code>*</code> expansion sorts them correctly in lexicographic order</li>
+                        <li>The price of order is that <strong>nothing can be emitted until the slowest job finishes.</strong> That conflicts with watching progress live</li>
+                        <li>If you need live progress, it is better to split them: <strong>progress logs to standard error, results to files</strong></li>
+                        <li>Ask first whether you really need order. If results get sorted later or looked up by key, there is no reason to pay for it</li>
+                    </ul>
+
+                    <h2 id="sec-10">Exit codes - what keeps going and what stops</h2>
+
+                    <p><code>xargs</code> does not stop when a child fails. Not knowing this leads to the accident where <strong>a batch that half failed gets reported as a success.</strong></p>
+
+                    <pre><code># One child exits 1 and the rest keep running
+$ seq 1 5 | xargs -P4 -n1 bash -c '[ "$1" = 3 ] &amp;&amp; { echo "FAIL $1" &gt;&amp;2; exit 1; }; echo "OK $1"' _
+OK 1
+OK 2
+FAIL 3
+OK 4
+OK 5
+$ echo $?
+123
+
+# exit 255 stops xargs itself
+$ seq 1 6 | xargs -n1 bash -c 'echo "run $1"; [ "$1" = 3 ] &amp;&amp; exit 255; exit 0' _
+run 1
+run 2
+run 3
+xargs: bash: exited with status 255; aborting
+$ echo $?
+124</code></pre>
+
+                    <p>In the second example items 4, 5 and 6 never started. <strong>255 is reserved as a 「stop now」 signal.</strong> If your job script happens to be written so that it can exit 255, the rest of the batch gets silently truncated.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>What happened to the child</th><th>xargs exit code</th><th>Remaining work</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>exited in the 1-125 range</td><td>123</td><td>Runs to the end</td></tr>
+                            <tr><td>exited with 255</td><td>124</td><td>Stops at once, with a message on standard error</td></tr>
+                            <tr><td>killed by a signal</td><td>125</td><td>Stops at once</td></tr>
+                            <tr><td>command not found</td><td>127</td><td>Stops at once</td></tr>
+                            <tr><td>all succeeded</td><td>0</td><td>-</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>I also checked what happens under <code>-P4</code> with a child exiting 1 and a child exiting 255 in the same run. All three times it was <strong>124</strong>. Whichever triggered the abort takes the report.</p>
+
+                    <p>What matters here is that <strong>the exit code cannot tell you which item failed.</strong> 123 only means 「at least one thing failed」. So it is better to put the responsibility for handling failure on the worker side.</p>
+
+                    <pre><code>#!/usr/bin/env bash
+# job.sh — records its own failures and is safe to run twice
+item=$1
+out="work/$item.out"
+[ -s "$out" ] &amp;&amp; exit 0            # skip what is already done
+
+tmp="work/.$item.part"
+(                                   # subshell. exit here leaves the worker alive
+  echo "processing $item"
+  do_the_real_work "$item"
+) &gt; "$tmp" 2&gt;&amp;1
+rc=$?
+
+if [ "$rc" -ne 0 ]; then
+  echo "$item rc=$rc" &gt;&gt; work/failed.txt
+  rm -f "$tmp"
+  exit 0                            # do not stop xargs
+fi
+mv -f "$tmp" "$out"                 # only finished work gets the final name</code></pre>
+
+                    <pre><code>$ seq 1 12 | xargs -P4 -n1 ./job.sh
+xargs exit code = 0
+succeeded: 10
+failed:
+  4 rc=3
+  9 rc=7
+
+# Run the same command again — the 10 successes are skipped
+$ seq 1 12 | xargs -P4 -n1 ./job.sh
+succeeded: 10
+
+# Retry only the failures
+$ cut -d' ' -f1 work/failed.txt | sort -nu | xargs -P4 -n1 ./job.sh</code></pre>
+
+                    <p>I made a mistake the first time I wrote this script. To simulate a failure I put <code>exit 3</code> inside a <code>{ ... }</code> brace group, and <strong>the whole worker ended right there</strong>, so the failure-recording code never ran. A brace group runs in the current shell and <code>exit</code> ends that shell. It has to be a <strong>parenthesised subshell</strong>, as above, for <code>exit</code> to stop only inside it. Same subshell boundary as in <a href="shell_subshell_variable_scope.html">Why Variables Vanish Inside a Piped while Loop</a>.</p>
+
+                    <p><code>failed.txt</code> accumulates through <code>&gt;&gt;</code>, so running twice gives two lines for the same item. That is why <code>sort -nu</code> is there above. The interaction with <code>set -e</code> is covered in <a href="shell_exit_code_pipefail.html">Shell Exit Codes and set -e</a>.</p>
+
+                    <h2 id="sec-11">Filenames with spaces belong to the sibling article</h2>
+
+                    <p>Not directly a parallelism issue, but it blows up alongside one often enough to deserve a mention. By default <code>xargs</code> <strong>splits arguments on whitespace.</strong></p>
+
+                    <pre><code>$ ls
+plain.txt
+report final.txt
+
+$ find . -name '*.txt' | xargs -P4 -n1 sh -c 'echo "[$1]"' _
+[./plain.txt]
+[./report]
+[final.txt]
+
+$ find . -name '*.txt' -print0 | xargs -0 -P4 -n1 sh -c 'echo "[$1]"' _
+[./plain.txt]
+[./report final.txt]</code></pre>
+
+                    <p>Two files went in and three jobs came out. Pairing <code>-print0</code> with <code>-0</code> fixes it. What makes this especially nasty under parallelism is that <strong>the fragments scatter across several children</strong>, so the log alone rarely reveals what went wrong. The details, and how <code>-I</code> changes things, are in <a href="find_xargs_whitespace_trap.html">The find and xargs Whitespace Trap</a>.</p>
+
+                    <h2 id="sec-12">Choosing the concurrency level</h2>
+
+                    <p>The common advice is to use the core count, but <strong>the answer depends on what the work is doing.</strong> Three types measured on an eight-core box.</p>
+
+                    <pre><code># 16 CPU-bound jobs (8 cores)
+-P 1  :   4.27 s
+-P 2  :   2.62 s
+-P 4  :   1.61 s
+-P 8  :   1.38 s
+-P 16 :   1.36 s
+-P 32 :   1.35 s
+
+# 32 jobs that only wait (sleep 0.5)
+-P 1  :  18.63 s
+-P 4  :   4.67 s
+-P 8  :   2.60 s
+-P 16 :   1.80 s
+-P 32 :   1.78 s
+-P 64 :   1.81 s
+
+# 400 jobs that finish instantly — only process creation cost remains
+-P 1  :  16.53 s
+-P 4  :  15.26 s
+-P 8  :  15.92 s
+-P 16 :  15.75 s</code></pre>
+
+                    <table>
+                        <thead>
+                            <tr><th>Work type</th><th>Observed behaviour</th><th>How to pick -P</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>CPU bound</td><td>1.38 to 1.35 s from <code>-P8</code> through <code>-P32</code>. Flat in practice</td><td>Core count. Higher gains nothing and only costs memory</td></tr>
+                            <tr><td>Wait bound</td><td>2.60 s at <code>-P8</code> down to 1.80 s at <code>-P16</code>. Keeps paying past the core count</td><td>How many waits can overlap. The other side's tolerance is the ceiling</td></tr>
+                            <tr><td>Very short jobs</td><td>Around 15 s for 400 jobs. Raising <code>-P</code> barely moves it</td><td>Not parallelism — group with <code>-n</code> to cut the invocation count</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>The third is the one most often missed. 400 jobs take 16.53 s at <code>-P1</code> and 15.75 s at <code>-P16</code>. <strong>Parallelism bought essentially nothing.</strong> The cost is not the work but creating the children, and that happens sequentially inside <code>xargs</code>. It works out to roughly 40 milliseconds per process, which reflects <strong>how expensive process creation is on Windows</strong>, so I expect a far smaller figure on Linux. I did not make that comparison.</p>
+
+                    <ul>
+                        <li>Going past the core count on CPU-bound work <strong>adds context switching and memory while the time stays put</strong></li>
+                        <li>For wait-bound work the criterion is not cores but <strong>how many concurrent requests the other side tolerates</strong></li>
+                        <li>With an external API, its rate limit is the ceiling. Exceed it and all you speed up is <strong>how fast you get blocked</strong></li>
+                        <li>When a spinning disk is the bottleneck, raising concurrency can <strong>add seeks and make things slower</strong></li>
+                        <li>On shared storage, <strong>your parallelism becomes someone else's latency.</strong> Your own core count is not an argument</li>
+                        <li>If a job is shorter than the cost of creating a process, raise <code>-n</code> rather than <code>-P</code> so <strong>one process handles several items</strong></li>
+                        <li>When in doubt, measure. Vary only <code>-P</code> across a few runs and <strong>the point where it flattens</strong> is immediately visible</li>
+                    </ul>
+
+                    <h2 id="sec-13">Before you reach for -P 0</h2>
+
+                    <p><code>-P 0</code> means <strong>start as many as possible, all at once</strong>. There is no ceiling. With twelve inputs it behaves like this.</p>
+
+                    <pre><code># 12 inputs, one second each
+$ seq 1 12 | xargs -P0 -I@ sleep 1
+   1.55 s   ← all 12 started together
+
+$ seq 1 12 | xargs -P4 -I@ sleep 1
+   3.46 s
+
+# Counting concurrent processes at the 0.6 s mark with 30 inputs
+15</code></pre>
+
+                    <p>Convenient when the input is small. The problem is <strong>a pipeline whose input count you do not control.</strong> Feed <code>find</code> output straight into <code>-P 0</code> and the file count becomes the child count; at a few thousand the machine stops responding. Fifteen processes by 0.6 seconds means <strong>it keeps growing at about 25 per second</strong>.</p>
+
+                    <ul>
+                        <li>Use it only where you know the input count for certain. Otherwise <strong>an explicit ceiling like <code>-P $(nproc)</code></strong> is better</li>
+                        <li>Never on a machine in production. <strong>Other services on that same box get pushed out first</strong></li>
+                        <li>If each child uses a lot of memory, <strong>total memory</strong> hits the wall before the count does</li>
+                        <li>For work touching a shared resource, unbounded concurrency amounts to <strong>a load test against that resource</strong></li>
+                    </ul>
+
+                    <h2 id="sec-14">What is left behind after an interrupt</h2>
+
+                    <p>Cutting a parallel batch short is common. If you have not checked what survives and in what state, <strong>the bigger problem arrives on the rerun.</strong> Twelve jobs under <code>-P3</code>, interrupted at the 1.3 second mark.</p>
+
+                    <pre><code># SIGTERM sent to xargs only
+xargs exit code = 143
+files created = 3   complete = 3   partial = 0
+   → xargs died, but the 3 children already running stayed alive and finished.
+     The remaining 9 never started at all.
+
+# When the children received the signal too
+  job1.txt  lines=9   COMPLETE=0
+  job2.txt  lines=10  COMPLETE=0
+  job3.txt  lines=10  COMPLETE=0
+   → all three files were left half written.</code></pre>
+
+                    <p>The difference is large. Kill only <code>xargs</code> and <strong>children already running stay alive and finish their work.</strong> Only the queued jobs are discarded. Press Ctrl-C in a terminal, though, and the signal goes to <strong>the entire foreground process group</strong>, so the children die too and whatever file they were writing is left half made.</p>
+
+                    <p>Here is the problem specific to <code>-P</code>. Serially you get one damaged artefact, but <strong>under <code>-P N</code> you get N damaged at once.</strong> And those N are indistinguishable by name from the finished ones. That is why <code>job.sh</code> above writes to a temporary name and does <code>mv</code> at the end.</p>
+
+                    <pre><code># The same experiment using temporary names
+files under their final name:
+    (none)
+leftover fragments:
+    .job1.part (lines=9)
+    .job2.part (lines=9)
+    .job3.part (lines=10)</code></pre>
+
+                    <p>Interrupted at the same moment, and <strong>not one half-finished file carries a final name.</strong> The fragments sit under dot-prefixed names, and the next run's <code>[ -s "$out" ]</code> check treats those items as unfinished and redoes them. <code>mv</code> within one filesystem is atomic, so no intermediate state is ever exposed.</p>
+
+                    <ul>
+                        <li>Once you think about life after an interrupt, <strong>making the worker idempotent is effectively the only remedy</strong></li>
+                        <li>Judge completion by <strong>a completion marker, not by file existence.</strong> Non-zero size, or a marker on the last line, is the kind of criterion you need</li>
+                        <li>Choose temporary names so that <strong>the next run can recognise fragments.</strong> A leading dot also keeps them out of the <code>*</code> expansion at merge time</li>
+                        <li>With a check that skips finished items, <strong>interrupt-and-rerun becomes the retry procedure itself</strong></li>
+                        <li>This design earns its keep even without parallelism. The background is in <a href="shell_readonly_idempotent_script.html">Idempotent Shell Scripts</a></li>
+                    </ul>
+
+                    <h2 id="sec-15">Checking the same things on your own box</h2>
+
+                    <p>Every number here came from one machine, and <strong>the boundary will land elsewhere in other environments.</strong> So the checking procedure itself is the part of this article with the longest shelf life. All you need are the two scripts above, in four steps.</p>
+
+                    <ul>
+                        <li>First, <strong>find the buffer boundary.</strong> Raise <code>mix.sh</code>'s line length from 200, doubling each time, and count with <code>check.sh</code>. The first non-zero result is your practical ceiling</li>
+                        <li>Second, <strong>measure pipe and file separately.</strong> Comparing <code>| ./check.sh</code> against <code>&gt;&gt; out.txt</code> at the same length exposes the buffer-size difference between the two paths</li>
+                        <li>Third, <strong>run at least five times.</strong> In the measurements above, identical conditions produced 0 once and 177 another time. One run settles nothing</li>
+                        <li>Fourth, <strong>count output lines alongside the broken-line count.</strong> A result of zero broken lines also happens when there is no output at all</li>
+                    </ul>
+
+                    <p>Keep the scale small. The experiment above is 8 workers emitting 100 lines each and finishes in seconds. On a machine in production, drop to 2 to 4 workers and raise the repetition count instead. <strong>Lowering concurrency still puts the boundary in the same place.</strong></p>
+
+                    <p>The fastest way to diagnose suspected interleaving in a real pipeline is <strong>to switch the output to a file</strong>. If it comes out clean there, the cause is the buffer-size difference; if both break, either the lines are too long or the worker is emitting one line across several calls.</p>
+
+                    <h2 id="sec-16">When to use something other than xargs -P</h2>
+
+                    <p><code>xargs -P</code> is good at exactly one thing: <strong>running mutually independent jobs, a fixed number at a time.</strong> As soon as other requirements attach, another tool is better.</p>
+
+                    <ul>
+                        <li><strong>When jobs depend on each other</strong>, use <code>make -j</code>. Declare the graph where B waits on A and the rest is parallelised for you</li>
+                        <li><strong>When you need to skip already-built artefacts</strong>, <code>make</code> again. Timestamp comparison is built in, so you write no idempotency code</li>
+                        <li><strong>When output order and line tidying are required</strong>, GNU parallel's <code>--keep-order</code> and <code>--line-buffer</code> exist for that job</li>
+                        <li><strong>When you need retries, timeouts or backoff</strong>, a worker pool in a language runtime is better. The moment you must hold state, the shell is at a disadvantage</li>
+                        <li><strong>When failures must carry into the next run</strong>, you need a job queue. The <code>failed.txt</code> approach only holds at small scale</li>
+                        <li><strong>When you must show progress</strong>, <code>xargs</code> offers nothing. Count it yourself or use another tool</li>
+                        <li>Conversely, <strong>for a few hundred independent jobs run once</strong>, <code>xargs -P</code> is still the cheapest thing going</li>
+                    </ul>
+
+                    <p>The criterion narrows to one thing: <strong>the moment relationships appear between jobs.</strong> Order, dependency, retry — once a relationship exists, <code>xargs</code> has no syntax to express it and all the complexity gets pushed into your script. When that complexity outgrows a few <code>make</code> rules, it is time to switch.</p>
+
+                    <h2 id="sec-17">What I Could Not Verify</h2>
+
+                    <ul>
+                        <li><strong>I could not measure on real Linux.</strong> Every number here came from MSYS2 on Windows. An MSYS2 pipe is an emulation, so the 64 KiB boundary in section 6 in particular is likely to land elsewhere on Linux</li>
+                        <li><strong>Whether a <code>write()</code> above <code>PIPE_BUF</code> actually gets split on Linux</strong> is unverified. On this box it stayed intact well past 4096, up to 64 KiB, but that is behaviour outside what the spec guarantees and cannot be carried elsewhere</li>
+                        <li><strong>The stdio buffer sizes of 1024 and 4096 are inferred from observation.</strong> I did not confirm actual <code>write()</code> call sizes directly with something like <code>strace</code>. All I confirmed is where the boundary appeared</li>
+                        <li><strong>GNU parallel's <code>--line-buffer</code> and <code>--keep-order</code> were not run.</strong> They are not installed on this box. Item 4 in section 8 states the tool's existence and purpose only, not a measurement</li>
+                        <li><strong>Serialisation with <code>flock</code> was also not measured.</strong> Likewise not installed. What the article records is only how that fact nearly produced a false zero</li>
+                        <li><strong>Exit code 126</strong>, the case where a command is found but cannot be executed, could not be reproduced. I created a file without execute permission, but <code>xargs</code> returned 0 in this environment. It looks like Windows filesystem permission handling, but I did not confirm that</li>
+                        <li><strong>Pressing Ctrl-C in a real terminal</strong> was not reproduced. Sending <code>SIGINT</code> to the process group from a script did not deliver the signal in this environment. The 「when the children received the signal too」 case in section 14 comes from terminating the child processes by explicit target</li>
+                        <li><strong>The 40 millisecond process creation cost was not compared against Linux.</strong> I expect it to be far smaller there, but I did not measure at what scale the 「very short jobs」 conclusion in section 12 starts to hold on Linux</li>
+                    </ul>
+
+                    <h2 id="sec-18">References</h2>
+
+                    <ul>
+                        <li><a href="https://www.gnu.org/software/findutils/manual/html_node/find_html/xargs-options.html" target="_blank" rel="noopener">GNU Findutils — xargs options</a> — the official description of <code>-P</code>, <code>-n</code>, <code>-L</code>, <code>-I</code>, <code>--process-slot-var</code> and <code>--show-limits</code>, including which options are mutually exclusive</li>
+                        <li><a href="https://pubs.opengroup.org/onlinepubs/9699919799/functions/write.html" target="_blank" rel="noopener">POSIX — write()</a> — the atomicity rule for writes of <code>PIPE_BUF</code> or less to a pipe, and the explicit absence of any guarantee above that</li>
+                        <li><a href="https://man7.org/linux/man-pages/man7/pipe.7.html" target="_blank" rel="noopener">pipe(7) — Linux manual page</a> — pipe capacity, <code>PIPE_BUF</code> and the atomicity conditions on Linux</li>
+                        <li><a href="https://www.gnu.org/software/coreutils/manual/html_node/stdbuf-invocation.html" target="_blank" rel="noopener">GNU Coreutils — stdbuf</a> — what <code>-o0</code>, <code>-oL</code> and <code>-oSIZE</code> mean, and the caveat that it has no effect on programs that set their own buffering</li>
+                        <li><a href="https://www.gnu.org/software/parallel/parallel.html" target="_blank" rel="noopener">GNU parallel manual</a> — <code>--line-buffer</code>, <code>--keep-order</code>, <code>--jobs</code> and the other options for tidying output and guaranteeing order</li>
+                        <li><a href="https://www.gnu.org/software/make/manual/html_node/Parallel.html" target="_blank" rel="noopener">GNU Make — Parallel Execution</a> — the rules for parallelising a dependency graph with <code>-j</code>, and its output tidying options</li>
+                        <li><a href="find_xargs_whitespace_trap.html">The find and xargs Whitespace Trap</a> — the detail on the argument separation problem handed off in section 11</li>
+                        <li><a href="shell_exit_code_pipefail.html">Shell Exit Codes and set -e</a> — the exit code handling of section 10, treated at whole-script level</li>
+                        <li><a href="shell_readonly_idempotent_script.html">Idempotent Shell Scripts</a> — the background to the temporary name and atomic replacement pattern used in section 14</li>
+                        <li><a href="shell_subshell_variable_scope.html">Why Variables Vanish Inside a Piped while Loop</a> — the brace group versus subshell difference mentioned in section 10</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>Share this article</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">Copy Link</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">Back to List</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Free tools you may find useful</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/ssh_config_generator.html">SSH Config Generator 2026</a></li>
+      <li><a href="../static/iptables_generator.html">iptables Generator 2026</a></li>
+      <li><a href="../static/code_image.html">Code Image Generator</a></li>
+      <li><a href="../static/char_counter.html">Character Counter</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">See all tools &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Related Posts</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="shell_here_doc_guide.html">Here-Documents in Practice - Turning Expansion Off and On, and the Indentation Trap</a></li>
+      <li><a href="shell_glob_vs_regex.html">Globs Are Not Regex - When the Asterisk Means Two Different Things</a></li>
+      <li><a href="personal_agent_server.html">A Server With a Resident Agent - What Changes When One Person Runs It</a></li>
+      <li><a href="agent_framework_abstraction.html">What Should an Agent Be in Code - What Classes, Graphs and Config Files Each Hide</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('Link copied. Paste it into the Threads app to share!');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('Link copied!'); });
+    });
+    </script>
+</body>
+</html>

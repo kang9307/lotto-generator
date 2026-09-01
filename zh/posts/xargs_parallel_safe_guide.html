@@ -1,0 +1,913 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>xargs 并行执行 -P - 输出互相穿插的真正原因与避免方法</title>
+    <meta name="description" content="用 xargs -P 并行之后输出会互相穿插。真正的原因不是管道的原子性，而是它前面那层 stdio 缓冲区。行长 1023 完好、1024 就坏，本文把这条分界线连同退出码规则、中断后的残留与并发度取值一起实测整理出来。">
+    <meta name="keywords" content="xargs, xargs -P, 并行执行, PIPE_BUF, stdbuf, 输出穿插, Shell 脚本, GNU findutils, 退出码, 幂等性, 并发度, 开发, 基础设施, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/xargs_parallel_safe_guide.html">
+
+    <meta property="og:title" content="xargs 并行执行 -P - 输出互相穿插的真正原因与避免方法">
+    <meta property="og:description" content="1023 个字符没事，1024 个字符就坏。在谈管道原子性之前，先该看的是 stdio 缓冲区，全部用实测结果说话。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/xargs_parallel_safe_guide.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-09-01">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="安全地使用 xargs -P">
+    <meta name="twitter:description" content="输出穿插的原因不是管道而是缓冲区。为什么分界线落在 1024。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "xargs 并行执行 -P - 输出互相穿插的真正原因与避免方法",
+      "alternativeHeadline": "分界线落在行长 1024。比管道原子性更先起作用的是 stdio 缓冲区",
+      "datePublished": "2026-09-01",
+      "dateModified": "2026-09-01",
+      "inLanguage": "zh-CN",
+      "articleSection": "开发/基础设施",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "xargs, xargs -P, 并行执行, PIPE_BUF, stdbuf, 输出穿插, Shell 脚本, GNU findutils, 退出码, 幂等性",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/xargs_parallel_safe_guide.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "加了 xargs -P 为什么没有并行起来",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "-P 只决定同时可以存活的子进程上限。到底会创建多少个子进程，是由 -n、-L、-I 决定的。这三个一个都不给的话，xargs 会把命令行缓冲区允许的参数一次性塞进去，于是只生成一两个子进程，此时 -P 再大也没有可并行的对象。把一万行输入交给不带 -n 的 -P8，实际启动的子进程只有四个，加上 -n100 之后变成一百个。看起来没有并行时，与其调 -P，不如先数一数实际执行了多少次。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "并行执行时输出穿插的原因是 PIPE_BUF 吗",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "多数情况下是它前面那层 stdio 缓冲区先制造了问题。PIPE_BUF 是内核层面的保证，指一次 write() 调用不会被拆开，而一行要用几次 write() 送出去，是由上层的标准输入输出库决定的。实测中行长 1023 个字符时一行都没坏，到 1024 个字符的那一刻就开始坏。这个分界线对应的不是 PIPE_BUF 的值，而是挂在管道上的 stdio 缓冲区大小。也就是说缓冲区写满、中途 flush 一次的瞬间，那一行就被拆成两次 write()，别的进程就从中间插了进来。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "用 stdbuf 能解决输出穿插吗",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "取决于给哪种模式，两种模式的结果完全相反。行缓冲的 stdbuf -oL 会让一行正好用一次 write() 送出，重复测十次一次坏行都没有出现。反过来，把缓冲完全关掉的 stdbuf -o0 让情况大幅恶化，800 行里坏了 252 到 467 行。因为没有缓冲时正文和换行会各自作为独立的 write() 发出去。另一个要注意的点是 stdbuf 对 Shell 内建命令不起作用。当 worker 是 bash 内建的 printf 时，加上 -oL 测出来的数值没有任何变化。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "子进程失败时 xargs 返回什么退出码",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "绝不会原样返回子进程的码。子进程以 1 到 125 之间的值结束时，xargs 会把剩下的活干完再返回 123。子进程以 255 结束时，xargs 当场中断并返回 124。子进程被信号杀死是 125，找不到命令是 127。用 -P 跑的过程中同时出现以 1 结束和以 255 结束的子进程时，报告的是引发中断的那一边，也就是 124。退出码无法告诉你是哪一项失败了，所以更好的做法是让 worker 自己把失败的输入写进文件。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "-P 的值按核心数设置就可以了吗",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "要看任务的性质。在 8 核机器上跑 16 个持续吃 CPU 的任务，-P8 是 1.38 秒，-P16 和 -P32 分别是 1.36 秒和 1.35 秒，实际上没有差别，意思是超过核心数就没有可拿的了。反过来 32 个只是等待的任务，从 -P8 的 2.60 秒一直降到 -P16 的 1.80 秒，以等待为主的任务取到远超核心数的值仍然有收益。不过如果对面是外部 API 或共享存储，基准应当是对方的极限，而且当单个任务比创建进程的开销还短时，并行几乎拿不到任何东西。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/xargs_parallel_safe_guide.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/xargs_parallel_safe_guide.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/xargs_parallel_safe_guide.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/xargs_parallel_safe_guide.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/xargs_parallel_safe_guide.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "首页",
+      "item": "https://braindetox.kr/zh/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "开发/基础设施",
+      "item": "https://braindetox.kr/zh/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "xargs 并行执行 -P - 输出互相穿插的真正原因与避免方法",
+      "item": "https://braindetox.kr/zh/posts/xargs_parallel_safe_guide.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="xargs 并行执行 -P - 输出互相穿插的真正原因与避免方法">
+                <meta itemprop="datePublished" content="2026-09-01">
+                <meta itemprop="dateModified" content="2026-09-01">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="xargs, xargs -P, 并行执行, PIPE_BUF, stdbuf, 输出穿插, Shell 脚本, GNU findutils, 退出码, 幂等性">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/xargs_parallel_safe_guide.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">xargs 并行执行 -P - 输出互相穿插的真正原因与避免方法</h1>
+                    <h2 class="post-subtitle">1023 个字符没事，1024 个字符就坏。比管道原子性更该先看的东西</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-01">2026-09-01</span>
+                        <span class="post-category" itemprop="articleSection">开发/基础设施</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p><code>xargs -P</code> 是加并行最便宜的办法。在管道中间插一个选项就行，也不用装新东西。可是这么加完之后，几乎每次都会发生同一件事：<strong>日志变得不对劲。</strong>行被截了一半、两个任务的输出在同一行里接在了一起、有些行看上去整个消失了。</p>
+
+                    <p>解释这个现象时出现最多的词是 <code>PIPE_BUF</code>。这话不算错，但真去复现就会发现<strong>开始坏掉的分界线和那个值对不上。</strong>这篇文章是亲手去找那条分界线的记录。所有例子都是跑出来的输出原样贴上的。</p>
+
+                    <div class="callout">
+                        这里的执行结果都是在下面说明的这一台环境上测的。缓冲区大小与原子性边界会随 C 库实现和内核而变，所以<strong>不要把这里的数字当成别的环境的常量搬过去。</strong>正文里一并附上了可以自己确认同样结论的最小脚本。
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>本文涉及的内容</h3>
+                        <ol>
+                            <li><a href="#sec-1">跑出这些结果的环境</a></li>
+                            <li><a href="#sec-2">-P 实际上做的事</a></li>
+                            <li><a href="#sec-3">加了 -P 却并行不起来的地方</a></li>
+                            <li><a href="#sec-4">-n、-L、-I 数的是不同的东西</a></li>
+                            <li><a href="#sec-5">找出输出开始穿插的分界线</a></li>
+                            <li><a href="#sec-6">一次 write() 安全到什么程度</a></li>
+                            <li><a href="#sec-7">管道和文件的行为不一样</a></li>
+                            <li><a href="#sec-8">避免穿插的四种办法</a></li>
+                            <li><a href="#sec-9">不穿插和按顺序出来是两回事</a></li>
+                            <li><a href="#sec-10">退出码 - 什么会继续跑，什么会停</a></li>
+                            <li><a href="#sec-11">带空格的文件名交给姊妹篇</a></li>
+                            <li><a href="#sec-12">并发度该设多少</a></li>
+                            <li><a href="#sec-13">用 -P 0 之前</a></li>
+                            <li><a href="#sec-14">中断之后留下什么</a></li>
+                            <li><a href="#sec-15">在自己的环境上确认同样的结论</a></li>
+                            <li><a href="#sec-16">该用别的东西而不是 xargs -P 的时候</a></li>
+                            <li><a href="#sec-17">未能确认的部分</a></li>
+                            <li><a href="#sec-18">参考资料</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">跑出这些结果的环境</h2>
+
+                    <p>下面所有输出都来自 Windows 10 上的 Git Bash，也就是 MSYS2 环境。这一点很重要。<strong>MSYS2 的管道不是 Linux 内核的管道，而是架在 Windows 上的模拟</strong>，后面会看到原子性边界落在了和 Linux 不同的位置。凡是这个差异显现的地方都单独标了出来。</p>
+
+                    <pre><code>$ bash --version | head -1
+GNU bash, version 5.2.37(1)-release (x86_64-pc-msys)
+
+$ xargs --version | head -1
+xargs (GNU findutils) 4.10.0
+
+$ uname -s
+MINGW64_NT-10.0-19045
+
+$ nproc
+8
+
+$ getconf PIPE_BUF /tmp
+4096</code></pre>
+
+                    <p>工具是 <strong>GNU findutils 4.10.0</strong>。<code>-P</code> 不是 POSIX 标准而是 GNU 扩展，所以 BSD 系或 busybox 上的行为可能不同。这台机器上没有 GNU parallel、没有 <code>flock</code>、也没有 <code>make</code>，所以那几个工具只写到<strong>它们是做什么用的</strong>为止。</p>
+
+                    <h2 id="sec-2">-P 实际上做的事</h2>
+
+                    <p><code>-P N</code> 决定的是<strong>同时可以存活的子进程最大数量</strong>，不多也不少。任务怎么切分、要创建几个子进程，它完全不管。用八个一秒的任务来确认是这样。</p>
+
+                    <pre><code># 8个任务，每个1秒。串行跑的话
+$ time (seq 1 8 | xargs -I{} sh -c 'sleep 1; echo done {}')
+real    0m9.448s
+
+# 同样的任务，同时最多4个
+$ time (seq 1 8 | xargs -P4 -I{} sh -c 'sleep 1; echo done {}')
+real    0m2.517s</code></pre>
+
+                    <p>9.45 秒变成了 2.52 秒。八个分成四个一组的两批，理论上是两秒出头，剩下的 0.5 秒是创建进程的价钱。问题在于<strong>这幅图成立的条件很窄</strong>。</p>
+
+                    <h2 id="sec-3">加了 -P 却并行不起来的地方</h2>
+
+                    <p><code>xargs</code> 的默认行为是<strong>尽量把参数攒在一起一次交出去</strong>，一直塞到命令行长度上限为止。所以不另外给出切分指令的话只会生成一个子进程，<code>-P</code> 取得再大也没有可以并行的对象。</p>
+
+                    <pre><code># 只给 -P8 而不给 -n
+$ seq 1 8 | xargs -P8 sh -c 'echo "PID=$$ args=$*"; sleep 1' sh
+PID=1751 args=1 2 3 4 5 6 7 8
+real    0m1.233s
+
+# 给上 -n1 才终于分成8个
+$ seq 1 8 | xargs -P8 -n1 sh -c 'echo "PID=$$ args=$*"; sleep 1' sh
+PID=1755 args=1
+PID=1756 args=2
+PID=1757 args=3
+PID=1758 args=4
+PID=1759 args=5
+PID=1760 args=6
+PID=1761 args=7
+PID=1762 args=8
+real    0m1.543s
+
+# -n2 的话是4个
+$ seq 1 8 | xargs -P8 -n2 sh -c 'echo "PID=$$ args=$*"; sleep 1' sh
+PID=1766 args=1 2
+PID=1767 args=3 4
+PID=1768 args=5 6
+PID=1769 args=7 8</code></pre>
+
+                    <p>第一次执行只有一个 PID。起了一个子进程，八个参数全接了过去，<code>-P8</code> 什么也没干。输入一大，这个陷阱藏得更好。</p>
+
+                    <pre><code># 一万个输入交给不带 -n 的 -P8。数一数实际起了多少子进程
+$ seq 1 10000 | xargs -P8 sh -c 'echo x' sh | wc -l
+4
+
+# 加上 -n100
+$ seq 1 10000 | xargs -P8 -n100 sh -c 'echo x' sh | wc -l
+100
+
+$ xargs --show-limits &lt; /dev/null
+POSIX upper limit on argument length (this system): 23857
+Maximum length of command we could actually use: 17762
+Size of command buffer we are actually using: 23857
+Maximum parallelism (--max-procs must be no greater): 2147483647</code></pre>
+
+                    <p>递进去一万个，子进程只有四个。说好了最多能起八个，可是<strong>能起的只有四个。</strong>看起来并行没生效时去调大 <code>-P</code> 多半是白费力气。像上面那样让子进程各打一行再用 <code>wc -l</code> 数，几秒钟就有答案。</p>
+
+                    <ul>
+                        <li><code>-P</code> 是上限，不是切分指令。<strong>切分是 <code>-n</code>、<code>-L</code>、<code>-I</code> 做的</strong></li>
+                        <li>三个都不给的话会一直塞参数直到命令行缓冲区满。上面这台机器的缓冲区是 23,857 字节</li>
+                        <li>所以输入少或者参数短的时候<strong>常常只生成一个子进程</strong></li>
+                        <li>反过来习惯性地加 <code>-n1</code>，在任务很轻时<strong>创建开销会把收益吃光</strong></li>
+                        <li>数执行次数是动 <code>-P</code> 之前的第一步</li>
+                    </ul>
+
+                    <h2 id="sec-4">-n、-L、-I 数的是不同的东西</h2>
+
+                    <p>三个都是切分用的选项，但<strong>数的单位不同。</strong><code>-n</code> 数参数个数，<code>-L</code> 数输入行数，<code>-I</code> 把整整一行塞进替换字符串。用每行两个单词的输入来比，差别立刻就看得出来。</p>
+
+                    <pre><code>$ printf 'a b\nc d\ne f\ng h\n' &gt; lines.txt
+
+$ xargs -n2 echo "batch:" &lt; lines.txt
+batch: a b
+batch: c d
+batch: e f
+batch: g h
+
+$ xargs -L2 echo "batch:" &lt; lines.txt
+batch: a b c d
+batch: e f g h
+
+$ xargs -I@ echo "batch: [@]" &lt; lines.txt
+batch: [a b]
+batch: [c d]
+batch: [e f]
+batch: [g h]
+
+$ xargs -n2 -I@ echo "batch: [@]" &lt; lines.txt
+xargs: warning: options --max-args and --replace/-I/-i are mutually exclusive,
+ignoring previous --max-args value
+batch: [a b]
+batch: [c d]
+batch: [e f]
+batch: [g h]</code></pre>
+
+                    <p>最后一次执行很关键。<code>-n</code> 和 <code>-I</code> 一起给的话<strong>会发出警告并把 <code>-n</code> 丢掉。</strong><code>-L</code> 和 <code>-I</code> 一起给也是一样，因为 <code>-I</code> 会把处理固定成一次一行。常见的 <code>xargs -n1 -P8 -I{}</code> 这种组合，其实是 <code>-n1</code> 被悄悄丢弃的形态。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>选项</th><th>数的单位</th><th>并行使用时的性格</th><th>不能一起用的</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>-n N</code></td><td>参数个数</td><td>无视行边界按 N 个一组打包。用来调批大小、减少进程创建开销</td><td><code>-I</code>、<code>-L</code></td></tr>
+                            <tr><td><code>-L N</code></td><td>输入行数</td><td>守住行边界来打包。一行就是一条记录时很安全</td><td><code>-I</code>、<code>-n</code></td></tr>
+                            <tr><td><code>-I R</code></td><td>整整一行</td><td>把整行插到 R 的位置。需要指定参数位置时是唯一选择</td><td><code>-n</code>、<code>-L</code></td></tr>
+                            <tr><td>什么都不给</td><td>直到缓冲区写满</td><td>子进程只生成极少数，<code>-P</code> 变得无力</td><td>-</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2 id="sec-5">找出输出开始穿插的分界线</h2>
+
+                    <p>正题来了。穿插是概率性发生的，所以<strong>跑一次没坏并不等于安全。</strong>要做成可复现的形式，就得让机器能判定一行有没有坏。让每个 worker 只输出由自己那一个字符重复而成的行，事情就简单了：一行里出现两种以上的字符，这行就是坏的。</p>
+
+                    <pre><code>#!/usr/bin/env bash
+# mix.sh &lt;行长&gt;
+# 8 个 worker 各自把自己的字符重复 L 次组成一行，输出 100 次。
+# 一行里混进两种以上的字符，就说明 write() 被拆开了。
+export L=${1:-1500}
+printf '%s\n' a b c d e f g h |
+xargs -P8 -n1 bash -c '
+  line=$(printf "%${L}s" "" | tr " " "$1")
+  for i in $(seq 1 100); do printf "%s\n" "$line"; done
+' _</code></pre>
+
+                    <pre><code>#!/usr/bin/env bash
+# check.sh &lt;行长&gt; — 读标准输入，数出坏行的数量
+awk -v L="${1:-1500}" '
+  { total++
+    if (length($0) != L) { bad++; next }
+    f = substr($0,1,1)
+    for (i = 2; i &lt;= length($0); i++)
+      if (substr($0,i,1) != f) { bad++; break }
+  }
+  END { printf "%d lines, %d broken\n", total, bad+0 }'</code></pre>
+
+                    <p>换着行长跑一遍，分界线出得非常清楚。</p>
+
+                    <pre><code>$ for L in 200 1023 1024 1500 8000; do
+    printf "L=%-6s " "$L"; ./mix.sh "$L" | ./check.sh "$L"
+  done
+L=200    800 lines, 0 broken
+L=1023   800 lines, 0 broken
+L=1024   800 lines, 68 broken
+L=1500   800 lines, 216 broken
+L=8000   800 lines, 666 broken</code></pre>
+
+                    <p><strong>到 1023 个字符为止一行都不坏，到 1024 个字符的那一刻开始坏。</strong>而这个数字和 <code>getconf</code> 报出来的 <code>PIPE_BUF</code> 值 4096 对不上。把换行也算进去，1024 个字符的行是 1025 字节。也就是说分界线是<strong>1024 字节的缓冲区写满、被清空一次的那个点</strong>。先把行切开的不是内核的管道，而是它上面的标准输入输出库。</p>
+
+                    <p>顺序是这样的。调用 <code>printf</code> 时字符不会直接进管道，而是<strong>先堆在用户空间的缓冲区里。</strong>缓冲区满了才调一次 <code>write()</code>。一行比缓冲区长的话，这一行就分成两次以上出去，中间就给别的进程留出了插进来的缝。<code>PIPE_BUF</code> 是再往后的事。</p>
+
+                    <h2 id="sec-6">一次 write() 安全到什么程度</h2>
+
+                    <p>那么<strong>真的用一次 <code>write()</code> 送出去</strong>会怎样，就成了想知道的事。得绕开缓冲区，所以用 <code>dd</code>。<code>dd</code> 按 <code>bs</code> 读一块，再把这一块一次写出去。</p>
+
+                    <pre><code>#!/usr/bin/env bash
+# 把预先做好的行用 dd 一次 write() 出去，跳过 stdio 缓冲区。
+export L=${1:-8000}
+for ch in a b c d e f g h; do
+  printf "%${L}s" "" | tr ' ' "$ch"  &gt;  "line.$ch"
+  printf '\n'                        &gt;&gt; "line.$ch"
+done
+export SZ=$((L+1))
+printf '%s\n' a b c d e f g h |
+xargs -P8 -n1 bash -c '
+  for i in $(seq 1 40); do dd if="line.$1" bs=$SZ count=1 status=none; done
+' _</code></pre>
+
+                    <pre><code>L=8000    320 lines, 0 broken
+L=16000   320 lines, 0 broken
+L=32000   320 lines, 0 broken
+L=63000   320 lines, 0 broken
+L=65535   320 lines, 0 broken
+L=65536   320 lines, 277 broken
+L=200000  320 lines, 306 broken</code></pre>
+
+                    <p>到 65,535 个字符都完好，到 65,536 个字符崩掉。加上换行，<strong>分界线正好是 64KiB</strong>，不是报成 <code>PIPE_BUF</code> 的 4096。64KiB 是这个平台上管道能装下的容量，比它更大的 <code>write()</code> 一次装不下，写到一半就阻塞，别的进程就从这个缝里插了进来。</p>
+
+                    <p>这里必须把实测和规范分开。<strong>POSIX 保证的只有 <code>PIPE_BUF</code> 及以下的 <code>write()</code></strong>，比它大的被拆开并不违反规范。上面的实测是「这个 MSYS2 环境比规范更宽松」这样一个观察，<strong>不是别的环境可以超过 4096 的依据。</strong>没有在 Linux 实机上做同样的测量。</p>
+
+                    <ul>
+                        <li>可以安全依靠的线是 <code>PIPE_BUF</code> 及以下。按上面这台机器是 <strong>4096 字节</strong>，而且这个值也该自己用 <code>getconf</code> 确认</li>
+                        <li>可是还没碰到那条线，<strong>stdio 缓冲区就先把行切开了。</strong>实测的分界线是 1024 字节</li>
+                        <li>因此实务上的基准不是 <code>PIPE_BUF</code>，而是<strong>「一行是不是用一次 <code>write()</code> 送出去的」</strong></li>
+                        <li>行短的话两个条件自然一起满足。把一条日志控制在 200 字符以内的习惯，在并行下特别值钱就是这个原因</li>
+                    </ul>
+
+                    <h2 id="sec-7">管道和文件的行为不一样</h2>
+
+                    <p>同样一条命令，<strong>输出是交给管道还是重定向到文件，结果会不同。</strong>两种情况各跑了五次。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>行长</th><th>用管道接（800 行中的坏行，5 次）</th><th>用 <code>&gt;&gt;</code> 接到文件（5 次）</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>1023 字符</td><td>0 · 0 · 0 · 0 · 0</td><td>0 · 0 · 0 · 0 · 0</td></tr>
+                            <tr><td>1024 字符</td><td>177 · 68 · 0 · 80 · 142</td><td>20 · 2 · 10 · 0 · 6</td></tr>
+                            <tr><td>1500 字符</td><td>226 · 124 · 300 · 250 · 153</td><td>0 · 0 · 0 · 2 · 0</td></tr>
+                            <tr><td>8000 字符</td><td>698 · 653 · 664 · 621 · 617</td><td>42 · 126 · 228 · 242 · 111</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>1500 字符时管道在 800 行里坏掉 100 到 300 行，文件却几乎完好。原因和上一节相同：<strong>挂在文件上的 stdio 缓冲区比挂在管道上的大。</strong>在这台机器上文件那边的分界线在 4096 字节附近，所以 1500 字符的行装得进一次 <code>write()</code>。到 8000 字符文件也垮了。</p>
+
+                    <p><code>&gt;&gt;</code> 打开的 <code>O_APPEND</code> 保证<strong>每次 <code>write()</code> 都追加到文件末尾</strong>，两个进程互相覆盖对方位置的事故不会发生。但保证也就到此为止。<strong>一行被分成两次的话，中间挤进别的碎片是拦不住的。</strong>上表 8000 字符那一行就是这个结果。</p>
+
+                    <p>1024 字符那一行里管道记了一次 0，这也不能一带而过。<strong>同样条件跑五次，有一次是完好的。</strong>不能把穿插当成「复现不出来所以不是问题」，原因就在这里。</p>
+
+                    <h2 id="sec-8">避免穿插的四种办法</h2>
+
+                    <p>对策大致有四种。分别测了实效，测量统一用行长 1500 字符，这个长度在管道里是必坏的区间。</p>
+
+                    <h3>① 每个 worker 写自己的文件，之后再合并</h3>
+
+                    <p>最可靠。进程之间不去争同一个 fd，原子性问题本身就消失了。</p>
+
+                    <pre><code># 每个 worker 写自己的文件，全部结束后按名字顺序接起来
+d=$(mktemp -d); export d
+printf '%s\n' a b c d e f g h |
+xargs -P8 -n1 bash -c '
+  line=$(printf "%1500s" "" | tr " " "$1")
+  for i in $(seq 1 100); do printf "%s\n" "$line"; done &gt; "$d/$1.out"
+' _
+cat "$d"/*.out
+rm -rf "$d"</code></pre>
+
+                    <p>重复 10 次<strong>一个坏行都没出现。</strong>代价是有多少任务就有多少文件，任务上万个的话就有负担了。findutils 4.7 以上有专为此准备的选项。</p>
+
+                    <pre><code># 不按任务数，只按并发度的数量来建文件
+d=$(mktemp -d); export d
+printf '%s\n' a b c d e f g h |
+xargs -P4 -n1 --process-slot-var=SLOT bash -c '
+  line=$(printf "%1500s" "" | tr " " "$1")
+  for i in $(seq 1 100); do printf "%s\n" "$line"; done &gt;&gt; "$d/slot$SLOT.out"
+' _
+cat "$d"/*.out; rm -rf "$d"</code></pre>
+
+                    <p><code>--process-slot-var</code> 会以环境变量的形式给每个子进程一个从 0 到 <code>-P</code> 值之前的槽位号。槽位在子进程结束后会被复用，所以文件数固定在并发度上。5 次测量坏行都是 0 个。</p>
+
+                    <h3>② 用 stdbuf 改变缓冲方式</h3>
+
+                    <p>这里陷阱最多。把 worker 换成 <code>awk</code>，只改缓冲设置，各测 10 次。</p>
+
+                    <pre><code>$ P='BEGIN{l=sprintf("%1500s",""); gsub(/ /,c,l); for(i=0;i&lt;100;i++) print l}'
+
+# 原样（awk 默认缓冲）
+$ printf '%s\n' a b c d e f g h | xargs -P8 -I@ awk -v c=@ "$P" | ./check.sh 1500
+   6  0  18  0  3  9  9  0  9  6
+
+# 把缓冲关掉
+$ ... | xargs -P8 -I@ stdbuf -o0 awk -v c=@ "$P" | ./check.sh 1500
+   418  264  467  310  299  262  324  278  252  298
+
+# 改成行缓冲
+$ ... | xargs -P8 -I@ stdbuf -oL awk -v c=@ "$P" | ./check.sh 1500
+   0  0  0  0  0  0  0  0  0  0</code></pre>
+
+                    <p><strong><code>stdbuf -o0</code> 会让情况大幅恶化</strong>，和直觉相反。关掉缓冲输出立刻就走，听上去很安全，但实际上正文和换行<strong>会各自作为独立的 <code>write()</code> 出去</strong>，反而造出了可插入的缝。相反 <code>-oL</code> 把一行正好一次送出，10 次全是 0。</p>
+
+                    <p>局限也很清楚。<strong><code>stdbuf</code> 对 Shell 内建命令不起作用。</strong>worker 是 <code>bash</code> 内建 <code>printf</code> 时试着加了 <code>-oL</code>，测出来的数值和没动过时没有区别。对自己设置缓冲的程序同样不管用。</p>
+
+                    <h3>③ 攒成一行再一次输出</h3>
+
+                    <p>与其让 worker 一点一点吐好几行，不如<strong>把结果攒成字符串、最后只输出一次</strong>，只要这个字符串比缓冲区短就是安全的。前面的测量里把行长缩到 120 字符，10 次全是 0。这个方式的价值在于<strong>行长上限由自己掌握。</strong>不过输出量无法预测的任务就用不了。</p>
+
+                    <h3>④ 交给专用工具</h3>
+
+                    <p>GNU parallel 有 <code>--line-buffer</code> 和 <code>--keep-order</code>。前者把子进程的输出按行整理好再送出，后者让结果按输入顺序出来。<strong>不过这台机器上没装 GNU parallel，没能确认实际运行结果。</strong>这里只写到有这么一个工具为止。</p>
+
+                    <p>用 <code>flock</code> 把输出串行化也是常被介绍的做法。这台机器上没有 <code>flock</code>，<strong>而我差点在不知情的状态下得到「坏行 0 个」这个结果。</strong>写成 <code>flock 9 &amp;&amp; printf ...</code> 之后 <code>flock</code> 以 127 失败，<code>&amp;&amp;</code> 后面整个没执行，输出是 0 行，坏行自然也是 0 个。测对策实效的时候<strong>必须一并确认输出行数和预期是否相符。</strong></p>
+
+                    <table>
+                        <thead>
+                            <tr><th>对策</th><th>1500 字符下的实测</th><th>代价</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>每 worker 一个临时文件后合并</td><td>10 次全为 0</td><td>有多少任务就有多少文件，需要收尾代码</td></tr>
+                            <tr><td><code>--process-slot-var</code> 按槽位分文件</td><td>5 次全为 0</td><td>需 findutils 4.7 以上。槽位内部顺序会乱</td></tr>
+                            <tr><td><code>stdbuf -oL</code></td><td>10 次全为 0</td><td>对内建命令、自带缓冲的程序无效</td></tr>
+                            <tr><td><code>stdbuf -o0</code></td><td>252~467 个（恶化）</td><td>不该使用</td></tr>
+                            <tr><td>把行控制得短（120 字符）</td><td>10 次全为 0</td><td>只适用于输出量可控的任务</td></tr>
+                            <tr><td>什么都不动（bash 内建 printf）</td><td>320~505 个</td><td>-</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2 id="sec-9">不穿插和按顺序出来是两回事</h2>
+
+                    <p>行完好了，<strong>顺序仍然是另一个问题。</strong>既然是并行跑，先结束的就先出来。任务耗时参差不齐的话，输出顺序每次都不一样。</p>
+
+                    <pre><code># 输入是 1 到 8，任务耗时随机
+$ seq 1 8 | xargs -P8 -n1 bash -c 'sleep 0.$((RANDOM%9)); printf "%s " "$1"' _
+4 7 6 3 1 8 2 5
+1 5 4 3 8 2 6 7
+3 6 1 4 8 2 7 5
+
+# 写进各 worker 的文件再按名字合并，永远是输入顺序
+1 2 3 4 5 6 7 8
+1 2 3 4 5 6 7 8
+1 2 3 4 5 6 7 8</code></pre>
+
+                    <p>跑三次，三次顺序都不同。这不是缺陷，这就是并行的定义。<strong>需要顺序的话，就得单独放一个制造顺序的阶段。</strong>像上面那样在文件名里放可排序的键、最后按名字合并是最简单的办法，而前面看过的临时文件对策本身就兼顾了顺序保证。</p>
+
+                    <ul>
+                        <li>文件名要用 <code>001</code>、<code>002</code> 这种<strong>补齐位数的数字</strong>，<code>*</code> 展开才会按字典序正确排列</li>
+                        <li>守住顺序的代价是<strong>在最慢的任务结束前什么都送不出去。</strong>想实时看进度的话就冲突了</li>
+                        <li>需要实时进度显示的话，<strong>进度日志走标准错误、结果走文件</strong>分开更好</li>
+                        <li>先问问是不是真的需要顺序。如果结果之后还要排序或按键查询，就没有理由为顺序保证付代价</li>
+                    </ul>
+
+                    <h2 id="sec-10">退出码 - 什么会继续跑，什么会停</h2>
+
+                    <p><code>xargs</code> 在子进程失败时不会停。不知道这一点就会出<strong>一半失败的批次被报告成成功</strong>的事故。</p>
+
+                    <pre><code># 有一个子进程以 exit 1 结束，其余照样跑
+$ seq 1 5 | xargs -P4 -n1 bash -c '[ "$1" = 3 ] &amp;&amp; { echo "FAIL $1" &gt;&amp;2; exit 1; }; echo "OK $1"' _
+OK 1
+OK 2
+FAIL 3
+OK 4
+OK 5
+$ echo $?
+123
+
+# exit 255 会让 xargs 本身停下
+$ seq 1 6 | xargs -n1 bash -c 'echo "run $1"; [ "$1" = 3 ] &amp;&amp; exit 255; exit 0' _
+run 1
+run 2
+run 3
+xargs: bash: exited with status 255; aborting
+$ echo $?
+124</code></pre>
+
+                    <p>第二个例子里 4、5、6 号根本没开始。<strong>255 被保留为「停下」这个信号。</strong>任务脚本要是碰巧写成了会以 255 结束，剩下的批次就被悄悄截断了。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>子进程发生的事</th><th>xargs 退出码</th><th>剩余任务</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>以 1~125 范围结束</td><td>123</td><td>一直跑到最后</td></tr>
+                            <tr><td>以 255 结束</td><td>124</td><td>立即中断，向标准错误输出消息</td></tr>
+                            <tr><td>被信号杀死</td><td>125</td><td>立即中断</td></tr>
+                            <tr><td>找不到命令</td><td>127</td><td>立即中断</td></tr>
+                            <tr><td>全部成功</td><td>0</td><td>-</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>还确认了用 <code>-P4</code> 跑时让以 1 结束和以 255 结束的子进程同时存在会怎样。三次都是 <strong>124</strong>，引发中断的那一边拿走了报告权。</p>
+
+                    <p>这里重要的是<strong>退出码没法告诉你是哪一项失败了。</strong>123 的意思只是「有至少一件事失败了」。所以把处理失败的责任放在 worker 那一侧更好。</p>
+
+                    <pre><code>#!/usr/bin/env bash
+# job.sh — 自己记录失败，跑两次也安全
+item=$1
+out="work/$item.out"
+[ -s "$out" ] &amp;&amp; exit 0            # 已经做完的跳过
+
+tmp="work/.$item.part"
+(                                   # 子 shell。在这里 exit 也不会杀掉 worker
+  echo "processing $item"
+  do_the_real_work "$item"
+) &gt; "$tmp" 2&gt;&amp;1
+rc=$?
+
+if [ "$rc" -ne 0 ]; then
+  echo "$item rc=$rc" &gt;&gt; work/failed.txt
+  rm -f "$tmp"
+  exit 0                            # 不让 xargs 停下
+fi
+mv -f "$tmp" "$out"                 # 只有做完的才拿到最终名字</code></pre>
+
+                    <pre><code>$ seq 1 12 | xargs -P4 -n1 ./job.sh
+xargs exit code = 0
+succeeded: 10
+failed:
+  4 rc=3
+  9 rc=7
+
+# 同样的命令再跑一次 — 成功的 10 个会被跳过
+$ seq 1 12 | xargs -P4 -n1 ./job.sh
+succeeded: 10
+
+# 只挑失败的重跑
+$ cut -d' ' -f1 work/failed.txt | sort -nu | xargs -P4 -n1 ./job.sh</code></pre>
+
+                    <p>第一次写这个脚本时出过一个错。为了模拟失败，把 <code>exit 3</code> 放进了 <code>{ ... }</code> 花括号组里，结果<strong>整个 worker 当场就结束了</strong>，记录失败的代码根本没执行。花括号是在当前 shell 里跑的组，而 <code>exit</code> 会结束这个 shell。得像上面那样用<strong>圆括号的子 shell</strong>，<code>exit</code> 才只在里面结束。这和<a href="shell_subshell_variable_scope.html">管道里的while为什么变量会消失</a>里讲的子 shell 边界是同一个问题。</p>
+
+                    <p><code>failed.txt</code> 是用 <code>&gt;&gt;</code> 累积的，跑两次同一项就会变成两行。上面过一道 <code>sort -nu</code> 就是这个原因。和 <code>set -e</code> 的相互作用在<a href="shell_exit_code_pipefail.html">Shell 退出码与 set -e</a>里。</p>
+
+                    <h2 id="sec-11">带空格的文件名交给姊妹篇</h2>
+
+                    <p>和并行没有直接关系，但是会一起爆的问题，所以还是要点一下。<code>xargs</code> 默认<strong>按空白切分参数。</strong></p>
+
+                    <pre><code>$ ls
+plain.txt
+report final.txt
+
+$ find . -name '*.txt' | xargs -P4 -n1 sh -c 'echo "[$1]"' _
+[./plain.txt]
+[./report]
+[final.txt]
+
+$ find . -name '*.txt' -print0 | xargs -0 -P4 -n1 sh -c 'echo "[$1]"' _
+[./plain.txt]
+[./report final.txt]</code></pre>
+
+                    <p>递进去两个文件，任务却裂成了三个。把 <code>-print0</code> 和 <code>-0</code> 配成一对用就解决了。这个事故在并行下特别糟糕，是因为<strong>裂开的碎片散到了好几个子进程里</strong>，光看日志很难看出哪里出了错。详情以及用 <code>-I</code> 时的差别在<a href="find_xargs_whitespace_trap.html">find 与 xargs 的空格换行陷阱</a>里。</p>
+
+                    <h2 id="sec-12">并发度该设多少</h2>
+
+                    <p>常见的建议是照搬核心数，但<strong>答案随任务的性质而变。</strong>在 8 核机器上测了三种类型。</p>
+
+                    <pre><code># 持续吃 CPU 的任务 16 个（8 核）
+-P 1  :   4.27 s
+-P 2  :   2.62 s
+-P 4  :   1.61 s
+-P 8  :   1.38 s
+-P 16 :   1.36 s
+-P 32 :   1.35 s
+
+# 只是等待的任务（sleep 0.5）32 个
+-P 1  :  18.63 s
+-P 4  :   4.67 s
+-P 8  :   2.60 s
+-P 16 :   1.80 s
+-P 32 :   1.78 s
+-P 64 :   1.81 s
+
+# 瞬间就结束的任务 400 个 — 只剩下创建进程的价钱
+-P 1  :  16.53 s
+-P 4  :  15.26 s
+-P 8  :  15.92 s
+-P 16 :  15.75 s</code></pre>
+
+                    <table>
+                        <thead>
+                            <tr><th>任务类型</th><th>观测到的性质</th><th>定 -P 的基准</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>CPU 密集</td><td><code>-P8</code> 之后到 <code>-P32</code> 是 1.38→1.35 秒，实际上是平的</td><td>核心数。再往上没有收获，只多占内存</td></tr>
+                            <tr><td>等待密集</td><td><code>-P8</code> 的 2.60 秒在 <code>-P16</code> 降到 1.80 秒，超过核心数还在给</td><td>能同时等待的数量。对方扛得住的线是上限</td></tr>
+                            <tr><td>极短的任务</td><td>400 个要 15 秒上下，调大 <code>-P</code> 几乎不动</td><td>不是并行，而是用 <code>-n</code> 打包来减少执行次数</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>第三种是最常被漏掉的地方。400 个任务在 <code>-P1</code> 下 16.53 秒，在 <code>-P16</code> 下也要 15.75 秒，<strong>并行实际上什么都没拿到。</strong>因为开销不在任务本身，而在创建子进程这个过程，而这个过程是在 <code>xargs</code> 内部按顺序发生的。折算下来每个进程约 40 毫秒，这是<strong>Windows 系创建进程昂贵</strong>的缘故，所以在 Linux 上估计会小得多。这个对比没有做。</p>
+
+                    <ul>
+                        <li>CPU 密集时超过核心数，<strong>只会增加上下文切换和内存，时间原地不动</strong></li>
+                        <li>等待密集的基准不是核心数，而是<strong>对方扛得住的并发请求数</strong></li>
+                        <li>调外部 API 的话，那边的速率限制就是上限。超了只会让<strong>被封的速度</strong>变快</li>
+                        <li>瓶颈是机械硬盘时，并发度越高<strong>寻道越多，反而可能更慢</strong></li>
+                        <li>在共享存储上，<strong>你的并行会变成别人的延迟。</strong>自己机器的核心数当不了依据</li>
+                        <li>任务比创建进程的开销还短时，要调大的是 <code>-n</code> 而不是 <code>-P</code>，让<strong>一个进程处理多件</strong></li>
+                        <li>不好选就去测。只改 <code>-P</code> 跑几次，<strong>变平的那个点</strong>立刻就看得见</li>
+                    </ul>
+
+                    <h2 id="sec-13">用 -P 0 之前</h2>
+
+                    <p><code>-P 0</code> 的意思是<strong>能起多少就同时起多少</strong>，没有上限。输入是 12 个时是这样。</p>
+
+                    <pre><code># 输入 12 个，每个 1 秒
+$ seq 1 12 | xargs -P0 -I@ sleep 1
+   1.55 s   ← 12 个一起起来了
+
+$ seq 1 12 | xargs -P4 -I@ sleep 1
+   3.46 s
+
+# 用 30 个输入，数 0.6 秒时刻的同时执行数
+15</code></pre>
+
+                    <p>输入小的时候很方便。问题在于<strong>输入数量不由自己决定的管道。</strong>把 <code>find</code> 的结果直接接上 <code>-P 0</code>，文件有多少子进程就有多少，这个数到几千机器就没响应了。0.6 秒起了 15 个，意思是<strong>还在以每秒 25 个左右往上涨</strong>。</p>
+
+                    <ul>
+                        <li>只在确切知道输入数量的地方用。不知道的话，<strong>像 <code>-P $(nproc)</code> 这样的显式上限</strong>更好</li>
+                        <li>在生产机器上不要用。<strong>同一台机器上的其他服务会先被挤出去</strong></li>
+                        <li>每个子进程都很吃内存的话，先撞墙的不是个数而是<strong>内存总量</strong></li>
+                        <li>任务碰到共享资源的话，没有上限的并发就成了<strong>对那个资源的压力测试</strong></li>
+                    </ul>
+
+                    <h2 id="sec-14">中断之后留下什么</h2>
+
+                    <p>中途掐掉并行批次是常事。不先确认那时候什么会以什么状态留下，<strong>再跑一次时会出更大的问题。</strong>把 12 个任务用 <code>-P3</code> 跑着，在 1.3 秒时刻掐掉试试。</p>
+
+                    <pre><code># 只给 xargs 发 SIGTERM 时
+xargs exit code = 143
+files created = 3   complete = 3   partial = 0
+   → xargs 死了，但已经起来的 3 个子进程活到最后把活干完了。
+     剩下的 9 个连开始都没开始。
+
+# 连子进程也收到信号时
+  job1.txt  lines=9   COMPLETE=0
+  job2.txt  lines=10  COMPLETE=0
+  job3.txt  lines=10  COMPLETE=0
+   → 三个文件全都停在写了一半的状态。</code></pre>
+
+                    <p>两者差别很大。只杀 <code>xargs</code> 的话<strong>已经起来的子进程会继续活着把活干完</strong>，被丢掉的只有排在队列里的任务。而在终端按 Ctrl-C 时信号会发给<strong>整个前台进程组</strong>，子进程也一起死，当时正在写的文件就以做了一半的状态留下。</p>
+
+                    <p>这里出现了 <code>-P</code> 特有的问题。串行的话坏掉的产物是一个，<strong>而 <code>-P N</code> 会同时坏掉 N 个。</strong>而这 N 个光看名字和做完的分不出来。上一节的 <code>job.sh</code> 先写临时名字、最后再 <code>mv</code>，就是这个原因。</p>
+
+                    <pre><code># 用临时名字的方式做同样的实验
+files under their final name:
+    (none)
+leftover fragments:
+    .job1.part (lines=9)
+    .job2.part (lines=9)
+    .job3.part (lines=10)</code></pre>
+
+                    <p>在同一时刻掐掉，<strong>却一个带最终名字的半成品都没有。</strong>碎片以点开头的名字留着，下一次执行在 <code>[ -s "$out" ]</code> 这道检查里把它们看成未完成再处理一遍。同一文件系统内的 <code>mv</code> 是原子的，所以中间状态不会暴露出来。</p>
+
+                    <ul>
+                        <li>一考虑中断之后的事，<strong>把 worker 做成幂等的几乎是唯一的对策</strong></li>
+                        <li>判断是否完成要<strong>看完成标记而不是文件是否存在</strong>，需要「大小不为 0」或者「末行有标记」这类基准</li>
+                        <li>临时名字要定得<strong>让下一次执行认得出碎片。</strong>用点开头的话，合并阶段的 <code>*</code> 展开也不会把它们卷进去</li>
+                        <li>有了跳过已完成项的检查，<strong>中断加重跑本身就成了重试流程</strong></li>
+                        <li>这个设计不并行也一样值钱。背景在<a href="shell_readonly_idempotent_script.html">跑两次也安全的脚本</a>里</li>
+                    </ul>
+
+                    <h2 id="sec-15">在自己的环境上确认同样的结论</h2>
+
+                    <p>这篇文章的数字全都出自一台机器，<strong>在别的环境上分界线会落在别的位置。</strong>所以确认的流程本身才是这篇文章里能用得最久的部分。需要的只有前面写的那两个脚本，步骤是四步。</p>
+
+                    <ul>
+                        <li>第一，<strong>找出缓冲区分界线。</strong>把 <code>mix.sh</code> 的行长从 200 开始翻倍往上加，用 <code>check.sh</code> 数。第一次出现非 0 值的那个点就是那个环境的实务上限</li>
+                        <li>第二，<strong>管道和文件分别测。</strong>用同样的长度对比 <code>| ./check.sh</code> 和 <code>&gt;&gt; out.txt</code>，两条路径的缓冲区大小差异就显出来了</li>
+                        <li>第三，<strong>至少各跑五次。</strong>上面的测量里同样的条件出过 0 也出过 177，一次什么都定不下来</li>
+                        <li>第四，<strong>用上对策之后要连输出行数一起数。</strong>坏行为 0 这个结果，在完全没有输出时也会出现</li>
+                    </ul>
+
+                    <p>规模要放小。上面的实验是 8 个 worker 各出 100 行，几秒钟就结束。要在生产机器上测的话，把 worker 数减到 2 到 4、把重复次数加大。<strong>并发度降低了，分界线本身还是会出现在同一个位置。</strong></p>
+
+                    <p>在真实管道里怀疑有穿插时，最快的鉴别办法是<strong>把输出改成文件试试</strong>。在文件上变得完好，原因就是缓冲区大小的差异；两边都坏，就说明行本身太长，或者 worker 把一行分成好几次在往外送。</p>
+
+                    <h2 id="sec-16">该用别的东西而不是 xargs -P 的时候</h2>
+
+                    <p><code>xargs -P</code> 只把<strong>互相独立的任务按一定数量同时跑</strong>这件事做得好。一旦附加上别的要求，别的工具会更合适。</p>
+
+                    <ul>
+                        <li><strong>任务之间有依赖关系的话</strong>用 <code>make -j</code>。声明「A 结束才能开始 B」的图，剩下的它会自己并行处理</li>
+                        <li><strong>需要跳过已经产出的成果的话</strong>还是 <code>make</code>。文件时间比较是内建的，不必自己写幂等代码</li>
+                        <li><strong>输出顺序和行整理是硬要求的话</strong>，GNU parallel 的 <code>--keep-order</code>、<code>--line-buffer</code> 就是为这件事存在的</li>
+                        <li><strong>需要重试、超时、退避的话</strong>，语言运行时的 worker 池更好。一旦要持有状态，Shell 就处于劣势</li>
+                        <li><strong>失败项要接到下一次执行的话</strong>需要任务队列。<code>failed.txt</code> 这种方式只在规模小的时候撑得住</li>
+                        <li><strong>需要显示进度的话</strong> <code>xargs</code> 什么都不提供，只能自己数或者换工具</li>
+                        <li>反过来，<strong>几百个独立任务跑一次就完的话</strong>，<code>xargs -P</code> 依然是最便宜的</li>
+                    </ul>
+
+                    <p>判断标准可以收敛成一条：<strong>任务之间产生关系的那一刻。</strong>无论是顺序、依赖还是重试，一旦有了关系，<code>xargs</code> 就没有表达它的语法，复杂度全被推到脚本那一侧。当这份复杂度超过几行 <code>make</code> 规则时，就是该换的时候了。</p>
+
+                    <h2 id="sec-17">未能确认的部分</h2>
+
+                    <ul>
+                        <li><strong>没能在 Linux 实机上测量。</strong>本文所有数字都出自 Windows 上的 MSYS2 环境。MSYS2 的管道是模拟的，特别是第 6 节的 64KiB 分界线，在 Linux 上很可能落在别处</li>
+                        <li><strong>超过 <code>PIPE_BUF</code> 的 <code>write()</code> 在 Linux 上是否真的会被拆开</strong>没能确认。在上面这台机器上远超 4096 也一直完好到 64KiB，但这是规范保证范围之外的行为，不能搬到别处套用</li>
+                        <li><strong>stdio 缓冲区是 1024 和 4096 这一点是从观察反推出来的。</strong>没有用 <code>strace</code> 之类直接确认实际 <code>write()</code> 调用的大小，确认的只是分界线出现在那个位置这个事实</li>
+                        <li><strong>GNU parallel 的 <code>--line-buffer</code>、<code>--keep-order</code> 没能运行。</strong>这台机器上没装。第 8 节的第四项只写了工具的存在和用途，不是实测</li>
+                        <li><strong>用 <code>flock</code> 做串行化也没能测量。</strong>同样没装。正文里写的只是因为这个事实差点得出错误的 0 这段经过</li>
+                        <li><strong>退出码 126</strong>，也就是找到了命令但无法执行的情况没能复现。做了一个没有执行权限的文件去试，但这个环境里 <code>xargs</code> 返回了 0。看上去是 Windows 文件系统的权限处理所致，但没有去确认</li>
+                        <li><strong>在真实终端里按 Ctrl-C 的情况</strong>没能复现。从脚本向进程组发 <code>SIGINT</code> 的方式在这个环境里信号没有传到。第 14 节的「连子进程也收到信号时」是直接指定子进程终止得到的结果</li>
+                        <li><strong>创建进程的 40 毫秒开销没能和 Linux 对比。</strong>估计在 Linux 上会小得多，但第 12 节「极短的任务」这个结论在 Linux 上从多大规模开始成立，没有测过</li>
+                    </ul>
+
+                    <h2 id="sec-18">参考资料</h2>
+
+                    <ul>
+                        <li><a href="https://www.gnu.org/software/findutils/manual/html_node/find_html/xargs-options.html" target="_blank" rel="noopener">GNU Findutils — xargs options</a> — <code>-P</code>、<code>-n</code>、<code>-L</code>、<code>-I</code>、<code>--process-slot-var</code>、<code>--show-limits</code> 的官方说明，选项之间的互斥关系也写在这里</li>
+                        <li><a href="https://pubs.opengroup.org/onlinepubs/9699919799/functions/write.html" target="_blank" rel="noopener">POSIX — write()</a> — 对管道写入 <code>PIPE_BUF</code> 及以下时的原子性规定，以及明确写出对更大的写入没有保证</li>
+                        <li><a href="https://man7.org/linux/man-pages/man7/pipe.7.html" target="_blank" rel="noopener">pipe(7) — Linux manual page</a> — Linux 上的管道容量、<code>PIPE_BUF</code> 与原子性条件的说明</li>
+                        <li><a href="https://www.gnu.org/software/coreutils/manual/html_node/stdbuf-invocation.html" target="_blank" rel="noopener">GNU Coreutils — stdbuf</a> — <code>-o0</code>、<code>-oL</code>、<code>-oSIZE</code> 的含义，以及对自行设置缓冲的程序无效这一限制</li>
+                        <li><a href="https://www.gnu.org/software/parallel/parallel.html" target="_blank" rel="noopener">GNU parallel 手册</a> — <code>--line-buffer</code>、<code>--keep-order</code>、<code>--jobs</code> 等关于输出整理与顺序保证的选项</li>
+                        <li><a href="https://www.gnu.org/software/make/manual/html_node/Parallel.html" target="_blank" rel="noopener">GNU Make — Parallel Execution</a> — 用 <code>-j</code> 并行处理依赖图时的规则与输出整理选项</li>
+                        <li><a href="find_xargs_whitespace_trap.html">find 与 xargs 的空格换行陷阱</a> — 本文第 11 节转交出去的参数切分问题的详情</li>
+                        <li><a href="shell_exit_code_pipefail.html">Shell 退出码与 set -e</a> — 把第 10 节的退出码处理放到整个脚本层面来讲的文章</li>
+                        <li><a href="shell_readonly_idempotent_script.html">跑两次也安全的脚本</a> — 第 14 节用到的临时名字与原子替换模式的背景</li>
+                        <li><a href="shell_subshell_variable_scope.html">管道里的while为什么变量会消失</a> — 第 10 节提到的花括号组与子 shell 的区别</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>分享本文</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">返回列表</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/ssh_config_generator.html">SSH config生成器 2026</a></li>
+      <li><a href="../static/iptables_generator.html">iptables 防火墙规则生成器</a></li>
+      <li><a href="../static/code_image.html">代码图片生成器</a></li>
+      <li><a href="../static/char_counter.html">字数统计</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="shell_here_doc_guide.html">Here Document 实战 - 变量展开的开与关，以及缩进陷阱</a></li>
+      <li><a href="shell_glob_vs_regex.html">glob 与正则不同 - 星号含义分岔的那一刻</a></li>
+      <li><a href="personal_agent_server.html">驻留着智能体的服务器 - 个人自己运行一台时新出现的问题</a></li>
+      <li><a href="agent_framework_abstraction.html">智能体在代码里该是什么 - 类、图与配置文件各自遮住了什么</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制！请粘贴到Threads应用中分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制！'); });
+    });
+    </script>
+</body>
+</html>

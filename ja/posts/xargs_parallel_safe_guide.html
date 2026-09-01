@@ -1,0 +1,913 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ja">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>xargs 並列実行 -P - 出力が混ざる本当の理由と混ざらせない方法</title>
+    <meta name="description" content="xargs -P で並列にすると出力が混ざる。原因はパイプの原子性ではなく、その手前にある stdio バッファだ。行長 1024 を境に何が変わるのか、終了コードと中断処理まで実際に走らせて確かめた結果をまとめる。">
+    <meta name="keywords" content="xargs, xargs -P, 並列実行, PIPE_BUF, stdbuf, 出力の混在, シェルスクリプト, GNU findutils, 終了コード, 冪等性, 並行度, 開発, インフラ, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/ja/posts/xargs_parallel_safe_guide.html">
+
+    <meta property="og:title" content="xargs 並列実行 -P - 出力が混ざる本当の理由と混ざらせない方法">
+    <meta property="og:description" content="1023文字なら無事で、1024文字で壊れる。パイプの原子性を語る前に stdio バッファを見るべき理由を、実行結果で整理する。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/ja/posts/xargs_parallel_safe_guide.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ja_JP">
+    <meta property="article:published_time" content="2026-09-01">
+    <meta property="article:section" content="開発・インフラ">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="xargs -P を安全に使う">
+    <meta name="twitter:description" content="出力が混ざる原因はパイプではなくバッファだ。1024文字で割れる理由。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "xargs 並列実行 -P - 出力が混ざる本当の理由と混ざらせない方法",
+      "alternativeHeadline": "境界は行長 1024 にある。パイプの原子性より先に stdio バッファが効く",
+      "datePublished": "2026-09-01",
+      "dateModified": "2026-09-01",
+      "inLanguage": "ja-JP",
+      "articleSection": "開発・インフラ",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "xargs, xargs -P, 並列実行, PIPE_BUF, stdbuf, 出力の混在, シェルスクリプト, GNU findutils, 終了コード, 冪等性",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/ja/posts/xargs_parallel_safe_guide.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "xargs -P を付けたのに並列で動かないのはなぜか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "-P は同時に起動できる子プロセスの上限を決めるだけである。子をいくつ作るかを決めるのは -n と -L と -I だ。この三つをどれも与えないと xargs はコマンドラインバッファが許す限り引数をまとめて渡すため、子が一つか二つしか生まれず、-P をいくら大きくしても並列に回す対象そのものがない。入力一万行を -n なしの -P8 で回したとき実際に起動した子は四つで、-n100 を付けると百になった。並列にならないように見えたら -P を疑う前に実行回数を数えるほうが早い。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "並列実行で出力が混ざる原因は PIPE_BUF か",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "多くの場合その手前にある stdio バッファが先に問題を作る。PIPE_BUF は一回の write() 呼び出しが分割されないというカーネル側の保証であり、一行を何回の write() で送り出すかはその上にある標準入出力ライブラリが決める。実測では行長が1023文字のときは一行も壊れず、1024文字になった瞬間から壊れ始めた。この境界は PIPE_BUF の値ではなく、パイプに付いた stdio バッファのサイズと一致していた。つまりバッファが埋まって途中で一度 flush される瞬間にその行は二回の write() に分かれ、その間に他プロセスの出力が割り込む。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "stdbuf を使えば出力の混在は解決するか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "どのモードを与えるかで正反対に分かれる。行バッファリングの stdbuf -oL は一行をちょうど一回の write() で送り出させるので、10回の反復測定で壊れた行が一度も出なかった。逆にバッファを完全に切る stdbuf -o0 は状況を大きく悪化させた。800行のうち252個から467個が壊れた。バッファがないと本文と改行がそれぞれ別の write() で出ていくからである。もう一つ注意すべき点は stdbuf がシェル組み込みコマンドには効かないことだ。ワーカーが bash 組み込みの printf の場合は -oL を付けても測定値が変わらなかった。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "xargs は子が失敗したときどの終了コードを返すか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "子のコードをそのまま返すことはない。子が1から125の範囲で終了すると xargs は残りの作業を最後まで回したうえで123を返す。子が255で終了するとその場で中断して124を返す。子がシグナルで死ねば125、コマンドが見つからなければ127である。-P で複数を回している最中に1で終わった子と255で終わった子が同居した場合は、中断を引き起こした側である124が報告される。どの項目が失敗したかは終了コードからは分からないので、失敗した入力をワーカー自身がファイルに書き残すようにしたほうがよい。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "-P の値はコア数に合わせればよいか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "作業の性質によって異なる。CPU を使い続ける作業16個を8コアで回したときは -P8 で1.38秒、-P16 と -P32 はそれぞれ1.36秒と1.35秒で事実上差がなかった。コア数を超えても得るものがないという意味だ。逆に待つだけの作業32個は -P8 で2.60秒だったものが -P16 で1.80秒まで縮んだ。待ちが大半の作業はコア数よりはるかに大きく取っても利得が残る。ただし相手が外部 API や共有ストレージなら向こうの限界が基準になるべきで、作業一つがプロセス生成コストより短ければ並列で得るものはほとんどない。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/xargs_parallel_safe_guide.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/xargs_parallel_safe_guide.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/xargs_parallel_safe_guide.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/xargs_parallel_safe_guide.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/xargs_parallel_safe_guide.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "ホーム",
+      "item": "https://braindetox.kr/ja/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "開発・インフラ",
+      "item": "https://braindetox.kr/ja/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "xargs 並列実行 -P - 出力が混ざる本当の理由と混ざらせない方法",
+      "item": "https://braindetox.kr/ja/posts/xargs_parallel_safe_guide.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="xargs 並列実行 -P - 出力が混ざる本当の理由と混ざらせない方法">
+                <meta itemprop="datePublished" content="2026-09-01">
+                <meta itemprop="dateModified" content="2026-09-01">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="xargs, xargs -P, 並列実行, PIPE_BUF, stdbuf, 出力の混在, シェルスクリプト, GNU findutils, 終了コード, 冪等性">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/ja/posts/xargs_parallel_safe_guide.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">xargs 並列実行 -P - 出力が混ざる本当の理由と混ざらせない方法</h1>
+                    <h2 class="post-subtitle">1023文字なら無事で、1024文字で壊れる。パイプの原子性より先に見るべきもの</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-01">2026-09-01</span>
+                        <span class="post-category" itemprop="articleSection">開発・インフラ</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p><code>xargs -P</code> は並列を付ける最も安い方法だ。パイプラインの途中にオプションを一つ挟むだけでよく、新しく入れるものもない。ところがそうして付けたあと、ほぼ必ず同じことが起きる。<strong>ログがおかしくなる。</strong>行が途中で切れていたり、二つの作業の出力が一行の中で繋がっていたり、ある行は丸ごと消えたように見えたりする。</p>
+
+                    <p>この現象を説明するとき最も頻繁に出てくる語が <code>PIPE_BUF</code> だ。間違いではないのだが、実際に再現してみると<strong>壊れ始める境界がその値と合わない。</strong>この記事はその境界を自分で探した記録である。例はすべて走らせて出た出力をそのまま貼った。</p>
+
+                    <div class="callout">
+                        実行結果は以下に示す一台の環境で測った値である。バッファサイズと原子性の境界は C ライブラリの実装とカーネルによって変わるので、<strong>ここに書いた数字を他の環境の定数として持ち出してはいけない。</strong>同じことを自分で確認できる最小スクリプトを本文に併せて載せた。
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>この記事で扱うこと</h3>
+                        <ol>
+                            <li><a href="#sec-1">走らせた環境</a></li>
+                            <li><a href="#sec-2">-P が実際にすること</a></li>
+                            <li><a href="#sec-3">-P を付けても並列にならない場所</a></li>
+                            <li><a href="#sec-4">-n と -L と -I は違うものを数える</a></li>
+                            <li><a href="#sec-5">出力が混ざる境界を探す</a></li>
+                            <li><a href="#sec-6">一回の write() はどこまで安全か</a></li>
+                            <li><a href="#sec-7">パイプとファイルは違う振る舞いをする</a></li>
+                            <li><a href="#sec-8">混ざらせない四つの方法</a></li>
+                            <li><a href="#sec-9">混ざらないことと順序どおり出ることは違う</a></li>
+                            <li><a href="#sec-10">終了コード - 何が回り続け何が止まるか</a></li>
+                            <li><a href="#sec-11">空白入りのファイル名は姉妹記事に渡す</a></li>
+                            <li><a href="#sec-12">並行度をいくつにするか</a></li>
+                            <li><a href="#sec-13">-P 0 を使う前に</a></li>
+                            <li><a href="#sec-14">中断したときに残るもの</a></li>
+                            <li><a href="#sec-15">自分の環境で同じことを確かめる</a></li>
+                            <li><a href="#sec-16">xargs -P ではなく別のものを使うべきとき</a></li>
+                            <li><a href="#sec-17">確認できなかったこと</a></li>
+                            <li><a href="#sec-18">参考資料</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">走らせた環境</h2>
+
+                    <p>以下のすべての出力は Windows 10 上の Git Bash、つまり MSYS2 環境で出たものだ。この点が重要である。<strong>MSYS2 のパイプは Linux カーネルのパイプではなく Windows の上に載せたエミュレーション</strong>であり、後で見るように原子性の境界が Linux と違う場所に出る。その差が現れる箇所には都度印を付けた。</p>
+
+                    <pre><code>$ bash --version | head -1
+GNU bash, version 5.2.37(1)-release (x86_64-pc-msys)
+
+$ xargs --version | head -1
+xargs (GNU findutils) 4.10.0
+
+$ uname -s
+MINGW64_NT-10.0-19045
+
+$ nproc
+8
+
+$ getconf PIPE_BUF /tmp
+4096</code></pre>
+
+                    <p>ツールは <strong>GNU findutils 4.10.0</strong> である。<code>-P</code> は POSIX 標準ではなく GNU 拡張なので、BSD 系や busybox では動作が違うことがある。この環境には GNU parallel も <code>flock</code> も <code>make</code> も入っておらず、それらのツールについては<strong>何をするものかまで</strong>を書いた。</p>
+
+                    <h2 id="sec-2">-P が実際にすること</h2>
+
+                    <p><code>-P N</code> は<strong>同時に生きていられる子プロセスの最大数</strong>を決める。それ以上でも以下でもない。作業をどう分けるか、子をいくつ作るかはまったく決めない。1秒の作業八個で確かめるとこうなる。</p>
+
+                    <pre><code># 8個の作業、それぞれ1秒。直列で回すと
+$ time (seq 1 8 | xargs -I{} sh -c 'sleep 1; echo done {}')
+real    0m9.448s
+
+# 同じ作業、同時に4個まで
+$ time (seq 1 8 | xargs -P4 -I{} sh -c 'sleep 1; echo done {}')
+real    0m2.517s</code></pre>
+
+                    <p>9.45秒が2.52秒になった。8個を4個ずつ二束に分けたので理論上は2秒あまり、残りの0.5秒がプロセスを作る値段である。問題は<strong>この絵が成り立つ条件が狭い</strong>ことだ。</p>
+
+                    <h2 id="sec-3">-P を付けても並列にならない場所</h2>
+
+                    <p><code>xargs</code> の既定の動作は<strong>引数をできるだけまとめて一度に渡すこと</strong>だ。コマンドライン長の限界に届くまで押し込み続ける。だから分けろという指示を別に与えないと子が一つしか生まれず、<code>-P</code> をいくら大きく取っても並列に回す対象がない。</p>
+
+                    <pre><code># -P8 だけ与えて -n を外すと
+$ seq 1 8 | xargs -P8 sh -c 'echo "PID=$$ args=$*"; sleep 1' sh
+PID=1751 args=1 2 3 4 5 6 7 8
+real    0m1.233s
+
+# -n1 を与えるとようやく8個に割れる
+$ seq 1 8 | xargs -P8 -n1 sh -c 'echo "PID=$$ args=$*"; sleep 1' sh
+PID=1755 args=1
+PID=1756 args=2
+PID=1757 args=3
+PID=1758 args=4
+PID=1759 args=5
+PID=1760 args=6
+PID=1761 args=7
+PID=1762 args=8
+real    0m1.543s
+
+# -n2 なら4個
+$ seq 1 8 | xargs -P8 -n2 sh -c 'echo "PID=$$ args=$*"; sleep 1' sh
+PID=1766 args=1 2
+PID=1767 args=3 4
+PID=1768 args=5 6
+PID=1769 args=7 8</code></pre>
+
+                    <p>一つめの実行は PID が一つだけだ。子プロセスが一つ起動し、引数八個を全部受け取った。<code>-P8</code> は何もしていない。入力が大きくなるとこの罠はもっとうまく隠れる。</p>
+
+                    <pre><code># 入力1万個を -n なしの -P8 で。実際に起動した子プロセス数を数える
+$ seq 1 10000 | xargs -P8 sh -c 'echo x' sh | wc -l
+4
+
+# -n100 を付けると
+$ seq 1 10000 | xargs -P8 -n100 sh -c 'echo x' sh | wc -l
+100
+
+$ xargs --show-limits &lt; /dev/null
+POSIX upper limit on argument length (this system): 23857
+Maximum length of command we could actually use: 17762
+Size of command buffer we are actually using: 23857
+Maximum parallelism (--max-procs must be no greater): 2147483647</code></pre>
+
+                    <p>1万個渡したのに子は四つだ。八個まで起動できると言っておきながら<strong>起動するものが四つしかなかった。</strong>並列が効いていないように見えるとき <code>-P</code> を上げてみるのはたいてい徒労である。上のように子に一行ずつ出させて <code>wc -l</code> で数えれば数秒で答えが出る。</p>
+
+                    <ul>
+                        <li><code>-P</code> は上限であって分割の指示ではない。<strong>分割は <code>-n</code>・<code>-L</code>・<code>-I</code> がする</strong></li>
+                        <li>三つのどれもなければコマンドラインバッファが埋まるまで引数をまとめて押し込む。上の環境のそのバッファは23,857バイトだった</li>
+                        <li>だから入力が少ないか引数が短いと<strong>子が一つで終わることがよくある</strong></li>
+                        <li>逆に <code>-n1</code> を癖のように付けると作業が軽いとき<strong>生成コストが利得を食い尽くす</strong></li>
+                        <li>実行回数を数えることが <code>-P</code> に手を付ける前の第一段階だ</li>
+                    </ul>
+
+                    <h2 id="sec-4">-n と -L と -I は違うものを数える</h2>
+
+                    <p>三つとも分けるオプションだが<strong>数える単位が違う。</strong><code>-n</code> は引数の個数を数え、<code>-L</code> は入力行数を数え、<code>-I</code> は一行全体を丸ごと置換文字列に入れる。一行に単語が二つずつ入った入力で比べると差がすぐ見える。</p>
+
+                    <pre><code>$ printf 'a b\nc d\ne f\ng h\n' &gt; lines.txt
+
+$ xargs -n2 echo "batch:" &lt; lines.txt
+batch: a b
+batch: c d
+batch: e f
+batch: g h
+
+$ xargs -L2 echo "batch:" &lt; lines.txt
+batch: a b c d
+batch: e f g h
+
+$ xargs -I@ echo "batch: [@]" &lt; lines.txt
+batch: [a b]
+batch: [c d]
+batch: [e f]
+batch: [g h]
+
+$ xargs -n2 -I@ echo "batch: [@]" &lt; lines.txt
+xargs: warning: options --max-args and --replace/-I/-i are mutually exclusive,
+ignoring previous --max-args value
+batch: [a b]
+batch: [c d]
+batch: [e f]
+batch: [g h]</code></pre>
+
+                    <p>最後の実行が重要だ。<code>-n</code> と <code>-I</code> を一緒に与えると<strong>警告を出しながら <code>-n</code> を捨てる。</strong><code>-L</code> と <code>-I</code> でも同じことが起きる。<code>-I</code> が一行ずつ処理するよう固定するからだ。よく見かける <code>xargs -n1 -P8 -I{}</code> という組み合わせは <code>-n1</code> が黙って捨てられている形である。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>オプション</th><th>数える単位</th><th>並列で使うときの性格</th><th>併用できないもの</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>-n N</code></td><td>引数の個数</td><td>行境界を無視して N 個ずつ束ねる。バッチサイズを調整してプロセス生成コストを減らすときに使う</td><td><code>-I</code>, <code>-L</code></td></tr>
+                            <tr><td><code>-L N</code></td><td>入力行数</td><td>行単位を守りながら束ねる。一行がそのまま一レコードのとき安全だ</td><td><code>-I</code>, <code>-n</code></td></tr>
+                            <tr><td><code>-I R</code></td><td>一行全体</td><td>行全体を R の位置に差し込む。引数の位置を指定したいときの唯一の選択肢だ</td><td><code>-n</code>, <code>-L</code></td></tr>
+                            <tr><td>何もなし</td><td>バッファが埋まるまで</td><td>子が極少数しか生まれず <code>-P</code> が無力になる</td><td>-</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2 id="sec-5">出力が混ざる境界を探す</h2>
+
+                    <p>ここからが本題だ。混在は確率的に起きるので<strong>一度回して壊れなかったから安全というわけではない。</strong>再現可能な形にするには壊れたかどうかを機械が判定できる必要がある。ワーカーごとに自分の文字一つだけを繰り返した行を出させれば簡単になる。一行の中に二種類以上の文字があればその行は壊れている。</p>
+
+                    <pre><code>#!/usr/bin/env bash
+# mix.sh &lt;行長&gt;
+# ワーカー8個がそれぞれ自分の文字を L 個繰り返した行を100回出力する。
+# 一行に二種類以上の文字が混ざれば write() が割れたということだ。
+export L=${1:-1500}
+printf '%s\n' a b c d e f g h |
+xargs -P8 -n1 bash -c '
+  line=$(printf "%${L}s" "" | tr " " "$1")
+  for i in $(seq 1 100); do printf "%s\n" "$line"; done
+' _</code></pre>
+
+                    <pre><code>#!/usr/bin/env bash
+# check.sh &lt;行長&gt; — 標準入力を読んで壊れた行の数を数える
+awk -v L="${1:-1500}" '
+  { total++
+    if (length($0) != L) { bad++; next }
+    f = substr($0,1,1)
+    for (i = 2; i &lt;= length($0); i++)
+      if (substr($0,i,1) != f) { bad++; break }
+  }
+  END { printf "%d lines, %d broken\n", total, bad+0 }'</code></pre>
+
+                    <p>行長を変えながら回すと境界が鮮明に出る。</p>
+
+                    <pre><code>$ for L in 200 1023 1024 1500 8000; do
+    printf "L=%-6s " "$L"; ./mix.sh "$L" | ./check.sh "$L"
+  done
+L=200    800 lines, 0 broken
+L=1023   800 lines, 0 broken
+L=1024   800 lines, 68 broken
+L=1500   800 lines, 216 broken
+L=8000   800 lines, 666 broken</code></pre>
+
+                    <p><strong>1023文字までは一行も壊れず、1024文字になった瞬間から壊れ始める。</strong>そしてこの数字は <code>getconf</code> が教えてくれた <code>PIPE_BUF</code> の値4096と合わない。改行まで数えると1024文字の行は1025バイトだ。つまり<strong>1024バイトのバッファが埋まって一度空になる地点</strong>が境界である。カーネルのパイプではなく、その上にある標準入出力ライブラリが先に行を切った。</p>
+
+                    <p>順序はこうだ。<code>printf</code> を呼ぶと文字はすぐパイプへ行かず<strong>ユーザー空間のバッファに溜まる。</strong>バッファが埋まるとそのとき <code>write()</code> が一度呼ばれる。一行がバッファより長ければその行は二回以上に分かれて出ていき、その間に他のプロセスが割り込む隙ができる。<code>PIPE_BUF</code> はその次の話だ。</p>
+
+                    <h2 id="sec-6">一回の write() はどこまで安全か</h2>
+
+                    <p>では<strong>本当に一回の <code>write()</code> で送り出したら</strong>どうなるかが気になる。バッファを迂回する必要があるので <code>dd</code> を使う。<code>dd</code> は <code>bs</code> の分だけ読んでその塊を一度に書く。</p>
+
+                    <pre><code>#!/usr/bin/env bash
+# あらかじめ作っておいた行を dd で一度に write() する。stdio バッファを飛ばす。
+export L=${1:-8000}
+for ch in a b c d e f g h; do
+  printf "%${L}s" "" | tr ' ' "$ch"  &gt;  "line.$ch"
+  printf '\n'                        &gt;&gt; "line.$ch"
+done
+export SZ=$((L+1))
+printf '%s\n' a b c d e f g h |
+xargs -P8 -n1 bash -c '
+  for i in $(seq 1 40); do dd if="line.$1" bs=$SZ count=1 status=none; done
+' _</code></pre>
+
+                    <pre><code>L=8000    320 lines, 0 broken
+L=16000   320 lines, 0 broken
+L=32000   320 lines, 0 broken
+L=63000   320 lines, 0 broken
+L=65535   320 lines, 0 broken
+L=65536   320 lines, 277 broken
+L=200000  320 lines, 306 broken</code></pre>
+
+                    <p>65,535文字までは無事で65,536文字で崩れる。改行を足すと<strong>ちょうど 64KiB が境界</strong>だ。<code>PIPE_BUF</code> として報告された4096ではない。64KiB はこのプラットフォームでパイプが抱えられる容量であり、それより大きい <code>write()</code> は一度に収まらず書きかけでブロックし、その隙に他のプロセスが割り込む。</p>
+
+                    <p>ここで実測と仕様を区別しなければならない。<strong>POSIX が保証するのは <code>PIPE_BUF</code> 以下の <code>write()</code> だけ</strong>である。それより大きければ割れても規格違反ではない。上の実測はこの MSYS2 環境が規格より寛大に動くという観察であって、<strong>他の環境で4096を超えてよい根拠ではない。</strong>Linux 実機で同じ測定はしていない。</p>
+
+                    <ul>
+                        <li>安全に頼れる線は <code>PIPE_BUF</code> 以下だ。上の環境で <strong>4096バイト</strong>であり、この値も <code>getconf</code> で確認すべきである</li>
+                        <li>ところがその線に届く前に<strong>stdio バッファが先に行を切る。</strong>実測の境界は1024バイトだった</li>
+                        <li>したがって実務の基準は <code>PIPE_BUF</code> ではなく<strong>「一行を一回の <code>write()</code> で送り出しているか」</strong>だ</li>
+                        <li>行が短ければ二つの条件は自然に同時に満たされる。ログ一行を200文字以内に収める慣行が並列で特に値打ちを持つ理由である</li>
+                    </ul>
+
+                    <h2 id="sec-7">パイプとファイルは違う振る舞いをする</h2>
+
+                    <p>同じコマンドでも<strong>出力をパイプに渡すかファイルにリダイレクトするかで結果が変わる。</strong>両方を五回ずつ回してみた。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>行長</th><th>パイプで受けたとき（800行中の壊れた行、5回）</th><th>ファイルに <code>&gt;&gt;</code> で受けたとき（5回）</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>1023文字</td><td>0 · 0 · 0 · 0 · 0</td><td>0 · 0 · 0 · 0 · 0</td></tr>
+                            <tr><td>1024文字</td><td>177 · 68 · 0 · 80 · 142</td><td>20 · 2 · 10 · 0 · 6</td></tr>
+                            <tr><td>1500文字</td><td>226 · 124 · 300 · 250 · 153</td><td>0 · 0 · 0 · 2 · 0</td></tr>
+                            <tr><td>8000文字</td><td>698 · 653 · 664 · 621 · 617</td><td>42 · 126 · 228 · 242 · 111</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>1500文字ではパイプは800行のうち100〜300行が壊れるのにファイルはほぼ無事だ。理由は前節と同じである。<strong>ファイルに付いた stdio バッファがパイプに付いたものより大きいから</strong>だ。この環境でファイル側の境界は4096バイト近辺で、だから1500文字の行は一回の <code>write()</code> に収まる。8000文字になるとファイルも崩れる。</p>
+
+                    <p><code>&gt;&gt;</code> で開く <code>O_APPEND</code> は<strong>各 <code>write()</code> が常にファイル末尾に付く</strong>ことを保証する。二つのプロセスが互いの場所を上書きする事故はない。ただしそこまでだ。<strong>一行が二回に分かれれば、その間に他の断片が割り込むのは防げない。</strong>上の表の8000文字の行がその結果である。</p>
+
+                    <p>1024文字の行でパイプが一度0を記録したことも見過ごせない。<strong>同じ条件で五回回して一度は無事だった。</strong>混在を「再現しないから問題ではない」と処理してはいけない理由がここにある。</p>
+
+                    <h2 id="sec-8">混ざらせない四つの方法</h2>
+
+                    <p>対策は大きく四つだ。実効をそれぞれ測り、測定は行長1500文字で統一した。この長さはパイプで確実に壊れる区間である。</p>
+
+                    <h3>① ワーカーごとに自分のファイルへ書き、あとで結合する</h3>
+
+                    <p>最も確実だ。同じ fd を奪い合わないので原子性の問題が消える。</p>
+
+                    <pre><code># ワーカーごとに自分のファイルへ書き、終わってから名前順に繋げる
+d=$(mktemp -d); export d
+printf '%s\n' a b c d e f g h |
+xargs -P8 -n1 bash -c '
+  line=$(printf "%1500s" "" | tr " " "$1")
+  for i in $(seq 1 100); do printf "%s\n" "$line"; done &gt; "$d/$1.out"
+' _
+cat "$d"/*.out
+rm -rf "$d"</code></pre>
+
+                    <p>10回繰り返して<strong>壊れた行が一度も出なかった。</strong>代わりに作業数だけファイルができる。作業が数万個なら負担だ。findutils 4.7 以上にはこのためのオプションがある。</p>
+
+                    <pre><code># 作業数ではなく並行度の数だけファイルを作る
+d=$(mktemp -d); export d
+printf '%s\n' a b c d e f g h |
+xargs -P4 -n1 --process-slot-var=SLOT bash -c '
+  line=$(printf "%1500s" "" | tr " " "$1")
+  for i in $(seq 1 100); do printf "%s\n" "$line"; done &gt;&gt; "$d/slot$SLOT.out"
+' _
+cat "$d"/*.out; rm -rf "$d"</code></pre>
+
+                    <p><code>--process-slot-var</code> は各子に0から <code>-P</code> の値の直前までのスロット番号を環境変数で渡す。スロットは子が終わると再利用されるのでファイル数が並行度に固定される。5回の測定で壊れた行は0個だった。</p>
+
+                    <h3>② stdbuf でバッファリングを変える</h3>
+
+                    <p>ここが最も罠が多い。ワーカーを <code>awk</code> にしてバッファ設定だけ変え、10回ずつ測った。</p>
+
+                    <pre><code>$ P='BEGIN{l=sprintf("%1500s",""); gsub(/ /,c,l); for(i=0;i&lt;100;i++) print l}'
+
+# そのまま（awk 既定のバッファリング）
+$ printf '%s\n' a b c d e f g h | xargs -P8 -I@ awk -v c=@ "$P" | ./check.sh 1500
+   6  0  18  0  3  9  9  0  9  6
+
+# バッファを切ると
+$ ... | xargs -P8 -I@ stdbuf -o0 awk -v c=@ "$P" | ./check.sh 1500
+   418  264  467  310  299  262  324  278  252  298
+
+# 行バッファに変えると
+$ ... | xargs -P8 -I@ stdbuf -oL awk -v c=@ "$P" | ./check.sh 1500
+   0  0  0  0  0  0  0  0  0  0</code></pre>
+
+                    <p><strong><code>stdbuf -o0</code> は状況を大きく悪化させる。</strong>直観と逆だ。バッファを切れば出力がすぐ出るので安全そうに思えるが、実際には本文と改行が<strong>それぞれ別に <code>write()</code> で出ていき</strong>、その間に割り込む隙を作る。逆に <code>-oL</code> は一行をちょうど一度で送り出すので10回すべて0だった。</p>
+
+                    <p>限界も明確だ。<strong><code>stdbuf</code> はシェル組み込みコマンドに効かない。</strong>ワーカーが <code>bash</code> の組み込み <code>printf</code> の場合に <code>-oL</code> を付けてみたが、測定値は手を付けなかったときと変わらなかった。自分でバッファリングを設定するプログラムにも同様に通じない。</p>
+
+                    <h3>③ 一行にまとめて一度に出す</h3>
+
+                    <p>ワーカーが何行もちびちび出す代わりに<strong>結果を文字列にまとめて最後に一度だけ出力</strong>すれば、その文字列がバッファより短い限り安全だ。先の測定で行長を120文字に縮めたら10回すべて0だった。この方式の値打ちは<strong>行長の上限を自分で制御できる</strong>点にある。ただし出力量を予測できない作業には使えない。</p>
+
+                    <h3>④ 専用ツールに任せる</h3>
+
+                    <p>GNU parallel には <code>--line-buffer</code> と <code>--keep-order</code> がある。前者は子たちの出力を行単位に整えて出し、後者は入力順に出るようにする。<strong>ただしこの環境には GNU parallel が入っておらず、実行結果を確認できなかった。</strong>ここではそういうツールがあるということまでを書く。</p>
+
+                    <p><code>flock</code> で出力を直列化する方法もよく紹介される。この環境には <code>flock</code> がなかったのだが、<strong>それを知らずに「壊れた行0個」という結果を得るところだった。</strong><code>flock 9 &amp;&amp; printf ...</code> の形で書いたら <code>flock</code> が127で失敗して <code>&amp;&amp;</code> の後ろが丸ごと実行されず、出力が0行なので壊れた行も0個だった。対策の実効を測るときは<strong>出力行数が期待値と合うかを併せて確認しなければならない。</strong></p>
+
+                    <table>
+                        <thead>
+                            <tr><th>対策</th><th>1500文字での実測</th><th>代償</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>ワーカー別の一時ファイル後に結合</td><td>10回すべて0</td><td>作業数だけファイル。後始末のコードが要る</td></tr>
+                            <tr><td><code>--process-slot-var</code> スロット別ファイル</td><td>5回すべて0</td><td>findutils 4.7 以上。スロット内では順序が混ざる</td></tr>
+                            <tr><td><code>stdbuf -oL</code></td><td>10回すべて0</td><td>組み込み・自前バッファリングのプログラムには無効</td></tr>
+                            <tr><td><code>stdbuf -o0</code></td><td>252〜467個（悪化）</td><td>使ってはいけない</td></tr>
+                            <tr><td>行を短く保つ（120文字）</td><td>10回すべて0</td><td>出力量を制御できる作業にのみ</td></tr>
+                            <tr><td>手を付けない（bash 組み込み printf）</td><td>320〜505個</td><td>-</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2 id="sec-9">混ざらないことと順序どおり出ることは違う</h2>
+
+                    <p>行が無事でも<strong>順序は別問題だ。</strong>並列で回る以上、先に終わったものが先に出る。作業時間がまちまちなら出力順は毎回変わる。</p>
+
+                    <pre><code># 入力は1から8まで、作業時間はランダム
+$ seq 1 8 | xargs -P8 -n1 bash -c 'sleep 0.$((RANDOM%9)); printf "%s " "$1"' _
+4 7 6 3 1 8 2 5
+1 5 4 3 8 2 6 7
+3 6 1 4 8 2 7 5
+
+# ワーカー別ファイルに書いて名前順に結合すれば常に入力順
+1 2 3 4 5 6 7 8
+1 2 3 4 5 6 7 8
+1 2 3 4 5 6 7 8</code></pre>
+
+                    <p>三回回して三回とも違う順序が出た。これは欠陥ではなく並列の定義である。<strong>順序が必要なら順序を作り出す段階を別に置かなければならない。</strong>上のようにファイル名に整列可能なキーを入れて最後に名前順で結合するのが最も単純な方法で、先に見た一時ファイルの対策がそのまま順序保証まで兼ねる。</p>
+
+                    <ul>
+                        <li>ファイル名を <code>001</code>、<code>002</code> のように<strong>桁を揃えた数字</strong>にしてはじめて <code>*</code> 展開が辞書順に正しく並ぶ</li>
+                        <li>順序を守る代わりに<strong>最も遅い作業が終わるまで何も出せない。</strong>進行状況をリアルタイムで見たいなら相反する</li>
+                        <li>リアルタイムの進行表示が必要なら<strong>進行ログは標準エラーへ、結果はファイルへ</strong>分けるほうがよい</li>
+                        <li>順序が本当に必要かをまず問うこと。結果をあとで整列したりキーで引くなら順序保証に代価を払う理由はない</li>
+                    </ul>
+
+                    <h2 id="sec-10">終了コード - 何が回り続け何が止まるか</h2>
+
+                    <p><code>xargs</code> は子が失敗しても止まらない。この点を知らないと<strong>半分失敗したバッチが成功として報告される</strong>事故が起きる。</p>
+
+                    <pre><code># 子の一つが exit 1 で終わっても残りは回り続ける
+$ seq 1 5 | xargs -P4 -n1 bash -c '[ "$1" = 3 ] &amp;&amp; { echo "FAIL $1" &gt;&amp;2; exit 1; }; echo "OK $1"' _
+OK 1
+OK 2
+FAIL 3
+OK 4
+OK 5
+$ echo $?
+123
+
+# exit 255 は xargs 自体を止める
+$ seq 1 6 | xargs -n1 bash -c 'echo "run $1"; [ "$1" = 3 ] &amp;&amp; exit 255; exit 0' _
+run 1
+run 2
+run 3
+xargs: bash: exited with status 255; aborting
+$ echo $?
+124</code></pre>
+
+                    <p>二つめの例で4・5・6番はまったく始まっていない。<strong>255 は「やめろ」という信号として予約されている。</strong>作業スクリプトがたまたま255で終わるように書かれていると残りのバッチが静かに切り捨てられる。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>子に起きたこと</th><th>xargs の終了コード</th><th>残りの作業</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>1〜125の範囲で終了</td><td>123</td><td>最後まで回り続ける</td></tr>
+                            <tr><td>255で終了</td><td>124</td><td>即座に中断。メッセージを標準エラーへ出す</td></tr>
+                            <tr><td>シグナルで死ぬ</td><td>125</td><td>即座に中断</td></tr>
+                            <tr><td>コマンドが見つからない</td><td>127</td><td>即座に中断</td></tr>
+                            <tr><td>すべて成功</td><td>0</td><td>-</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p><code>-P4</code> で回しながら1で終わる子と255で終わる子を同居させたらどうなるかも確認した。三回とも <strong>124</strong> だった。中断を引き起こした側が報告を持っていく。</p>
+
+                    <p>ここで重要なのは<strong>終了コードではどの項目が失敗したか分からない</strong>という点だ。123は「何か一つ以上失敗した」という意味でしかない。だから失敗を扱う責任はワーカー側に置くほうがよい。</p>
+
+                    <pre><code>#!/usr/bin/env bash
+# job.sh — 失敗を自分で記録し、二度回しても安全に
+item=$1
+out="work/$item.out"
+[ -s "$out" ] &amp;&amp; exit 0            # 既に終わったものは飛ばす
+
+tmp="work/.$item.part"
+(                                   # サブシェル。ここで exit してもワーカーは生きている
+  echo "processing $item"
+  do_the_real_work "$item"
+) &gt; "$tmp" 2&gt;&amp;1
+rc=$?
+
+if [ "$rc" -ne 0 ]; then
+  echo "$item rc=$rc" &gt;&gt; work/failed.txt
+  rm -f "$tmp"
+  exit 0                            # xargs を止めない
+fi
+mv -f "$tmp" "$out"                 # 完結したものだけが最終名を持つ</code></pre>
+
+                    <pre><code>$ seq 1 12 | xargs -P4 -n1 ./job.sh
+xargs exit code = 0
+succeeded: 10
+failed:
+  4 rc=3
+  9 rc=7
+
+# 同じコマンドをもう一度 — 成功した10個は飛ばす
+$ seq 1 12 | xargs -P4 -n1 ./job.sh
+succeeded: 10
+
+# 失敗したものだけ選んで再実行
+$ cut -d' ' -f1 work/failed.txt | sort -nu | xargs -P4 -n1 ./job.sh</code></pre>
+
+                    <p>このスクリプトを最初に書いたとき失敗をした。失敗を真似ようとして <code>{ ... }</code> 中括弧グループの中に <code>exit 3</code> を入れたら<strong>ワーカー全体がその場で終わり</strong>、失敗記録のコードが実行されなかった。中括弧は現在のシェルで回るグループであり <code>exit</code> はシェルを終わらせる。上のように<strong>丸括弧のサブシェル</strong>でなければ <code>exit</code> がその中だけで終わらない。<a href="shell_subshell_variable_scope.html">パイプの中のwhileで変数が消える理由</a>で扱ったサブシェル境界と同じ問題だ。</p>
+
+                    <p><code>failed.txt</code> は <code>&gt;&gt;</code> で溜まるので二度回すと同じ項目が二行になる。上で <code>sort -nu</code> を通した理由である。<code>set -e</code> との相互作用は<a href="shell_exit_code_pipefail.html">シェルの終了コードと set -e</a>にある。</p>
+
+                    <h2 id="sec-11">空白入りのファイル名は姉妹記事に渡す</h2>
+
+                    <p>並列と直接の関係はないが一緒に爆発する問題なので一度は押さえておく。<code>xargs</code> は既定で<strong>空白で引数を割る。</strong></p>
+
+                    <pre><code>$ ls
+plain.txt
+report final.txt
+
+$ find . -name '*.txt' | xargs -P4 -n1 sh -c 'echo "[$1]"' _
+[./plain.txt]
+[./report]
+[final.txt]
+
+$ find . -name '*.txt' -print0 | xargs -0 -P4 -n1 sh -c 'echo "[$1]"' _
+[./plain.txt]
+[./report final.txt]</code></pre>
+
+                    <p>ファイル二つを渡したのに作業が三つに割れた。<code>-print0</code> と <code>-0</code> を組にして使えば解決する。並列でこの事故が特に悪いのは<strong>割れた断片が複数の子に散らばって</strong>ログだけ見ても何が間違ったのか分かりにくい点にある。詳細と <code>-I</code> を使ったときの違いは<a href="find_xargs_whitespace_trap.html">find・xargs の空白と改行の罠</a>にある。</p>
+
+                    <h2 id="sec-12">並行度をいくつにするか</h2>
+
+                    <p>コア数をそのまま使えという助言をよく見るが、<strong>作業の性質によって答えが違う。</strong>8コアの機械で三つの類型を測った。</p>
+
+                    <pre><code># CPU を使い続ける作業16個（コア8個）
+-P 1  :   4.27 s
+-P 2  :   2.62 s
+-P 4  :   1.61 s
+-P 8  :   1.38 s
+-P 16 :   1.36 s
+-P 32 :   1.35 s
+
+# 待つだけの作業（sleep 0.5）32個
+-P 1  :  18.63 s
+-P 4  :   4.67 s
+-P 8  :   2.60 s
+-P 16 :   1.80 s
+-P 32 :   1.78 s
+-P 64 :   1.81 s
+
+# すぐ終わる作業400個 — プロセスを作る値段だけが残る
+-P 1  :  16.53 s
+-P 4  :  15.26 s
+-P 8  :  15.92 s
+-P 16 :  15.75 s</code></pre>
+
+                    <table>
+                        <thead>
+                            <tr><th>作業の類型</th><th>観測された性質</th><th>-P を決める基準</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>CPU バウンド</td><td><code>-P8</code> 以降 <code>-P32</code> まで1.38→1.35秒。事実上平らだ</td><td>コア数。上げても得るものがなくメモリだけ使う</td></tr>
+                            <tr><td>待ちバウンド</td><td><code>-P8</code> の2.60秒が <code>-P16</code> で1.80秒。コア数を超えても効き続ける</td><td>同時に待てる数。相手が耐える線が上限</td></tr>
+                            <tr><td>ごく短い作業</td><td>400個で15秒台。<code>-P</code> を上げてもほぼそのままだ</td><td>並列ではなく <code>-n</code> で束ねて実行回数を減らすこと</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>三つめが最もよく見落とされる箇所だ。400個の作業が <code>-P1</code> で16.53秒なのに <code>-P16</code> でも15.75秒である。<strong>並列で得たものが事実上ない。</strong>コストが作業ではなく子を作り出す過程にあり、その過程は <code>xargs</code> の中で順番に起きるからだ。プロセス一つあたり約40ミリ秒だが、これは <strong>Windows 系でプロセス生成が高い</strong>せいなので Linux ではずっと小さいと見ている。その比較はしていない。</p>
+
+                    <ul>
+                        <li>CPU バウンドでコア数を超えると<strong>コンテキストスイッチとメモリだけ増えて時間はそのままだ</strong></li>
+                        <li>待ちバウンドの基準はコア数ではなく<strong>相手が耐える同時リクエスト数</strong>だ</li>
+                        <li>外部 API ならあちらのレート制限が上限である。超えると<strong>ブロックされる速度</strong>が速くなるだけだ</li>
+                        <li>回転ディスクがボトルネックなら並行度を上げるほど<strong>シークが増えてむしろ遅くなりうる</strong></li>
+                        <li>共有ストレージの上では<strong>自分の並列が他人の遅延になる。</strong>自分の機械のコア数は根拠にならない</li>
+                        <li>作業がプロセス生成コストより短ければ <code>-P</code> ではなく <code>-n</code> を大きくして<strong>一プロセスが複数件を処理</strong>するようにする</li>
+                        <li>選びにくければ測る。<code>-P</code> だけ変えて何度か回せば<strong>平らになる地点</strong>がすぐ見える</li>
+                    </ul>
+
+                    <h2 id="sec-13">-P 0 を使う前に</h2>
+
+                    <p><code>-P 0</code> は<strong>可能な限り全部同時に</strong>起動しろという意味だ。上限がない。入力が12個のときはこう動く。</p>
+
+                    <pre><code># 入力12個、それぞれ1秒
+$ seq 1 12 | xargs -P0 -I@ sleep 1
+   1.55 s   ← 12個が一度に起動した
+
+$ seq 1 12 | xargs -P4 -I@ sleep 1
+   3.46 s
+
+# 入力30個で0.6秒時点の同時実行数を数えると
+15</code></pre>
+
+                    <p>入力が小さいときは便利だ。問題は<strong>入力数を自分で決めないパイプライン</strong>である。<code>find</code> の結果をそのまま噛ませた <code>-P 0</code> はファイル数がそのまま子の数になり、その数が数千なら機械が応答を失う。0.6秒で15個起動したということは<strong>毎秒25個ほどで増え続ける</strong>という意味だ。</p>
+
+                    <ul>
+                        <li>入力数を確実に知っている場所でのみ使う。分からなければ <strong><code>-P $(nproc)</code> のような明示的な上限</strong>のほうがよい</li>
+                        <li>運用中の機械では使わない。<strong>同じ機械の他のサービスが先に押し出される</strong></li>
+                        <li>各子がメモリを大きく使うなら個数ではなく<strong>メモリ総量</strong>が先に限界に届く</li>
+                        <li>共有資源に触る作業なら上限のない並行度は<strong>その資源に対する負荷試験</strong>になる</li>
+                    </ul>
+
+                    <h2 id="sec-14">中断したときに残るもの</h2>
+
+                    <p>並列バッチを途中で切ることはよくある。そのとき何がどう残るかを確認しておかないと<strong>もう一度回したときにもっと大きな問題が起きる。</strong>12個の作業を <code>-P3</code> で回しながら1.3秒時点で切ってみた。</p>
+
+                    <pre><code># xargs にだけ SIGTERM を送ったとき
+xargs exit code = 143
+files created = 3   complete = 3   partial = 0
+   → xargs は死んだが、既に起動していた子3個は最後まで生きて仕事を終えた。
+     残りの9個は始まりすらしなかった。
+
+# 子たちまで信号を受けたとき
+  job1.txt  lines=9   COMPLETE=0
+  job2.txt  lines=10  COMPLETE=0
+  job3.txt  lines=10  COMPLETE=0
+   → 三つのファイルすべてが書きかけのまま残った。</code></pre>
+
+                    <p>二つの差が大きい。<code>xargs</code> だけ殺せば<strong>既に起動している子は生き続けて仕事を終える。</strong>待ち行列に残った作業だけが捨てられる。一方ターミナルで Ctrl-C を押すと信号が<strong>フォアグラウンドプロセスグループ全体</strong>へ行くので子たちも一緒に死に、書きかけのファイルは半分作られたまま残る。</p>
+
+                    <p>ここで <code>-P</code> 特有の問題が出る。直列なら壊れた成果物は一つだが<strong><code>-P N</code> なら N 個が同時に壊れる。</strong>その N 個は名前だけ見ても完結したものと区別できない。前節の <code>job.sh</code> が一時名に書いて最後に <code>mv</code> する理由だ。</p>
+
+                    <pre><code># 一時名の方式で同じ実験をすると
+files under their final name:
+    (none)
+leftover fragments:
+    .job1.part (lines=9)
+    .job2.part (lines=9)
+    .job3.part (lines=10)</code></pre>
+
+                    <p>同じ時点で切ったのに<strong>最終名を持つ半端なファイルが一つもない。</strong>断片は点で始まる名前で残り、次の実行が <code>[ -s "$out" ]</code> の検査でこれらを未完と見て再処理する。同じファイルシステム内の <code>mv</code> は原子的なので中間状態が露出しない。</p>
+
+                    <ul>
+                        <li>中断後を考えると<strong>ワーカーを冪等にすることが事実上唯一の対策</strong>だ</li>
+                        <li>完結の判定は<strong>ファイルの存在ではなく完結の印</strong>で行う。サイズが0でないか、末尾行に印があるかといった基準が要る</li>
+                        <li>一時名は<strong>次の実行が断片を見分けられるように</strong>決める。点で始めれば結合段階の <code>*</code> 展開にも引っかからない</li>
+                        <li>終わった項目を飛ばす検査があれば<strong>中断と再実行がそのまま再試行の手続きになる</strong></li>
+                        <li>この設計は並列でなくても値打ちがある。背景は<a href="shell_readonly_idempotent_script.html">二度実行しても壊れないスクリプト</a>にある</li>
+                    </ul>
+
+                    <h2 id="sec-15">自分の環境で同じことを確かめる</h2>
+
+                    <p>この記事の数字はすべて一台の機械から出たもので、<strong>他の環境では境界が違う場所に出るはずだ。</strong>だから確認の手続き自体がこの記事で最も長く役に立つ部分である。必要なのは前で書いた二つのスクリプトだけで、順序は四つだ。</p>
+
+                    <ul>
+                        <li>第一に<strong>バッファの境界を探す。</strong><code>mix.sh</code> の行長を200から倍ずつ上げながら <code>check.sh</code> で数える。初めて0でない値が出る地点がその環境の実務上限だ</li>
+                        <li>第二に<strong>パイプとファイルをそれぞれ測る。</strong>同じ長さで <code>| ./check.sh</code> と <code>&gt;&gt; out.txt</code> を比べれば二つの経路のバッファサイズの差が現れる</li>
+                        <li>第三に<strong>最低五回ずつ回す。</strong>上の測定で同じ条件が0を出したこともあり177を出したこともある。一度では何も確定できない</li>
+                        <li>第四に<strong>対策を適用したあと出力行数を併せて数える。</strong>壊れた行が0という結果は出力がまったくないときにも出る</li>
+                    </ul>
+
+                    <p>規模は小さく取る。上の実験はワーカー8個が100行ずつ出す程度で数秒で終わる。運用中の機械で測るならワーカー数を2〜4に減らして反復を増やす。<strong>並行度を下げても境界自体は同じ場所に現れる。</strong></p>
+
+                    <p>実際のパイプラインで混在を疑うとき最も速い見分け方は<strong>出力をファイルに変えてみること</strong>だ。ファイルで無事になれば原因はバッファサイズの差で、両方とも壊れるなら行が長すぎるかワーカーが一行を何度かに分けて出しているという意味である。</p>
+
+                    <h2 id="sec-16">xargs -P ではなく別のものを使うべきとき</h2>
+
+                    <p><code>xargs -P</code> は<strong>互いに独立した作業を一定数だけ同時に回すこと</strong>までしかうまくやらない。それ以外の要求が付き始めたら別のツールがよい。</p>
+
+                    <ul>
+                        <li><strong>作業のあいだに依存関係があるなら</strong> <code>make -j</code> だ。A が終わってから B を始めるグラフを宣言すれば残りは勝手に並列で処理する</li>
+                        <li><strong>既に作られた成果物を飛ばす必要があるなら</strong>やはり <code>make</code> だ。ファイル時刻の比較が内蔵なので冪等性のコードを自分で書く必要がない</li>
+                        <li><strong>出力順と行の整理が必須なら</strong> GNU parallel の <code>--keep-order</code>・<code>--line-buffer</code> がその仕事のためにある</li>
+                        <li><strong>再試行・タイムアウト・バックオフが必要なら</strong>言語ランタイムのワーカープールがよい。状態を抱える瞬間からシェルは不利だ</li>
+                        <li><strong>失敗項目を次の実行に繋ぐ必要があるなら</strong>ジョブキューが要る。<code>failed.txt</code> の方式は規模が小さいときだけ持ちこたえる</li>
+                        <li><strong>進捗を見せる必要があるなら</strong> <code>xargs</code> は何も提供しない。自分で数えるか別のツールを使う</li>
+                        <li>逆に<strong>独立した作業を数百個、一度回して終わりなら</strong> <code>xargs -P</code> が依然として最も安い</li>
+                    </ul>
+
+                    <p>基準は一つに絞れる。<strong>作業のあいだに関係が生まれる瞬間</strong>だ。順序でも依存でも再試行でも、関係が生まれると <code>xargs</code> にはそれを表現する文法がなく、複雑さが全部スクリプト側へ押し出される。その複雑さが <code>make</code> のルール数行より大きくなったら替えどきである。</p>
+
+                    <h2 id="sec-17">確認できなかったこと</h2>
+
+                    <ul>
+                        <li><strong>Linux 実機での測定ができなかった。</strong>この記事のすべての数字は Windows 上の MSYS2 環境で出たものだ。MSYS2 のパイプはエミュレーションなので、特に6節の 64KiB の境界は Linux で違う値になる可能性が高い</li>
+                        <li><strong><code>PIPE_BUF</code> を超える <code>write()</code> が Linux で実際に割れるか</strong>は確認できなかった。上の環境では4096を大きく超えても 64KiB まで無事だったが、これは規格が保証する範囲外の動作なので他所に持ち出せない</li>
+                        <li><strong>stdio バッファのサイズが1024と4096だというのは観察からの逆算</strong>だ。<code>strace</code> の類で実際の <code>write()</code> 呼び出しサイズを直接確認してはいない。境界がその地点に現れたという事実だけを確認した</li>
+                        <li><strong>GNU parallel の <code>--line-buffer</code>・<code>--keep-order</code> は実行できなかった。</strong>この環境に入っていない。8節④はツールの存在と用途までを書いたもので実測ではない</li>
+                        <li><strong><code>flock</code> を用いた直列化も測定できなかった。</strong>やはり入っていなかった。本文に書いたのはその事実のせいで誤った0が出るところだったという経緯だけだ</li>
+                        <li><strong>終了コード126</strong>、つまりコマンドは見つかったが実行できない場合は再現できなかった。実行権限のないファイルを作って試したがこの環境では <code>xargs</code> が0を返した。Windows ファイルシステムの権限処理のためと見えるが確認していない</li>
+                        <li><strong>Ctrl-C を実際のターミナルで押す状況</strong>は再現できなかった。スクリプトからプロセスグループに <code>SIGINT</code> を送る方式ではこの環境で信号が伝わらなかった。14節の「子たちまで信号を受けたとき」は子プロセスを直接指定して終了させた結果である</li>
+                        <li><strong>プロセス生成コスト40ミリ秒を Linux と比較できなかった。</strong>Linux ではずっと小さいと見ているが、12節の「ごく短い作業」の結論が Linux でどの規模から成り立つかは測っていない</li>
+                    </ul>
+
+                    <h2 id="sec-18">参考資料</h2>
+
+                    <ul>
+                        <li><a href="https://www.gnu.org/software/findutils/manual/html_node/find_html/xargs-options.html" target="_blank" rel="noopener">GNU Findutils — xargs options</a> — <code>-P</code>・<code>-n</code>・<code>-L</code>・<code>-I</code>・<code>--process-slot-var</code>・<code>--show-limits</code> の公式説明。オプション間の排他関係もここに書かれている</li>
+                        <li><a href="https://pubs.opengroup.org/onlinepubs/9699919799/functions/write.html" target="_blank" rel="noopener">POSIX — write()</a> — パイプに対する <code>PIPE_BUF</code> 以下の書き込みの原子性規定。それより大きい書き込みには保証がないことが明記されている</li>
+                        <li><a href="https://man7.org/linux/man-pages/man7/pipe.7.html" target="_blank" rel="noopener">pipe(7) — Linux manual page</a> — Linux でのパイプ容量と <code>PIPE_BUF</code>、原子性の条件の説明</li>
+                        <li><a href="https://www.gnu.org/software/coreutils/manual/html_node/stdbuf-invocation.html" target="_blank" rel="noopener">GNU Coreutils — stdbuf</a> — <code>-o0</code>・<code>-oL</code>・<code>-oSIZE</code> の意味と、自前でバッファリングを設定するプログラムには効果がないという制約</li>
+                        <li><a href="https://www.gnu.org/software/parallel/parallel.html" target="_blank" rel="noopener">GNU parallel マニュアル</a> — <code>--line-buffer</code>・<code>--keep-order</code>・<code>--jobs</code> など出力の整理と順序保証に関するオプション</li>
+                        <li><a href="https://www.gnu.org/software/make/manual/html_node/Parallel.html" target="_blank" rel="noopener">GNU Make — Parallel Execution</a> — <code>-j</code> で依存グラフを並列処理するときの規則と出力整理のオプション</li>
+                        <li><a href="find_xargs_whitespace_trap.html">find・xargs の空白と改行の罠</a> — この記事の11節で渡した入力区切りの問題の詳細</li>
+                        <li><a href="shell_exit_code_pipefail.html">シェルの終了コードと set -e</a> — 10節の終了コード処理をスクリプト全体のレベルで扱った記事</li>
+                        <li><a href="shell_readonly_idempotent_script.html">二度実行しても壊れないスクリプト</a> — 14節で使った一時名と原子的な置き換えパターンの背景</li>
+                        <li><a href="shell_subshell_variable_scope.html">パイプの中のwhileで変数が消える理由</a> — 10節で言及した中括弧グループとサブシェルの違い</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>この記事をシェア</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">スレッズ</button>
+                        <button id="link-copy" class="share-btn link-btn">リンクをコピー</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">一覧に戻る</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">一緒に使うと便利な無料ツール</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/ssh_config_generator.html">SSH config生成器 2026</a></li>
+      <li><a href="../static/iptables_generator.html">iptables ファイアウォールルール生成ツール</a></li>
+      <li><a href="../static/code_image.html">コード画像ジェネレーター</a></li>
+      <li><a href="../static/char_counter.html">文字数カウント</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">すべてのツールを見る &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">関連記事</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="shell_here_doc_guide.html">ヒアドキュメント実践 - 変数展開を切る・入れる、インデントの罠</a></li>
+      <li><a href="shell_glob_vs_regex.html">グロブと正規表現は違う - アスタリスクが別の意味になる瞬間</a></li>
+      <li><a href="personal_agent_server.html">エージェントが常駐するサーバー - 個人が一台を回すときに新しく必要になるもの</a></li>
+      <li><a href="agent_framework_abstraction.html">エージェントをコードで何として表現するか - クラス・グラフ・設定ファイルがそれぞれ隠すもの</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('リンクをコピーしました。スレッズアプリに貼り付けて共有してください！');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('リンクをコピーしました！'); });
+    });
+    </script>
+</body>
+</html>

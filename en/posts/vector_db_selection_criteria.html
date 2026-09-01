@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<!--
+ * Tech blog post template
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="en">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>What Should Vector Search Run On - Bolting It Onto Your Search Engine Versus Standing Up a Dedicated One</title>
+    <meta name="description" content="Add vectors to the search engine you already run, or stand up a dedicated one? Filter selectivity, updates, memory and how to read a benchmark.">
+    <meta name="keywords" content="vector database, vector search, OpenSearch, Elasticsearch, Weaviate, pgvector, HNSW, hybrid search, BM25, RRF, pre-filter, post-filter, recall, P99, reindexing, multi-tenancy, dev, infra, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/en/posts/vector_db_selection_criteria.html">
+
+    <meta property="og:title" content="What Should Vector Search Run On - Bolting It Onto Your Search Engine Versus Standing Up a Dedicated One">
+    <meta property="og:description" content="The moment a filter is attached, the index does something different. Update patterns, memory residency and the order in which a benchmark must be read.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/en/posts/vector_db_selection_criteria.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="en_US">
+    <meta property="article:published_time" content="2026-09-01">
+    <meta property="article:section" content="Dev &amp; Infra">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="What Should Vector Search Run On">
+    <meta name="twitter:description" content="Bolt it on or stand one up. Filters, updates, memory and benchmarks split the road.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "What Should Vector Search Run On - Bolting It Onto Your Search Engine Versus Standing Up a Dedicated One",
+      "alternativeHeadline": "Filters, updates, memory and the order a benchmark must be read - criteria that split an expensive-to-reverse decision before you make it",
+      "datePublished": "2026-09-01",
+      "dateModified": "2026-09-01",
+      "inLanguage": "en-US",
+      "articleSection": "Dev & Infra",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "vector database, vector search, OpenSearch, Weaviate, pgvector, HNSW, hybrid search, RRF, pre-filter, recall, P99, reindexing, multi-tenancy",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/en/posts/vector_db_selection_criteria.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "Is it better to add vectors to an existing search engine or run a dedicated vector database?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "It depends on conditions. If vector queries are a minority of traffic and the index sits below tens of millions of documents, bolting onto the cluster you already run usually wins. The reason is not search quality but everything around it. An existing cluster already has backup procedures, a permission model, dashboards, and someone who gets paged at 3am. Adding a datastore means rebuilding all four. If instead vectors become the main path, tail latency carries an SLO, filtered queries are the norm and the corpus heads toward hundreds of millions, you have entered the range where a dedicated engine starts to win."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How do keyword scores and vector scores get combined in hybrid search?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Two branches. One normalises scores into a shared range and then combines them. The other throws the scores away and uses only the ranks, which is what RRF does. RRF sums the reciprocal of each rank plus a constant, so the original score scales never have to be reconciled. OpenSearch added this in 2.19 as the score-ranker-processor with a rank constant defaulting to 60. Note the benchmark published alongside it: RRF scored on average 3.86 percent lower on NDCG@10 than the existing normalisation approach. Rank-based fusion is more robust to outliers, but robustness is not the same thing as better relevance."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Why does adding a filter shrink the number of results?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Under post-filtering the approximate search collects candidates first and the filter is applied afterwards. The pgvector docs put a number on it. If only 10 percent of rows satisfy the condition and hnsw.ef_search is left at its default of 40, you get roughly four rows back on average. The query succeeds, nothing errors, and the result set quietly empties out. Iterative index scans, added in pgvector 0.8.0, keep scanning the index in that situation until enough rows are found. Pre-filtering takes the opposite route and applies the filter during the search so that k results are actually returned."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How should a vector search benchmark be read?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Recall and latency mean nothing apart from each other. Approximate search buys speed by giving up accuracy, so a latency figure quoted without recall simply means the system looked at less. The reading order is fixed. First align every candidate on the same recall target, and only then do latency and throughput become comparable numbers. Second, check the percentile. p50 tends to look fine on any engine; the difference shows at p99. Third, check the conditions. A table that does not state filter distribution, write ratio, concurrency and whether the loop was closed cannot speak for your workload."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Is choosing a vector database hard to reverse later?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Your code structure decides that. If every access to the vector store sits behind an internal service, clients never talk to the storage layer directly, and running several databases side by side while switching backends becomes possible. There is a price. A shared interface tends to settle at the lowest common denominator, and the knobs that actually produce performance - fusion method, filter strategy, quantisation settings - carry different names in every engine and disappear behind the wrapper. The practical rule is this. Wrap writes and reads, do not wrap tuning. And if you can run two stores side by side, the decision is reversible."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/vector_db_selection_criteria.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/vector_db_selection_criteria.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/vector_db_selection_criteria.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/vector_db_selection_criteria.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/vector_db_selection_criteria.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "Home",
+      "item": "https://braindetox.kr/en/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "Dev & Infra",
+      "item": "https://braindetox.kr/en/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "What Should Vector Search Run On - Bolting It Onto Your Search Engine Versus Standing Up a Dedicated One",
+      "item": "https://braindetox.kr/en/posts/vector_db_selection_criteria.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="What Should Vector Search Run On - Bolting It Onto Your Search Engine Versus Standing Up a Dedicated One">
+                <meta itemprop="datePublished" content="2026-09-01">
+                <meta itemprop="dateModified" content="2026-09-01">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="vector database, vector search, OpenSearch, Weaviate, pgvector, HNSW, hybrid search, RRF, pre-filter, recall, P99, reindexing, multi-tenancy">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/en/posts/vector_db_selection_criteria.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">What Should Vector Search Run On - Bolting It Onto Your Search Engine Versus Standing Up a Dedicated One</h1>
+                    <h2 class="post-subtitle">Filters, updates, memory and the order a benchmark must be read - criteria that split an expensive-to-reverse decision before you make it</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-01">Sep 1, 2026</span>
+                        <span class="post-category" itemprop="articleSection">Dev &amp; Infra</span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>The first question a team hits after deciding to put vectors into search is not which model to use. It is that a cluster is already running, and now someone has to decide whether to <strong>add one more field to it or stand up an engine that does nothing but vectors</strong>. In week one the question looks minor. On the day the index crosses a hundred million rows it has become the most expensive decision in the system to reverse.</p>
+
+                    <p>What RAG is as a whole, and what an embedding is, are covered in <a href="rag_architecture_basics.html">Why RAG Is Simple and Still Hard</a>, so this skips both. What follows is the next layer. What the index actually does the moment a filter is attached, how keyword and vector scores get combined, where things break first when updates are frequent, and what you have to pay to keep this decision reversible.</p>
+
+                    <div class="callout">
+                        The product behaviour described here reflects the official documentation as of early September 2026. Defaults and supported feature sets in vector search change on a quarterly cadence, so check the docs for the version you will actually deploy. There is no conclusion here that one product is better than another.
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>What this covers</h3>
+                        <ol>
+                            <li><a href="#sec-1">The trigger - a team that measured a hundred million vectors and moved</a></li>
+                            <li><a href="#sec-2">Where the fork actually forks</a></li>
+                            <li><a href="#sec-3">Hybrid search - the problem starts when you combine scores</a></li>
+                            <li><a href="#sec-4">Constraints the index structure imposes</a></li>
+                            <li><a href="#sec-5">Pre-filtering and post-filtering</a></li>
+                            <li><a href="#sec-6">Update patterns change the answer</a></li>
+                            <li><a href="#sec-7">Where the operating cost actually lands</a></li>
+                            <li><a href="#sec-8">Multi-tenancy and sharding</a></li>
+                            <li><a href="#sec-9">The order in which a benchmark must be read</a></li>
+                            <li><a href="#sec-10">A minimum design for measuring your own workload</a></li>
+                            <li><a href="#sec-11">Is this reversible - the value and the price of abstraction</a></li>
+                            <li><a href="#sec-12">The criteria on one page</a></li>
+                            <li><a href="#sec-13">Summary</a></li>
+                            <li><a href="#sec-14">What I Could Not Verify</a></li>
+                            <li><a href="#sec-15">References</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">The trigger - a team that measured a hundred million vectors and moved</h2>
+
+                    <p>In late August 2026 the engineering blog of a large travel booking service published how it picked a vector database. A team handling hundreds of millions of embeddings moved off an OpenSearch-based setup onto a dedicated engine, landing on Weaviate and roughly 40 percent lower cost. The part worth copying is not that conclusion but <strong>the way they arrived at it</strong>.</p>
+
+                    <p>They did not evaluate with public benchmarks. Their reasoning was that workloads at scale are extremely specific and generic benchmarks barely reflect real behaviour. Instead they pulled a hundred million embeddings out of a public product review dataset, used all-MiniLM-L6-v2 straight from the internal model catalogue, and attached ratings and custom tags as metadata so that <strong>filtered search</strong> could be measured.</p>
+
+                    <p>Three scenarios were measured. Approximate nearest neighbour search across the full hundred million, search combining vector similarity with metadata filters, and a mixed read-write workload under live indexing pressure. The last one carried roughly 20 percent writes, and parallel clients were stepped up through 5, 50 and 100 threads.</p>
+
+                    <p>The important part is what they did <em>before</em> comparing anything. They validated recall by sampling around two million vectors and checking whether a query vector appeared among its own top-k neighbours, and they measured latency only after <strong>normalising every system to about 99 percent recall</strong>. The metric they watched was not the median but P99 tail latency, on the reasoning that the worst case, not the average, is what defines the experience users actually get.</p>
+
+                    <p>What generalises from this is not that some product is good. It is that a latency comparison run without aligning recall is not a number, and that a benchmark without filters and writes does not speak for your workload.</p>
+
+                    <h2 id="sec-2">Where the fork actually forks</h2>
+
+                    <p>Adding vectors to a search engine you already run and standing up a dedicated engine both have a wide band where they are the right answer. That is why this fork is not settled by a performance table. What settles it is usually a single sentence. <strong>In this system, is vector search a side feature or the main path?</strong></p>
+
+                    <p>If it is a side feature, bolting on almost always wins, and the reason lives outside search quality. A cluster already in production has backup procedures, a permission model, dashboards, and someone who gets paged at 3am. Adding a datastore means <strong>rebuilding all four</strong>. That is not a cost a few milliseconds of latency offsets.</p>
+
+                    <p>The moment it becomes the main path the arithmetic flips. The sentence the team above wrote captures that state well. Constant tuning was required, the cluster kept having to grow, and time spent managing infrastructure ate into the time meant for building the product. When those three show up together, the line has already been crossed.</p>
+
+                    <ul>
+                        <li><strong>Conditions favouring bolt-on</strong> — vectors are a minority of queries, keyword search still carries the load, and the index sits below tens of millions. Operational integration outweighs performance here</li>
+                        <li><strong>Conditions favouring a dedicated engine</strong> — tail latency carries an SLO, concurrency is high, filtered queries are the default, and the corpus is heading toward hundreds of millions</li>
+                        <li><strong>The band that is neither</strong> — the scale is ambiguous and traffic is unpredictable. What has value then is not the engine choice but the abstraction layer covered further down</li>
+                        <li><strong>What cannot be deferred</strong> — vector dimension, distance function, metadata schema, shard count. Changing any of them later usually means a full reindex</li>
+                    </ul>
+
+                    <h2 id="sec-3">Hybrid search - the problem starts when you combine scores</h2>
+
+                    <p>Running keyword and vector search together is close to the default now. The problem starts with the fact that the two <strong>do not produce scores on the same scale</strong>. BM25 is unbounded above and moves with corpus statistics; cosine similarity generally sits inside a fixed range. Adding them straight together is not addition, it is erasing one of them.</p>
+
+                    <p>Solutions split two ways. Normalise the scores into a common range and combine, or discard the scores and use only the ranks. The latter is RRF, reciprocal rank fusion. It sums the reciprocal of each rank plus a constant, so <strong>the original score scales never have to be reconciled</strong>.</p>
+
+                    <p>OpenSearch added this in 2.19 as the score-ranker-processor. The constant defaults to 60; a larger value flattens the scores while a smaller one weights the top ranks more heavily. The interesting part is the benchmark published in the same announcement. RRF scored on average 3.86 percent <em>lower</em> on NDCG@10 than the existing normalisation approach, with slightly better latency. Being robust to outliers and producing better relevance are not the same claim.</p>
+
+                    <p>Weaviate moved its default the other way. From v1.24 relative score fusion is the default and rank-based fusion is the option. Setting alpha to 1 uses vectors only, 0 uses keywords only. That two products chose opposite defaults is itself <strong>evidence there is no universal answer here</strong>.</p>
+
+                    <ul>
+                        <li><strong>Pagination</strong> — serving a stable second page out of a fused ranking means widening both candidate sets accordingly. Widen them and latency grows; leave them and results shuffle at the page boundary</li>
+                        <li><strong>Interaction with filters</strong> — whether the filter applies to each branch separately or after fusion changes the final count. You cannot know without reading the docs</li>
+                        <li><strong>Weight tuning</strong> — one alpha rarely fits a whole service. Different query types often want different values, and that branching becomes something to maintain</li>
+                        <li><strong>No evaluation</strong> — whether normalisation or RRF is better cannot be stated without your own ground truth. The NDCG comparison above is the example</li>
+                        <li><strong>Shard boundaries</strong> — normalising scores per shard means each shard uses a different baseline. This differs by product and version, so check it each time</li>
+                    </ul>
+
+                    <h2 id="sec-4">Constraints the index structure imposes</h2>
+
+                    <p>HNSW is effectively the default index for vector search today. It builds a multilayer graph and walks neighbours downward, which makes queries fast, but the price attaches in three places. <strong>Build time, memory, and how it gets along with filters.</strong></p>
+
+                    <p>Memory is the most direct. The pgvector docs compare HNSW with IVFFlat and state that it has better query performance but is slower to build and uses more memory, and that builds are significantly faster when the graph fits in <code>maintenance_work_mem</code>. When it does not fit, a notice appears and build time increases substantially.</p>
+
+                    <p>On managed services that constraint translates into instance size. The Amazon OpenSearch Service documentation says half the instance RAM goes to the Java heap (up to a 32 GiB heap) and k-NN uses up to 50 percent of the remaining half by default. On a 32 GiB instance that leaves 8 GiB for graphs. The arithmetic is <code>32 × 0.5 × 0.5</code>, and the docs warn directly that performance can suffer above that value.</p>
+
+                    <p>So capacity planning is done in <strong>bytes</strong>, not document counts. For four-byte float vectors the raw size is dimension × 4 × count. A hundred million 384-dimension vectors is roughly 153 GB of raw vectors alone, with graph structure and metadata stacked on top.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Aspect</th><th>HNSW family</th><th>List-based (IVF family)</th><th>Brute force, no index</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Query speed</td><td>Fast. It walks down the graph</td><td>Middling. The number of lists probed decides</td><td>Degrades in proportion to size</td></tr>
+                            <tr><td>Build cost</td><td>Slow and memory-hungry</td><td>Relatively fast and light</td><td>None</td></tr>
+                            <tr><td>Memory residency</td><td>Needs the graph in memory to perform</td><td>Relatively little</td><td>Raw vectors only</td></tr>
+                            <tr><td>Updates</td><td>Inserts trigger graph relinking</td><td>Drifting data distribution forces a rebuild</td><td>Almost no constraint</td></tr>
+                            <tr><td>Where it fits</td><td>A large, heavily queried main path</td><td>Bulk indexing on a tight memory budget</td><td>Small collections or per-tenant splits</td></tr>
+                        </tbody>
+                    </table>
+
+                    <ul>
+                        <li>Weaviate separates hnsw, flat and dynamic. The dynamic index switches from flat to hnsw automatically once the object count passes a default threshold of 10,000, and that switch is <strong>one-way</strong></li>
+                        <li>That is why the flat index is documented as suited to small collections and multi-tenant setups. Building a separate HNSW graph for thousands of tenants means the graph count itself eats memory</li>
+                        <li>Cutting dimensions has a more direct effect than changing the index. But it means swapping the embedding model, which forces a <strong>full reindex</strong></li>
+                        <li>Quantisation cuts memory sharply and costs recall. How much it costs depends on your data distribution, so someone else's number cannot be carried over</li>
+                    </ul>
+
+                    <h2 id="sec-5">Pre-filtering and post-filtering</h2>
+
+                    <p>In practice vector search almost always arrives with a filter attached. Find me something similar inside this category, inside this date range, inside this tenant. And the moment a filter is attached, what the index does changes.</p>
+
+                    <h3>Post-filtering - the count quietly shrinks</h3>
+
+                    <p>The pgvector docs state this most plainly. With an approximate index, a <code>WHERE</code> filter is applied <strong>after the index scan</strong>. If only 10 percent of rows satisfy the condition and <code>hnsw.ef_search</code> is left at its default of 40, you get roughly four rows back on average. The query succeeds and nothing errors. Only the result set quietly empties. Iterative index scans in 0.8.0 keep scanning the index in that situation until the count is filled, with <code>strict_order</code> and <code>relaxed_order</code> modes.</p>
+
+                    <p>Managed search engines behave no differently. The Amazon OpenSearch Service docs show an example where <code>post_filter</code> reduces the result from <code>k</code> of 2 down to one. This failure leaves no trace in the logs, so in production it gets discovered <strong>when a user says there are too few results</strong>.</p>
+
+                    <h3>Pre-filtering - the point where the graph stops helping</h3>
+
+                    <p>The other side applies the filter first. The Elasticsearch docs say the filter on approximate kNN is applied <em>during</em> the search so that k documents come back, and contrast that with post-filtering, which can return fewer than k. What follows is the part worth noting. If the filtered document count is at or below <code>num_candidates</code>, the search bypasses the graph and runs brute force. And if the number of nodes explored exceeds the number of documents passing the filter, exploration stops and switches to brute force over the filtered set.</p>
+
+                    <p>OpenSearch solves the same problem the same way. Efficient k-NN filtering extended to HNSW on the Faiss engine from 2.9 and to IVF from 2.10, is available on the Lucene engine, and is not supported on nmslib. When the filtered set is small it prefers exact search for accuracy, and settings such as <code>knn.advanced.filtered_exact_search_threshold</code> feed that decision.</p>
+
+                    <p>Weaviate builds an allow list first with an inverted index, and HNSW only adds ids present on that list to the result set. It also separates filter strategies. ACORN, the default from v1.34, ignores objects that fail the filter in distance calculations, while the older sweeping strategy walks the graph from the root checking conditions. The same documentation notes that a very restrictive filter turns HNSW traversal effectively exhaustive, making flat the better choice.</p>
+
+                    <ul>
+                        <li>Three products arrive at <strong>the same conclusion</strong> under different names. The stronger the filter, the less the graph is worth, and past some point brute force is faster</li>
+                        <li>So the thing to check is not whether filters are supported but <strong>what it switches to when selectivity is low</strong>, and whether you can tune that decision</li>
+                        <li>Measure your filter selectivity distribution first. If most queries leave 1 percent of the corpus, changing data layout beats tuning the index</li>
+                        <li>Tenant filters are especially dangerous. With many small tenants, <strong>every query becomes a low-selectivity filter</strong>. Splitting collections is the alternative</li>
+                    </ul>
+
+                    <h2 id="sec-6">Update patterns change the answer</h2>
+
+                    <p>Vector stores are generally tuned for one of two update styles. Rebuilding everything overnight, or absorbing changes that arrive by the second. An engine chosen without deciding which one your workload is will hurt on one side, guaranteed.</p>
+
+                    <p>If bulk reindexing dominates, what matters is build time and the window. The gap between an HNSW build that fits in memory and one that does not is large, so whether the reindex fits inside the budget effectively decides the index type. Building a new index alongside and swapping an alias is the safe pattern, but it <strong>doubles storage</strong>, even briefly.</p>
+
+                    <p>If real-time upserts dominate, the problem moves. It becomes query latency while inserts keep arriving. That is exactly why the case above included a 20 percent write mixed workload as its third scenario. Latency measured without indexing pressure does not predict latency in production. What an environment of constantly arriving and changing documents looks like is covered in <a href="ai_knowledge_base_rot_2026.html">Your Internal Knowledge Base Rots Quietly</a>.</p>
+
+                    <ul>
+                        <li>Swapping the embedding model is a full reindex. If the dimension changes, schema and index change with it. <strong>When you will change models is a decision that precedes choosing a store</strong></li>
+                        <li>Check whether deletes take effect immediately. Marking and cleaning up later is common, so measure it yourself</li>
+                        <li>Partial updates are another split. If changing metadata alone forces the vector to be rewritten, update cost multiplies</li>
+                        <li>How many hours of reindex window you can secure decides the index type. With no window, slow-building indexes drop out of contention</li>
+                        <li>Always measure latency during indexing. <strong>A read-only benchmark does not describe operations</strong></li>
+                    </ul>
+
+                    <h2 id="sec-7">Where the operating cost actually lands</h2>
+
+                    <p>What sets the bill is not query volume but <strong>resident bytes</strong>. This is where the cost structure of vector search departs from ordinary search. More documents does not mean more disk, it means more memory. And on a managed service memory can only be bought one instance at a time.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Cost item</th><th>What grows it</th><th>How to reduce it</th><th>What you lose</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Resident vector memory</td><td>Dimension × count, multiplied by replicas</td><td>Quantisation, fewer dimensions, disk-based index</td><td>Recall or latency</td></tr>
+                            <tr><td>Graph structure overhead</td><td>The neighbour connection setting</td><td>Lower the connection count</td><td>Recall</td></tr>
+                            <tr><td>Build time</td><td>Index type, whether memory is short</td><td>Add memory or change index</td><td>Cost or query performance</td></tr>
+                            <tr><td>Replication and availability</td><td>Replica count, availability zones</td><td>Cut replicas</td><td>Failure headroom and read throughput</td></tr>
+                            <tr><td>Reindex window</td><td>Data volume, model swap frequency</td><td>Design incremental updates</td><td>Implementation complexity</td></tr>
+                            <tr><td>Human time</td><td>Number of datastores, tuning frequency</td><td>Bolt onto the existing cluster</td><td>Tuning room and the performance ceiling</td></tr>
+                        </tbody>
+                    </table>
+
+                    <ul>
+                        <li>A savings percentage does not travel on its own. The roughly 40 percent above was a footprint comparison <strong>with recall and SLO held at the same level</strong>. A comparison without that alignment has merely traded cost for recall</li>
+                        <li>Managed services are sold in instance units, so cost jumps in steps the moment required memory crosses a threshold. Plan against the position of those steps</li>
+                        <li>Replicas are an availability cost and a throughput instrument. Read-heavy systems use replicas for performance, and memory multiplies accordingly</li>
+                        <li>The item most often left out is human time. A setup that keeps consuming tuning hours never appears on the invoice and is usually the most expensive line</li>
+                    </ul>
+
+                    <h2 id="sec-8">Multi-tenancy and sharding</h2>
+
+                    <p>Shard count is hard to change after creation in most systems. With vector indexes the constraint gains another layer. A graph is built per shard, and a query fans out across every shard before results are merged. Split them finely and each graph shrinks but the number of graphs a query meets grows, and <strong>tail latency is set by the slowest shard.</strong> Make them large and a single graph hits the memory ceiling first.</p>
+
+                    <p>Multi-tenancy adds one more choice on top. Separate tenants by filter, or split them into collections. Filtering keeps management simple but puts the low-selectivity filter problem <strong>on every query</strong>. Splitting removes that problem while multiplying index count by tenant count. That is exactly why Weaviate's docs describe the flat index as suited to multi-tenant setups. Where to draw the permission boundary overlaps with <a href="cerebras_internal_knowledge_platform_2026.html">Designing an Internal Knowledge Platform</a>.</p>
+
+                    <ul>
+                        <li>Small data per tenant across many tenants suits per-tenant separation with a light index. Avoid scraping one huge graph with a low-selectivity filter</li>
+                        <li>Few tenants each holding a lot makes filtering sufficient. Just confirm the selectivity really is high</li>
+                        <li>If deletion requests arrive per tenant, separation is effectively forced. Removing one tenant from a filtered layout is a mass delete, and mass deletes trigger index rebuilds</li>
+                        <li>Shard count, dimension and distance function are the three set on day one and the most expensive to reverse. The rest can be changed later</li>
+                    </ul>
+
+                    <h2 id="sec-9">The order in which a benchmark must be read</h2>
+
+                    <p>A latency number pulled alone out of a vector search benchmark is not information. Approximate search buys speed by giving up accuracy, so latency quoted without recall <strong>just means it looked at less</strong>. The reverse holds too. Recall of 99 percent with no latency attached is indistinguishable from brute force.</p>
+
+                    <p>So there is a reading order. Align recall first. Only after every candidate sits on the same recall target do latency and throughput become comparable. Second comes the percentile. p50 tends to look fine on any engine; the difference shows at p99. Third comes the conditions.</p>
+
+<pre><code># 1) Ground truth: build top-k by brute force over a query sample
+ground_truth = brute_force_topk(queries_sample, k=10)
+
+# 2) Align recall: raise the search width until recall@10 hits the target
+for engine in engines:
+    tune(engine, target_recall=0.99, sweep=["ef_search", "nprobe"])
+
+# 3) Only then measure latency (filter mix and write ratio as in production)
+for concurrency in [5, 50, 100]:
+    run(engine, closed_loop=True, write_ratio=0.2,
+        filters=production_filter_distribution)
+    report(p50, p95, p99, throughput, recall_at_10)
+</code></pre>
+
+                    <ul>
+                        <li>If a public benchmark's dimensions and distribution differ from yours, the ranking flips. A <strong>benchmark without filters</strong> in particular cannot describe a service where filters are the default</li>
+                        <li>A comparison table produced without recall alignment is better left unread. There is no way to tell which side narrowed its search width</li>
+                        <li>Closed loop (send the next request after a response) and open loop (keep sending at a fixed rate) measure different things. Numbers that do not state which are not comparable</li>
+                        <li>Check for warm-up. Figures taken before the graph is in memory apply only to the first query</li>
+                        <li>Vendor comparison tables are set up on terms that favour the vendor. What is useful is not the conclusion but <strong>the measurement conditions they disclosed</strong></li>
+                    </ul>
+
+                    <h2 id="sec-10">A minimum design for measuring your own workload</h2>
+
+                    <p>There is rarely time to build a complete benchmark. There is still a minimum setup that takes a day, and even that beats taking published figures at face value.</p>
+
+                    <ol>
+                        <li><strong>Use real embeddings.</strong> Random vectors distort the graph structure. What decides HNSW performance is the cluster structure of real data</li>
+                        <li><strong>Use the real filter distribution.</strong> Pull filter conditions out of production logs and reproduce the selectivity distribution as it is. Most of the surprises come from here</li>
+                        <li><strong>Build ground truth.</strong> Compute top-k by brute force over a few thousand sampled queries. That single computation becomes the baseline for every later comparison</li>
+                        <li><strong>Mix in writes.</strong> Use the production write ratio as it is. Read-only figures betray you after deployment</li>
+                        <li><strong>Step concurrency upward.</strong> Measuring at one value misses the saturation point. Step through 5, 50 and 100 and watch where the curve bends</li>
+                    </ol>
+
+                    <h2 id="sec-11">Is this reversible - the value and the price of abstraction</h2>
+
+                    <p>How hard this decision is to reverse is mostly decided by <strong>code structure.</strong> The migration in the case above ended largely in configuration changes because every access to the vector store sat behind an internal embedding service. Clients never talked to the storage layer directly, which is what made it possible to run several databases in parallel and swap the backend transparently.</p>
+
+                    <p>The value is clear, and so is the price. A shared interface tends to settle at the <strong>lowest common denominator</strong>, and most of the knobs that produce performance in vector search carry different names and meanings in every engine.</p>
+
+                    <ul>
+                        <li>What disappears behind the abstraction — fusion method selection, filter strategy, quantisation settings, engine-specific search width parameters. They do not sit well on a shared interface</li>
+                        <li>So the rule for scope is one line. <strong>Wrap writes and reads, do not wrap tuning.</strong> Wrap tuning too and the abstraction becomes the performance ceiling</li>
+                        <li>Running them side by side is the real test. If you can write the same data to two stores and split queries by ratio, the decision is reversible</li>
+                        <li>Sometimes wrapping is not worth it. If vectors are a side feature and the index is small, <strong>maintaining the abstraction costs more than the migration would</strong></li>
+                    </ul>
+
+                    <h2 id="sec-12">The criteria on one page</h2>
+
+                    <p>What follows is not an answer but a questionnaire. Mark which column your situation sits closer to on each row, and you will see which way the six rows lean. If they scatter, that is a signal it is not yet time to choose, and what to do then is run the checks in the right-hand column first.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Question</th><th>This way, bolt onto the existing engine</th><th>This way, look at a dedicated engine</th><th>How to check</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Share of vector queries</td><td>A slice of total queries</td><td>The main path, and still growing</td><td>Aggregate the query logs</td></tr>
+                            <tr><td>Index size</td><td>Tens of millions or below</td><td>Heading past a hundred million</td><td>Convert to bytes via dimension × 4 × count</td></tr>
+                            <tr><td>Filter selectivity</td><td>Generally high</td><td>Low, with complex condition combinations</td><td>Filter condition distribution in production logs</td></tr>
+                            <tr><td>Latency requirement</td><td>The average is the yardstick</td><td>p99 carries an SLO</td><td>Current SLO docs and alert thresholds</td></tr>
+                            <tr><td>Update pattern</td><td>Mostly nightly batches</td><td>Constant upserts mixed with reads</td><td>Measure the write ratio</td></tr>
+                            <tr><td>Operational capacity</td><td>Nobody free to own a new datastore</td><td>A dedicated owner and on-call can be assigned</td><td>The on-call roster and handover docs</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2 id="sec-13">Summary</h2>
+
+                    <p>What vector search should run on is not settled by a product comparison table. The fork sits in four places. Is the vector a side feature or the main path, is filter selectivity high or low, is updating batch or continuous, and did you write the code so this decision can be reversed. The first three can be measured; the last can be decided right now.</p>
+
+                    <p>What transfers from the triggering case is the procedure, not the conclusion. They distrusted public benchmarks and built a hundred million vectors from their own data, mixed in filters and writes, aligned recall to the same value before comparing, and watched P99 rather than the median. Hold to those four and whichever engine you pick becomes an explainable choice. Skip them and it is taste.</p>
+
+                    <p>And the answer you pick today is unlikely to still be right in two years. Defaults in this field change quarterly. So the practical goal is not picking the optimal engine but <strong>staying in a state where you can switch once you are wrong</strong>. Can you run two stores side by side? If you can answer yes to that, the rest is adjustable.</p>
+
+                    <h2 id="sec-14">What I Could Not Verify</h2>
+
+                    <ul>
+                        <li>The triggering article could not be opened directly. The server refused access, so that team's evaluation design and figures are written only within what was confirmed through <strong>the community summary and a third-party write-up</strong>. Nothing is quoted at sentence level</li>
+                        <li>The candidate list was not verified. There is a mention of several specialised products being evaluated, but no names beyond the baseline and the final result were disclosed</li>
+                        <li>The instance configuration and time period behind the roughly 40 percent figure were not verified. Only the statement that it is a compute and memory footprint basis was confirmed</li>
+                        <li>Licence terms were not used as grounds for any judgement here. Beyond Weaviate's core being BSD 3-Clause nothing was checked, and terms for commercial add-ons and managed services must be verified separately</li>
+                        <li>Items that vary widely by product and version, such as when deletes take effect and how often segments are compacted, are described only in general terms</li>
+                    </ul>
+
+                    <h2 id="sec-15">References</h2>
+
+                    <ul>
+                        <li><a href="https://news.hada.io/topic?id=33061" target="_blank" rel="noopener">GeekNews topic 33061</a> — the summary and discussion that triggered this piece</li>
+                        <li><a href="https://www.zenml.io/llmops-database/vector-database-selection-and-migration-for-production-ml-and-genai-systems" target="_blank" rel="noopener">ZenML LLMOps Database, Vector Database Selection and Migration</a> — the third-party write-up used to confirm the evaluation design and figures. A hundred million embeddings, three scenarios, 99 percent recall alignment, P99, roughly 40 percent savings</li>
+                        <li><a href="https://docs.aws.amazon.com/opensearch-service/latest/developerguide/knn.html" target="_blank" rel="noopener">Amazon OpenSearch Service, k-NN search</a> — the graph memory arithmetic and the <code>post_filter</code> example where results shrink</li>
+                        <li><a href="https://opensearch.org/blog/efficient-filters-in-knn/" target="_blank" rel="noopener">OpenSearch Blog, Efficient filters in k-NN search</a> — limits of pre- and post-filtering, engine support, and the switch to exact search</li>
+                        <li><a href="https://opensearch.org/blog/introducing-reciprocal-rank-fusion-hybrid-search/" target="_blank" rel="noopener">OpenSearch Blog, Introducing reciprocal rank fusion for hybrid search</a> — the 2.19 score-ranker-processor, rank_constant default 60, NDCG@10 down 3.86 percent</li>
+                        <li><a href="https://www.elastic.co/docs/solutions/search/vector/knn" target="_blank" rel="noopener">Elasticsearch Docs, kNN search</a> — the filter applied during search, the role of <code>num_candidates</code>, and the brute force switch condition</li>
+                        <li><a href="https://github.com/pgvector/pgvector" target="_blank" rel="noopener">pgvector README</a> — HNSW versus IVFFlat, the statement that <code>WHERE</code> applies after the index scan with the 10 percent example, and iterative index scans in 0.8.0</li>
+                        <li><a href="https://docs.weaviate.io/weaviate/search/hybrid" target="_blank" rel="noopener">Weaviate Docs, Hybrid search</a> — relative score fusion as the default from v1.24, and alpha</li>
+                        <li><a href="https://docs.weaviate.io/weaviate/concepts/vector-index" target="_blank" rel="noopener">Weaviate Docs, Vector indexes</a> — what hnsw, flat and dynamic are for, the 10,000 object default threshold, one-way switching</li>
+                        <li><a href="https://docs.weaviate.io/weaviate/concepts/filtering" target="_blank" rel="noopener">Weaviate Docs, Filtering</a> — the allow list approach, ACORN and sweeping, and why brute force wins under restrictive filters</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>Share this post</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">Copy link</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">Back to list</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Free tools you may find useful</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/nginx_generator.html">Nginx Config Generator 2026</a></li>
+      <li><a href="../static/ssh_config_generator.html">SSH Config Generator 2026</a></li>
+      <li><a href="../static/iptables_generator.html">iptables Generator 2026</a></li>
+      <li><a href="../static/code_image.html">Code Image Generator</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">See all tools &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Related Posts</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="rag_architecture_basics.html">Why RAG Is Simple and Still Hard - The Structure Is Two Lines, the Problem Is Everything Around It</a></li>
+      <li><a href="cerebras_internal_knowledge_platform_2026.html">Designing an Internal Knowledge Platform - Source, Permission, Chunking and Cost Decisions 2026</a></li>
+      <li><a href="agent_behavior_spec.html">How Do You Grade a Long-Running Agent - What It Really Means to Write Behavior Down as a Spec</a></li>
+      <li><a href="bug_blindness.html">How a Defect Becomes the Way It Has Always Been - Why Familiar Bugs Stop Registering, and How to Make Them Visible Again</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('Link copied. Paste it in the Threads app to share!');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('Link copied!'); });
+    });
+    </script>
+</body>
+</html>
