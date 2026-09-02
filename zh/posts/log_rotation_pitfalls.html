@@ -1,0 +1,869 @@
+<!DOCTYPE html>
+<!--
+ * 技术博客文章模板
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>日志轮转悄悄失败的地方 - 磁盘在涨却没人发现</title>
+    <meta name="description" content="轮转做的是改名字，而进程握住的不是名字而是文件描述符。本文用真实跑出来的命令输出展示这种错位造成的静默失败，梳理信号与 copytruncate 各自失去了什么，并给出在轮转坏掉的那一刻就能立刻发现它的检查办法。">
+    <meta name="keywords" content="日志轮转, logrotate, copytruncate, delaycompress, inode, 文件描述符, postrotate, 磁盘写满, journald, 容器日志, Linux, 服务器运维, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/log_rotation_pitfalls.html">
+
+    <meta property="og:title" content="日志轮转悄悄失败的地方 - 磁盘在涨却没人发现">
+    <meta property="og:description" content="新日志文件是0字节，磁盘却一直在涨。当轮转只改了名字而进程仍然握着旧文件时会发生什么。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/log_rotation_pitfalls.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-09-02">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="日志轮转悄悄失败的地方">
+    <meta name="twitter:description" content="进程握住的是文件描述符而不是名字。所有问题的根都在这里。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "日志轮转悄悄失败的地方 - 磁盘在涨却没人发现",
+      "alternativeHeadline": "轮转做的是改名字，而进程握住的不是名字而是文件描述符",
+      "datePublished": "2026-09-02",
+      "dateModified": "2026-09-02",
+      "inLanguage": "zh-CN",
+      "articleSection": "开发/基础设施",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "日志轮转, logrotate, copytruncate, delaycompress, inode, 文件描述符, postrotate, 磁盘写满, journald, 容器日志",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/log_rotation_pitfalls.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "日志已经轮转了，为什么磁盘空间没有回来",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "因为轮转做的是改名字，不是删除文件。进程握住的不是文件名，而是 open 返回的文件描述符，那个描述符指向的是 inode 而不是名字。所以用 mv 改了名字，进程依然在往同一个文件里写。新建的日志文件停在0字节，只有被轮转出去的那个文件在长。此时如果有人用 rm 删掉它，名字消失了，但只要进程不松手，块就不会归还。也就是说，如果轮转之后没有让进程重新打开文件，那么轮转只是换了个名字，一点空间都还不回来。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "postrotate 信号和 copytruncate 该选哪一个",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "如果进程能接收重新打开的信号，信号这一侧更好。nginx 文档把日志轮转的步骤写得很明确，先改名，然后给 master 进程发 USR1。这种方式一行都不会丢。麻烦在于进程必须具备这个能力。没有这种手段时剩下的就是 copytruncate，而 logrotate 手册自己就写着，复制和截断之间存在极短的时间差，因此可能丢失部分日志数据。还有第二个代价，如果进程没有用 O_APPEND 打开文件，截断之后它仍会写在自己记住的旧偏移上，于是产生一个开头被空字节填满的文件。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "轮转周期只设 daily 有什么问题",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "出事的时候撑不过一天。本文构造的访问日志平均每行 122.2 字节。按这个数值计算，每秒 1,000 行时 24 小时约增长 9.83 GiB，每秒 5,000 行时 4.9 小时就会超过 10 GiB。错误风暴让日志变成平时的几十倍，正是这样的时刻。所以时间条件和容量条件要一起设。不过容量条件也不是万能的，logrotate 不是常驻程序，只有在 cron 或定时器调用它的时候才会检查文件大小，如果一天只调用一次，容量条件也就一天只检查一次。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "为什么需要 delaycompress",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "因为压缩是读取原文件、生成新文件、然后删掉原文件的动作。进程还握着那个文件的时候去压缩，压缩包里只会有那一刻之前的内容，之后写的行会流进一个没有名字的文件，任何地方都读不到，空间也不会回来。实际复现一下就能看到，只有压缩前的两行留在 gz 里，压缩之后写的那一行既不在新日志文件里也不在压缩包里。delaycompress 正如手册所说，把上一个日志文件的压缩推迟到下一个轮转周期，而这一个周期就是进程松手所需要的时间。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "怎么确认轮转是不是真的在工作",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "最快的办法是比较两个 inode。用 stat 读取日志路径的 inode，再用带符号链接跟随的 stat 读取写日志的进程所打开的那个文件描述符背后的 inode。两个值相同，说明进程此刻正在往该路径的文件里写，不同则说明轮转已经坏了。同时还要看新日志文件是不是一直停在0字节，以及已轮转文件的修改时间是不是每个周期一个台阶。实际跑下来，轮转一坏，这两个值立刻就分开了。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/log_rotation_pitfalls.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/log_rotation_pitfalls.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/log_rotation_pitfalls.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/log_rotation_pitfalls.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/log_rotation_pitfalls.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "首页",
+      "item": "https://braindetox.kr/zh/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "开发/基础设施",
+      "item": "https://braindetox.kr/zh/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "日志轮转悄悄失败的地方 - 磁盘在涨却没人发现",
+      "item": "https://braindetox.kr/zh/posts/log_rotation_pitfalls.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="日志轮转悄悄失败的地方 - 磁盘在涨却没人发现">
+                <meta itemprop="datePublished" content="2026-09-02">
+                <meta itemprop="dateModified" content="2026-09-02">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="日志轮转, logrotate, copytruncate, delaycompress, inode, 文件描述符, postrotate, 磁盘写满, journald, 容器日志">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/log_rotation_pitfalls.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">日志轮转悄悄失败的地方 - 磁盘在涨却没人发现</h1>
+                    <h2 class="post-subtitle">轮转做的是改名字，而进程握住的不是名字而是文件描述符</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-02">2026-09-02</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">开发/基础设施</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>日志轮转是服务器上最安静的一套装置。它正常工作时没人知道它存在，它坏了之后也有很长一段时间没人发现。服务照常响应，日志目录里 <code>app.log</code> 和 <code>app.log.1</code> 并排放着，文件个数也和配置一致。表面上没有任何不对劲的地方。可磁盘还在一直涨。</p>
+
+                    <p>这种状态的真相通常只有一个。<strong>轮转做的是改名字，而进程握住的并不是名字。</strong>进程握住的是 <code>open</code> 返回的文件描述符，那个描述符指向的是名字底下的实体，而不是名字本身。改名也好、删除也好，实体原封不动，进程照样往里写。这篇文章把这种错位造成的各种失败一个一个跑出来给你看。</p>
+
+                    <div class="callout">
+                        <strong>范围</strong> - 本文针对的是 Linux 服务器上的文件日志和 <code>logrotate</code> 配置。下面贴出的输出，有一部分是在 <strong>Windows 上的 Git Bash</strong> 里真实跑出来的，凡是需要 Linux 专属工具的地方，都<strong>明确说明没能跑起来，只给出命令和读法</strong>。没有一行输出是编造的。下面的例子里混有会让文件无法恢复的命令，请在非生产服务器上验证。
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>本文涵盖的内容</h3>
+                        <ol>
+                            <li><a href="#sec-1">症状 - 新日志是0字节，磁盘却在涨</a></li>
+                            <li><a href="#sec-2">本文的运行环境与验证范围</a></li>
+                            <li><a href="#sec-3">轮转实际做的事 - 摘下名字再挂上去</a></li>
+                            <li><a href="#sec-4">所以它会悄悄失败</a></li>
+                            <li><a href="#sec-5">让它重新打开的两种办法</a></li>
+                            <li><a href="#sec-6">copytruncate 失去了什么</a></li>
+                            <li><a href="#sec-7">&gt; 和 &gt;&gt; 的差别在这里变得重要</a></li>
+                            <li><a href="#sec-8">容量条件与时间条件</a></li>
+                            <li><a href="#sec-9">压缩的陷阱 - 还开着的文件</a></li>
+                            <li><a href="#sec-10">rotate N 实际留下多少</a></li>
+                            <li><a href="#sec-11">权限与属主 - 轮转之后写不进去的事故</a></li>
+                            <li><a href="#sec-12">轮转本身根本没跑的情况</a></li>
+                            <li><a href="#sec-13">应用自己做轮转的情况</a></li>
+                            <li><a href="#sec-14">容器里情况不一样</a></li>
+                            <li><a href="#sec-15">检查清单 - 轮转到底有没有在跑</a></li>
+                            <li><a href="#sec-16">小结</a></li>
+                            <li><a href="#sec-17">未能确认的部分</a></li>
+                            <li><a href="#sec-18">参考资料</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">症状 - 新日志是0字节，磁盘却在涨</h2>
+
+                    <p>这个故障有一张容易辨认的脸。三件事同时出现基本就能确定。第一，已轮转的文件正常地在增加。第二，当前日志文件<strong>是0字节，或者好几天大小没变</strong>。第三，磁盘使用量曲线不在每个轮转时刻往下掉一个台阶，而是<strong>笔直往上爬</strong>。</p>
+
+                    <p>再加上一条就很确定了。用 <code>du</code> 汇总日志目录得到的数字，和 <code>df</code> 报告的使用量差得很远。如果清理脚本已经删掉了某个已轮转文件，而进程不肯松手，那个文件就没有名字，<code>du</code> 根本看不见它。这两个数字拉开差距这件事本身，正是 <a href="no_space_left_but_disk_free.html">磁盘没满却报 No space left on device</a> 里的原因②，而<strong>在实际运维中最常制造出这种局面的，就是轮转配置的失误</strong>。所以这篇文章往轮转这一侧挖。</p>
+
+                    <p>真正定位到那个凶手进程的步骤在 <a href="find_process_holding_file.html">找出正握着文件的进程</a> 那边。这里只看到<strong>为什么会形成被握住的状态</strong>为止。顺带一提，日志暴涨先把内存撑爆而不是磁盘，那是另一副面孔，属于 <a href="oom_killer_diagnosis.html">读懂 OOM Killer 到底杀了什么</a> 的话题。</p>
+
+                    <h2 id="sec-2">本文的运行环境与验证范围</h2>
+
+                    <p>主题是 Linux 服务器，但产生下面这些输出的环境是 <strong>Windows 10 上的 Git Bash</strong>。先把这一点说清楚，是因为读的人必须能分辨<strong>哪些输出可以照单全收，哪些输出压根不在这里</strong>。</p>
+
+                    <pre><code>$ bash --version | head -1
+GNU bash, version 5.2.37(1)-release (x86_64-pc-msys)
+
+$ uname -a
+MINGW64_NT-10.0-19045 3.5.7-882031da.x86_64 2025-01-30 11:14 UTC x86_64 Msys
+
+$ stat --version | head -1
+stat (GNU coreutils) 8.32
+$ gzip --version | head -1
+gzip 1.13
+
+$ for c in logrotate lsof systemctl journalctl gzip stat ln truncate; do
+&gt;   printf '%-12s %s\n' "$c" "$(command -v $c || echo '(not found)')"
+&gt; done
+logrotate    (not found)
+lsof         (not found)
+systemctl    (not found)
+journalctl   (not found)
+gzip         /usr/bin/gzip
+stat         /usr/bin/stat
+ln           /usr/bin/ln
+truncate     /usr/bin/truncate</code></pre>
+
+                    <p>也就是说这个环境里连 <code>logrotate</code> 本身都没有。但本文讨论的问题，<strong>根子在内核处理文件的方式而不在 logrotate</strong>，这一部分在这里能原样复现。名字和实体怎么分开、打开的描述符指向哪里、截断之后的写入落到哪里，全都跑得出来。</p>
+
+                    <ul>
+                        <li><strong>真正跑过的</strong> - <code>rename</code> 前后的 inode 对比、用硬链接看名字与实体的分离、<strong>轮转之后仍往旧文件写的整个过程</strong>、被删文件的 <code>(deleted)</code> 标记、<code>&gt;</code> 与 <code>&gt;&gt;</code> 的差别、两个描述符看同一文件时的互相覆盖、截断之后产生空字节的过程、复制与截断之间的丢失、压缩仍被打开的文件的后果、编号方式的连锁改名、压缩率实测</li>
+                        <li><strong>没能跑的</strong> - <code>logrotate -d</code>（程序本身不存在）、<code>lsof +L1</code>、<code>systemctl</code> 和 <code>journalctl</code>、容器运行时相关的全部、属主与权限的更改</li>
+                        <li><strong>没有编造的</strong> - 跑不了的命令，它的输出在本文里一行都没有。只写了命令和<strong>读法</strong></li>
+                        <li><strong>动过手的</strong> - 只是把输出里过长的路径缩短了。<strong>数字一个都没改</strong></li>
+                        <li>配置语法和各指令的行为，是在 <code>logrotate</code> 手册原文里确认的。那些段落靠的是<strong>文档依据</strong>而不是执行</li>
+                        <li>这个环境的文件系统是 NTFS。<strong>inode 编号比 Linux 上大得多</strong>就是这个缘故，只需要看两个值<strong>是否相同</strong>，不必在意数值本身</li>
+                    </ul>
+
+                    <h2 id="sec-3">轮转实际做的事 - 摘下名字再挂上去</h2>
+
+                    <p>轮转并没有做什么了不起的事。把 <code>app.log</code> 改名为 <code>app.log.1</code>，再在同一个位置建一个新的 <code>app.log</code>。就这些。关键在于<strong>改名并不会改变文件</strong>。它只是把目录里写着的那张名牌挪个位置，名牌所指的实体一动没动。</p>
+
+                    <pre><code>$ echo "line 1" &gt; app.log
+$ echo "line 2" &gt;&gt; app.log
+$ stat -c 'inode=%i  size=%s  links=%h  name=%n' app.log
+inode=3096224745851500  size=14  links=1  name=app.log
+
+$ mv app.log app.log.1
+$ stat -c 'inode=%i  size=%s  links=%h  name=%n' app.log.1
+inode=3096224745851500  size=14  links=1  name=app.log.1        # 同一个 inode
+
+$ : &gt; app.log            # 轮转后新建文件
+$ stat -c 'inode=%i  size=%s  links=%h  name=%n' app.log app.log.1
+inode=5066549582825943  size=0   links=1  name=app.log          # 新的 inode
+inode=3096224745851500  size=14  links=1  name=app.log.1</code></pre>
+
+                    <p>名字变了，inode 编号没变。而新建的 <code>app.log</code> 是<strong>完全不同的另一个文件</strong>。名字不等于文件这件事，用硬链接来看更清楚。给同一个实体挂两张名牌，删掉其中一张，用剩下的名字照样能读出内容。</p>
+
+                    <pre><code>$ echo "payload" &gt; one.txt
+$ ln one.txt two.txt
+$ stat -c 'inode=%i  links=%h  name=%n' one.txt two.txt
+inode=3940649675983497  links=2  name=one.txt
+inode=3940649675983497  links=2  name=two.txt
+
+$ rm one.txt                     # 这是无法撤销的命令
+$ stat -c 'inode=%i  links=%h  name=%n' two.txt
+inode=3940649675983497  links=1  name=two.txt
+$ cat two.txt
+payload</code></pre>
+
+                    <p><code>rm</code> 做的只是把链接数从2减到1。文件只有在<strong>所有名字都消失、并且没有任何进程还开着它</strong>的时候才会消失。这两个条件只要有一个还立着，数据就还在，数据占的块也还在。轮转问题的全部都从这一句里长出来。</p>
+
+                    <h2 id="sec-4">所以它会悄悄失败</h2>
+
+                    <p>现在把服务这一侧接上来。写日志的进程在启动时打开文件一次，之后就一直往这个已打开的描述符里写，不会每次都重新去找名字。所以轮转把名字改了，<strong>进程根本没有办法知道</strong>。下面是让 shell 扮演那个进程实际跑出来的结果。</p>
+
+                    <pre><code>$ : &gt; svc.log
+$ exec 9&gt;&gt; svc.log                       # 服务已经打开了日志
+$ echo "[1] 轮转前写的行" &gt;&amp;9
+
+$ ls -l /proc/$$/fd/9
+lrwxrwxrwx ... /proc/1725/fd/9 -&gt; /tmp/demo/svc.log
+
+$ mv svc.log svc.log.1                   # 轮转
+$ : &gt; svc.log                            # 新建文件。没有发送任何信号
+$ echo "[2] 轮转后写的行" &gt;&amp;9
+$ echo "[3] 再下一行"     &gt;&amp;9
+
+$ wc -c svc.log svc.log.1
+ 0 svc.log
+71 svc.log.1
+
+$ cat svc.log                            # 新的日志文件
+$ cat svc.log.1                          # 被轮转出去的旧文件
+[1] 轮转前写的行
+[2] 轮转后写的行
+[3] 再下一行</code></pre>
+
+                    <p>三行全都进了 <code>svc.log.1</code>。连轮转<strong>之后</strong>写的两行也去了旧文件，而新建的 <code>svc.log</code> 还是0字节。用 <code>ls</code> 看目录，两个文件都在，看起来正常。到了下一个周期，<code>svc.log.1</code> 变成 <code>svc.log.2</code>，进程依旧往同一个实体里写。就这样，<strong>只有轮转编号在往后推的同一个文件</strong>一直长下去。</p>
+
+                    <p>这时候如果清理脚本把旧文件删掉，情况会更糟。名字没了，但进程还握着，所以空间不会回来，而且现在连 <code>ls</code> 都看不见了。</p>
+
+                    <pre><code>$ : &gt; svc.log
+$ exec 9&gt;&gt; svc.log
+$ echo "[1] 删除前" &gt;&amp;9
+$ rm svc.log                             # 这是无法撤销的命令
+$ echo "[2] 删除后还在写" &gt;&amp;9
+$ echo "[3] 而且继续写"   &gt;&amp;9
+
+$ ls -l /proc/$$/fd/9
+lrwxrwxrwx ... /proc/1725/fd/9 -&gt; /tmp/demo/svc.log (deleted)
+
+$ ls -l .
+total 0                                  # 什么都没有
+
+$ wc -c /proc/$$/fd/9
+71 /proc/1725/fd/9                       # 可是内容还活着</code></pre>
+
+                    <p>目录是空的，71 字节却还留在磁盘上。内核标注为 <code>(deleted)</code> 的这个状态，就是<strong>磁盘在涨却没人知道</strong>的精确定义。在真实服务器上，那不是 71 字节，而是几十 GB。</p>
+
+                    <h2 id="sec-5">让它重新打开的两种办法</h2>
+
+                    <p>修复的方向只有一个。<strong>让进程重新打开文件。</strong>办法有两种，各自要求不同的东西，也各自失去不同的东西。</p>
+
+                    <p>第一种是轮转之后发信号。nginx 文档把这个步骤写得很明确。先改日志文件的名字，然后给 master 进程发 <code>USR1</code>，master 会重新打开所有当前打开的日志文件，并让 worker 也重新打开。文档还说明了结果，<strong>旧文件几乎立刻就可以用于压缩之类的后处理</strong>。顺序很重要，改名在前，信号在后。</p>
+
+                    <pre><code># 在 logrotate 配置里这种方式长这样
+/var/log/nginx/*.log {
+    daily
+    maxsize 100M
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    create 0640 nginx adm
+    sharedscripts                 # 通配符匹配到几个文件，脚本都只跑一次
+    postrotate
+        [ -f /run/nginx.pid ] &amp;&amp; kill -USR1 "$(cat /run/nginx.pid)"
+    endscript
+}</code></pre>
+
+                    <p>去掉 <code>sharedscripts</code>，就会像手册说的那样，<strong>通配符匹配到几个文件，脚本就重复执行几次</strong>。六个日志文件就发六次信号。nginx 扛得住，但如果配置里写的是重启命令，服务就会连着重启六次。</p>
+
+                    <p>第二种是 <code>copytruncate</code>。照搬手册的说法，它<strong>不是移走旧日志再建新文件，而是先做一份副本，然后就地把原文件截断为零</strong>。从进程的角度看文件没有变化，所以它什么都不用做。对于不会接收信号的程序，这几乎是唯一可用的手段。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>方式</th><th>成立条件</th><th>失去的东西</th><th>适用场合</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>改名 + 信号（postrotate）</td><td>进程支持重新打开的信号</td><td>没有，一行都不会丢</td><td>nginx、rsyslog 等有信号约定的服务</td></tr>
+                            <tr><td>改名 + 重启</td><td>该服务允许重启</td><td>重启期间的可用性</td><td>没有重新打开机制、也不要求不停机的场合</td></tr>
+                            <tr><td>copytruncate</td><td>没有，进程什么都不用做</td><td>复制与截断之间的日志，另外若不是 O_APPEND，文件开头会被空字节填满</td><td>既不能发信号也不能重启时的最后手段</td></tr>
+                            <tr><td>应用自己轮转</td><td>日志库自带轮转功能</td><td>与外部轮转重叠时双方都会丢文件</td><td>能把轮转主体统一到应用一处的时候</td></tr>
+                            <tr><td>输出到标准输出</td><td>运行时或进程管理器接收</td><td>对文件日志的精细控制，要受运行时配置约束</td><td>容器环境的默认做法</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2 id="sec-6">copytruncate 失去了什么</h2>
+
+                    <p>手册自己写明了 <code>copytruncate</code> 的代价，<strong>复制和截断之间存在极短的时间差，因此可能丢失部分日志数据</strong>。这句话读起来很抽象，但只要往那个缝隙里塞一行进去，就能立刻看清到底发生了什么。</p>
+
+                    <pre><code>$ exec 9&gt;&gt; gap.log
+$ echo "复制之前写的行" &gt;&amp;9
+
+$ cp gap.log gap.log.1                       # 1) 复制
+$ echo "★复制与截断之间写的行" &gt;&amp;9            # 2) 挤进缝隙的日志
+$ : &gt; gap.log                                # 3) 截断，无法撤销
+$ echo "截断之后写的行" &gt;&amp;9
+
+$ cat gap.log.1
+复制之前写的行
+$ cat gap.log
+截断之后写的行
+
+$ grep -l "复制与截断之间" gap.log gap.log.1
+没有</code></pre>
+
+                    <p>写在那个缝隙里的行，<strong>归档里没有，新文件里也没有</strong>。哪里都没有。在每秒进来几千行的服务上，这个缝隙如果是几十毫秒，一次轮转就会消失几百行。支付或审计日志这种一行都不能丢的数据，不能用 <code>copytruncate</code> 来轮转，原因就在这里。</p>
+
+                    <p>还有第二个代价，知道的人少得多，样子也怪得多。<strong>如果进程不是以追加模式打开文件</strong>，截断之后它仍然会写在<strong>自己记住的旧偏移</strong>上。文件开头没人写过，于是被空字节填满。</p>
+
+                    <pre><code># 以追加模式（&gt;&gt;, O_APPEND）打开时
+$ exec 9&gt;&gt; ok.log
+$ echo "0123456789" &gt;&amp;9          # 11 字节
+$ cp ok.log ok.log.1
+$ : &gt; ok.log                     # 截断
+$ echo "after" &gt;&amp;9
+$ stat -c 'size=%s' ok.log
+size=6
+$ od -c ok.log
+0000000   a   f   t   e   r  \n
+
+# 不是追加模式时（&gt;）
+$ exec 9&gt; bad.log
+$ echo "0123456789" &gt;&amp;9          # 11 字节，偏移现在是 11
+$ cp bad.log bad.log.1
+$ : &gt; bad.log                    # 截断
+$ echo "after" &gt;&amp;9               # 照样写在偏移 11 上
+$ stat -c 'size=%s' bad.log
+size=17
+$ od -c bad.log
+0000000  \0  \0  \0  \0  \0  \0  \0  \0  \0  \0  \0   a   f   t   e   r
+0000020  \n</code></pre>
+
+                    <p>17 字节里前面 11 个是空字节。用日志查看器打开会看到开头是乱的，<code>grep</code> 把它数成一行，文件大小报得比真实内容大。在 Linux 的 ext4 或 XFS 上，这个开头通常会变成<strong>稀疏区域</strong>而不占用真实的块，但这一点在本环境无法确认。不过<strong>对读取方而言空字节确实存在于文件里</strong>这一事实，就是上面输出的样子。</p>
+
+                    <ul>
+                        <li>大多数日志库都以追加模式打开文件。所以这个症状出现在<strong>直接调用 <code>open</code> 的代码</strong>，或者用重定向接收日志的脚本里</li>
+                        <li>用 <code>copytruncate</code> 时 <code>create</code> 没有意义，因为不会新建文件。手册也把这两者当成不同的分支来讲</li>
+                        <li>复制期间磁盘上需要临时多出<strong>一份原文件大小的空闲空间</strong>。在已经写满的磁盘上，这种方式会失败</li>
+                        <li>按手册的说法，<code>olddir</code> 指定的目录本应位于<strong>同一个物理设备</strong>上，但使用 <code>copy</code>、<code>copytruncate</code> 或 <code>renamecopy</code> 时这个限制就没有了。想把归档挪到别的设备上时，绕路就在这里</li>
+                    </ul>
+
+                    <h2 id="sec-7">&gt; 和 &gt;&gt; 的差别在这里变得重要</h2>
+
+                    <p>脚本用重定向接收日志的场景很常见。<code>cron</code> 条目或 <code>ExecStart</code> 后面那个符号究竟做了什么，决定了轮转的结果。<code>&gt;</code> 会<strong>在打开时把文件截断为零</strong>，<code>&gt;&gt;</code> 则<strong>每次都先移到文件末尾再写</strong>。</p>
+
+                    <pre><code>$ echo "第一行" &gt; t1.log
+$ echo "第二行" &gt; t1.log
+$ cat t1.log
+第二行                        # 前面那行没了
+
+$ echo "第一行" &gt; t2.log
+$ echo "第二行" &gt;&gt; t2.log
+$ cat t2.log
+第一行
+第二行
+
+# 两个描述符看同一个文件 - 不是追加模式时
+$ exec 7&gt; noappend.log
+$ exec 8&gt; noappend.log
+$ echo "AAAAAAAAAA" &gt;&amp;7       # 11 字节从 0 号位置开始
+$ echo "BBB"        &gt;&amp;8       # 4 字节又从 0 号位置开始
+$ od -c noappend.log
+0000000   B   B   B  \n   A   A   A   A   A   A  \n
+
+# 追加模式则互不覆盖
+$ exec 7&gt;&gt; append.log
+$ exec 8&gt;&gt; append.log
+$ echo "AAAAAAAAAA" &gt;&amp;7
+$ echo "BBB"        &gt;&amp;8
+$ od -c append.log
+0000000   A   A   A   A   A   A   A   A   A   A  \n   B   B   B  \n</code></pre>
+
+                    <p>第二个实验很重要。用 <code>&gt;</code> 打开的描述符<strong>各自持有自己的偏移</strong>。所以两个进程用这种方式打开同一个日志文件，就会互相覆盖对方的内容。启动多个 worker 进程，让它们各自用 <code>&gt;</code> 往同一个文件写，日志就会一块一块地消失。这是非常难追查的一类丢失。</p>
+
+                    <p>对轮转来说更重要的是，<strong>重定向只在进程启动时打开一次</strong>。用 <code>&gt;&gt; /var/log/job.log</code> 启动一个长跑的守护进程，那个描述符会一直活到进程死掉，轮转就会以和上面 <a href="#sec-4">第4节</a> 完全一样的方式坏掉。反过来，<code>cron</code> 每5分钟重新执行一次的脚本每次都会重新打开，轮转自然就对上了。<strong>同一份轮转配置只在某些服务上坏掉</strong>，原因多半就是这个差别。</p>
+
+                    <h2 id="sec-8">容量条件与时间条件</h2>
+
+                    <p>手册的定义简短而清楚。<code>size</code> 只有在文件长得比指定容量大时才轮转。<code>daily</code>、<code>weekly</code>、<code>monthly</code> 是时间间隔。<code>maxsize</code> 是<strong>即使还没到指定的时间间隔</strong>，只要超过容量就轮转，<code>minsize</code> 则相反，<strong>即使超过了容量，时间间隔没到</strong>也不轮转。</p>
+
+                    <p>为什么只设时间条件很危险，算一算就出来了。本文构造的 20 万行访问日志，平均每行 <strong>122.2 字节</strong>。按这个值算是这样。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>每秒行数</th><th>1 小时</th><th>24 小时</th><th>到达 10 GiB 的时间</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>10</td><td>0.00 GiB</td><td>0.10 GiB</td><td>101.7 天</td></tr>
+                            <tr><td>100</td><td>0.04 GiB</td><td>0.98 GiB</td><td>10.2 天</td></tr>
+                            <tr><td>1,000</td><td>0.41 GiB</td><td>9.83 GiB</td><td>1.0 天</td></tr>
+                            <tr><td>5,000</td><td>2.05 GiB</td><td>49.16 GiB</td><td>4.9 小时</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>平时每秒 100 行的服务，出故障时吐出每秒 5,000 行并不稀奇，再混进堆栈跟踪，行长也会翻好几倍。只写了 <code>daily</code> 的配置在当天午夜之前什么都不会做。<strong>所以时间条件和容量条件要一起设。</strong></p>
+
+                    <pre><code>/var/log/app/*.log {
+    daily              # 平时一天一次
+    maxsize 200M       # 没到时间但超过 200M 就立即轮转
+    rotate 14
+    missingok          # 文件不存在也不报错，直接跳过
+    notifempty         # 空文件不轮转
+    compress
+    delaycompress
+    create 0640 app app
+}
+
+# ★ 容量条件只在 logrotate 被调用时才检查。
+#    一天只调用一次，maxsize 也就一天只检查一次。
+#    想更频繁地检查，就得让调用方更频繁地跑。
+$ systemctl list-timers logrotate.timer      # 本环境无法确认
+$ cat /usr/lib/systemd/system/logrotate.timer</code></pre>
+
+                    <p>最后那段注释是实际运维中最常被漏掉的地方。<code>logrotate</code> 不是常驻程序，而是<strong>被调用才跑的程序</strong>。发行版提供的定时器单元是 <code>OnCalendar=daily</code>，加上最多一小时的随机延迟和 <code>Persistent=true</code>。意思就是一天一次，那么 <code>maxsize</code> 设得再小，<strong>检查间隔仍然是一天</strong>。想抓住暴涨的日志，就得用另外的定时器或 cron 条目更频繁地调用它。</p>
+
+                    <h2 id="sec-9">压缩的陷阱 - 还开着的文件</h2>
+
+                    <p>压缩的行为和看上去不一样。<code>gzip</code> 读取原文件、生成新文件、然后<strong>删掉原文件</strong>。前面那条规则在这里又生效了。进程还握着那个文件的时候去压缩，压缩包里只会有那一刻之前的内容，之后的行会流进一个没有名字的文件。</p>
+
+                    <pre><code>$ exec 9&gt;&gt; svc.log
+$ echo "[1] 轮转前写的行" &gt;&amp;9
+$ mv svc.log svc.log.1
+$ : &gt; svc.log
+$ echo "[2] 轮转后写的行（还是旧 inode）" &gt;&amp;9
+
+$ gzip svc.log.1                 # 压缩之后原文件就没了
+$ echo "[3] 压缩结束之后写的行" &gt;&amp;9
+
+$ ls -l /proc/$$/fd/9
+lrwxrwxrwx ... -&gt; /tmp/demo/svc.log (deleted)
+
+$ ls -l
+   0  svc.log
+  85  svc.log.1.gz
+
+$ zcat svc.log.1.gz
+[1] 轮转前写的行
+[2] 轮转后写的行（还是旧 inode）
+
+$ zcat svc.log.1.gz | grep -c "\[3\]"
+0
+$ grep -c "\[3\]" svc.log
+0</code></pre>
+
+                    <p>第三行<strong>压缩包里没有，新日志文件里也没有</strong>。而且那一行进的那个文件没有名字，既没法读也没法删。只有进程退出，空间才会回来。<code>delaycompress</code> 做的正是避免这种局面。照手册的表述，它<strong>把上一个日志文件的压缩推迟到下一个轮转周期</strong>，而这一个周期就是进程松手所需要的时间。</p>
+
+                    <p>压缩本身的成本也值得记一笔。下面是同一个文件只改压缩级别跑出来的实测。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>对象</th><th>原始</th><th>压缩后</th><th>比例</th><th>耗时</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>访问日志 20 万行，<code>gzip -1</code></td><td>24,447,614 B</td><td>5,700,988 B</td><td>23.32%</td><td>581 ms</td></tr>
+                            <tr><td>同一文件，<code>gzip -6</code>（默认）</td><td>24,447,614 B</td><td>4,453,030 B</td><td>18.21%</td><td>920 ms</td></tr>
+                            <tr><td>同一文件，<code>gzip -9</code></td><td>24,447,614 B</td><td>4,235,905 B</td><td>17.33%</td><td>2,290 ms</td></tr>
+                            <tr><td>完全相同的行重复 20 万次</td><td>26,400,000 B</td><td>102,537 B</td><td>0.39%</td><td>-</td></tr>
+                            <tr><td>随机字节 4 MB</td><td>4,000,000 B</td><td>4,000,639 B</td><td>100.02%</td><td>-</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>要读出来的有两点。第一，<code>-9</code> 为了比默认多削掉 0.88 个百分点，花掉了 <strong>2.5 倍的时间</strong>。作为轮转时刻抢占 CPU 的代价，多半是亏的。第二，<strong>不能直接相信合成日志测出来的压缩率</strong>。只重复同一行的文件缩到了 0.39%，而字段真正在变的日志是 18%。已经压缩过的数据或接近随机的数据反而会变大。</p>
+
+                    <h2 id="sec-10">rotate N 实际留下多少</h2>
+
+                    <p><code>rotate</code> 按手册的说法，是文件<strong>在被删除之前被轮转的次数</strong>。个数很明确，容量却不然。按压缩前的大小去乘会严重高估，对压缩率乐观又会低估。而且用了 <code>delaycompress</code>，就<strong>总会多留一个没压缩的文件</strong>。下面是按 <code>size 100M</code> 算出来的最大占用。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>配置</th><th>压缩率 12%</th><th>压缩率 25%</th><th>算式</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>rotate 7</code> + <code>delaycompress</code></td><td>0.27 GiB</td><td>0.34 GiB</td><td>当前 + 未压缩 1 个 + 压缩 6 个</td></tr>
+                            <tr><td><code>rotate 7</code> 只压缩</td><td>0.18 GiB</td><td>0.27 GiB</td><td>当前 + 压缩 7 个</td></tr>
+                            <tr><td><code>rotate 14</code> + <code>delaycompress</code></td><td>0.35 GiB</td><td>0.51 GiB</td><td>当前 + 未压缩 1 个 + 压缩 13 个</td></tr>
+                            <tr><td><code>rotate 30</code> + <code>delaycompress</code></td><td>0.54 GiB</td><td>0.90 GiB</td><td>当前 + 未压缩 1 个 + 压缩 29 个</td></tr>
+                            <tr><td><code>rotate 30</code> 不压缩</td><td colspan="2">3.03 GiB</td><td>当前 + 未压缩 30 个</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>实测的 18.21% 落在这两列之间。这张表里还缺一项。<strong><code>size</code> 是下限而不是上限。</strong>轮转只在检查时刻发生，所以在一天检查一次的配置里出现暴涨，文件被发现时已经不是 200M 而是好几个 GB 了。计算时得乘上这份余量。</p>
+
+                    <p>归档方式也会影响容量。编号方式每次轮转都要<strong>把所有文件的名字往后推一格</strong>。实际模拟一下是这样动的。</p>
+
+                    <pre><code># rotate 4 轮转六次之后的最终状态
+$ for f in app.log*; do
+&gt;   printf '%-12s inode=%-18s %s\n' "$f" "$(stat -c %i "$f")" "$(cat "$f")"
+&gt; done
+app.log      inode=4785074606123239
+app.log.1    inode=4222124652701929   day 6 的日志
+app.log.2    inode=3940649675991270   day 5 的日志
+app.log.3    inode=4785074606123229   day 4 的日志
+app.log.4    inode=3940649675991267   day 3 的日志
+
+# day 1、day 2 超过 rotate 4 已被删除。
+# 每个文件的 inode 都不同 = 轮转时只发生了改名，内容没有被复制。</code></pre>
+
+                    <p>有多少文件就有多少次改名，所以在有几百个文件的目录里，仅此一项就成了负担。用 <code>dateext</code> 的话，按手册的说明会以<strong>日期扩展名</strong>代替编号，连锁改名就消失了。代价是文件名每次都不一样，所以<strong>按名字模式采集的工具</strong>也得跟着改配置。</p>
+
+                    <h2 id="sec-11">权限与属主 - 轮转之后写不进去的事故</h2>
+
+                    <p><code>create</code> 按手册的说明，会在<strong>轮转之后、postrotate 脚本运行之前</strong>建一个同名文件。语法是 <code>create mode owner group</code>，省略的项会继承原文件的值。事故就出在这里。<code>logrotate</code> 通常以 root 身份运行，所以不写模式和属主，或者写错了，就会造出一个<strong>服务账号写不进去的新文件</strong>。</p>
+
+                    <pre><code>/var/log/app/*.log {
+    daily
+    rotate 14
+    create 0640 app app        # 模式、属主、属组。三个都写更安全
+    su app app                 # 轮转操作本身以这个用户和组来执行
+    postrotate
+        systemctl reload app.service &gt;/dev/null 2&gt;&amp;1 || true
+    endscript
+}
+
+# 手册：如果 su 指定的用户和组没有权限按 create 指定的属主关系创建文件，
+# 就会报错。
+#
+# 本环境无法确认属主与权限。改了 umask 之后，
+# stat 对两个文件都报告 644，属组是 UNKNOWN。
+$ stat -c '%a  %U:%G  %n' u027.log u022.log
+644  &lt;user&gt;:UNKNOWN  u027.log
+644  &lt;user&gt;:UNKNOWN  u022.log</code></pre>
+
+                    <p>这类事故的症状往往不是在轮转之后立刻出现，而是在<strong>几个小时后</strong>。日志不再增长而服务照常运转，所以要过一阵才会察觉。也有进程因为写不了日志而不停报错、把 CPU 吃掉的情况。</p>
+
+                    <ul>
+                        <li><code>su</code> 指令在日志目录<strong>可被 root 之外的账号写入</strong>时是必需的。这种条件下不带 <code>su</code> 去跑，轮转会被拒绝</li>
+                        <li>如果 <code>postrotate</code> 里要读 pid 文件，那个文件的权限也要一并检查。这是轮转成功了但信号没送到的常见原因</li>
+                        <li>用 <code>reload</code> 代替信号时，要记得那条命令<strong>就算失败，轮转也已经做完了</strong>。把脚本的退出码吞掉，失败就变得悄无声息</li>
+                        <li>启用了 SELinux 或 AppArmor 的环境里，即使文件模式正确，也可能<strong>因为标签</strong>而写不进去。本文不涉及那一层</li>
+                    </ul>
+
+                    <h2 id="sec-12">轮转本身根本没跑的情况</h2>
+
+                    <p>到这里说的都是轮转在跑但跑错了的情况。完全不跑的情况同样常见，而且更安静。错误信息会写进日志，但那份日志没人看。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>原因</th><th>表面看到的</th><th>确认方法</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>定时器或 cron 关着</td><td>已轮转文件的日期停在某个时间点</td><td>在定时器列表里看上次执行和下次执行的时刻</td></tr>
+                            <tr><td>某一个配置文件的语法错误</td><td>不只是那个文件，<strong>连别的日志</strong>也停止轮转</td><td>用调试模式把整套配置解析一遍</td></tr>
+                            <tr><td>同一个文件被两份配置抓住</td><td>因重复条目报错而中断处理</td><td>在整个配置目录里搜索那个路径</td></tr>
+                            <tr><td>刚刚登记进状态文件</td><td>新加的配置第一天不会跑</td><td>在状态文件里看那个路径记录的时刻</td></tr>
+                            <tr><td><code>notifempty</code> 加上已经坏掉的轮转</td><td>当前文件是0字节，于是被排除在外</td><td>把当前文件的大小和进程的描述符对照起来看</td></tr>
+                            <tr><td>只用调试模式确认过</td><td>跑一遍看着正常，实际却不跑</td><td>记住调试模式不会更新状态文件</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>第四行尤其是个坑。按手册的说法，<strong>第一次遇到状态文件里没有条目的日志文件时，会把当前时刻记录为最后一次轮转的时刻</strong>。也就是说，加配置的当天 <code>daily</code> 条件根本不成立。着急加了配置又手动跑了一次 <code>logrotate</code> 却什么都没发生，原因多半就是这个。</p>
+
+                    <p>第六行也是同样的性质。手册明确写着调试选项<strong>不会改动日志，也不会更新状态文件</strong>。用来做语法检查很好，但<strong>不能当作真的跑过的证据</strong>。下面这些命令，因为本环境里连 <code>logrotate</code> 都没有，所以没能跑。</p>
+
+                    <pre><code># 本环境没能跑的命令 - 不附输出
+$ logrotate -d /etc/logrotate.conf            # 解析整套配置，什么都不改
+$ logrotate -d /etc/logrotate.d/app           # 只看一份配置
+$ logrotate -v -f /etc/logrotate.d/app        # 强制轮转，会真的改动
+$ cat /var/lib/logrotate/logrotate.status     # 每个路径的最后轮转时刻
+$ grep -rn "/var/log/app" /etc/logrotate.conf /etc/logrotate.d/   # 抓重复
+$ systemctl list-timers logrotate.timer
+$ journalctl -u logrotate.service --since "-7d"
+
+# 读法
+#  -d 是检查用的。用它确认过，不代表真的轮转过。
+#  -f 会忽略时间和容量条件立刻轮转。生产环境要谨慎。
+#  状态文件里的日期不是今天，那个路径今天就没轮转。</code></pre>
+
+                    <h2 id="sec-13">应用自己做轮转的情况</h2>
+
+                    <p>现在的框架自带的日志组件大多内置了轮转功能。写满了就自己改名并打开新文件。这种方式根本不会产生 <a href="#sec-4">第4节</a> 的问题，因为打开文件的主体和改名的主体是同一个。</p>
+
+                    <p>问题出在<strong>同一个文件上有两个轮转主体</strong>的时候。应用改自己文件名的那一刻 <code>logrotate</code> 也在改名，两边就都丢掉了自己造的文件。应用往它自己建的文件里写，而 <code>logrotate</code> 建的文件占了那个位置，保留个数也因为两套规则混在一起而无法预测。</p>
+
+                    <ul>
+                        <li><strong>规则只有一条：一个文件只能有一个轮转主体。</strong>如果应用在轮转，就把那个路径从 <code>logrotate</code> 配置里去掉。如果用 <code>logrotate</code>，就关掉应用的轮转并解除它的大小限制</li>
+                        <li>在启动多个 worker 进程的架构里，如果每个 worker 都对<strong>同一个文件带着各自的轮转逻辑</strong>，那么 worker 之间也会发生同样的冲突。这种情况要么按 worker 分文件，要么把轮转交给外部</li>
+                        <li>应用内置的轮转大多<strong>只在写入的那一刻</strong>检查大小。流量停了，文件再大也不会轮转。夜里安静的服务会把这个差别暴露出来</li>
+                        <li>两边都设了保留个数时，<strong>并不是小的那个说了算</strong>。它们用不同的命名规则，所以两边的个数都会各自留下文件</li>
+                    </ul>
+
+                    <h2 id="sec-14">容器里情况不一样</h2>
+
+                    <p>想在容器里写文件日志再用 <code>logrotate</code> 轮转，多半会卡住。容器里没有 cron，没人去调用 <code>logrotate</code>，就算用 sidecar 挂上去，进程命名空间不同，<strong>连要发信号的对象都够不着</strong>。剩下的手段只有 <code>copytruncate</code>，那就要原封不动地付出 <a href="#sec-6">第6节</a> 的代价。</p>
+
+                    <p>所以容器里的标准做法是输出到标准输出和标准错误，交给运行时收集。不过这里也有默认值的陷阱。按 Docker 的 <code>json-file</code> 驱动文档，<code>max-size</code> 的默认值是 <strong>-1，也就是无限制</strong>，<code>max-file</code> 的默认值是 <strong>1</strong>，而且 <code>max-file</code> 只有在设置了 <code>max-size</code> 时才生效。合起来就是<strong>默认配置下没有轮转</strong>。容器日志把宿主机磁盘写满的事故就是从这里来的。</p>
+
+                    <p>systemd 那边会自己管。按 journald 手册，<code>SystemMaxUse</code> 和 <code>SystemKeepFree</code> 分别以所在文件系统容量的 <strong>10% 和 15%</strong> 为默认值，但计算出的值会被<strong>限制在 4G 以内</strong>。单个文件的大小是 <code>SystemMaxUse</code> 的八分之一并限制在 128M，结果通常会维持<strong>七个已轮转的日志文件</strong>作为历史。<code>SystemMaxFiles</code> 的默认值是 100。</p>
+
+                    <ul>
+                        <li>journald 的清理有个附注。手册写着<strong>只删除已归档的文件</strong>。活动文件会留下，所以清理完成之后仍可能占用超过上限的空间</li>
+                        <li>容器日志的容量限制通常在<strong>重新创建容器时</strong>才生效。改了守护进程的默认值，对已经在跑的容器不会生效</li>
+                        <li>由运行时接管轮转，<strong>归档的位置就在宿主机上</strong>。如果应用的结构是要回头读自己的日志，那条路径就没了</li>
+                        <li>往标准输出写时，如果应用做了<strong>缓冲</strong>，日志就会成块地延迟出来。这会让故障时刻和日志时刻对不上，所以要打开按行刷新</li>
+                    </ul>
+
+                    <h2 id="sec-15">检查清单 - 轮转到底有没有在跑</h2>
+
+                    <p>最快的确认是<strong>比较两个 inode</strong>。看路径指向的文件，和进程打开的描述符背后的文件是不是同一个。相同就正常，不同就是轮转坏了。这个比较在本环境里原样跑通了。</p>
+
+                    <pre><code>$ : &gt; live.log
+$ exec 9&gt;&gt; live.log
+$ echo "正常" &gt;&amp;9
+$ stat -c %i live.log              ; stat -Lc %i /proc/$$/fd/9
+4222124652701932
+4222124652701932                   # 相同 = 此刻正在往那个路径写
+
+$ mv live.log live.log.1 ; : &gt; live.log     # 没发信号的轮转
+$ stat -c %i live.log              ; stat -Lc %i /proc/$$/fd/9
+4503599629412593
+4222124652701932                   # 分开了 = 轮转坏了
+
+$ echo "[坏了之后还在写]" &gt;&amp;9
+$ stat -c %s live.log   ; stat -c %s live.log.1
+0                                  # 新文件是0字节
+40                                 # 写入都跑到这边来了</code></pre>
+
+                    <p>在真实服务器上要先找到描述符编号。顺序是这样。</p>
+
+                    <ol>
+                        <li>找到写日志的进程的 pid</li>
+                        <li>在 <code>ls -l /proc/&lt;pid&gt;/fd</code> 里挑出指向那个日志路径的编号。如果带着 <code>(deleted)</code>，那本身就是答案</li>
+                        <li>比较 <code>stat -c %i &lt;日志路径&gt;</code> 和 <code>stat -Lc %i /proc/&lt;pid&gt;/fd/&lt;编号&gt;</code></li>
+                        <li>两个值不同，说明轮转之后没有重新打开。发信号或者重启</li>
+                        <li>看已轮转文件的修改时间是不是<strong>每个周期一个台阶</strong>。从某个时间点起就停住了，说明轮转本身没跑</li>
+                        <li>在状态文件里确认那个路径的最后轮转时刻。不是今天，今天就没轮转</li>
+                    </ol>
+
+                    <p>新加或者改动配置时该确认的东西也一并列出来。下面任何一条不过关，那份配置就还没完成。</p>
+
+                    <ul>
+                        <li>有没有重新打开的手段。既没有 <code>postrotate</code> 也没有 <code>copytruncate</code>，那份配置<strong>会在第一次轮转时就坏掉</strong></li>
+                        <li>时间条件和容量条件<strong>是否都有</strong>。以及调用得够不够频繁，能让容量条件真正被检查到</li>
+                        <li>开了 <code>compress</code>，有没有一并开 <code>delaycompress</code></li>
+                        <li><code>create</code> 里模式、属主、属组<strong>三项是否都写了</strong></li>
+                        <li>用了通配符的话，有没有 <code>sharedscripts</code></li>
+                        <li>有没有别的配置也抓着同一个路径。软件包装进来的配置和手写的配置重叠很常见</li>
+                        <li>按压缩率换算之后，保留个数是否装得进那个文件系统。<strong>有没有乘上暴涨的余量</strong></li>
+                        <li>应用是不是在自己做轮转</li>
+                    </ul>
+
+                    <h2 id="sec-16">小结</h2>
+
+                    <p>本文里所有的失败都从同一句话分叉出来。<strong>轮转改的是名字，而进程握住的不是名字。</strong>所以轮转配置有一半说的不是怎么挪文件，而是<strong>让进程去打开新文件的那个手段</strong>。没有那个手段，轮转就只是换了个名字，一点空间都还不回来。</p>
+
+                    <p>选项只有两个，而且都有代价。信号需要进程本身具备这个能力，<code>copytruncate</code> 会丢掉复制与截断之间的日志，在非追加模式的描述符上还会造出混着空字节的文件。不管选哪一个，<strong>知道自己放弃了什么再去选</strong>，和把默认值原样放着，是两回事。</p>
+
+                    <p>确认比想象中便宜。比较两个 inode 只要几秒，而这个比较在轮转坏掉的那一刻就会给出答案。日志轮转是平时没人看的装置，所以<strong>事先定好坏了怎么发现</strong>，在实际效果上比把配置写好更重要。</p>
+
+                    <h2 id="sec-17">未能确认的部分</h2>
+
+                    <ul>
+                        <li><code>logrotate</code> 本身<strong>一次都没能执行</strong>。这个环境里没有这个程序。所有配置语法和指令行为都以手册原文为依据，本文里没有 <code>-d</code> 的输出，也没有真实的轮转结果</li>
+                        <li><code>lsof +L1</code>、<code>systemctl</code>、<code>journalctl</code> 和容器运行时的命令也都没能跑。journald 与 Docker 的数值来自各自的文档，<strong>没有用实际运行去验证</strong></li>
+                        <li>轮转之后 <code>/proc/&lt;pid&gt;/fd</code> 下的符号链接，在这个环境里<strong>照旧显示旧的路径字符串</strong>。Linux 上改名后会不会更新为新名字，没能确认。不过 <code>(deleted)</code> 标记和 <code>stat -Lc %i</code> 的比较在这里是原样可用的，检查步骤依靠的是后者</li>
+                        <li>截断之后开头会不会变成<strong>稀疏区域</strong>，没能确认。这个环境的块统计对两个文件都报告 1，是不能用的值。只用输出确认了空字节确实存在</li>
+                        <li>属主与权限没能确认。改了 umask，两个文件仍然都是 644，属组显示为 <code>UNKNOWN</code>，因为这个环境表达权限的方式和 Linux 不同</li>
+                        <li>同一个文件被两份配置抓住时出现的<strong>准确错误文案</strong>没能复现。只写了那种情况下处理会中断这一点</li>
+                        <li>压缩率是以本文构造的<strong>合成日志</strong>为基准的。真实日志的压缩率会随字段构成而变化很大，做容量计算时要用自己日志上量出来的数值</li>
+                        <li>应用内置日志组件的行为<strong>因实现而异</strong>。本文没有验证任何具体的库，只写了轮转主体有两个时会冲突这一普遍结构</li>
+                    </ul>
+
+                    <h2 id="sec-18">参考资料</h2>
+
+                    <ul>
+                        <li><a href="https://raw.githubusercontent.com/logrotate/logrotate/main/logrotate.8.in" target="_blank" rel="noopener">logrotate(8) 手册原文（logrotate 仓库）</a> - <code>copytruncate</code>、<code>delaycompress</code>、<code>create</code>、<code>su</code>、<code>size</code>、<code>maxsize</code>、<code>minsize</code>、<code>rotate</code>、<code>sharedscripts</code>、<code>olddir</code>、<code>dateext</code>、<code>-d</code> 以及状态文件行为的依据</li>
+                        <li><a href="https://raw.githubusercontent.com/logrotate/logrotate/main/examples/logrotate.timer" target="_blank" rel="noopener">logrotate.timer（logrotate 仓库示例）</a> - <code>OnCalendar=daily</code>、<code>RandomizedDelaySec=1h</code>、<code>Persistent=true</code>。容量条件检查间隔变成一天的依据</li>
+                        <li><a href="https://nginx.org/en/docs/control.html" target="_blank" rel="noopener">nginx - Controlling nginx</a> - 信号列表与日志轮转步骤。先改名再发 <code>USR1</code> 这一顺序的出处</li>
+                        <li><a href="https://man7.org/linux/man-pages/man5/journald.conf.5.html" target="_blank" rel="noopener">journald.conf(5)</a> - <code>SystemMaxUse</code> 10%、<code>SystemKeepFree</code> 15%、4G 上限，<code>SystemMaxFiles</code> 默认 100，以及只删除已归档文件的说明</li>
+                        <li><a href="https://docs.docker.com/engine/logging/drivers/json-file/" target="_blank" rel="noopener">Docker - JSON File logging driver</a> - <code>max-size</code> 默认 -1（无限制）、<code>max-file</code> 默认 1，以及 <code>max-file</code> 只有在设置了 <code>max-size</code> 时才生效的说明</li>
+                        <li><a href="no_space_left_but_disk_free.html">磁盘没满却报 No space left on device</a> - 从另一侧看本文所造成的状态。<code>df</code> 与 <code>du</code> 为何不一致，以及 inode 耗尽</li>
+                        <li><a href="find_process_holding_file.html">找出正握着文件的进程</a> - 轮转坏掉之后定位凶手的步骤</li>
+                        <li><a href="oom_killer_diagnosis.html">读懂 OOM Killer 到底杀了什么</a> - 日志暴涨爆在内存而不是磁盘上的时候</li>
+                        <li>systemd 官网的 journald.conf 页面拒绝访问（HTTP 403），没能打开。上面那一条是在 <strong>man7.org 版本</strong>上确认的</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>分享本文</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">返回列表</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/base64_encoder.html">Base64 编码器/解码器</a></li>
+      <li><a href="../static/yaml_json_converter.html">YAML JSON转换器 2026</a></li>
+      <li><a href="../static/curl_builder.html">curl命令生成器 2026</a></li>
+      <li><a href="../static/http_status_codes.html">HTTP状态码完全参考 2026</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="linux_server_guide_08_logging.html">Linux服务器管理完全攻略 第8篇：日志管理与监控</a></li>
+      <li><a href="codex_cli_disk_bloat_2026.html">Codex CLI 会话日志膨胀至数百GB - AI编程CLI磁盘耗尽的原因与应对 2026</a></li>
+      <li><a href="linux_server_guide_01_basics.html">Linux服务器管理完全攻略 第1篇：基础与文件系统理解</a></li>
+      <li><a href="git_bisect_practical.html">git bisect - 用二分查找定位引入 Bug 的那次提交</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制。粘贴到 Threads 应用即可分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制!'); });
+    });
+    </script>
+</body>
+</html>

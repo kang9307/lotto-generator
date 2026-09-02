@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<!--
+ * 技术博客文章模板
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JVM 如何看待容器上限 - Kubernetes 的 Request 与 Limit 决定堆、GC 与延迟的地方 2026</title>
+    <meta name="description" content="设了上限，JVM 仍按自己的方式读取。MaxRAMPercentage 默认 25 个百分点、堆之外的内存、availableProcessors 决定的 GC 线程数，以及 CFS 节流，只整理官方文档中确认过的部分。">
+    <meta name="keywords" content="JVM 容器, Kubernetes Request Limit, MaxRAMPercentage, ActiveProcessorCount, UseContainerSupport, CPU 节流, CFS 配额, OOMKilled, QoS 等级, G1 GC, 元空间, 开发, 基础设施, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/jvm_container_resource_limits.html">
+
+    <meta property="og:title" content="JVM 如何看待容器上限 - Kubernetes 的 Request 与 Limit 决定堆、GC 与延迟的地方 2026">
+    <meta property="og:description" content="把 -Xmx 设成和 limit 一样为何必死，一个 availableProcessors 如何决定 GC 线程数与并行度。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/jvm_container_resource_limits.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-09-02">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="JVM 如何看待容器上限">
+    <meta name="twitter:description" content="JVM 不是遵守上限的程序，而是看着上限给自己做计划的程序。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "JVM 如何看待容器上限 - Kubernetes 的 Request 与 Limit 决定堆、GC 与延迟的地方 2026",
+      "alternativeHeadline": "把 -Xmx 设成和 limit 一样为何必死，一个 availableProcessors 如何决定 GC 线程数与并行度",
+      "datePublished": "2026-09-02",
+      "dateModified": "2026-09-02",
+      "inLanguage": "zh-CN",
+      "articleSection": "开发/基础设施",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "JVM 容器, Kubernetes Request Limit, MaxRAMPercentage, ActiveProcessorCount, UseContainerSupport, CPU 节流, CFS 配额, OOMKilled, QoS 等级, G1 GC",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/jvm_container_resource_limits.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "已经设了内存 limit，Java 容器为什么还会越过上限被杀?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "因为 JVM 用的内存不只有堆。堆之外还有元空间、JIT 代码缓存、线程栈、直接缓冲区，以及垃圾收集器自身的内部结构，它们都不计入 -Xmx。按 Java 21 的 man page，-XX:MaxMetaspaceSize 默认不限制大小，-XX:ReservedCodeCacheSize 的默认最大值是 240MB，Linux x64 上 -Xss 的默认值是每线程 1024KB。所以把 -Xmx 设成和容器 limit 一样，堆还没填满容器就先触顶了。此时动手的不是 JVM 而是内核，Kubernetes 文档写明 memory limit 由内核以 OOM kill 强制执行。这就是既没有 Java 异常也没有堆转储的原因。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "在容器里该用 -Xmx 还是 -XX:MaxRAMPercentage?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "比例更好维护。-Xmx 是绝对值，与 Pod 规格分开存在，每改一次 limit 就要再改一次 JVM 参数，漏掉一边就是事故。-XX:MaxRAMPercentage 按 -XX:MaxRAM 解析出的值的比例来定最大堆，而 Java 21 的 man page 把 MaxRAM 的默认值定义为「JVM 进程可用的最大内存与 128GB 中较小的一个」，并补充说这个可用内存是「机器物理内存与环境所施加的约束例如容器中较小的一个」。也就是说容器 limit 自动成为分母。但要注意默认值是 25 个百分点，什么都不指定时 1Gi 容器的最大堆只有约 256Mi。到底该用多少，是测出来的。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "不要设 CPU limit 这个说法对吗?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "两边都有文档支撑，答案取决于负载。不设的一方的依据是，Kubernetes 用 CPU 节流来强制执行 cpu limit，而 kubelet 的 CFS 周期默认是 100ms，一旦在周期内用完配额，剩下的时间就停住。驱逐信号清单里也只有内存、文件系统和 pid，没有 CPU。要设的一方的依据是 QoS 等级。要成为 Guaranteed，每个容器的 cpu limit 都必须等于 request，而驱逐顺序是 BestEffort、Burstable、Guaranteed。static CPU 管理策略下拿到独占 CPU 的条件同样是 Guaranteed Pod 加整数 CPU request。判断要看真实的节流指标。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "CPU limit 调低为什么会让 GC 变慢?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "两条路叠在一起。第一，JVM 看到的处理器数变少。OpenJDK 的 cgroup 代码写明，指定了 quota 时用 quota 除以 period 求处理器数，且所有除法结果一律向上取整。这个值决定 GC 工作线程数和 ForkJoinPool 的并行度。第二，数值足够小时连收集器的选择都会变。Oracle 的 GC 调优指南写明，只有处理器两个以上且物理内存不低于 1792MB 才算服务器级，那时选 G1，否则选 Serial。再加上如果配额在 stop-the-world 期间耗尽，GC 线程要等下一个周期，停顿就被拉长到周期边界。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "怎么确认容器里的 JVM 设置真的生效了?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "别猜，直接问 JVM 更快。-Xlog:os+container=trace 会最大限度地打印容器信息的识别日志，Java 21 的 man page 正是把它作为容器支持的诊断手段来介绍的。堆之外的内存去了哪里，用 -XX:NativeMemoryTracking=summary 打开跟踪，再用 jcmd 查看，默认值是 off。然后要把该看的数字分开。堆大小的依据是 GC 之后的用量，而不是锯齿图的顶点；容器会不会死由 cgroup 看到的值决定；CPU 要看被节流的时间而不是使用率。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/jvm_container_resource_limits.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/jvm_container_resource_limits.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/jvm_container_resource_limits.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/jvm_container_resource_limits.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/jvm_container_resource_limits.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "首页",
+      "item": "https://braindetox.kr/zh/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "开发/基础设施",
+      "item": "https://braindetox.kr/zh/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "JVM 如何看待容器上限 - Kubernetes 的 Request 与 Limit 决定堆、GC 与延迟的地方 2026",
+      "item": "https://braindetox.kr/zh/posts/jvm_container_resource_limits.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="JVM 如何看待容器上限 - Kubernetes 的 Request 与 Limit 决定堆、GC 与延迟的地方 2026">
+                <meta itemprop="datePublished" content="2026-09-02">
+                <meta itemprop="dateModified" content="2026-09-02">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="JVM 容器, Kubernetes Request Limit, MaxRAMPercentage, ActiveProcessorCount, UseContainerSupport, CPU 节流, CFS 配额, OOMKilled, QoS 等级, G1 GC">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/jvm_container_resource_limits.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">JVM 如何看待容器上限 - Kubernetes 的 Request 与 Limit 决定堆、GC 与延迟的地方 2026</h1>
+                    <h2 class="post-subtitle">把 -Xmx 设成和 limit 一样为何必死，一个 availableProcessors 如何决定 GC 线程数与并行度</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-02">2026年9月2日</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">开发/基础设施</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>在 Pod 规格里写下 <code>limits.memory: 1Gi</code>，那个容器确实越不过这条线。问题在于里面跑的 JVM <strong>怎么读这个数字</strong>。JVM 不是一个遵守上限的程序，而是一个看着上限给自己做计划的程序，计划一旦错了，守住上限的就是内核，而内核守住上限的方式是杀掉进程。</p>
+
+                    <p>CPU 那边错得更安静。平均使用率很低，只有 p99 在跳。与此同时在 JVM 内部，收集器的选择和线程池的大小已经跟着<strong>Pod 规格里的一个数字</strong>改变了。</p>
+
+                    <div class="callout">
+                        本文的依据是 Java 21 的 <code>java</code> man page、Java 25 的 GC 调优指南、OpenJDK 源码与缺陷库，以及 2026 年 9 月时点的 Kubernetes 官方文档。没能在 Linux 容器里实际运行验证，因此<strong>没有附上任何命令输出。</strong>正文中的默认值与行为全部来自上述文档。
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>本文涵盖的内容</h3>
+                        <ol>
+                            <li><a href="#sec-1">起因 - 设了上限仍然对不上的地方</a></li>
+                            <li><a href="#sec-2">JVM 本来看的是宿主机</a></li>
+                            <li><a href="#sec-3">容器识别实际读取的值</a></li>
+                            <li><a href="#sec-4">为什么用比例而不是 -Xmx</a></li>
+                            <li><a href="#sec-5">堆并不是全部的内存</a></li>
+                            <li><a href="#sec-6">一个 availableProcessors 决定的东西</a></li>
+                            <li><a href="#sec-7">CPU Limit 为什么会制造延迟</a></li>
+                            <li><a href="#sec-8">CPU limit 该设还是不该设</a></li>
+                            <li><a href="#sec-9">Request 和 Limit 做的是不同的事</a></li>
+                            <li><a href="#sec-10">JIT 预热击垮 readiness 的地方</a></li>
+                            <li><a href="#sec-11">看什么来决定</a></li>
+                            <li><a href="#sec-12">五种常见的失败</a></li>
+                            <li><a href="#sec-13">这篇是以哪个版本为准的</a></li>
+                            <li><a href="#sec-14">小结</a></li>
+                            <li><a href="#sec-15">未能确认的部分</a></li>
+                            <li><a href="#sec-16">参考资料</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">起因 - 设了上限仍然对不上的地方</h2>
+
+                    <p>2026 年 9 月初，一篇讲 Kubernetes 上 Java JVM 的 CPU 与内存 Request 和 Limit 的文章在韩国开发者社区被转载。论点只有一个。<strong>容器里的 Java 进程有两条内存边界。</strong>一条是堆边界，一条是容器边界，把这两条当成同一条的那一刻，事故就开始了。</p>
+
+                    <p>CPU 那边是同样的结构。Pod 规格里的 CPU 数字既是对调度器说的话，同时也是<strong>JVM 计算自身并行度的输入</strong>，而仪表盘只显示其中一边。容器为什么以 <code>OOMKilled</code> 收场的一般性诊断在<a href="oom_killer_diagnosis.html">另一篇</a>，故障中管控台为什么给不出答案在<a href="k8s_control_room_questions.html">那一篇</a>。这里只谈<strong>JVM 特有的问题</strong>。</p>
+
+                    <h2 id="sec-2">JVM 本来看的是宿主机</h2>
+
+                    <p>根子在于 JVM 自己决定自己的堆大小。Oracle 的 GC 调优指南列出的默认选择是这样的。初始堆是物理内存的六十四分之一，最大堆是四分之一，收集器在服务器级机器上是 G1，其他情况是 Serial。服务器级的定义也有脚注。<strong>处理器两个以上，且物理内存不低于 1792MB</strong> 时才算。</p>
+
+                    <p>问题就出在「物理内存」这个词上。对容器识别出现之前的 JVM 来说，它指的是<strong>整台宿主机</strong>。在 64GB 的节点上放一个 limit 为 512Mi 的 Pod，里面的 JVM 会按 16GB 的最大堆做计划。计划本身错了，于是 GC 认为还有很多余量而推迟回收，与此同时容器越过 512Mi，被内核杀掉。</p>
+
+                    <p>修好的时间点很明确，是 JDK 10 发行说明里的 <code>JDK-8146115</code> 条目。JVM 被修改为能感知自己运行在容器中，不再询问操作系统，而是<strong>提取容器专有的配置信息</strong>。提取的是分配给容器的 CPU 数量和总内存。只在 Linux 上生效，默认开启，可用 <code>-XX:-UseContainerSupport</code> 关闭。</p>
+
+                    <ul>
+                        <li>同一变更加入了 <code>-XX:ActiveProcessorCount</code>。发行说明写明这个数值会<strong>覆盖 JVM 中其他所有的 CPU 自动探测逻辑</strong></li>
+                        <li>同一处的 <code>JDK-8186248</code> 加入了 <code>InitialRAMPercentage</code>、<code>MaxRAMPercentage</code>、<code>MinRAMPercentage</code>，替代旧的 <code>Fraction</code> 形式</li>
+                        <li>这一条目<strong>同样出现在 Oracle JDK 8u191 的发行说明里。</strong>JDK 8 系列只要在 8u191 以上也带有容器识别</li>
+                        <li>反过来说<strong>8u190 以下和 JDK 9 没有。</strong>如果还在用那样的镜像，就只能照老办法把 <code>-Xmx</code> 钉死</li>
+                    </ul>
+
+                    <h2 id="sec-3">容器识别实际读取的值</h2>
+
+                    <p>内存这条路径在 <code>-XX:MaxRAM</code> 的文档里写得很清楚。默认值是「JVM 进程可用的最大内存与 128GB 中较小的一个」，紧接着的一句才是关键。这个可用内存是<strong>机器物理内存与环境所施加的约束例如容器中较小的一个</strong>。容器的 memory limit 从这里进来，比例类的参数再压在它之上。</p>
+
+                    <p>CPU 这边的算法不在 man page 里，而在 OpenJDK 的源码注释中。<code>cgroupSubsystem_linux.cpp</code> 里 <code>active_processor_count</code> 的说明只有三行。用 <code>sched_getaffinity</code> 求出可用的 CPU 数。若指定了 quota，就用 quota 除以 period。而且<strong>所有除法结果一律向上取整到下一个整数。</strong>结果不会超过活跃处理器数。</p>
+
+                    <p>向上取整在实践中影响很大。CPU limit 是 <code>500m</code> 时 0.5 进位成 1，<code>1500m</code> 时是 2。<strong>就算给不到一个 CPU，JVM 看到的也至少是一个。</strong>反过来 <code>2100m</code> 这样的值会变成 3，让它创建出比实际能跑的更多的线程。</p>
+
+                    <p>最容易漏掉的是<strong>根本没有 limit 的情况</strong>。cgroup 里没有 quota 时，上面的算法直接采用系统的活跃处理器数。在 96 核的节点上只放一个 <code>requests.cpu: 500m</code> 的 Pod，那个 JVM 就会按 96 核做计划。</p>
+
+                    <h2 id="sec-4">为什么用比例而不是 -Xmx</h2>
+
+                    <p>绝对值和比例的差别不是口味，而是要维护的地方有几处。<code>-Xmx2g</code> 是一个<strong>与 Pod 规格分开活着的数字</strong>。把 limit 提到 3Gi 却不改 JVM 参数，多出来的内存就闲着；降到 1Gi 却不改，那个 Pod 从上线那一刻起就会死。用比例给，只有一处要改。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>参数</th><th>决定什么</th><th>Java 21 man page 的默认值</th><th>注意</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>-XX:InitialRAMPercentage</code></td><td>初始堆</td><td>1.5625 个百分点</td><td>启动后堆很小。增长过程中 GC 会跑得很频繁</td></tr>
+                            <tr><td><code>-XX:MaxRAMPercentage</code></td><td>最大堆</td><td>25 个百分点</td><td>不指定时 1Gi 容器的最大堆约为 256Mi</td></tr>
+                            <tr><td><code>-XX:MinRAMPercentage</code></td><td>小堆场景下的最大堆</td><td>50 个百分点</td><td>不是最小值。文档说它适用于「约 125MB 以下的小堆」</td></tr>
+                            <tr><td><code>-XX:MaxRAM</code></td><td>上面这些比例的分母</td><td>可用内存与 128GB 中较小的一个</td><td>这里的可用内存就是容器 limit</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>默认值 25 个百分点在实战中出的事最多。给了容器 4Gi，堆只拿到 1Gi，剩下的 3Gi 没人用。「内存都加了为什么 GC 还是这么厉害」的一半都出在这里。<strong>MaxRAMPercentage 在容器里实际上是必填项。</strong></p>
+
+                    <p>还有一个命名陷阱。<code>MinRAMPercentage</code> 不是「至少给堆留多少个百分点」，而是<strong>小堆区间里的最大比例</strong>。250Mi 的 sidecar Java 进程里只动了 MaxRAMPercentage，然后想不通为什么不生效，就是这一条。</p>
+
+                    <pre><code class="language-yaml">resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    memory: 1Gi          # 作为比例分母的值
+env:
+  - name: JAVA_TOOL_OPTIONS
+    value: &gt;-
+      -XX:MaxRAMPercentage=70.0
+      -XX:InitialRAMPercentage=70.0
+      -XX:+ExitOnOutOfMemoryError</code></pre>
+
+                    <p>70 这个数字没有依据。<strong>官方文档里任何地方都没有「堆取 limit 的百分之几」这样的推荐。</strong>引出这篇的那篇文章说从 50 到 75 之间开始再验证，这已经是相当诚实的说法。剩下的那部分用在哪里，下一节来讲。</p>
+
+                    <h2 id="sec-5">堆并不是全部的内存</h2>
+
+                    <p>只带走这一节也够了。<strong>把 <code>-Xmx</code> 设成和容器 limit 一样，那个 Pod 一定会死。</strong>堆之外还有好几处 JVM 要用的内存，它们不算进 <code>-Xmx</code>，却原封不动地算进容器的用量。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>区域</th><th>由什么决定</th><th>官方文档中的默认值</th><th>计入容器用量</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Java 堆</td><td><code>-Xmx</code> / <code>MaxRAMPercentage</code></td><td>MaxRAM 的 25 个百分点</td><td>计入</td></tr>
+                            <tr><td>元空间</td><td><code>-XX:MaxMetaspaceSize</code></td><td>默认不限制大小</td><td>计入</td></tr>
+                            <tr><td>JIT 代码缓存</td><td><code>-XX:ReservedCodeCacheSize</code></td><td>240MB，关闭分层编译则为 48MB</td><td>计入</td></tr>
+                            <tr><td>线程栈</td><td><code>-Xss</code> × 线程数</td><td>Linux x64 为每线程 1024KB</td><td>计入</td></tr>
+                            <tr><td>直接缓冲区(NIO)</td><td><code>-XX:MaxDirectMemorySize</code></td><td>不指定时由 JVM 自动决定</td><td>计入</td></tr>
+                            <tr><td>GC 内部结构、JVM 自身、原生库</td><td>没有参数</td><td>没有文档化的固定值</td><td>计入</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>表里最扎眼的是<strong>元空间默认不设上限</strong>。在大量生成类的框架里这个值一涨，堆看着很健康，只有容器触顶。不过<strong>预留和实际提交是两回事。</strong>表里的数字是上限，不是常态占用量。</p>
+
+                    <p>更重要的是死法不同。堆不够时 JVM 抛出 <code>OutOfMemoryError</code>，留下栈轨迹和堆转储。而越过容器上限时，用 Kubernetes 文档的说法，<strong>memory limit 由内核以 OOM kill 强制执行。</strong>既没有异常也没有转储。同一份文档还补了一句，这种终止只在内核检测到内存压力时才发生，所以<strong>超额分配内存的容器未必会被立即杀掉。</strong>同样的代码、同样的负载，死的时刻却不一样，原因就在这里。</p>
+
+                    <p>要知道堆外的内存去了哪里，JVM 自带的手段是原生内存跟踪。<code>-XX:NativeMemoryTracking</code> 的默认值是 <code>off</code>，设为 <code>summary</code> 就会按子系统跟踪用量。</p>
+
+                    <pre><code class="language-bash"># 堆外内存明细 (仅对启动时开启跟踪的进程有效)
+jcmd 1 VM.native_memory summary
+
+# 最大限度记录 JVM 如何识别容器
+java -Xlog:os+container=trace -XX:MaxRAMPercentage=70 -version
+
+# 查看最终确定下来的参数值
+java -XX:+PrintFlagsFinal -version | grep -E 'MaxHeapSize|ActiveProcessorCount'</code></pre>
+
+                    <h2 id="sec-6">一个 availableProcessors 决定的东西</h2>
+
+                    <p><code>Runtime.availableProcessors()</code> 的 javadoc 很短。它返回 JVM 可用的处理器数，这个值在运行期间<strong>可能变化</strong>，且不会小于 1。在容器里，它就是上一节那个向上取整的结果。这一个数字会连锁地决定下面这些。</p>
+
+                    <h3>收集器的选择与 GC 线程数</h3>
+
+                    <p>服务器级判定的条件卡在这里。处理器不足两个或内存不足 1792MB 就不算服务器级，默认收集器就变成<strong>Serial 而不是 G1</strong>。CPU limit 为 <code>500m</code> 的容器被算作一个处理器，正好撞上这个条件。在这种状态下再挂一堆 G1 专用的调优参数，什么都不会发生。</p>
+
+                    <p>就算过了服务器级这一关，GC 工作线程数也跟着处理器数走。指南只写了「最大 GC 线程数受堆大小和可用 CPU 资源限制」，没有给出算式。但方向是清楚的。<strong>看到的处理器少，GC 就转得慢。</strong></p>
+
+                    <h3>用 ActiveProcessorCount 覆盖</h3>
+
+                    <p>man page 把这个参数的范围说得很准。它覆盖的是 VM 在<strong>计算线程池大小时</strong>使用的 CPU 数，用于垃圾收集和 ForkJoinPool 之类的操作。它还补充说，即使 <code>UseContainerSupport</code> 没有开启这个参数也会被尊重，并写明了用途，<strong>在容器中运行多个 Java 进程时用来划分 CPU 资源</strong>。</p>
+
+                    <ul>
+                        <li>这个参数<strong>只改变 JVM 看到的值。</strong>cgroup 的 quota 一动不动。调成 1，容器照样能用满 limit</li>
+                        <li>所以调低会减少 GC 工作线程和并行处理，而节流一点没少。<strong>它不是节流的解药</strong></li>
+                        <li>反过来调高只是多出线程而 quota 不变，节流反而更重。「就当多给了几个核」这套是不成立的</li>
+                        <li>真正用得上的地方是<strong>一个 Pod 里有两个以上 Java 进程</strong>时，防止各自把整个 Pod 都算成自己的</li>
+                    </ul>
+
+                    <p>并行流也绑在同一个值上。<code>ForkJoinPool</code> 的 javadoc 写明无参构造器创建的池，其并行度等于 <code>Runtime.availableProcessors()</code>，而公共池的并行度可以通过 <code>java.util.concurrent.ForkJoinPool.common.parallelism</code> 属性指定。改 CPU limit 同时也是<strong>在改应用代码的并行度</strong>。</p>
+
+                    <h2 id="sec-7">CPU Limit 为什么会制造延迟</h2>
+
+                    <p>Kubernetes 文档的句子很明确。cpu limit 由<strong>CPU 节流强制执行</strong>，容器接近 limit 时内核会把 CPU 访问限制到与该 limit 对应的量。这是内核强制的硬上限。和内存不同，不是「越过就死」，而是「想越过就停」。</p>
+
+                    <p>停的单位才是要害。kubelet 默认用 CFS quota 强制执行 Pod 的 CPU limit，而决定周期值的选项 <code>--cpu-cfs-quota-period</code> <strong>默认是 100ms</strong>。节流不是以秒为单位平滑发生的，而是<strong>在 100ms 的窗口里用完配额就停到那个窗口结束</strong>。</p>
+
+                    <p>平均值的陷阱就在这里。CPU limit 为 1 而线程有 4 个时，100ms 的配额在 25ms 就用完，剩下的 75ms 里那个容器的<strong>所有线程</strong>都停住。按一秒平均，使用率不到百分之百，图看着很平静。哪怕那一秒里塞着好几次最长 75ms 的停顿也一样。<strong>平均使用率低而 p99 却在跳，来源多半就是这个。</strong></p>
+
+                    <p>和 GC 撞上会更糟。在 stop-the-world 期间配额耗尽，GC 线程也一起停住，要等下一个周期打开才恢复。本来很短的停顿被<strong>拉长到周期边界。</strong>这就是必须把 GC 日志的停顿时间和节流指标并排看的理由。</p>
+
+                    <h2 id="sec-8">CPU limit 该设还是不该设</h2>
+
+                    <p>这个题目结论是分裂的。两边优化的东西不一样，而且两边都有文档支撑的依据。并排放着比选一边更准确。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>主张不设的一方</th><th>依据</th><th>主张要设的一方</th><th>依据</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>节流会制造真实的延迟</td><td>内核强制的硬上限，周期默认值是 100ms</td><td>这是 Guaranteed QoS 的条件</td><td>所有容器的 cpu limit 必须等于 request</td></tr>
+                            <tr><td>CPU 不够 Pod 也不会死</td><td>驱逐信号只有内存、文件系统和 pid，没有 CPU</td><td>在驱逐顺序里被排到后面</td><td>驱逐顺序是 BestEffort、Burstable、Guaranteed</td></tr>
+                            <tr><td>节点空闲时可以用掉富余的 CPU</td><td>资源有富余时允许用超过 request 的量</td><td>要做 CPU 绑定就必须有</td><td>static 策略的独占 CPU 只分配给整数 request 的 Guaranteed Pod</td></tr>
+                            <tr><td>只有 request 也能定下调度</td><td>request 用于调度器决定放在哪个节点</td><td>邻居的延迟变得可预测</td><td>这更接近运维方针而不是文档依据</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>归纳起来，<strong>延迟要紧的少数服务</strong>和<strong>密度要紧的大量批处理</strong>会给出不同的答案。前者为了躲开节流而不设或放大 limit，后者为了可预测性和驱逐排序而设。判断标准不是口味而是指标。<strong>先看节流指标是不是真的在涨。</strong></p>
+
+                    <p>有一点必须分清。<strong>去掉内存 limit 和去掉 CPU limit 不是同一性质的决定。</strong>CPU 不够只是变慢，内存却不可压缩。没有内存 limit，那个 Pod 会把整个节点拖下水，而 JVM 会按节点内存去规划堆。</p>
+
+                    <h2 id="sec-9">Request 和 Limit 做的是不同的事</h2>
+
+                    <p>Kubernetes 文档的定义很短。指定 request 后<strong>kube-scheduler 用这个信息决定把 Pod 放到哪个节点上。</strong>指定 limit 后<strong>kubelet 会强制执行它</strong>，让运行中的容器用不到超出的量。一个是调度阶段的数字，一个是运行阶段的数字。</p>
+
+                    <p>从 JVM 的角度看，决定性的一点是<strong>JVM 根本不看 request</strong>。<code>MaxRAM</code> 参照的是「环境所施加的约束」，也就是 cgroup 的 limit。只把 request 开大而 limit 留空的 Pod，在调度器眼里是安排得很宽裕的 Pod，里面的 JVM 却按并不存在的内存在动。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>QoS 等级</th><th>条件</th><th>驱逐顺序</th><th>从 JVM 角度的含义</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Guaranteed</td><td>所有容器都有 CPU 与内存的 limit 和 request，且两者相等</td><td>最后被驱逐</td><td>堆比例的分母是确定的，最不容易跑偏</td></tr>
+                            <tr><td>Burstable</td><td>不满足 Guaranteed，但至少有一个容器有 request 或 limit</td><td>排在 BestEffort 之后</td><td>有 limit 就以它为分母，没有就以节点内存为分母</td></tr>
+                            <tr><td>BestEffort</td><td>没有任何容器设了 CPU 或内存的 request 与 limit</td><td>最先被驱逐</td><td>JVM 把整个节点算成自己的，对 Java 实际上等于禁用</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>文档补充的一个条件也值得知道。因资源压力发生驱逐时，<strong>成为候选的是用量超过 request 的 Pod</strong>。把 request 定得贴近现实并不是走形式，原因就在这里。</p>
+
+                    <h2 id="sec-10">JIT 预热击垮 readiness 的地方</h2>
+
+                    <p>HotSpot 默认以 C1 和 C2 并用的分层编译器启动，而编译本身要吃 CPU。所以 Java 应用的 CPU 用量<strong>在启动之后最高</strong>，进入稳定状态后回落。可 CPU limit 大多是按稳定状态定的。<strong>最需要 CPU 的那一段被节流得最狠。</strong></p>
+
+                    <p>接下来是既定套路。启动一慢 readiness probe 就失败，按文档的说法 kubelet 会把容器标记为未就绪，端点控制器随即<strong>把这个 Pod 的 IP 从所有匹配的服务端点中移除</strong>。到这里都是正常行为。问题出在 liveness probe 也用了同样的阈值。liveness 一失败，容器就按重启策略被杀掉，重新启动又走一遍同一段，重启循环就此形成。</p>
+
+                    <p>官方的处方是 startup probe。文档说这个探针<strong>保护启动缓慢的容器</strong>，让人在不影响正常 liveness 与 readiness 检查的前提下定义启动专用的成功标准。连推荐形态都给了：用与 liveness 相同的检查，只把<strong>失败阈值调高</strong>。把 liveness 本身放松，就抓不到真正的故障了。</p>
+
+                    <ul>
+                        <li>只在启动阶段多给 CPU，<strong>用标准的 request 与 limit 是做不到的。</strong>要么用 startup probe 争取时间，要么把 limit 抬上去</li>
+                        <li>不想抬 limit 的话，类数据共享或提前编译这类启动优化是下一个选项。它们的效果本文没有验证</li>
+                        <li>因启动慢导致首个请求慢，和因节流导致 p99 长期偏高，是<strong>两个问题</strong>。不把启动阶段和稳定阶段分开看就会混在一起</li>
+                    </ul>
+
+                    <h2 id="sec-11">看什么来决定</h2>
+
+                    <p>最常见的错误是只凭一个数字下判断。用一张堆用量曲线定 limit，或者用一个 CPU 使用率判断有没有节流。下面这五个说的是不同的事。</p>
+
+                    <ul>
+                        <li><strong>GC 之后的堆用量</strong> — 堆大小的依据是这个值。锯齿图的顶点不是「需要的大小」，而是「回收前含垃圾的大小」</li>
+                        <li><strong>已提交的堆</strong> — JVM 实际占下来的大小。取决于收集器，用不到的部分有可能还给操作系统</li>
+                        <li><strong>进程 RSS</strong> — 真正驻留在物理内存里的量。减掉堆，大致能看出堆外有多少</li>
+                        <li><strong>容器内存用量</strong> — cgroup 看到的值，也是判定 OOM 的依据。里面掺着页缓存</li>
+                        <li><strong>CPU 节流指标</strong> — 不看使用率，看<strong>被节流的周期数与时间</strong>。使用率会把节流藏起来</li>
+                    </ul>
+
+                    <p>顺序很简单。先定 limit，用比例给堆，在真实流量下把上面五个一起看，再回头改。特别要注意<strong>合成压测很难暴露堆外内存。</strong>类加载和代码缓存要在真实代码路径被广泛踩到之后才会涨。</p>
+
+                    <h2 id="sec-12">五种常见的失败</h2>
+
+                    <p>同样的失败反复出现，是因为症状离原因很远。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>失败</th><th>实际发生的事</th><th>症状</th><th>看什么</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>根本没设 limit</td><td>JVM 按节点内存和节点 CPU 数做计划</td><td>节点受压，被驱逐的却是不相干的 Pod</td><td>QoS 等级与节点驱逐事件</td></tr>
+                            <tr><td>把 <code>-Xmx</code> 设成和 limit 一样</td><td>堆外的份额变成 0</td><td>没有异常的 <code>OOMKilled</code>，也没有转储</td><td>RSS 与堆的差值、原生内存跟踪</td></tr>
+                            <tr><td>只有 request 没有 limit</td><td>变成 Burstable，JVM 按节点做计划</td><td>调度看着宽裕，运行中却会死</td><td>把 request 与 limit 并排确认</td></tr>
+                            <tr><td>CPU limit 定得太低</td><td>被算成一个处理器，够不上服务器级判定</td><td>GC 停顿变长，调优参数不生效</td><td>实际选中的收集器、GC 停顿时间、节流指标</td></tr>
+                            <tr><td>多容器 Pod 忘了合计</td><td>sidecar 与主进程分享同一个上限</td><td>加了 sidecar 之后才开始死</td><td>Pod 内所有容器的 request 与 limit 合计</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>第四条还有一个反方向的陷阱。用 <code>-XX:ActiveProcessorCount</code> 只把处理器数调高，收集器的选择会变，quota 却纹丝不动。<strong>线程多出来多少，节流就重多少。</strong>想换收集器的话，与其在处理器数上撒谎，不如用 <code>-XX:+UseG1GC</code> 这样直接指定来得诚实。</p>
+
+                    <h2 id="sec-13">这篇是以哪个版本为准的</h2>
+
+                    <p>这个领域的行为确实随版本而不同，也是照搬旧文章最容易翻车的地方，所以先把基准说清楚。</p>
+
+                    <ul>
+                        <li><strong>JDK 8u190 以下与 JDK 9</strong> — 没有容器识别。堆和处理器数按宿主机来定，除了手工钉死 <code>-Xmx</code> 没有别的办法</li>
+                        <li><strong>JDK 8u191 以上与 JDK 10 以上</strong> — <code>UseContainerSupport</code> 默认开启，可以用 RAMPercentage 三个参数和 <code>ActiveProcessorCount</code></li>
+                        <li><strong>JDK 19</strong> — OpenJDK 的缺陷 <code>JDK-8281181</code>「Do not use CPU Shares to compute active processor count」落在这个版本。在此之前，没有 quota 时是用 cpu shares 算处理器数的，而在 Kubernetes 里 cpu shares <strong>来自 CPU request。</strong>也就是说在旧 JDK 上，request 会影响 JVM 的并行度</li>
+                        <li><strong>正文里的参数默认值</strong> — 以 Java 21 的 <code>java</code> man page 为准。收集器选择与服务器级判定以 Java 25 的 GC 调优指南为准</li>
+                        <li><strong>Kubernetes 这一侧</strong> — 是 2026 年 9 月时点的官方文档。cgroup v1 与 v2 的差异没有涉及</li>
+                    </ul>
+
+                    <p>第三条尤其麻烦。升了运行时却没动 CPU 设置，并行度也可能变了。意思是<strong>把参数原样留着这件事本身，就可能是一次变更。</strong></p>
+
+                    <h2 id="sec-14">小结</h2>
+
+                    <p>骨架就一句话。<strong>Pod 规格里的数字既是约束容器的值，也是 JVM 给自己做计划的输入。</strong>内存 limit 成为堆比例的分母，CPU limit 成为处理器数，决定收集器的选择和线程池的大小。</p>
+
+                    <p>落到实务上剩下三件事。不要把 <code>-Xmx</code> 设成和 limit 一样，不给堆外留出份额，内核会悄无声息地动手。用比例给，要维护的数字减到一个，而默认的 25 个百分点通常太小。CPU limit 要连同延迟预算一起定，100ms 周期内的停顿不会出现在按秒的平均里。还有，任何比例都不是别人能替你定的。堆外内存随框架和线程数在每个服务上都不一样。<strong>测出来再定，每次升运行时都重新看一遍。</strong></p>
+
+                    <h2 id="sec-15">未能确认的部分</h2>
+
+                    <ul>
+                        <li><strong>没有在 Linux 容器里实际运行验证。</strong>正文里的命令都是依据文档写的，一条执行输出也没有附上</li>
+                        <li><code>ForkJoinPool</code> <strong>公共池默认并行度</strong>的算式不在 javadoc 里。只确认了无参构造器与 <code>availableProcessors()</code> 相等这一点</li>
+                        <li><code>-XX:ParallelGCThreads</code> 与 <code>-XX:ConcGCThreads</code> 的<strong>默认算式</strong>同样不在 man page 里。指南只写了「受堆大小和可用 CPU 资源限制」</li>
+                        <li><code>JDK-8281181</code> <strong>有没有回合</strong>没能确认。缺陷库里记录的修复版本只有 19 一个</li>
+                        <li><strong>cgroup v1 与 v2 的差异</strong>对上述计算的影响没有涉及。文件名和单位都不同</li>
+                        <li>不重启就改 Pod 资源的功能，以及那时 JVM 会不会重新读取这些值，超出了本文核对的范围</li>
+                        <li>启动优化手段<strong>在被节流的区间里到底有多大帮助</strong>没有测量</li>
+                    </ul>
+
+                    <h2 id="sec-16">参考资料</h2>
+
+                    <ul>
+                        <li><a href="https://news.hada.io/topic?id=33103" target="_blank" rel="noopener">GeekNews 话题 33103</a> — 引出本文的转载</li>
+                        <li><a href="https://learnkube.com/java-jvm-kubernetes-requests-limits" target="_blank" rel="noopener">Java JVM in Kubernetes: CPU and Memory Requests and Limits (learnkube.com)</a> — 引出本文的原文。最大堆从容器内存的 50 到 75 个百分点之间开始再验证这一建议的出处</li>
+                        <li><a href="https://docs.oracle.com/en/java/javase/21/docs/specs/man/java.html" target="_blank" rel="noopener">java Command Reference (Java SE 21, Oracle)</a> — <code>MaxRAM</code>、<code>MaxRAMPercentage</code>(25 个百分点)、<code>MinRAMPercentage</code>(50 个百分点)、<code>InitialRAMPercentage</code>(1.5625 个百分点)、<code>ActiveProcessorCount</code>、<code>UseContainerSupport</code>、<code>MaxMetaspaceSize</code>、<code>ReservedCodeCacheSize</code>(240MB)、<code>Xss</code>、<code>NativeMemoryTracking</code> 的出处</li>
+                        <li><a href="https://docs.oracle.com/en/java/javase/25/gctuning/ergonomics.html" target="_blank" rel="noopener">Ergonomics (HotSpot GC Tuning Guide, Java SE 25)</a> — 服务器级判定的 1792MB 与两个处理器、默认收集器、初始堆六十四分之一与最大堆四分之一</li>
+                        <li><a href="https://www.oracle.com/java/technologies/javase/10-relnote-issues.html" target="_blank" rel="noopener">JDK 10 Release Notes (Oracle)</a> — <code>JDK-8146115</code> 容器识别、<code>JDK-8186248</code> RAMPercentage</li>
+                        <li><a href="https://www.oracle.com/java/technologies/javase/8u191-relnotes.html" target="_blank" rel="noopener">Java SE 8u191 Release Notes (Oracle)</a> — 同一条目在 8u191 也有</li>
+                        <li><a href="https://raw.githubusercontent.com/openjdk/jdk/master/src/hotspot/os/linux/cgroupSubsystem_linux.cpp" target="_blank" rel="noopener">OpenJDK cgroupSubsystem_linux.cpp</a> — <code>active_processor_count</code> 的算法与向上取整规则</li>
+                        <li><a href="https://bugs.openjdk.org/browse/JDK-8281181" target="_blank" rel="noopener">JDK-8281181 Do not use CPU Shares to compute active processor count</a> — 修复版本 19</li>
+                        <li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/Runtime.html" target="_blank" rel="noopener">Runtime (Java SE 21 API)</a> — <code>availableProcessors()</code> 的定义</li>
+                        <li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ForkJoinPool.html" target="_blank" rel="noopener">ForkJoinPool (Java SE 21 API)</a> — 构造器的并行度与公共池的系统属性</li>
+                        <li><a href="https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/" target="_blank" rel="noopener">Resource Management for Pods and Containers (Kubernetes)</a> — request 与 limit 的角色、cpu 节流、memory limit 的内核 OOM kill</li>
+                        <li><a href="https://kubernetes.io/docs/concepts/workloads/pods/pod-qos/" target="_blank" rel="noopener">Pod Quality of Service Classes (Kubernetes)</a> — 三个 QoS 等级与驱逐顺序</li>
+                        <li><a href="https://kubernetes.io/docs/reference/command-line-tools-reference/kubelet/" target="_blank" rel="noopener">kubelet Command Line Reference (Kubernetes)</a> — <code>--cpu-cfs-quota-period</code> 默认值 100ms</li>
+                        <li><a href="https://kubernetes.io/docs/tasks/administer-cluster/cpu-management-policies/" target="_blank" rel="noopener">Control CPU Management Policies on the Node (Kubernetes)</a> — CFS quota 强制执行与 static 策略的独占 CPU 条件</li>
+                        <li><a href="https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/" target="_blank" rel="noopener">Node-pressure Eviction (Kubernetes)</a> — 驱逐信号清单中没有 CPU 的依据</li>
+                        <li><a href="https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/" target="_blank" rel="noopener">Pod Lifecycle (Kubernetes)</a> — readiness 失败时移除端点、startup probe 的作用</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>分享这篇文章</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">返回列表</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/code_image.html">代码图片生成器</a></li>
+      <li><a href="../static/char_counter.html">字数统计</a></li>
+      <li><a href="../static/json_formatter.html">JSON 格式化工具</a></li>
+      <li><a href="../static/regex_tester.html">正则表达式测试器</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="oom_killer_diagnosis.html">进程无声无息地死了 - 读懂 OOM Killer</a></li>
+      <li><a href="agent_behavior_spec.html">长时间运行的智能体该拿什么来打分 - 把行为写成规格这个想法的实质</a></li>
+      <li><a href="vector_db_selection_criteria.html">向量检索该建在什么之上 - 加在现有搜索引擎上与另立专用引擎</a></li>
+      <li><a href="bug_blindness.html">「本来就这样」是怎么形成的 - 缺陷沉入背景的过程，以及让它重新可见的办法</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制。粘贴到 Threads 应用即可分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制。'); });
+    });
+    </script>
+</body>
+</html>

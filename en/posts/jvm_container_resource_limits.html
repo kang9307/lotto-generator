@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<!--
+ * Tech blog post template
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="en">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>How the JVM Reads Container Limits - Where Kubernetes Requests and Limits Decide Heap, GC and Latency 2026</title>
+    <meta name="description" content="A container limit is not what the JVM thinks. MaxRAMPercentage defaults to 25 percent, heap is not all the memory, and availableProcessors sets GC threads.">
+    <meta name="keywords" content="JVM container, Kubernetes requests limits, MaxRAMPercentage, ActiveProcessorCount, UseContainerSupport, CPU throttling, CFS quota, OOMKilled, QoS classes, G1 GC, metaspace, dev, infra, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/en/posts/jvm_container_resource_limits.html">
+
+    <meta property="og:title" content="How the JVM Reads Container Limits - Where Kubernetes Requests and Limits Decide Heap, GC and Latency 2026">
+    <meta property="og:description" content="Why matching -Xmx to your memory limit kills the pod, and how one availableProcessors value sets GC threads and parallelism.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/en/posts/jvm_container_resource_limits.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="en_US">
+    <meta property="article:published_time" content="2026-09-02">
+    <meta property="article:section" content="Dev &amp; Infra">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="How the JVM Reads Container Limits">
+    <meta name="twitter:description" content="The JVM does not obey your limit. It reads it and makes a plan of its own.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "How the JVM Reads Container Limits - Where Kubernetes Requests and Limits Decide Heap, GC and Latency 2026",
+      "alternativeHeadline": "Why matching -Xmx to your memory limit kills the pod, and how one availableProcessors value sets GC threads and parallelism",
+      "datePublished": "2026-09-02",
+      "dateModified": "2026-09-02",
+      "inLanguage": "en-US",
+      "articleSection": "Dev & Infra",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "JVM container, Kubernetes requests limits, MaxRAMPercentage, ActiveProcessorCount, UseContainerSupport, CPU throttling, CFS quota, OOMKilled, QoS classes, G1 GC",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/en/posts/jvm_container_resource_limits.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "Why does a Java container blow past a memory limit that is clearly set?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Because the heap is not the only memory the JVM uses. Outside it sit metaspace, the JIT code cache, thread stacks, direct buffers and the garbage collector's own structures, and none of them count against -Xmx. Per the Java 21 man page, -XX:MaxMetaspaceSize is by default not limited, the default maximum for -XX:ReservedCodeCacheSize is 240MB, and the default -Xss on Linux x64 is 1024KB per thread. So setting -Xmx equal to the container limit means the container hits its ceiling before the heap fills. The thing that kills the process then is not the JVM but the kernel: the Kubernetes docs state that memory limits are enforced by the kernel with out of memory kills. That is why no Java exception and no heap dump are left behind."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Should I use -Xmx or -XX:MaxRAMPercentage inside a container?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "The percentage is easier to keep honest. -Xmx is an absolute number that lives apart from the pod spec, so every limit change means a second edit, and forgetting it is an outage. -XX:MaxRAMPercentage sizes the maximum heap as a share of whatever -XX:MaxRAM resolves to, and the Java 21 man page defines the MaxRAM default as the maximum amount of available memory to the JVM process or 128 GB, whichever is lower, then adds that this available memory is the minimum of the machine's physical memory and any constraints set by the environment such as a container. The container limit therefore becomes the denominator automatically. Watch the default though: it is 25 percent, so an unconfigured 1Gi container caps the heap near 256Mi. What percentage is right is something you measure."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Is the advice to never set CPU limits correct?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Both sides have documented backing and the answer depends on the workload. Against limits: Kubernetes enforces cpu limits by CPU throttling, and the kubelet's CFS quota period defaults to 100ms, so a container that burns its slice inside a window stalls until the window ends. The eviction signal list also covers only memory, filesystems and pids, never CPU. For limits: QoS class. Guaranteed requires every container's CPU limit to equal its request, and eviction runs BestEffort first, then Burstable, then Guaranteed. Exclusive CPUs under the static CPU manager policy also go only to Guaranteed pods with integer CPU requests. Decide by looking at your actual throttling metrics."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Why does a low CPU limit make garbage collection slower?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Two paths overlap. First, the JVM sees fewer processors. OpenJDK's cgroup code documents that when a quota is set it divides quota by period and rounds every division up to the next whole number, and that figure sizes GC worker threads and ForkJoinPool parallelism. Second, once the number is small enough the collector choice itself changes: Oracle's GC tuning guide says a machine counts as server-class only with two or more processors and physical memory of at least 1792MB, choosing G1 there and Serial otherwise. On top of that, if the quota runs out mid stop-the-world, GC threads wait for the next period and the pause stretches to the period boundary."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How do I confirm the JVM actually picked up my container settings?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Ask the JVM instead of guessing. -Xlog:os+container=trace gives maximum logging of container information, and the Java 21 man page points to it specifically for diagnosing container support. For memory outside the heap, turn on -XX:NativeMemoryTracking=summary, which is off by default, and read it with jcmd. Then keep your numbers apart. Heap sizing follows the usage right after a collection, not the peaks of the sawtooth. Whether the container dies is decided by what the cgroup sees. And for CPU you want throttled time, not utilisation, because utilisation hides throttling."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/jvm_container_resource_limits.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/jvm_container_resource_limits.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/jvm_container_resource_limits.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/jvm_container_resource_limits.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/jvm_container_resource_limits.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "Home",
+      "item": "https://braindetox.kr/en/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "Dev & Infra",
+      "item": "https://braindetox.kr/en/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "How the JVM Reads Container Limits - Where Kubernetes Requests and Limits Decide Heap, GC and Latency 2026",
+      "item": "https://braindetox.kr/en/posts/jvm_container_resource_limits.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="How the JVM Reads Container Limits - Where Kubernetes Requests and Limits Decide Heap, GC and Latency 2026">
+                <meta itemprop="datePublished" content="2026-09-02">
+                <meta itemprop="dateModified" content="2026-09-02">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="JVM container, Kubernetes requests limits, MaxRAMPercentage, ActiveProcessorCount, UseContainerSupport, CPU throttling, CFS quota, OOMKilled, QoS classes, G1 GC">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/en/posts/jvm_container_resource_limits.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">How the JVM Reads Container Limits - Where Kubernetes Requests and Limits Decide Heap, GC and Latency 2026</h1>
+                    <h2 class="post-subtitle">Why matching -Xmx to your memory limit kills the pod, and how one availableProcessors value sets GC threads and parallelism</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-02">Sep 2, 2026</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">Dev &amp; Infra</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>Write <code>limits.memory: 1Gi</code> into a pod spec and the container really will not cross that line. The question is how the JVM inside it <strong>reads that number</strong>. The JVM is not a program that obeys a limit; it is a program that looks at a limit and makes a plan of its own. When the plan is wrong, the thing that enforces the limit is the kernel, and the way the kernel enforces it is by killing the process.</p>
+
+                    <p>The CPU side goes wrong more quietly. Average utilisation stays low while p99 spikes. Meanwhile, inside the JVM, the collector choice and the thread pool sizes have shifted to follow <strong>a single number in the pod spec</strong>.</p>
+
+                    <div class="callout">
+                        The basis for this piece is the Java 21 <code>java</code> man page, the Java 25 GC tuning guide, the OpenJDK source and bug database, and the Kubernetes official documentation as of September 2026. I could not run any of it in a Linux container, so <strong>no command output is included here.</strong> Every default and behaviour below comes from those documents.
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>What this piece covers</h3>
+                        <ol>
+                            <li><a href="#sec-1">The trigger - where a limit still does not line up</a></li>
+                            <li><a href="#sec-2">The JVM used to look at the host</a></li>
+                            <li><a href="#sec-3">What container awareness actually reads</a></li>
+                            <li><a href="#sec-4">Why a percentage beats -Xmx</a></li>
+                            <li><a href="#sec-5">The heap is not all the memory</a></li>
+                            <li><a href="#sec-6">Everything one availableProcessors value decides</a></li>
+                            <li><a href="#sec-7">Why a CPU limit creates latency</a></li>
+                            <li><a href="#sec-8">To set a CPU limit or not</a></li>
+                            <li><a href="#sec-9">Requests and limits do different jobs</a></li>
+                            <li><a href="#sec-10">Where JIT warm-up breaks readiness</a></li>
+                            <li><a href="#sec-11">What to look at before deciding</a></li>
+                            <li><a href="#sec-12">Five common failures</a></li>
+                            <li><a href="#sec-13">Which versions this is written against</a></li>
+                            <li><a href="#sec-14">Summary</a></li>
+                            <li><a href="#sec-15">What I could not verify</a></li>
+                            <li><a href="#sec-16">References</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">The trigger - where a limit still does not line up</h2>
+
+                    <p>In early September 2026 a piece on CPU and memory requests and limits for the Java JVM on Kubernetes made the rounds in the Korean developer community. It had one thesis. <strong>A Java process in a container has two memory boundaries.</strong> The heap boundary and the container boundary, and treating them as one thing is the moment things break.</p>
+
+                    <p>The same shape exists on the CPU side. The CPU number in a pod spec is a message to the scheduler and at the same time <strong>the input the JVM uses to compute its own parallelism</strong>, and the dashboard shows you only one of the two. How to diagnose an <code>OOMKilled</code> container in general is <a href="oom_killer_diagnosis.html">a separate piece</a>, and why control room screens fail to answer during an incident is <a href="k8s_control_room_questions.html">that one</a>. This one stays on <strong>problems specific to the JVM</strong>.</p>
+
+                    <h2 id="sec-2">The JVM used to look at the host</h2>
+
+                    <p>The root of it is that the JVM sizes its own heap. Oracle's GC tuning guide lists the default selections plainly. Initial heap size of one sixty-fourth of physical memory, maximum heap size of one quarter, the Garbage-First collector on server-class machines and the Serial collector otherwise. It even footnotes what server-class means. <strong>Two or more processors and physical memory larger than or equal to 1792MB.</strong></p>
+
+                    <p>The trouble is that phrase, physical memory. To a JVM from before container awareness, that meant <strong>the whole host</strong>. Put a pod with a 512Mi limit on a 64GB node and the JVM inside planned for a 16GB maximum heap. Since the plan was wrong, the collector saw plenty of room and postponed collection, and meanwhile the container crossed 512Mi and died at the hands of the kernel.</p>
+
+                    <p>The point of repair is documented. It is the <code>JDK-8146115</code> entry in the JDK 10 release notes. The JVM was modified to be aware that it is running inside a container and to <strong>extract container specific configuration information</strong> instead of querying the operating system. What it extracts is the number of CPUs and the total memory allocated to the container. It works only on Linux, it is enabled by default, and it can be disabled with <code>-XX:-UseContainerSupport</code>.</p>
+
+                    <ul>
+                        <li>The same change added <code>-XX:ActiveProcessorCount</code>. The release note says this count <strong>overrides any other automatic CPU detection logic in the JVM</strong></li>
+                        <li>Alongside it, <code>JDK-8186248</code> added <code>InitialRAMPercentage</code>, <code>MaxRAMPercentage</code> and <code>MinRAMPercentage</code>, replacing the older <code>Fraction</code> forms</li>
+                        <li>The same entry <strong>also appears in the Oracle JDK 8u191 release notes.</strong> Anything on the JDK 8 line at 8u191 or later has container awareness too</li>
+                        <li>Which also means <strong>8u190 and below, and JDK 9, do not.</strong> On images like that you are back to nailing <code>-Xmx</code> down by hand</li>
+                    </ul>
+
+                    <h2 id="sec-3">What container awareness actually reads</h2>
+
+                    <p>The memory path is spelled out under <code>-XX:MaxRAM</code>. The default is the maximum amount of available memory to the JVM process or 128 GB, whichever is lower, and the next sentence is the important one. That available memory is <strong>the minimum of the machine's physical memory and any constraints set by the environment, for example a container</strong>. The container memory limit enters here, and the percentage flags sit on top of it.</p>
+
+                    <p>The CPU algorithm lives in an OpenJDK source comment rather than the man page. The description of <code>active_processor_count</code> in <code>cgroupSubsystem_linux.cpp</code> is three lines. Determine the number of available CPUs from <code>sched_getaffinity</code>. If a quota is specified, divide quota by period. And <strong>all results of division are rounded up to the next whole number.</strong> The result never exceeds the number of active processors.</p>
+
+                    <p>That rounding matters in practice. A CPU limit of <code>500m</code> gives 0.5, which rounds up to 1; <code>1500m</code> gives 2. <strong>Even below one CPU, the JVM still sees at least one.</strong> Going the other way, an awkward value like <code>2100m</code> becomes 3, which encourages more threads than the container can actually run.</p>
+
+                    <p>The easy thing to miss is <strong>having no limit at all</strong>. With no quota in the cgroup, the algorithm above simply uses the system's active processor count. Put a pod with nothing but <code>requests.cpu: 500m</code> on a 96-core node and its JVM plans for 96 cores.</p>
+
+                    <h2 id="sec-4">Why a percentage beats -Xmx</h2>
+
+                    <p>The difference between an absolute and a percentage is not taste, it is the number of places you have to maintain. <code>-Xmx2g</code> is a number that <strong>lives apart from the pod spec</strong>. Raise the limit to 3Gi without touching the JVM argument and the extra memory sits idle; drop it to 1Gi without touching it and the pod dies from the moment it rolls out. A percentage leaves one place to edit.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Flag</th><th>What it sets</th><th>Default per the Java 21 man page</th><th>Watch out</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>-XX:InitialRAMPercentage</code></td><td>Initial heap</td><td>1.5625 percent</td><td>The heap starts very small. It collects often while growing</td></tr>
+                            <tr><td><code>-XX:MaxRAMPercentage</code></td><td>Maximum heap</td><td>25 percent</td><td>Left unset, a 1Gi container caps the heap around 256Mi</td></tr>
+                            <tr><td><code>-XX:MinRAMPercentage</code></td><td>Maximum heap for small heaps</td><td>50 percent</td><td>Not a minimum. The docs apply it to a small heap of approximately 125 MB</td></tr>
+                            <tr><td><code>-XX:MaxRAM</code></td><td>The denominator for the above</td><td>Available memory or 128 GB, whichever is lower</td><td>Available memory here is the container limit</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>That 25 percent default causes more trouble than anything else in the field. You give a container 4Gi, the heap takes 1Gi, and nobody uses the remaining 3Gi. Half of every complaint that goes we added memory and GC is still bad starts here. <strong>MaxRAMPercentage is effectively a mandatory setting in a container.</strong></p>
+
+                    <p>There is a naming trap too. <code>MinRAMPercentage</code> does not mean at least this share goes to the heap; it is <strong>the maximum share in the small-heap range</strong>. A 250Mi sidecar Java process where only MaxRAMPercentage was touched, and nobody can work out why it does nothing, is this.</p>
+
+                    <pre><code class="language-yaml">resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    memory: 1Gi          # the denominator for the percentage
+env:
+  - name: JAVA_TOOL_OPTIONS
+    value: &gt;-
+      -XX:MaxRAMPercentage=70.0
+      -XX:InitialRAMPercentage=70.0
+      -XX:+ExitOnOutOfMemoryError</code></pre>
+
+                    <p>There is no authority behind the number 70. <strong>No official document anywhere recommends a particular heap share of the limit.</strong> The piece that prompted this said to start somewhere between 50 and 75 and then verify, and that is about as honest as it gets. What the remainder is for is the next section.</p>
+
+                    <h2 id="sec-5">The heap is not all the memory</h2>
+
+                    <p>If you take one section, take this one. <strong>Set <code>-Xmx</code> equal to the container limit and that pod will die.</strong> Outside the heap sit several other things the JVM uses, and none of them count against <code>-Xmx</code> while all of them count against the container.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Region</th><th>What sets it</th><th>Documented default</th><th>Counts against the container</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Java heap</td><td><code>-Xmx</code> / <code>MaxRAMPercentage</code></td><td>25 percent of MaxRAM</td><td>Yes</td></tr>
+                            <tr><td>Metaspace</td><td><code>-XX:MaxMetaspaceSize</code></td><td>By default the size is not limited</td><td>Yes</td></tr>
+                            <tr><td>JIT code cache</td><td><code>-XX:ReservedCodeCacheSize</code></td><td>240MB, or 48MB without tiered compilation</td><td>Yes</td></tr>
+                            <tr><td>Thread stacks</td><td><code>-Xss</code> × thread count</td><td>1024 KB per thread on Linux x64</td><td>Yes</td></tr>
+                            <tr><td>Direct buffers (NIO)</td><td><code>-XX:MaxDirectMemorySize</code></td><td>Unset, the JVM chooses automatically</td><td>Yes</td></tr>
+                            <tr><td>GC structures, the JVM itself, native libraries</td><td>No flag</td><td>No documented fixed value</td><td>Yes</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>The line that stands out is that <strong>metaspace is unlimited by default</strong>. In a framework that mints classes freely, that number grows while the heap looks perfectly healthy and only the container reaches its ceiling. Note though that <strong>reservation and commit are different things.</strong> The figures above are ceilings, not steady-state occupancy.</p>
+
+                    <p>The way it dies matters more. When the heap runs short the JVM throws <code>OutOfMemoryError</code> and leaves a stack trace and a heap dump. Cross the container limit and, in the words of the Kubernetes docs, <strong>memory limits are enforced by the kernel with out of memory kills.</strong> No exception, no dump. The same page adds that these terminations only happen when the kernel detects memory pressure, so <strong>a container that over allocates memory may not be immediately killed.</strong> Same code, same load, different moment of death.</p>
+
+                    <p>The JVM's own way of telling you where the non-heap memory went is native memory tracking. <code>-XX:NativeMemoryTracking</code> defaults to <code>off</code>, and <code>summary</code> tracks usage by JVM subsystem.</p>
+
+                    <pre><code class="language-bash"># non-heap breakdown (only valid if tracking was on at launch)
+jcmd 1 VM.native_memory summary
+
+# maximum logging of how the JVM saw the container
+java -Xlog:os+container=trace -XX:MaxRAMPercentage=70 -version
+
+# the values the flags actually resolved to
+java -XX:+PrintFlagsFinal -version | grep -E 'MaxHeapSize|ActiveProcessorCount'</code></pre>
+
+                    <h2 id="sec-6">Everything one availableProcessors value decides</h2>
+
+                    <p>The javadoc for <code>Runtime.availableProcessors()</code> is short. It returns the number of processors available to the virtual machine, the value <strong>may change during a particular invocation</strong>, and it is never smaller than one. In a container that value is the rounded-up figure from the previous section, and this single number sets off a chain.</p>
+
+                    <h3>Collector choice and GC thread count</h3>
+
+                    <p>The server-class test lands here. Fewer than two processors or less than 1792MB and the machine is not server-class, so the default collector becomes <strong>Serial rather than G1</strong>. A container with a <code>500m</code> CPU limit counts as one processor and trips exactly this condition. Bolting G1-specific tuning flags onto that does nothing at all.</p>
+
+                    <p>Even past the server-class bar, the number of GC workers follows the processor count. The guide only says the maximum number of GC threads is limited by heap size and available CPU resources, without giving the formula. The direction is clear regardless. <strong>See fewer processors and the collector runs slower.</strong></p>
+
+                    <h3>Overriding with ActiveProcessorCount</h3>
+
+                    <p>The man page states the scope of this flag exactly. It overrides the number of CPUs the VM uses <strong>to calculate the size of thread pools</strong> it will use for operations such as garbage collection and ForkJoinPool. It adds that the flag is honored even if <code>UseContainerSupport</code> is not enabled, and even names the use case: it is <strong>useful for partitioning CPU resources when running multiple Java processes in containers</strong>.</p>
+
+                    <ul>
+                        <li>This flag changes <strong>only what the JVM sees.</strong> The cgroup quota does not move. Set it to 1 and the container can still use the whole limit</li>
+                        <li>So dialling it down shrinks GC workers and parallel work while throttling stays exactly where it was. <strong>It is not a throttling fix</strong></li>
+                        <li>Dialling it up adds threads against an unchanged quota, which makes throttling worse. Pretending you have more cores does not work</li>
+                        <li>Where it earns its keep is <strong>a pod with two or more Java processes</strong>, so that each one stops counting the whole pod as its own</li>
+                    </ul>
+
+                    <p>Parallel streams hang off the same value. The <code>ForkJoinPool</code> javadoc states that the no-argument constructor creates a pool with parallelism equal to <code>Runtime.availableProcessors()</code>, and that the common pool's parallelism can be set through the <code>java.util.concurrent.ForkJoinPool.common.parallelism</code> property. Changing a CPU limit is also <strong>changing the parallelism of your application code</strong>.</p>
+
+                    <h2 id="sec-7">Why a CPU limit creates latency</h2>
+
+                    <p>The Kubernetes sentence is unambiguous. cpu limits are <strong>enforced by CPU throttling</strong>, and when a container approaches its cpu limit the kernel restricts access to the CPU corresponding to that limit. It is a hard limit the kernel enforces. Unlike memory, this is not cross it and die, it is try to cross it and stall.</p>
+
+                    <p>The unit of stalling is the crux. The kubelet enforces pod CPU limits with CFS quota by default, and <code>--cpu-cfs-quota-period</code>, which sets that period, <strong>defaults to 100ms</strong>. Throttling does not spread smoothly across a second; it happens as <strong>burn your slice inside a 100ms window and stop until that window ends</strong>.</p>
+
+                    <p>Here is where averages lie. With a CPU limit of 1 and four threads, a 100ms allowance is gone in 25ms and <strong>every thread</strong> in that container stops for the remaining 75ms. Averaged over a second, utilisation is under 100 percent and the graph looks calm, even though that second contains several stalls of up to 75ms. <strong>That is usually the whole story behind low average utilisation with a spiking p99.</strong></p>
+
+                    <p>Overlap it with GC and it gets worse. If the allowance runs out during a stop-the-world phase, the GC threads stop with everything else and resume only when the next period opens. A pause that would have been short <strong>stretches to the period boundary.</strong> That is why GC log pause times and throttling metrics have to be read side by side.</p>
+
+                    <h2 id="sec-8">To set a CPU limit or not</h2>
+
+                    <p>This one genuinely splits. The two camps are optimising for different things and both have documented backing. Putting them side by side is more accurate than picking one.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Against limits</th><th>Grounds</th><th>For limits</th><th>Grounds</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Throttling produces real latency</td><td>A hard limit enforced by the kernel with a 100ms default period</td><td>It is the condition for Guaranteed QoS</td><td>Every container's CPU limit must equal its request</td></tr>
+                            <tr><td>A pod does not die from lack of CPU</td><td>Eviction signals cover memory, filesystems and pids, never CPU</td><td>You move down the eviction order</td><td>Eviction runs BestEffort, then Burstable, then Guaranteed</td></tr>
+                            <tr><td>An idle node lets you use the spare CPU</td><td>With resources to spare, using more than the request is allowed</td><td>CPU pinning requires it</td><td>Exclusive CPUs go to Guaranteed pods with integer requests</td></tr>
+                            <tr><td>Requests alone still decide placement</td><td>The scheduler uses the request to place the pod</td><td>Neighbour latency becomes predictable</td><td>An operating preference rather than a documented ground</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>In short, <strong>a handful of latency-critical services</strong> and <strong>a fleet of density-critical batch jobs</strong> arrive at different answers. The first group drops or widens limits to dodge throttling; the second sets them for predictability and eviction ranking. The deciding factor is not taste but data. <strong>Are the throttling metrics actually rising?</strong></p>
+
+                    <p>One distinction has to stay sharp. <strong>Dropping a memory limit is not the same kind of decision as dropping a CPU limit.</strong> CPU is compressible, so short supply just makes things slower; memory is not. With no memory limit that pod endangers the whole node, and the JVM will plan its heap against node memory.</p>
+
+                    <h2 id="sec-9">Requests and limits do different jobs</h2>
+
+                    <p>The Kubernetes definition is short. Specify a request and <strong>the kube-scheduler uses that information to decide which node to place the Pod on.</strong> Specify a limit and <strong>the kubelet enforces it</strong> so the running container cannot use more than that. One is a placement-time number, the other a runtime one.</p>
+
+                    <p>What settles it from the JVM's side is that <strong>the JVM never looks at the request</strong>. What <code>MaxRAM</code> consults is the constraint set by the environment, which is the cgroup limit. A pod with a generous request and an empty limit looks comfortably placed to the scheduler while the JVM inside it works from memory that is not there.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>QoS class</th><th>Condition</th><th>Eviction order</th><th>What it means for the JVM</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Guaranteed</td><td>Every container has CPU and memory limits and requests, and each pair is equal</td><td>Evicted last</td><td>The heap denominator is fixed. Least room for the plan to drift</td></tr>
+                            <tr><td>Burstable</td><td>Not Guaranteed, but at least one container has a request or a limit</td><td>After BestEffort</td><td>With a limit that is the denominator. Without one, node memory is</td></tr>
+                            <tr><td>BestEffort</td><td>No container has any CPU or memory request or limit</td><td>Evicted first</td><td>The JVM counts the whole node as its own. Effectively banned for Java</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>One more condition from the docs is worth knowing. When eviction is due to resource pressure, <strong>only pods exceeding their resource requests are candidates.</strong> That is why setting realistic requests is not paperwork.</p>
+
+                    <h2 id="sec-10">Where JIT warm-up breaks readiness</h2>
+
+                    <p>HotSpot starts with the tiered compiler, using both C1 and C2, and compilation costs CPU. So a Java application's CPU usage is <strong>at its highest right after startup</strong> and falls off in steady state. CPU limits, meanwhile, are usually sized for steady state. <strong>The phase that needs CPU most is throttled hardest.</strong></p>
+
+                    <p>What follows is scripted. Slow startup fails the readiness probe, and as the docs put it the kubelet marks the container as not ready, at which point the endpoint controller <strong>removes the Pod's IP address from all Service endpoints that match the Pod</strong>. That much is correct behaviour. The problem is a liveness probe wired to the same thresholds. When liveness fails the container is killed per the restart policy, starts again and walks through the same phase again. That is a restart loop.</p>
+
+                    <p>The documented remedy is the startup probe. The docs say it <strong>protects slow starting containers</strong> and lets you define startup-specific success criteria without affecting the normal liveness or readiness checks. They even give the shape: use the same check as liveness but with <strong>a higher failure threshold</strong>. Loosening liveness itself would mean you stop catching real failures.</p>
+
+                    <ul>
+                        <li>Giving extra CPU only during startup <strong>is not possible with standard requests and limits.</strong> You either buy time with a startup probe or raise the limit</li>
+                        <li>If you would rather not raise it, startup optimisations such as class data sharing or ahead-of-time compilation are the next option. Their effect was not measured here</li>
+                        <li>A slow first request from slow startup and a permanently high p99 from throttling are <strong>different problems</strong>. Read startup and steady state separately or they blur</li>
+                    </ul>
+
+                    <h2 id="sec-11">What to look at before deciding</h2>
+
+                    <p>The commonest mistake is deciding on one number. Sizing a limit from a heap usage graph, or judging throttling from CPU utilisation. The five below say different things.</p>
+
+                    <ul>
+                        <li><strong>Heap usage right after a collection</strong> — this is what heap sizing rests on. The top of the sawtooth is not the size you need, it is the size including garbage about to go</li>
+                        <li><strong>Committed heap</strong> — what the JVM has actually secured. Depending on the collector, unused portions may be returned to the operating system</li>
+                        <li><strong>Process RSS</strong> — what is resident in physical memory. Subtract the heap and you get a rough read on everything outside it</li>
+                        <li><strong>Container memory usage</strong> — what the cgroup sees, and what decides an OOM. Page cache is mixed in</li>
+                        <li><strong>CPU throttling metrics</strong> — not utilisation but <strong>throttled periods and time</strong>. Utilisation hides throttling</li>
+                    </ul>
+
+                    <p>The order is plain. Set the limit, give the heap as a percentage, watch those five together under real traffic, then go back and fix it. Note in particular that <strong>synthetic load rarely exposes non-heap memory.</strong> Class loading and the code cache only grow once a variety of real code paths get walked.</p>
+
+                    <h2 id="sec-12">Five common failures</h2>
+
+                    <p>These repeat because the symptom shows up a long way from the cause.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Failure</th><th>What actually happens</th><th>Symptom</th><th>What to look at</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>No limit set at all</td><td>The JVM plans against node memory and node CPU count</td><td>The node comes under pressure and the wrong pod gets evicted</td><td>QoS class and node eviction events</td></tr>
+                            <tr><td><code>-Xmx</code> set equal to the limit</td><td>The non-heap share becomes zero</td><td><code>OOMKilled</code> with no exception and no dump</td><td>The gap between RSS and heap, native memory tracking</td></tr>
+                            <tr><td>Request set, limit missing</td><td>It becomes Burstable and the JVM plans against the node</td><td>Comfortable placement, death at runtime</td><td>Request and limit read side by side</td></tr>
+                            <tr><td>CPU limit set too low</td><td>One processor, which fails the server-class test</td><td>Longer GC pauses and tuning flags that do nothing</td><td>The collector actually chosen, GC pauses, throttling</td></tr>
+                            <tr><td>Multi-container pod, totals forgotten</td><td>Sidecars share the same ceiling</td><td>It starts dying after the sidecar was added</td><td>The summed requests and limits of every container</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>The fourth has a trap in the other direction too. Raise only the processor count with <code>-XX:ActiveProcessorCount</code> and the collector choice changes while the quota does not. <strong>You get more threads and worse throttling.</strong> If you want a different collector, naming it with <code>-XX:+UseG1GC</code> is more honest than lying about processors.</p>
+
+                    <h2 id="sec-13">Which versions this is written against</h2>
+
+                    <p>Behaviour here genuinely differs by version. It is a classic place where copying an old article straight across goes wrong, so the basis is worth stating.</p>
+
+                    <ul>
+                        <li><strong>JDK 8u190 and below, and JDK 9</strong> — no container awareness. Heap and processor count come from the host, so nailing <code>-Xmx</code> down by hand is the only option</li>
+                        <li><strong>JDK 8u191 and above, and JDK 10 and above</strong> — <code>UseContainerSupport</code> is on by default and the three RAMPercentage flags plus <code>ActiveProcessorCount</code> are available</li>
+                        <li><strong>JDK 19</strong> — the OpenJDK issue <code>JDK-8281181</code>, Do not use CPU Shares to compute active processor count, landed in this version. Before it, with no quota set, cpu shares decided the processor count, and in Kubernetes cpu shares <strong>come from the CPU request.</strong> On older JDKs the request influenced JVM parallelism</li>
+                        <li><strong>The flag defaults above</strong> are from the Java 21 <code>java</code> man page. Collector selection and the server-class test are from the Java 25 GC tuning guide</li>
+                        <li><strong>The Kubernetes side</strong> is the official documentation as of September 2026. Differences between cgroup v1 and v2 are not covered</li>
+                    </ul>
+
+                    <p>The third is the awkward one. You can raise a runtime, leave the CPU settings alone, and still get different parallelism. <strong>Leaving flags untouched can itself be a change.</strong></p>
+
+                    <h2 id="sec-14">Summary</h2>
+
+                    <p>The spine is one sentence. <strong>A number in a pod spec constrains the container and is at the same time the input the JVM uses to plan.</strong> The memory limit becomes the denominator of the heap percentage; the CPU limit becomes a processor count that decides collector selection and thread pool sizes.</p>
+
+                    <p>Three things survive into practice. Do not set <code>-Xmx</code> equal to the limit; leave no room outside the heap and the kernel kills you quietly. Give it as a percentage; there is one number to maintain and the 25 percent default is usually far too small. Decide the CPU limit together with a latency budget; a stall inside a 100ms period never shows up in a per-second average. And no one else can pick your percentage. Non-heap memory varies by framework and thread count from service to service. <strong>Measure it, set it, and look again every time you raise the runtime.</strong></p>
+
+                    <h2 id="sec-15">What I could not verify</h2>
+
+                    <ul>
+                        <li><strong>None of this was verified by running it in a Linux container.</strong> The commands above come from documentation, and no command output has been included</li>
+                        <li>The formula behind the <code>ForkJoinPool</code> <strong>common pool's default parallelism</strong> is not in the javadoc. Only the no-argument constructor's equality with <code>availableProcessors()</code> is documented</li>
+                        <li>The <strong>default formulas</strong> for <code>-XX:ParallelGCThreads</code> and <code>-XX:ConcGCThreads</code> are not in the man page either. The guide says only that they are limited by heap size and available CPU resources</li>
+                        <li>Whether <code>JDK-8281181</code> was <strong>backported</strong> I could not confirm. The bug database listed a single fix version, 19</li>
+                        <li>How <strong>the difference between cgroup v1 and v2</strong> affects the calculations above is not covered. File names and units differ</li>
+                        <li>Changing pod resources <strong>without a restart</strong>, and whether the JVM re-reads its numbers if you do, is outside what I checked</li>
+                        <li>How much startup optimisation actually helps <strong>inside a throttled window</strong> was not measured</li>
+                    </ul>
+
+                    <h2 id="sec-16">References</h2>
+
+                    <ul>
+                        <li><a href="https://news.hada.io/topic?id=33103" target="_blank" rel="noopener">GeekNews topic 33103</a> — the write-up that prompted this piece</li>
+                        <li><a href="https://learnkube.com/java-jvm-kubernetes-requests-limits" target="_blank" rel="noopener">Java JVM in Kubernetes: CPU and Memory Requests and Limits (learnkube.com)</a> — the original article, and the source of the advice to start the maximum heap between 50 and 75 percent of container memory and verify</li>
+                        <li><a href="https://docs.oracle.com/en/java/javase/21/docs/specs/man/java.html" target="_blank" rel="noopener">java Command Reference (Java SE 21, Oracle)</a> — source for <code>MaxRAM</code>, <code>MaxRAMPercentage</code> (25 percent), <code>MinRAMPercentage</code> (50 percent), <code>InitialRAMPercentage</code> (1.5625 percent), <code>ActiveProcessorCount</code>, <code>UseContainerSupport</code>, <code>MaxMetaspaceSize</code>, <code>ReservedCodeCacheSize</code> (240MB), <code>Xss</code> and <code>NativeMemoryTracking</code></li>
+                        <li><a href="https://docs.oracle.com/en/java/javase/25/gctuning/ergonomics.html" target="_blank" rel="noopener">Ergonomics (HotSpot GC Tuning Guide, Java SE 25)</a> — the server-class test at 1792MB and two processors, default collector, initial heap one sixty-fourth and maximum one quarter</li>
+                        <li><a href="https://www.oracle.com/java/technologies/javase/10-relnote-issues.html" target="_blank" rel="noopener">JDK 10 Release Notes (Oracle)</a> — <code>JDK-8146115</code> container awareness and <code>JDK-8186248</code> RAMPercentage</li>
+                        <li><a href="https://www.oracle.com/java/technologies/javase/8u191-relnotes.html" target="_blank" rel="noopener">Java SE 8u191 Release Notes (Oracle)</a> — the same entry also appears at 8u191</li>
+                        <li><a href="https://raw.githubusercontent.com/openjdk/jdk/master/src/hotspot/os/linux/cgroupSubsystem_linux.cpp" target="_blank" rel="noopener">OpenJDK cgroupSubsystem_linux.cpp</a> — the <code>active_processor_count</code> algorithm and its rounding rule</li>
+                        <li><a href="https://bugs.openjdk.org/browse/JDK-8281181" target="_blank" rel="noopener">JDK-8281181 Do not use CPU Shares to compute active processor count</a> — fix version 19</li>
+                        <li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/Runtime.html" target="_blank" rel="noopener">Runtime (Java SE 21 API)</a> — the definition of <code>availableProcessors()</code></li>
+                        <li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ForkJoinPool.html" target="_blank" rel="noopener">ForkJoinPool (Java SE 21 API)</a> — constructor parallelism and the common pool system property</li>
+                        <li><a href="https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/" target="_blank" rel="noopener">Resource Management for Pods and Containers (Kubernetes)</a> — the roles of request and limit, cpu throttling, and memory limits enforced by kernel OOM kills</li>
+                        <li><a href="https://kubernetes.io/docs/concepts/workloads/pods/pod-qos/" target="_blank" rel="noopener">Pod Quality of Service Classes (Kubernetes)</a> — the three QoS classes and the eviction order</li>
+                        <li><a href="https://kubernetes.io/docs/reference/command-line-tools-reference/kubelet/" target="_blank" rel="noopener">kubelet Command Line Reference (Kubernetes)</a> — <code>--cpu-cfs-quota-period</code> default 100ms</li>
+                        <li><a href="https://kubernetes.io/docs/tasks/administer-cluster/cpu-management-policies/" target="_blank" rel="noopener">Control CPU Management Policies on the Node (Kubernetes)</a> — CFS quota enforcement and the static policy's exclusive CPU condition</li>
+                        <li><a href="https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/" target="_blank" rel="noopener">Node-pressure Eviction (Kubernetes)</a> — the eviction signal list, with no CPU in it</li>
+                        <li><a href="https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/" target="_blank" rel="noopener">Pod Lifecycle (Kubernetes)</a> — endpoint removal on readiness failure and the role of the startup probe</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>Share this post</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X (Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">Copy link</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">Back to list</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Free tools you may find useful</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/code_image.html">Code Image Generator</a></li>
+      <li><a href="../static/char_counter.html">Character Counter</a></li>
+      <li><a href="../static/json_formatter.html">JSON Formatter</a></li>
+      <li><a href="../static/regex_tester.html">Regex Tester</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">See all tools &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Related Posts</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="oom_killer_diagnosis.html">The Process Died Without a Word - How to Read the OOM Killer</a></li>
+      <li><a href="agent_behavior_spec.html">How Do You Grade a Long-Running Agent - What It Really Means to Write Behavior Down as a Spec</a></li>
+      <li><a href="vector_db_selection_criteria.html">What Should Vector Search Run On - Bolting It Onto Your Search Engine Versus Standing Up a Dedicated One</a></li>
+      <li><a href="bug_blindness.html">How a Defect Becomes the Way It Has Always Been - Why Familiar Bugs Stop Registering, and How to Make Them Visible Again</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('Link copied. Paste it into the Threads app to share.');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('Link copied.'); });
+    });
+    </script>
+</body>
+</html>

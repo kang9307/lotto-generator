@@ -1,0 +1,701 @@
+<!DOCTYPE html>
+<!--
+ * Technical blog post template
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="en">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>The Process Died Without a Word - How to Read the OOM Killer</title>
+    <meta name="description" content="An empty application log means the process was killed, not that it crashed. Exit code 137, reading the kernel OOM table, and telling node OOM from cgroup OOM.">
+    <meta name="keywords" content="OOM killer, OOMKilled, exit code 137, SIGKILL, dmesg, journalctl, oom_score_adj, oom_badness, cgroup v2, memory.max, memory.events, overcommit, vm.overcommit_memory, CommitLimit, MemAvailable, swap, PSI, CrashLoopBackOff, dev, infra, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/en/posts/oom_killer_diagnosis.html">
+
+    <meta property="og:title" content="The Process Died Without a Word - How to Read the OOM Killer">
+    <meta property="og:description" content="Nothing is left in the application log. What to look at on the kernel side, and how to tell a system OOM apart from a cgroup OOM.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/en/posts/oom_killer_diagnosis.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="en_US">
+    <meta property="article:published_time" content="2026-09-02">
+    <meta property="article:section" content="Dev &amp; Infra">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="The Process Died Without a Word - How to Read the OOM Killer">
+    <meta name="twitter:description" content="Start at exit code 137, pick the culprit out of the table the kernel left behind, and decide whether it was the node or the limit.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "The Process Died Without a Word - How to Read the OOM Killer",
+      "alternativeHeadline": "What to look for in the kernel's record when the application log is empty",
+      "datePublished": "2026-09-02",
+      "dateModified": "2026-09-02",
+      "inLanguage": "en-US",
+      "articleSection": "Dev & Infra",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "OOM killer, OOMKilled, exit code 137, SIGKILL, dmesg, oom_score_adj, cgroup v2, memory.max, overcommit, swap, CrashLoopBackOff",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/en/posts/oom_killer_diagnosis.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "Does exit code 137 always mean OOM?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "No. The shell reports 128 plus the signal number, and signal 9 is SIGKILL. So 137 tells you the process was force-terminated and nothing more. It does not say who sent the signal. It could be the kernel OOM killer, it could be an orchestrator finishing the job after the termination grace period expired, or it could be a person. The next step is to check whether the kernel log has an OOM record at the same timestamp. If there is no record, the kernel is not what killed it."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Why does a container get OOMKilled while the node still has free memory?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Because it hit the cgroup limit. The kernel cgroup v2 documentation says of memory.max that if a cgroup's memory usage reaches this limit and cannot be reduced, the OOM killer is invoked in the cgroup. The selection is scoped to that cgroup and its descendants, so the process dies even when the node as a whole has room to spare. The kernel source separates the two cases in the log prefix as well. A system OOM begins with Out of memory, while a cgroup OOM begins with Memory cgroup out of memory. In this case adding nodes changes nothing."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Isn't the process using the most memory always the one that dies?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Usually, but not always. The kernel's badness calculation starts from RSS plus swap entries plus the page table size, and then adds oom_score_adj after scaling it against total memory. As a result a process with oom_score_adj raised by 100 is treated as though it were using an extra 10 percent of total memory. Per the kernel documentation the value ranges from -1000 to +1000, and -1000 effectively disables OOM killing for that task. You have to read the oom_score_adj column in the table the kernel left behind to explain why that particular process was picked."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Why does the process die later when malloc succeeded?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Because Linux promises more memory than it has by default. The kernel sysctl documentation says that with vm.overcommit_memory set to 0, the kernel compares the userspace memory request size against total memory plus swap and rejects obvious overcommits. Allocation gets you address space, and physical pages are attached on the first write to that address. So the failure appears not at the allocation call but at that first write, and it arrives as SIGKILL rather than as an error return. That is why the application has no way to catch it."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Does raising the memory limit fix it?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "If the cause is a leak, it only lengthens the interval. Raising a limit buys time rather than fixing anything, so if you buy time it is better to write down how long you intend to keep it. And if you raise only the limit while leaving the request untouched, the scheduler may misjudge placement and a cgroup OOM can migrate into a node-wide system OOM. Look first at the shape of the growth. Rising in proportion to time points at a leak, rising in steps points at traffic or a deployment, and rising only as much as the data grows points at result set size."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/oom_killer_diagnosis.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/oom_killer_diagnosis.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/oom_killer_diagnosis.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/oom_killer_diagnosis.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/oom_killer_diagnosis.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "Home",
+      "item": "https://braindetox.kr/en/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "Dev & Infra",
+      "item": "https://braindetox.kr/en/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "The Process Died Without a Word - How to Read the OOM Killer",
+      "item": "https://braindetox.kr/en/posts/oom_killer_diagnosis.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="The Process Died Without a Word - How to Read the OOM Killer">
+                <meta itemprop="datePublished" content="2026-09-02">
+                <meta itemprop="dateModified" content="2026-09-02">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="OOM killer, OOMKilled, exit code 137, SIGKILL, dmesg, oom_score_adj, cgroup v2, memory.max, overcommit, swap, CrashLoopBackOff">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/en/posts/oom_killer_diagnosis.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">The Process Died Without a Word - How to Read the OOM Killer</h1>
+                    <h2 class="post-subtitle">When the application log is empty, the order in which you pick the culprit out of what the kernel left behind</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-02">2026-09-02</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">Dev &amp; Infra</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>The process is gone. The last line of the application log is an ordinary record of a request being handled, and after it there is nothing. No exception stack, no parting message from a shutdown hook. The monitoring tool tells you only that the process no longer exists.</p>
+
+                    <p>The time most often wasted here goes into digging through the application log more carefully. It is not there. It cannot be there. <strong>SIGKILL is not a signal the process receives and handles but an operation that ends the process where it stands</strong>, so at that moment the application never gets the chance to write a single character. The first move, then, is not to dig deeper into the log but to change the hypothesis. It did not die. It <strong>was killed</strong>.</p>
+
+                    <div class="callout">
+                        The environment this article was written in is Windows 10 with Git Bash (MSYS2, GNU bash 5.2.37(1)-release). <strong>There is no Linux kernel, no cgroup and no <code>dmesg</code> here</strong>, so every kernel behavior, field definition and file path below was confirmed against the official kernel.org documentation and the kernel source. No OOM log was reproduced and pasted in. The only thing actually executed and confirmed in this environment is the exit code rule, and that output appears verbatim in the body. <strong>The line between what was verified and what was not is collected in the second-to-last section.</strong>
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>What this article covers</h3>
+                        <ol>
+                            <li><a href="#sec-1">Why the application log says nothing</a></li>
+                            <li><a href="#sec-2">It did not die, it was killed - 137 and OOMKilled</a></li>
+                            <li><a href="#sec-3">Where to look</a></li>
+                            <li><a href="#sec-4">How to read the table the kernel prints</a></li>
+                            <li><a href="#sec-5">Why that particular process died</a></li>
+                            <li><a href="#sec-6">A system OOM and a cgroup OOM are different events</a></li>
+                            <li><a href="#sec-7">What changes between cgroup v1 and v2</a></li>
+                            <li><a href="#sec-8">Overcommit - why you die even though malloc succeeded</a></li>
+                            <li><a href="#sec-9">What swap changes</a></li>
+                            <li><a href="#sec-10">RSS is not the whole story</a></li>
+                            <li><a href="#sec-11">OOM is a symptom, not a cause</a></li>
+                            <li><a href="#sec-12">How to prevent it - limits, requests and the restart loop</a></li>
+                            <li><a href="#sec-13">The order of investigation</a></li>
+                            <li><a href="#sec-14">Summary</a></li>
+                            <li><a href="#sec-15">What I could not verify</a></li>
+                            <li><a href="#sec-16">References</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">Why the application log says nothing</h2>
+
+                    <p>The kernel memory management documentation describes the OOM killer this way. It is possible that on a loaded machine memory will be exhausted and the kernel will be unable to reclaim enough memory to continue to operate, and in order to save the rest of the system it invokes the OOM killer. And it goes on to say that the OOM killer <strong>selects a task to sacrifice for the sake of the overall system health</strong>. The important word is <em>selects</em>. The choice happens on the kernel side, and the one selected is never notified.</p>
+
+                    <p>So everything the application normally leaves behind drops out at once. An exception stack requires an exception, and no exception occurred. A shutdown hook needs a catchable signal, and SIGKILL cannot be caught. Log lines still sitting in a buffer disappear without being flushed. <strong>The fact that the last log line looks ordinary is itself the signal</strong>, not evidence that there is no information.</p>
+
+                    <ul>
+                        <li><strong>What is not left behind</strong> — exception stacks, traces of shutdown hooks running, unflushed log buffers, the exit code the application records for itself</li>
+                        <li><strong>What is left behind</strong> — the OOM record in the kernel ring buffer, the exit status the parent process received, the termination reason attached by the container runtime, the last value the metrics collector scraped</li>
+                        <li><strong>The order is inverted</strong> — normally the application log is the primary source and the kernel log is secondary. In this incident it is the other way around</li>
+                        <li><strong>The point where metrics stop is a hint</strong> — with a 15-second scrape interval there is no value for the last 15 seconds before death. Even if the final point looks calm, there may have been a spike in between</li>
+                    </ul>
+
+                    <h2 id="sec-2">It did not die, it was killed - 137 and OOMKilled</h2>
+
+                    <p>The basis for switching hypotheses is the exit code. When a command terminates on a fatal signal, the shell reports 128 plus the signal number as the exit status. That rule behaves the same way for the same shell even outside Linux, so it could be confirmed directly in the Git Bash this article was written in.</p>
+
+                    <pre><code>$ bash --version | head -1
+GNU bash, version 5.2.37(1)-release (x86_64-pc-msys)
+
+$ bash -c 'kill -9 $$'; echo "exit=$?"
+/usr/bin/bash: line 1:  1419 Killed                  bash -c 'kill -9 $$'
+exit=137
+
+$ bash -c 'kill -15 $$'; echo "term_exit=$?"
+Terminated
+term_exit=143</code></pre>
+
+                    <p>Signal 9 is SIGKILL, so 128 plus 9 is 137, and signal 15 is SIGTERM, so 143. What deserves attention is that <strong>137 tells you less than people assume</strong>. It says only that the process was force-terminated. Who sent the SIGKILL is not contained in it. It could be the kernel OOM killer, it could be an orchestrator finishing up after the grace period expired, it could be a batch script.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Signal</th><th>Number</th><th>Exit code the shell reports</th><th>What this code tells you</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>SIGTERM</td><td>15</td><td>143</td><td>There was a chance to clean up. What it did is in the application log</td></tr>
+                            <tr><td>SIGKILL</td><td>9</td><td>137</td><td>Terminated immediately. Who sent it can only be learned by cross-checking the kernel log</td></tr>
+                            <tr><td>SIGSEGV</td><td>11</td><td>139</td><td>Invalid memory access. A different event from running out of memory</td></tr>
+                            <tr><td>SIGABRT</td><td>6</td><td>134</td><td>The runtime itself gave up. Seen in implementations that treat allocation failure as abort</td></tr>
+                            <tr><td>Normal exit</td><td>-</td><td>0 ~ 125</td><td>A value the application chose. Not a forced termination</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>Signal numbers follow the platform's signal table. The 6, 9, 11 and 15 above are stable across Linux, but not every number is. In the MSYS environment this article was written in, <code>kill -l</code> prints signal 7 as SIGEMT, while on Linux x86 signal 7 is SIGBUS. <strong>Printing that system's own table once is safer than memorizing numbers.</strong></p>
+
+                    <p>In containers there is one more label. The runtime records the termination reason as <code>OOMKilled</code> and the orchestrator exposes it in the pod status. That is more explicit than an exit code, but <strong>it still does not tell you which kind of OOM it was.</strong> A node running out entirely and a container hitting its own limit come back wearing the same label.</p>
+
+                    <p>The Kubernetes documentation adds that memory limits are enforced <strong>reactively</strong>. When a container uses more than its memory limit the kernel may terminate it, but terminations only happen when the kernel detects memory pressure, so a container that over allocates memory may not be immediately killed. <strong>That is the answer to <em>it was over the limit yesterday too, so why did it die today</em>.</strong></p>
+
+                    <h2 id="sec-3">Where to look</h2>
+
+                    <p>The kernel writes to one place, but there are several windows onto it and each window keeps records for a different length of time. That difference is why the conclusion <em>there is no record</em> is so often wrong.</p>
+
+                    <pre><code># 1) Kernel ring buffer - fastest, but does not stay long
+dmesg -T | grep -i -E 'out of memory|oom-killer|killed process'
+
+# 2) Journal - kernel messages only, narrowed to a time range
+journalctl -k --since '2 hours ago' | grep -i -E 'oom|killed process'
+
+# 3) If a reboot happened in between, walk back by boot
+journalctl --list-boots
+journalctl -k -b -1 | grep -i 'killed process'
+
+# 4) When the ring buffer has already rolled - the path differs by distribution
+grep -i -E 'oom-killer|killed process' /var/log/messages
+grep -i -E 'oom-killer|killed process' /var/log/syslog</code></pre>
+
+                    <p>The ring buffer <code>dmesg</code> reads is fixed in size, so new messages push the oldest ones out. On a node where storage or network messages are printed several lines per second, an OOM record from a few hours ago is already gone. <strong>The conclusion <em>it is not in dmesg, so it was not OOM</em> only holds once you have confirmed the ring buffer did not roll.</strong> The journal disappears with a reboot too if its storage is volatile. How far back logs survive is a subject of its own, and the traps that rotation settings create are covered separately in <a href="log_rotation_pitfalls.html">where log rotation quietly goes wrong</a>.</p>
+
+                    <p>The container-side windows are held by the runtime and the orchestrator. You often work without permission to reach the kernel log, so these are the ones within reach first.</p>
+
+                    <pre><code># Kubernetes - the reason and code of the previous termination
+kubectl describe pod &lt;pod&gt; | sed -n '/Last State/,/Restart Count/p'
+kubectl get pod &lt;pod&gt; -o jsonpath='{range .status.containerStatuses[*]}{.name}{"\t"}{.lastState.terminated.reason}{"\t"}{.lastState.terminated.exitCode}{"\n"}{end}'
+
+# Docker - the OOMKilled flag and the exit code on one line
+docker inspect --format '{{.Name}} oom={{.State.OOMKilled}} exit={{.State.ExitCode}}' &lt;container&gt;
+
+# If you can get onto the node, line the timestamps up with the kernel side
+journalctl -k --since '2026-09-02 09:00' --until '2026-09-02 10:00'</code></pre>
+
+                    <p>This is where the first fork appears. If the container status is <code>OOMKilled</code> but <strong>the node's kernel log has no system OOM record, the node was fine</strong> and the incident belongs to the cgroup limit. Conversely, if several pods died at the same moment and the kernel log holds a dump of node-wide memory state, it is the node. <strong>Raising a limit or adding a node before passing this fork is a coin flip.</strong></p>
+
+                    <h2 id="sec-4">How to read the table the kernel prints</h2>
+
+                    <p>When the kernel performs an OOM killing it dumps the task list as a table, and that behavior is switched on and off with a sysctl. The kernel sysctl documentation says <code>oom_dump_tasks</code> enables a system-wide task dump excluding kernel threads that includes such information as pid, uid, tgid, vm size, rss, pgtables_bytes, swapents, oom_score_adj score and name. The kernel source's header-printing function shows the same thing plainly: the dump is gated on that sysctl value.</p>
+
+                    <p>The strings that reach the log come in three chunks. Below are the format strings copied straight from the kernel source; actual values are filled into the <code>%s</code> and <code>%d</code> positions when printed.</p>
+
+                    <pre><code># (1) Who invoked the OOM killer - dump_header()
+%s invoked oom-killer: gfp_mask=%#x(%pGg), order=%d, oom_score_adj=%d
+
+# (2) Column names of the candidate list - dump_tasks()
+[  pid  ]   uid  tgid total_vm      rss rss_anon rss_file rss_shmem pgtables_bytes swapents oom_score_adj name
+
+# (3) The conclusion - __oom_kill_process()
+%s: Killed process %d (%s) total-vm:%lukB, anon-rss:%lukB, file-rss:%lukB, shmem-rss:%lukB, UID:%u pgtables:%lukB oom_score_adj:%d</code></pre>
+
+                    <p>Most people read (3) and stop. But (3) is the <strong>conclusion</strong>, and the list of candidate causes is in the table that follows (2). Without reading the table you cannot answer <em>why that process</em>, and if you cannot answer it the same thing happens again next time.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Column</th><th>Unit</th><th>What it is</th><th>Its use in picking the culprit</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>total_vm</td><td>pages</td><td>Size of the virtual address space</td><td>Low. It includes regions that were only reserved and never used</td></tr>
+                            <tr><td>rss</td><td>pages</td><td>Total amount resident in physical memory</td><td>Start here. Sorting descending narrows the candidates</td></tr>
+                            <tr><td>rss_anon</td><td>pages</td><td>The part with no file backing. Heap and stack</td><td>First suspect for a leak. Swap is the only way to reclaim it</td></tr>
+                            <tr><td>rss_file</td><td>pages</td><td>Mapped file pages</td><td>Mostly reclaimable. A process large only in this column is likely not the culprit</td></tr>
+                            <tr><td>rss_shmem</td><td>pages</td><td>tmpfs and shared memory</td><td><code>/dev/shm</code> usage. Looks like files but is not reclaimed</td></tr>
+                            <tr><td>pgtables_bytes</td><td>bytes</td><td>Memory the page tables themselves use</td><td>Grows with many threads or with finely fragmented mappings</td></tr>
+                            <tr><td>swapents</td><td>pages</td><td>Number of pages swapped out</td><td>With swap, rss looks smaller than reality. Read both together</td></tr>
+                            <tr><td>oom_score_adj</td><td>none</td><td>The weight applied to the selection</td><td>If the process that died is not first by rss, the answer is in this column</td></tr>
+                            <tr><td>name</td><td>none</td><td>Executable name</td><td>Truncated if long. With duplicate names, match by pid</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>Two things are easy to get wrong while reading. One is that <strong>the unit is pages</strong>. Only <code>pgtables_bytes</code>, which carries <code>_bytes</code> in its name, is in bytes; the remaining memory columns are page counts. Page size varies with architecture and configuration, so confirm that system's value before multiplying. The other is that <strong>the column layout differs by kernel version</strong>. The list in the sysctl documentation above and the header string in the current source already disagree (the source has <code>rss_anon</code>, <code>rss_file</code> and <code>rss_shmem</code> in addition). <strong>Read the header line in your own log first and line the columns up against it.</strong></p>
+
+                    <pre><code># Pull just the table out of a saved log
+# Column numbers differ per kernel version, so always print the header line with it
+awk '/\[ *pid *\]/{print; f=1; next} f &amp;&amp; /^\[/{print} f &amp;&amp; !/^\[/{f=0}' oom.log | head -40
+
+# Count which position rss occupies in the header, then sort (below assumes the 4th)
+awk '/^\[/{print $4, $NF, $0}' oom.log | sort -nr | head -20</code></pre>
+
+                    <h2 id="sec-5">Why that particular process died</h2>
+
+                    <p>The kernel scores each candidate for badness and picks the highest. In the current source that calculation starts from <strong>adding RSS, the number of swap entries, and the page table size converted into pages</strong>. It is an estimate of <em>how many pages come back if this process ends right now</em>. Then <code>oom_score_adj</code> is added, and not raw: <strong>it is multiplied by total pages divided by 1000 before being added.</strong></p>
+
+                    <p>That multiplication is what matters in practice. One point of <code>oom_score_adj</code> converts to the page count of 0.1 percent of total memory, so a process with this value raised to 100 is <strong>treated as though it were using an extra 10 percent of total memory.</strong> On a 128GiB node that is an extra 13GiB. This is the arithmetic reason <em>the process using the most memory dies</em> is not always true.</p>
+
+                    <p>Per the kernel documentation the range of this value is -1000 to +1000. The documentation says of the lowest value, -1000, that it is <strong>equivalent to disabling OOM killing entirely for that task</strong>, because it will always report a badness score of 0. It also notes that the value exposed through <code>/proc/&lt;pid&gt;/oom_score</code> already includes this weight, making its effective range 0 to 2000.</p>
+
+                    <pre><code># The current score and weight for one process
+cat /proc/&lt;pid&gt;/oom_score
+cat /proc/&lt;pid&gt;/oom_score_adj
+
+# Sweep for processes whose weight is not 0 (find out who has been touching it)
+for p in /proc/[0-9]*; do
+  a=$(cat "$p/oom_score_adj" 2>/dev/null) || continue
+  [ "$a" = "0" ] &amp;&amp; continue
+  printf '%s\t%s\t%s\n' "${p#/proc/}" "$a" "$(tr -d '\0' &lt; "$p/comm")"
+done</code></pre>
+
+                    <ul>
+                        <li>The kernel works in units of <strong>the thread group, not a single thread</strong>. That is why the table has a <code>tgid</code> column</li>
+                        <li><strong>Monitoring agents and sidecars usually score low</strong> because they use little memory. So the one that dies is the main process, and after it dies the agent lives on to report <em>process not found</em></li>
+                        <li>The reverse also happens: <strong>a weight raised on a sidecar and then forgotten</strong>. If something using far less memory dies first, suspect this column</li>
+                        <li>Orchestrators sometimes set this value according to workload class. <strong>It can be non-zero even if you never touched it</strong></li>
+                    </ul>
+
+                    <div class="callout">
+                        <strong>Risk note.</strong> Lowering <code>oom_score_adj</code> to -1000 removes that process from the candidate pool; it does not give it more memory. The shortage remains and <strong>something else dies instead.</strong> Exempt the database and the monitoring agent next to it dies, and then nobody tells you about the incident. An exemption is not a fix but <strong>a reordering of who dies</strong>, so it is a value to touch only after deciding what is acceptable to lose in its place.
+                    </div>
+
+                    <h2 id="sec-6">A system OOM and a cgroup OOM are different events</h2>
+
+                    <p>The kernel source contains the point where these two diverge in a single line. When it calls the OOM handling function it picks the message string with a ternary operator, passing <code>"Out of memory"</code> when it is not a memory cgroup OOM and <code>"Memory cgroup out of memory"</code> when it is. That string goes into the leading <code>%s</code> of format (3) from the previous section. <strong>The first word of the log tells you which kind of event it was.</strong></p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Aspect</th><th>System (node) OOM</th><th>cgroup OOM</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Trigger</td><td>Reclaim failed across the whole node</td><td>That cgroup reached its own limit</td></tr>
+                            <tr><td>Log prefix</td><td><code>Out of memory: Killed process ...</code></td><td><code>Memory cgroup out of memory: Killed process ...</code></td></tr>
+                            <tr><td>Candidate scope</td><td>Every process on the node</td><td>That cgroup and its descendants</td></tr>
+                            <tr><td>Free memory on the node</td><td>None. That is why this happened</td><td><strong>Can be plentiful.</strong> The dashboard looks calm</td></tr>
+                            <tr><td>What dies alongside</td><td>Unrelated workloads get shaken too</td><td>Only that container dies</td></tr>
+                            <tr><td>Common misdiagnosis</td><td>Blaming an application leak</td><td>Adding nodes</td></tr>
+                            <tr><td>Where to look first</td><td><code>/proc/meminfo</code>, the memory dump in the kernel log</td><td><code>memory.events</code>, <code>memory.max</code>, <code>memory.current</code></td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>The kernel cgroup v2 documentation defines <code>memory.max</code> as the <strong>memory usage hard limit</strong> and says that if a cgroup's memory usage reaches this limit and cannot be reduced, the OOM killer is invoked in the cgroup. <code>memory.high</code> is different. If usage goes over the high boundary the processes of the cgroup are throttled and put under heavy reclaim pressure, but <strong>going over the high limit never invokes the OOM killer</strong>, the same document says. high is a brake; max is a wall.</p>
+
+                    <pre><code># From inside the container - cgroup v2
+cat /sys/fs/cgroup/memory.max        # the wall. max means no limit
+cat /sys/fs/cgroup/memory.high       # the brake
+cat /sys/fs/cgroup/memory.current    # how much is in use right now
+cat /sys/fs/cgroup/memory.events     # read low/high/max/oom/oom_kill here
+cat /sys/fs/cgroup/memory.stat | head -20
+
+# When pointing at a specific cgroup path from the node
+cat /sys/fs/cgroup/kubepods.slice/.../memory.events</code></pre>
+
+                    <p>The two values in <code>memory.events</code> mean different things, and that difference works as a forecast. The documentation defines <code>oom</code> as <strong>the number of times the cgroup's memory usage reached the limit and allocation was about to fail</strong>, and <code>oom_kill</code> as <strong>the number of processes belonging to this cgroup killed by any kind of OOM killer</strong>. So if <code>oom</code> is climbing while <code>oom_kill</code> is 0, nobody has died yet, and that is <strong>an advance notice of dying at the next deployment or the next peak</strong>. Alert on this value and you can act before the fact rather than after it.</p>
+
+                    <p>The same document has <code>memory.oom.group</code>. It determines whether the OOM killer should treat this cgroup as <strong>an indivisible workload</strong>, and when set, all tasks in the cgroup and its descendants are killed together or not at all. It is the switch that prevents one process dying while the rest keep running at half capacity.</p>
+
+                    <p>How the runtime itself perceives the memory limit is another layer. Runtimes that infer heap size from the container limit, like the JVM, have traps of their own, and that is covered separately in <a href="jvm_container_resource_limits.html">when the JVM inside a container misreads the limit</a>. This article stays with the kernel and cgroup generalities.</p>
+
+                    <h2 id="sec-7">What changes between cgroup v1 and v2</h2>
+
+                    <p>The same <em>memory limit 512Mi</em> can mean different things in the two versions. The file names differ to begin with, and so does the way swap is counted.</p>
+
+                    <pre><code># Which version is running - cgroup2fs alone means v2 only
+stat -fc %T /sys/fs/cgroup
+mount | grep -E 'cgroup|cgroup2'
+
+# The files you read on the v1 side
+cat /sys/fs/cgroup/memory/memory.limit_in_bytes
+cat /sys/fs/cgroup/memory/memory.usage_in_bytes
+cat /sys/fs/cgroup/memory/memory.failcnt
+cat /sys/fs/cgroup/memory/memory.memsw.limit_in_bytes
+cat /sys/fs/cgroup/memory/memory.oom_control
+grep -E '^(cache|rss|mapped_file) ' /sys/fs/cgroup/memory/memory.stat</code></pre>
+
+                    <ul>
+                        <li><strong>How swap is counted.</strong> v1 sets the limit on memory and swap <strong>combined</strong> through <code>memory.memsw.limit_in_bytes</code>. v2 sets swap separately through <code>memory.swap.max</code>. This is the classic place where the same number means something different</li>
+                        <li><strong>Accuracy of the usage value.</strong> The v1 documentation admits that <code>memory.usage_in_bytes</code> does not show an exact value, and directs you to RSS plus CACHE (plus SWAP) in <code>memory.stat</code> for a more precise reading</li>
+                        <li><strong>The failure counter.</strong> v1's <code>memory.failcnt</code> counts how many times the limit was hit. What takes its place in v2 is <code>memory.events</code></li>
+                        <li><strong>The procedure on hitting the limit has the same skeleton.</strong> The v1 documentation says that when a cgroup goes over its limit the kernel first tries to reclaim memory from the cgroup, and if the reclaim is unsuccessful an OOM routine is invoked to select and kill the bulkiest task</li>
+                        <li><strong>The switch that disables OOM killing.</strong> v1's <code>memory.oom_control</code> has <code>oom_kill_disable</code> and <code>under_oom</code>. The documentation says that when <code>under_oom</code> is 1 the memory cgroup is under OOM and <strong>tasks may be stopped</strong></li>
+                    </ul>
+
+                    <div class="callout">
+                        <strong>Risk note.</strong> Turning on v1's <code>oom_kill_disable</code> means the process does not die but <strong>stops instead.</strong> It is alive in the process list and may even pass a health check depending on its type, while handling no requests at all. Dying and being restarted is often the better outcome, so <strong>consider this value only when you have a separate way to detect that state.</strong>
+                    </div>
+
+                    <h2 id="sec-8">Overcommit - why you die even though malloc succeeded</h2>
+
+                    <p>Linux promises more memory than it actually has by default, because doing so pays off in most cases. A process that calls <code>exec</code> right after <code>fork</code> barely touches the address space it copied, and code that reserves a large array up front and uses only the beginning is common. <strong>Physical pages are attached on the first write to that address.</strong></p>
+
+                    <p>So the failure arrives late. The allocation function succeeds in obtaining address space, and death comes at the moment of the first write to that address. In the code it looks like <strong>dying on the line after a successful allocation.</strong> That is why no matter how carefully you write allocation-failure handling, control never reaches that path.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>vm.overcommit_memory</th><th>What the kernel documentation says</th><th>What actually happens</th><th>Side effect</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>0 (default)</td><td>The kernel compares the userspace memory request size against total memory plus swap and rejects obvious overcommits</td><td>Most requests get through</td><td>Failure shows up as an OOM at use time rather than at allocation time</td></tr>
+                            <tr><td>1</td><td>The kernel pretends there is always enough memory until it actually runs out</td><td>Nearly every request succeeds</td><td>The allocation-failure signal disappears and every problem converges on OOM</td></tr>
+                            <tr><td>2</td><td>The kernel uses a never overcommit policy that attempts to prevent any overcommit of memory</td><td>Commits beyond <code>CommitLimit</code> are refused outright</td><td>Allocations that used to succeed start failing</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>The overcommit accounting documentation describes the limit in mode 2 as <strong>swap plus a configurable amount of physical RAM, defaulting to 50 percent</strong>. That percentage is set with <code>vm.overcommit_ratio</code> and the absolute value with <code>vm.overcommit_kbytes</code>, and both take effect only in mode 2. It also states that the current limit and the amount committed are viewable in <code>/proc/meminfo</code> as <code>CommitLimit</code> and <code>Committed_AS</code>.</p>
+
+                    <pre><code>sysctl vm.overcommit_memory vm.overcommit_ratio vm.overcommit_kbytes
+
+# How much has been promised - see how close Committed_AS sits to CommitLimit
+grep -E '^(MemTotal|SwapTotal|CommitLimit|Committed_AS):' /proc/meminfo</code></pre>
+
+                    <p>Per the documentation <code>Committed_AS</code> is <strong>the amount of memory presently allocated on the system</strong>, a sum of all memory allocated by processes, with the caveat that it counts even memory that has not been used by them as of yet. So this value comfortably exceeding <code>MemTotal</code> is <strong>normal and is evidence that overcommit is working</strong>. It is not a value to treat as a problem.</p>
+
+                    <div class="callout">
+                        <strong>Risk note.</strong> Changing <code>vm.overcommit_memory</code> to 2 replaces OOM with allocation failure. Processes that reserve large and use little <strong>may not even start.</strong> Changing it immediately with <code>sysctl</code> on a production node shakes every service at once, so first measure the normal trend of <code>Committed_AS</code> against <code>CommitLimit</code> for several days and confirm startup in staging before doing it.
+                    </div>
+
+                    <h2 id="sec-9">What swap changes</h2>
+
+                    <p>With swap, the kernel gains one more place to reclaim from. Anonymous pages can be pushed out to the storage device and their frames reused, so OOM arrives later. In exchange that stretch is slow. Whether that slowness is <strong>better than dying</strong> depends on the nature of the service.</p>
+
+                    <p>The kernel PSI documentation splits this state into two lines. <code>some</code> is <strong>the share of time in which at least some tasks are stalled on a given resource</strong>, and <code>full</code> is <strong>the share of time in which all non-idle tasks are stalled on a given resource simultaneously</strong>. The document describes the <code>full</code> state as wasteful CPU cycles and says it indicates thrashing. If <code>full</code> is climbing, the node simply has not died yet; it is already not working.</p>
+
+                    <pre><code>swapon --show
+free -h
+grep -E '^(SwapTotal|SwapFree|SwapCached):' /proc/meminfo
+
+# The share of time currently stalled - read some and full separately
+cat /proc/pressure/memory
+cat /sys/fs/cgroup/memory.pressure
+
+# Which processes are sitting in swap
+grep -H VmSwap /proc/[0-9]*/status | sort -t: -k3 -n -r | head -10</code></pre>
+
+                    <p>The practice of disabling swap in container environments has this behind it: for some services, response latency is worse than dying. A response that takes 30 seconds has already failed, but the process is alive and passes the health check, so traffic keeps arriving and the state gets worse. In that case <strong>dying fast and restarting fast</strong> is better for overall availability.</p>
+
+                    <ul>
+                        <li>The Kubernetes documentation states that by default the kubelet <strong>will not start on a Linux node that has swap enabled</strong>. To make it start you must set <code>failSwapOn: false</code> explicitly</li>
+                        <li>Swap behavior is set with <code>memorySwap.swapBehavior</code>. Under the default <code>NoSwap</code>, workloads running as pods on that node do not and cannot use swap; under <code>LimitedSwap</code> they can</li>
+                        <li>The same document carries a clue worth noting. Even with <code>NoSwap</code> and swap tolerated, <strong>processes outside of Kubernetes-managed containers, such as systemd services and even the kubelet itself, can utilize swap</strong>. Non-zero swap usage on a node does not mean the pods are using it</li>
+                        <li>The kubelet directs the container runtime through the runtime API, and the example the document gives for the cgroup v2 case is <code>memory.swap.max</code>. It connects straight back to the file from the previous section</li>
+                        <li>If you decide to enable swap, <strong>decide first how much latency is acceptable.</strong> Without that decision, a permanent state of <em>not dying but always slow</em> sets in, and that state rarely triggers an alert</li>
+                    </ul>
+
+                    <div class="callout">
+                        <strong>Risk note.</strong> On a production node, <code>swapoff -a</code> <strong>reads every swapped-out page back into physical memory.</strong> If free physical memory at that moment is smaller than swap usage, it invokes an OOM on the spot. Before disabling, check that <code>SwapTotal</code> minus <code>SwapFree</code> fits inside <code>MemAvailable</code>, and turn devices off one at a time during a low-traffic window.
+                    </div>
+
+                    <h2 id="sec-10">RSS is not the whole story</h2>
+
+                    <p>The value most often misread when looking at memory is the free column of <code>free</code>. The <code>free</code> manual defines free as <strong>unused memory</strong> only, and computes used as <strong>total minus available</strong>. On the kernel side the counterpart of that available is <code>MemAvailable</code> in <code>/proc/meminfo</code>, which the kernel documentation defines as <strong>an estimate of how much memory is available for starting new applications, without swapping</strong>, calculated from <code>MemFree</code>, <code>SReclaimable</code>, the size of the file LRU lists and the low watermarks in each zone. <strong>The value to read is available, not free.</strong></p>
+
+                    <pre><code>free -h
+grep -E '^(MemTotal|MemFree|MemAvailable|Buffers|Cached|Shmem|Slab|SReclaimable|SUnreclaim):' /proc/meminfo
+
+# The breakdown for one process - VmRSS is the sum of the three below
+grep -E '^(VmRSS|RssAnon|RssFile|RssShmem|VmSwap):' /proc/&lt;pid&gt;/status
+
+# The place that looks like files but is memory
+df -h /dev/shm</code></pre>
+
+                    <ul>
+                        <li><strong>Page cache is not locked memory.</strong> It is reclaimed when needed. A large cache making free look small is normal, and reporting that state as a memory shortage sends you to fix the wrong thing</li>
+                        <li><strong>Shared memory and tmpfs are different.</strong> What piles up in <code>/dev/shm</code> looks like files but is memory and is not reclaimed the way cache is. The kernel documentation defines <code>Shmem</code> as the total memory used by shared memory and tmpfs</li>
+                        <li><strong>Kernel slab uses memory too.</strong> <code>SReclaimable</code> is the part that might be reclaimed and <code>SUnreclaim</code> is the part that cannot be reclaimed under memory pressure. If the latter has grown large, no amount of digging through userspace produces an answer</li>
+                        <li><strong>Do not sum RSS.</strong> Per the kernel documentation <code>VmRSS</code> comprises <code>RssAnon</code>, <code>RssFile</code> and <code>RssShmem</code>, and pages shared between processes such as shared libraries are counted once per process. Estimating node usage by adding per-process RSS gives a number larger than reality</li>
+                        <li><strong>Processes holding files count as memory as well.</strong> How to find a process holding a deleted-but-open file or a large mapping is laid out in <a href="find_process_holding_file.html">which process is holding this file</a></li>
+                    </ul>
+
+                    <h2 id="sec-11">OOM is a symptom, not a cause</h2>
+
+                    <p>An OOM kill tells you memory ran out, not why it ran out. And the why is not in the snapshot of the moment of death but in <strong>the shape of the stretch before it</strong>. At the moment of death everything has already grown, so cause and effect are indistinguishable. In that one symptom has many causes and you must separate them in a fixed order, it is the same kind of problem as <a href="no_space_left_but_disk_free.html">No space left on device while the disk is not full</a>.</p>
+
+                    <ul>
+                        <li><strong>Leak</strong> — rises in proportion to time. After a restart it rises again at <strong>the same slope</strong>. If it rises overnight with no traffic, it is close to confirmed</li>
+                        <li><strong>Traffic surge</strong> — rises in steps and lines up in time with the traffic graph. It comes back down after the peak. If it does not come down, a surge and a leak are overlapping</li>
+                        <li><strong>A misconfigured limit</strong> — starts right after a deployment. Putting the previous deployment's manifest side by side settles it in minutes, so it goes early in the order</li>
+                        <li><strong>An unbounded cache</strong> — the hit rate keeps improving and memory keeps climbing. Invisible at low load, it blows up all at once when load rises. Check first whether a maximum entry count or maximum byte size is set</li>
+                        <li><strong>A growing result set</strong> — queries without pagination, lists inflated by re-reading related data per row. This is usually the category behind <strong>code that did not change but blew up one day</strong>, and its slope is gentle enough to miss</li>
+                        <li><strong>Concurrency numbers</strong> — buffer size per request times concurrent requests. It blows up the day after someone raises worker count or connection pool size. Look for it in the <strong>configuration change history</strong>, not the deployment history</li>
+                        <li><strong>The neighbors</strong> — a system OOM in which our process happened to be selected. The cause is another workload on the same node and ours was merely large, so no amount of reading our code turns anything up</li>
+                        <li><strong>Other consumers on the node</strong> — non-container things like log shipping daemons, backup agents, kernel slab. If the sum of pod usage and node usage diverge widely, it is this</li>
+                    </ul>
+
+                    <p>If you had to pick one thing most useful for separating them, it is <strong>the shape of the slope</strong>. Straight, stepped or sawtooth: that alone removes half the candidates. Which is why the first thing to secure in a post-mortem is not logs but <strong>the memory time series for the hours before death</strong>. Without it the investigation becomes guesswork.</p>
+
+                    <h2 id="sec-12">How to prevent it - limits, requests and the restart loop</h2>
+
+                    <p>Setting a limit is necessary but not sufficient. The scheduler decides placement by looking at requests, so if requests are missing or much smaller than reality, pods get packed onto one node. Then the per-container limits hold while <strong>the node as a whole falls over first.</strong> The Kubernetes documentation says that when a node runs out of resources Kubernetes evicts BestEffort pods first, followed by Burstable and finally Guaranteed. How you wrote requests and limits <strong>sets the eviction order.</strong></p>
+
+                    <ul>
+                        <li><strong>Set limits and requests together.</strong> With only a limit the scheduler does not know real consumption; with only a request nothing stops a runaway</li>
+                        <li><strong>Start from requests at normal usage and limits at peak plus headroom.</strong> Setting them equal raises the class but lowers node utilization</li>
+                        <li><strong>Raising a limit buys time.</strong> If it is a leak, only the interval lengthens. If you buy time, <strong>write in the ticket how long you are buying.</strong> If you do not, that limit becomes permanent</li>
+                        <li><strong>Without readiness the moments after a restart are dangerous.</strong> Traffic enters an instance still warming up, and that load pushes memory back up</li>
+                        <li><strong>An overly aggressive liveness probe mixes in deaths that are not OOM.</strong> A brief stall gets read as death and triggers a restart, and that path is SIGTERM, so the code is 143. <strong>If 137 and 143 are mixed together, you are treating two events as one</strong></li>
+                        <li><strong>Exceeding the grace period turns 143 into 137.</strong> Even for the same 137, if the kernel log has no OOM record at that timestamp, this is what happened</li>
+                        <li><strong>Adding replicas cuts both ways.</strong> If requests spread out it helps, but if the structure gives each instance one more cache of the same size, node-wide totals go up instead</li>
+                        <li><strong>For multi-process containers, consider <code>memory.oom.group</code>.</strong> If one dies and the rest remain, the container is alive while the function is half-broken, and that state is not cleared by a restart either</li>
+                    </ul>
+
+                    <p>The path into a restart loop usually runs like this. It dies. It restarts. During warm-up it takes the queued requests all at once. It dies again. The orchestrator widens the restart interval progressively, so the first few minutes are back-to-back deaths and after that they turn intermittent. <strong>The moment you call that later half an <em>intermittent fault</em> you move away from the cause.</strong> Checking whether the restart interval widens exponentially settles immediately whether it is the same event.</p>
+
+                    <div class="callout">
+                        <strong>Risk note.</strong> Removing the memory limit altogether does not remove the problem; it <strong>promotes a cgroup OOM into a system OOM.</strong> With a limit in place the victim is confined to that container, but without one the kernel picks candidates across the whole node. What gets picked is then out of your hands, and unrelated workloads get shaken along with it.
+                    </div>
+
+                    <h2 id="sec-13">The order of investigation</h2>
+
+                    <p>The reason for fixing an order is that each step narrows the next. Skip an earlier step and the later ones cannot be interpreted.</p>
+
+                    <ol>
+                        <li><strong>Confirm it really died.</strong> Is the exit code 137, 143, or somewhere between 0 and 125? For a container, read the reason and code of the previous termination together. If 143 or a normal exit turns up, close the OOM investigation</li>
+                        <li><strong>Confirm the kernel killed it.</strong> Is there an OOM record in the kernel log at that timestamp? If not, first check whether the ring buffer rolled, and if it did not, it was not the kernel but an orchestrator, a watchdog or a person</li>
+                        <li><strong>Separate system from cgroup.</strong> Is the log prefix <code>Out of memory</code> or <code>Memory cgroup out of memory</code>? On the container side, check whether <code>oom_kill</code> in <code>memory.events</code> went up. The direction of the response splits completely here</li>
+                        <li><strong>See who grew.</strong> Sort the table the kernel left behind by rss. If the process that died is not first, read the <code>oom_score_adj</code> column; if it is first, look at the split between <code>rss_anon</code> and <code>rss_shmem</code></li>
+                        <li><strong>See when it started growing.</strong> Secure the time series for the hours before death. Straight, stepped or sawtooth is decided here</li>
+                        <li><strong>Cross-check why it grew.</strong> Overlay deployment times, configuration change history, the traffic graph and data growth on that time series. One overlap is almost the answer; none means going a layer down to cache bounds, result set size and concurrency</li>
+                        <li><strong>Decide what to change.</strong> Raising the limit is the last option. Ahead of it are cache bounds, page size, worker count and connection pool. If you do raise it, <strong>write down how long it stays that way</strong></li>
+                    </ol>
+
+                    <h2 id="sec-14">Summary</h2>
+
+                    <p>An empty application log does not mean there is no information; it means <strong>the author of the record changed</strong>. SIGKILL cannot be caught, so the application can write nothing and the event is left on the kernel side. That is why the investigation starts by checking the exit code and moving to the kernel log rather than digging further into the application log.</p>
+
+                    <p>After that move there is one fork. <strong>Did the node run out, or did something hit its limit?</strong> The first word of the log tells you, and the response diverges completely from there. Touching limits for a node problem or adding nodes for a limit problem both change nothing. And either way, <strong>OOM itself is not the cause.</strong> The cause is inside the slope of the hours before death, and that slope cannot be recovered once the incident is over. So what to keep is not a list of commands but an order. Did it die, did the kernel kill it, system or cgroup, who grew, since when, and why. <strong>Pass those six in order and the last question usually has only one answer left.</strong></p>
+
+                    <h2 id="sec-15">What I could not verify</h2>
+
+                    <ul>
+                        <li>The environment this article was written in is Windows 10 with Git Bash (MSYS2, GNU bash 5.2.37(1)-release), and <strong>there is no Linux kernel.</strong> <strong>No actual output from <code>dmesg</code>, <code>journalctl</code>, <code>/proc/meminfo</code> or <code>/sys/fs/cgroup</code> was reproduced and pasted in.</strong> The commands in the body were written on the basis of official documentation and kernel source</li>
+                        <li>Exactly three things were executed and confirmed: the exit status of <code>bash -c 'kill -9 $$'</code> is 137, <code>kill -15</code> gives 143, and the shell version is GNU bash 5.2.37(1)-release. Only those three appear in the body as real output</li>
+                        <li>The kernel documentation on <code>docs.kernel.org</code> was opened directly, but <strong>the kernel source itself could not be opened because <code>git.kernel.org</code> returned 403.</strong> The format strings and the badness calculation were therefore confirmed on the master branch of the official mirror at <code>raw.githubusercontent.com/torvalds/linux</code>. It is not the code of any particular distribution kernel</li>
+                        <li>The <strong>column layout of <code>dump_tasks</code> differs by kernel version.</strong> The list in the sysctl documentation and the header string in the master source already disagree. You have to check the header line of your own kernel directly</li>
+                        <li>The function names used in the badness calculation have changed across versions. So the names were not carried over, only <strong>the composition and the way <code>oom_score_adj</code> is scaled</strong>. Implementation details need checking per kernel version</li>
+                        <li>Log file paths differ by distribution and log daemon configuration. Which of <code>/var/log/messages</code> and <code>/var/log/syslog</code> is used <strong>was not verified</strong></li>
+                        <li>The <strong>exact rule by which a container runtime attaches exit code 137</strong> could not be confirmed in official documentation. 128 plus the signal number is the shell's rule, confirmed here, and no documentary basis was found for runtimes following the same rule. The corresponding clause in the Bash manual could not be opened either, as gnu.org refused the request with a rate limit</li>
+                        <li>The Kubernetes QoS documentation explains only the eviction order and <strong>says nothing about how <code>oom_score_adj</code> is set per class.</strong> That is why the body says no more than <em>orchestrators sometimes set it</em>. Userspace OOM managers such as <code>systemd-oomd</code> are also out of scope here</li>
+                    </ul>
+
+                    <h2 id="sec-16">References</h2>
+
+                    <ul>
+                        <li><a href="https://docs.kernel.org/admin-guide/mm/concepts.html" target="_blank" rel="noopener">Concepts overview (Linux kernel documentation)</a> - the description that the kernel invokes the OOM killer and selects a task to sacrifice, plus the definitions of page cache and reclaim</li>
+                        <li><a href="https://docs.kernel.org/admin-guide/sysctl/vm.html" target="_blank" rel="noopener">Documentation for /proc/sys/vm/ (Linux kernel documentation)</a> - the three values of <code>overcommit_memory</code>, <code>overcommit_ratio</code> and <code>overcommit_kbytes</code>, and the item list <code>oom_dump_tasks</code> includes in the dump</li>
+                        <li><a href="https://docs.kernel.org/mm/overcommit-accounting.html" target="_blank" rel="noopener">Overcommit Accounting (Linux kernel documentation)</a> - the definition that the mode 2 limit is swap plus a configurable amount of physical RAM, defaulting to 50 percent</li>
+                        <li><a href="https://docs.kernel.org/admin-guide/cgroup-v2.html" target="_blank" rel="noopener">Control Group v2 (Linux kernel documentation)</a> - the definitions of <code>memory.max</code> and <code>memory.high</code>, the <code>oom</code> and <code>oom_kill</code> fields of <code>memory.events</code>, and <code>memory.oom.group</code></li>
+                        <li><a href="https://docs.kernel.org/admin-guide/cgroup-v1/memory.html" target="_blank" rel="noopener">Memory Resource Controller (cgroup v1)</a> - <code>memory.limit_in_bytes</code>, <code>memory.memsw.limit_in_bytes</code>, <code>memory.failcnt</code> and <code>memory.oom_control</code>, and the procedure once the limit is exceeded</li>
+                        <li><a href="https://docs.kernel.org/filesystems/proc.html" target="_blank" rel="noopener">The /proc Filesystem (Linux kernel documentation)</a> - the range of <code>oom_score_adj</code> and the meaning of -1000, plus the definitions of <code>MemAvailable</code>, <code>CommitLimit</code>, <code>Committed_AS</code> and <code>VmRSS</code></li>
+                        <li><a href="https://docs.kernel.org/accounting/psi.html" target="_blank" rel="noopener">PSI - Pressure Stall Information</a> - the definitions of <code>some</code> and <code>full</code>, and the explanation that <code>full</code> indicates thrashing</li>
+                        <li><a href="https://raw.githubusercontent.com/torvalds/linux/master/mm/oom_kill.c" target="_blank" rel="noopener">linux/mm/oom_kill.c (torvalds/linux, master)</a> - the column name string, the kill message format, <code>dump_header()</code>, the ternary that splits the messages of the two OOM kinds, and the badness calculation</li>
+                        <li><a href="https://man7.org/linux/man-pages/man1/free.1.html" target="_blank" rel="noopener">free(1) - Linux manual page</a> - the definition of used as total minus available, and the description of the available column</li>
+                        <li><a href="https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/" target="_blank" rel="noopener">Resource Management for Pods and Containers (Kubernetes)</a> - the statement that memory limits are enforced reactively</li>
+                        <li><a href="https://kubernetes.io/docs/concepts/cluster-administration/swap-memory-management/" target="_blank" rel="noopener">Swap Memory Management (Kubernetes)</a> - the kubelet's default behavior, <code>NoSwap</code> and <code>LimitedSwap</code>, and the note that unmanaged processes can still use swap</li>
+                        <li><a href="https://kubernetes.io/docs/concepts/workloads/pods/pod-qos/" target="_blank" rel="noopener">Pod Quality of Service Classes (Kubernetes)</a> - the statement that eviction goes BestEffort, then Burstable, then Guaranteed</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>Share this article</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">Copy Link</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">Back to list</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Free tools you may find useful</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/char_counter.html">Character Counter</a></li>
+      <li><a href="../static/json_formatter.html">JSON Formatter</a></li>
+      <li><a href="../static/regex_tester.html">Regex Tester</a></li>
+      <li><a href="../static/jwt_decoder.html">JWT Decoder Generator 2026</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">See all tools &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Related Posts</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="jvm_container_resource_limits.html">How the JVM Reads Container Limits - Where Kubernetes Requests and Limits Decide Heap, GC and Latency 2026</a></li>
+      <li><a href="find_process_holding_file.html">Finding the Process Holding a File - When Deleting It Frees Nothing</a></li>
+      <li><a href="ai_generated_code_disclosure_license.html">Putting AI Authorship in the License - Where Permission and Disclosure Come Apart</a></li>
+      <li><a href="always_available_terminal.html">What Changes When the Terminal Is Always There - The Few Seconds It Takes to Open One</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('Link copied! Paste it in the Threads app to share.');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('Link copied!'); });
+    });
+    </script>
+</body>
+</html>

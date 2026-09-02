@@ -1,0 +1,701 @@
+<!DOCTYPE html>
+<!--
+ * 技術ブログ記事テンプレート
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ja">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>プロセスが黙って死んだ - OOM キラーの読み方</title>
+    <meta name="description" content="アプリケーションログが空なのにプロセスだけ消えたなら、死んだのではなく殺された可能性が高い。終了コード 137、カーネルが出力する OOM の表の読み方、システム OOM と cgroup OOM の違い、そしてオーバーコミットとスワップが変えるものを順に整理した。">
+    <meta name="keywords" content="OOM killer, OOMKilled, 終了コード 137, SIGKILL, dmesg, journalctl, oom_score_adj, oom_badness, cgroup v2, memory.max, memory.events, オーバーコミット, vm.overcommit_memory, CommitLimit, MemAvailable, スワップ, PSI, CrashLoopBackOff, 開発, インフラ, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/ja/posts/oom_killer_diagnosis.html">
+
+    <meta property="og:title" content="プロセスが黙って死んだ - OOM キラーの読み方">
+    <meta property="og:description" content="アプリケーションログには何も残らない。カーネル側の記録で何を見て、システム OOM と cgroup OOM をどう切り分けるか。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/ja/posts/oom_killer_diagnosis.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ja_JP">
+    <meta property="article:published_time" content="2026-09-02">
+    <meta property="article:section" content="開発・インフラ">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="プロセスが黙って死んだ - OOM キラーの読み方">
+    <meta name="twitter:description" content="終了コード 137 から始めて、カーネルが残した表から犯人を選び、ノードの問題か上限の問題かを切り分ける順番。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "プロセスが黙って死んだ - OOM キラーの読み方",
+      "alternativeHeadline": "アプリケーションログが空のとき、カーネルが残した記録から何を見るか",
+      "datePublished": "2026-09-02",
+      "dateModified": "2026-09-02",
+      "inLanguage": "ja-JP",
+      "articleSection": "開発・インフラ",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "OOM killer, OOMKilled, 終了コード 137, SIGKILL, dmesg, oom_score_adj, cgroup v2, memory.max, オーバーコミット, スワップ, CrashLoopBackOff",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/ja/posts/oom_killer_diagnosis.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "終了コード 137 なら必ず OOM なのか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "違う。137 はシェルが報告する 128 足すシグナル番号の結果であり、9 番のシグナルが SIGKILL である。つまり 137 が伝えるのは「強制終了された」までで、誰が送ったのかは伝えない。カーネルの OOM キラーかもしれないし、終了猶予時間を超えてオーケストレータが送ったものかもしれないし、人が送ったものかもしれない。次の段階は同じ時刻にカーネルログへ OOM の記録があるかを確認することだ。記録がなければカーネルが殺したのではない。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "ノードにメモリが残っているのにコンテナが OOMKilled になる理由は?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "cgroup の上限に達したからだ。カーネルの cgroup v2 ドキュメントは memory.max について「cgroup のメモリ使用量がこの上限に達して減らせない場合、その cgroup 内で OOM キラーが呼び出される」と記している。判断範囲がその cgroup とその配下に限られるため、ノード全体に余裕があっても死ぬ。カーネルソースでもこの二つはログの先頭で分かれる。システム OOM は Out of memory で、cgroup OOM は Memory cgroup out of memory で始まる。この場合はノードを増設しても何も変わらない。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "最もメモリを使っているプロセスが死ぬのではないのか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "たいていはそうだが、常にそうとは限らない。カーネルの badness 計算は RSS とスワップエントリとページテーブルの大きさを足した値から始まり、そこへ oom_score_adj を全体メモリの大きさに比例するよう換算して加える。そのため oom_score_adj を 100 上げてあるプロセスは、全体メモリの 10 パーセントを余分に使っているかのように扱われる。カーネルドキュメントによればこの値の範囲は -1000 から +1000 で、-1000 はそのタスクの OOM キリングを事実上無効にする値だ。カーネルが残した表の oom_score_adj 列を見なければ、なぜそのプロセスが選ばれたのかは説明できない。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "malloc が成功したのに後で死ぬのはなぜか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Linux が既定で実メモリより多く約束するからだ。カーネルの sysctl ドキュメントは vm.overcommit_memory が 0 のとき「カーネルはユーザ空間のメモリ要求サイズを全体メモリとスワップの合計と比較し、明白な過剰要求を拒否する」と記す。確保はアドレス空間を得る行為であり、物理ページはそのアドレスへ最初に書き込むときに割り当てられる。したがって失敗は malloc ではなくその後の最初の書き込み時点に現れ、その時の扱いは例外ではなく SIGKILL である。アプリケーションが捕捉できない理由はここにある。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "メモリ上限を上げれば解決するのか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "原因がリークなら周期が延びるだけだ。上限を上げるのは直す行為ではなく時間を買う行為なので、買うならいつまで買うのかも併せて書いておくほうがよい。そして上限だけ上げてリクエスト値をそのままにすると、スケジューラが配置を誤り、cgroup OOM がノード全体のシステム OOM へ移る場合がある。まず見るべきは使用量が上がる形だ。時間に比例して上がるならリークで、階段状に上がるならトラフィックかデプロイで、データ増加のぶんだけ上がるなら結果セットの大きさである。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/oom_killer_diagnosis.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/oom_killer_diagnosis.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/oom_killer_diagnosis.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/oom_killer_diagnosis.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/oom_killer_diagnosis.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "ホーム",
+      "item": "https://braindetox.kr/ja/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "開発・インフラ",
+      "item": "https://braindetox.kr/ja/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "プロセスが黙って死んだ - OOM キラーの読み方",
+      "item": "https://braindetox.kr/ja/posts/oom_killer_diagnosis.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="プロセスが黙って死んだ - OOM キラーの読み方">
+                <meta itemprop="datePublished" content="2026-09-02">
+                <meta itemprop="dateModified" content="2026-09-02">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="OOM killer, OOMKilled, 終了コード 137, SIGKILL, dmesg, oom_score_adj, cgroup v2, memory.max, オーバーコミット, スワップ, CrashLoopBackOff">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/ja/posts/oom_killer_diagnosis.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">プロセスが黙って死んだ - OOM キラーの読み方</h1>
+                    <h2 class="post-subtitle">アプリケーションログが空のとき、カーネルが残した記録から犯人を絞る順番</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-02">2026-09-02</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">開発・インフラ</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>プロセスが消えた。アプリケーションログの最後の行はありふれたリクエスト処理の記録で、その後には何もない。例外スタックもなく、終了フックが残す挨拶もない。監視ツールはプロセスがもう存在しないという事実だけを伝えてくる。</p>
+
+                    <p>ここで最も多く浪費される時間は、アプリケーションログをさらに詳しく漁ることに使われる。そこにはない。あるはずがない。<strong>SIGKILL はプロセスが受け取って処理するシグナルではなく、プロセスをその場で終わらせる動作</strong>なので、その時点でアプリケーションは一文字も書く機会を持たない。だから最初の一手はログを掘ることではなく、仮説を変えることだ。死んだのではなく<strong>殺された</strong>のである。</p>
+
+                    <div class="callout">
+                        この記事を書いた環境は Windows 10 に Git Bash(MSYS2、GNU bash 5.2.37(1)-release)である。<strong>Linux カーネルも cgroup も <code>dmesg</code> もない環境</strong>なので、以下に出てくるカーネルの挙動・フィールド定義・ファイルパスはすべて kernel.org の公式ドキュメントとカーネルソースで確認したものであり、実際の OOM ログを再現して貼ったものではない。この環境で実際に実行して確認したのは終了コードの規則だけで、その出力は本文にそのまま載せてある。<strong>確認できたことと確認できなかったことの境界は、最後から二番目の節にまとめてある。</strong>
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>この記事で扱うこと</h3>
+                        <ol>
+                            <li><a href="#sec-1">アプリケーションログが何も語らない理由</a></li>
+                            <li><a href="#sec-2">死んだのではなく殺された - 137 と OOMKilled</a></li>
+                            <li><a href="#sec-3">どこを見るか</a></li>
+                            <li><a href="#sec-4">カーネルが出力する表の読み方</a></li>
+                            <li><a href="#sec-5">なぜよりによってそのプロセスが死んだのか</a></li>
+                            <li><a href="#sec-6">システム OOM と cgroup OOM は別の事件だ</a></li>
+                            <li><a href="#sec-7">cgroup v1 と v2 で変わるもの</a></li>
+                            <li><a href="#sec-8">オーバーコミット - malloc が成功しても死ぬ仕組み</a></li>
+                            <li><a href="#sec-9">スワップが変えるもの</a></li>
+                            <li><a href="#sec-10">RSS がすべてではない</a></li>
+                            <li><a href="#sec-11">OOM は症状であって原因ではない</a></li>
+                            <li><a href="#sec-12">防ぎ方 - 上限とリクエスト、そして再起動ループ</a></li>
+                            <li><a href="#sec-13">点検の順番</a></li>
+                            <li><a href="#sec-14">まとめ</a></li>
+                            <li><a href="#sec-15">確認できなかったこと</a></li>
+                            <li><a href="#sec-16">参考資料</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">アプリケーションログが何も語らない理由</h2>
+
+                    <p>カーネルのメモリ管理ドキュメントは OOM キラーをこう説明する。負荷のかかったマシンでメモリが枯渇し、カーネルが動作を続けられるだけのメモリを回収できない状況が起こりうるので、残りのシステムを救うためにカーネルが OOM キラーを呼び出す、というものだ。そして<strong>システム全体の健全性のために犠牲にするタスクを一つ選ぶ</strong>と書かれている。重要なのは「選ぶ」だ。選択はカーネル側で起こり、選ばれた側は通知を受けない。</p>
+
+                    <p>そのためアプリケーションが普段残していたものが丸ごと抜け落ちる。例外スタックは例外が起きなければ生まれないが、例外は起きていない。終了フックはシグナルを捕捉できて初めて回るが、SIGKILL は捕捉できない。バッファに残っていたログはフラッシュされずに消える。<strong>「最後のログ行がありふれている」ということ自体が信号</strong>であって、情報がないという意味ではない。</p>
+
+                    <ul>
+                        <li><strong>残らないもの</strong> — 例外スタック、終了フックが走った痕跡、フラッシュされていないログバッファ、アプリケーション自身が記録する終了コード</li>
+                        <li><strong>残るもの</strong> — カーネルリングバッファの OOM 記録、親プロセスが受け取った終了ステータス、コンテナランタイムが付けた終了理由、メトリクス収集器が最後に取得した値</li>
+                        <li><strong>順番が逆になっている</strong> — 普段はアプリケーションログが一次資料でカーネルログが補助だ。この事件では逆になる</li>
+                        <li><strong>メトリクスが途切れた地点がヒントだ</strong> — 収集周期が 15 秒なら死ぬ直前 15 秒の値はない。最後の点が穏やかに見えても、その間に急騰があった可能性がある</li>
+                    </ul>
+
+                    <h2 id="sec-2">死んだのではなく殺された - 137 と OOMKilled</h2>
+
+                    <p>仮説を切り替える根拠は終了コードだ。シェルはコマンドが致命的シグナルで終わったとき、128 にシグナル番号を足した値を終了ステータスとして報告する。この規則は Linux でない環境でも同じシェルなら同様に動くので、この記事を書いた Git Bash でそのまま確認できた。</p>
+
+                    <pre><code>$ bash --version | head -1
+GNU bash, version 5.2.37(1)-release (x86_64-pc-msys)
+
+$ bash -c 'kill -9 $$'; echo "exit=$?"
+/usr/bin/bash: line 1:  1419 Killed                  bash -c 'kill -9 $$'
+exit=137
+
+$ bash -c 'kill -15 $$'; echo "term_exit=$?"
+Terminated
+term_exit=143</code></pre>
+
+                    <p>9 番が SIGKILL なので 128 足す 9 は 137、15 番が SIGTERM なので 143 になる。押さえておくべきは<strong>137 が伝える範囲が思ったより狭い</strong>という点だ。137 は「強制終了された」までしか語らない。誰が SIGKILL を送ったのかはここに含まれていない。カーネルの OOM キラーかもしれないし、終了猶予を超えてオーケストレータが仕上げに送ったものかもしれないし、バッチスクリプトかもしれない。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>シグナル</th><th>番号</th><th>シェルが報告する終了コード</th><th>このコードが伝えること</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>SIGTERM</td><td>15</td><td>143</td><td>片付ける機会があった。何をしたかはアプリケーションログに残る</td></tr>
+                            <tr><td>SIGKILL</td><td>9</td><td>137</td><td>即座に終了した。送った主体はカーネルログと突き合わせないと分からない</td></tr>
+                            <tr><td>SIGSEGV</td><td>11</td><td>139</td><td>不正なメモリアクセス。メモリ不足とは別の事件だ</td></tr>
+                            <tr><td>SIGABRT</td><td>6</td><td>134</td><td>ランタイム自身が諦めた。確保失敗を abort で処理する実装で出る</td></tr>
+                            <tr><td>正常終了</td><td>-</td><td>0 ~ 125</td><td>アプリケーションが決めた値。強制終了ではない</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>シグナル番号はプラットフォームのシグナル表に従う。上の 6、9、11、15 は Linux では安定して同じだが、すべての番号がそうではない。この記事を書いた MSYS 環境で <code>kill -l</code> を出すと 7 番が SIGEMT と出るが、Linux x86 で 7 番は SIGBUS だ。<strong>番号を暗記して使うより、そのシステムの表を一度出してみるほうが安全である。</strong></p>
+
+                    <p>コンテナではラベルがもう一つ付く。ランタイムが終了理由を <code>OOMKilled</code> として記録し、オーケストレータがそれを Pod のステータスに露出する。終了コードより明示的だが、<strong>「どの OOM なのか」は依然として伝えてくれない。</strong>ノード全体が不足していた場合とコンテナの上限に達した場合が、同じラベルを付けて出てくる。</p>
+
+                    <p>付け加えると、Kubernetes のドキュメントはメモリ上限が<strong>反応的に</strong>強制されると記す。上限を超えて使うとカーネルが終了させうるが、終了はカーネルがメモリ圧迫を検知したときにのみ起こるので、過剰に確保したコンテナが即座に殺されない場合があるという説明だ。<strong>「昨日も上限を超えていたのになぜ今日死んだのか」の答えがここにある。</strong></p>
+
+                    <h2 id="sec-3">どこを見るか</h2>
+
+                    <p>カーネルが残す場所は一つだが、読む窓口は複数あり、窓口ごとに保存期間が違う。この差のせいで「記録がない」という結論がよく間違う。</p>
+
+                    <pre><code># 1) カーネルリングバッファ - 最も速いが長くは残らない
+dmesg -T | grep -i -E 'out of memory|oom-killer|killed process'
+
+# 2) ジャーナル - カーネルメッセージのみ、時刻範囲を絞って
+journalctl -k --since '2 hours ago' | grep -i -E 'oom|killed process'
+
+# 3) 再起動を挟んでいるならブート単位でさかのぼる
+journalctl --list-boots
+journalctl -k -b -1 | grep -i 'killed process'
+
+# 4) リングバッファがすでに流れたとき - パスはディストリビューションによって違う
+grep -i -E 'oom-killer|killed process' /var/log/messages
+grep -i -E 'oom-killer|killed process' /var/log/syslog</code></pre>
+
+                    <p><code>dmesg</code> が見るリングバッファは固定サイズなので、新しいメッセージが入ると古いものから押し出される。ストレージやネットワークのメッセージが毎秒数行出るノードなら、数時間前の OOM 記録はすでにない。<strong>「dmesg にないから OOM ではない」という結論は、リングバッファが流れていないことを確認した後にのみ成り立つ。</strong>ジャーナルも保存方式が揮発性なら再起動とともに消える。ログがどこまで残っているかはそれ自体が別の主題であり、ローテーション設定が作る罠は<a href="log_rotation_pitfalls.html">ログローテーションが静かにずれる場所</a>で別に扱った。</p>
+
+                    <p>コンテナ側の窓口はランタイムとオーケストレータが持っている。カーネルログにアクセスする権限がない場合が多く、こちらのほうが先に手に届く。</p>
+
+                    <pre><code># Kubernetes - 前回の終了の理由とコード
+kubectl describe pod &lt;pod&gt; | sed -n '/Last State/,/Restart Count/p'
+kubectl get pod &lt;pod&gt; -o jsonpath='{range .status.containerStatuses[*]}{.name}{"\t"}{.lastState.terminated.reason}{"\t"}{.lastState.terminated.exitCode}{"\n"}{end}'
+
+# Docker - OOMKilled フラグと終了コードを一行で
+docker inspect --format '{{.Name}} oom={{.State.OOMKilled}} exit={{.State.ExitCode}}' &lt;container&gt;
+
+# ノードに入れるなら、カーネル側と時刻を合わせる
+journalctl -k --since '2026-09-02 09:00' --until '2026-09-02 10:00'</code></pre>
+
+                    <p>ここで最初の分かれ道が出る。コンテナのステータスは <code>OOMKilled</code> なのに<strong>ノードのカーネルログにシステム OOM の記録がなければノードは無事だった</strong>ということで、事件は cgroup の上限側だ。逆に同じ時刻に複数の Pod が一緒に死に、カーネルログにノード全体のメモリダンプが残っていればノード側である。<strong>この分かれ道を通る前に上限を上げたりノードを増設したりするのはコイン投げだ。</strong></p>
+
+                    <h2 id="sec-4">カーネルが出力する表の読み方</h2>
+
+                    <p>カーネルは OOM キリングを実行するときタスク一覧を表としてダンプし、この動作は sysctl でオンオフする。カーネルの sysctl ドキュメントは <code>oom_dump_tasks</code> が、カーネルスレッドを除いたシステム全域のタスクダンプを生成し、pid、uid、tgid、vm size、rss、pgtables_bytes、swapents、oom_score_adj スコア、name といった情報を含めると記す。カーネルソースのヘッダ出力関数でも、このダンプが sysctl 値に掛かっているのがそのまま見える。</p>
+
+                    <p>ログに出る文字列は三つの塊だ。以下はカーネルソースのフォーマット文字列をそのまま写したもので、<code>%s</code> や <code>%d</code> の位置に実際の値が埋められて出力される。</p>
+
+                    <pre><code># (1) 誰が OOM キラーを呼んだか - dump_header()
+%s invoked oom-killer: gfp_mask=%#x(%pGg), order=%d, oom_score_adj=%d
+
+# (2) 候補一覧の列名 - dump_tasks()
+[  pid  ]   uid  tgid total_vm      rss rss_anon rss_file rss_shmem pgtables_bytes swapents oom_score_adj name
+
+# (3) 結論 - __oom_kill_process()
+%s: Killed process %d (%s) total-vm:%lukB, anon-rss:%lukB, file-rss:%lukB, shmem-rss:%lukB, UID:%u pgtables:%lukB oom_score_adj:%d</code></pre>
+
+                    <p>ほとんどの人は (3) だけ読んで終わる。ところが (3) は<strong>結論</strong>であり、原因候補の一覧は (2) の下に続く表にある。表を見なければ「なぜあのプロセスだったのか」に答えられず、答えられなければ次も同じことが起こる。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>列</th><th>単位</th><th>何か</th><th>犯人を選ぶときの使いどころ</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>total_vm</td><td>ページ</td><td>仮想アドレス空間の大きさ</td><td>低い。予約しただけで使っていない領域が含まれる</td></tr>
+                            <tr><td>rss</td><td>ページ</td><td>実際に物理メモリに載っている総量</td><td>ここから始める。大きい順に並べると候補が絞られる</td></tr>
+                            <tr><td>rss_anon</td><td>ページ</td><td>ファイル背景のない部分。ヒープとスタック</td><td>リーク疑いの筆頭。回収手段がスワップしかない</td></tr>
+                            <tr><td>rss_file</td><td>ページ</td><td>マップされたファイルページ</td><td>おおむね回収可能。この列だけ大きいプロセスは犯人でない確率が高い</td></tr>
+                            <tr><td>rss_shmem</td><td>ページ</td><td>tmpfs と共有メモリ</td><td><code>/dev/shm</code> の使用量。ファイルのように見えるが回収されない</td></tr>
+                            <tr><td>pgtables_bytes</td><td>バイト</td><td>ページテーブル自体が使うメモリ</td><td>スレッドが多いときやマッピングが細かく割れているときに大きくなる</td></tr>
+                            <tr><td>swapents</td><td>ページ</td><td>スワップに出ているページ数</td><td>スワップがあると rss が実際より小さく見える。一緒に見る必要がある</td></tr>
+                            <tr><td>oom_score_adj</td><td>なし</td><td>選択に掛かる重み</td><td>rss で一位でないプロセスが死んだなら答えはこの列にある</td></tr>
+                            <tr><td>name</td><td>なし</td><td>実行ファイル名</td><td>長いと切れる。同じ名前が複数あれば pid で突き合わせる</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>読むときに間違えやすい箇所が二つある。一つは<strong>単位がページ</strong>だということだ。名前に <code>_bytes</code> が付いた <code>pgtables_bytes</code> だけがバイトで、残りのメモリ列はページ数である。ページサイズはアーキテクチャと設定によって違うので、そのシステムの値を確認して掛ける必要がある。もう一つは<strong>列構成がカーネルバージョンによって違う</strong>ことだ。上の sysctl ドキュメントの一覧と現在のソースのヘッダ文字列はすでに食い違っている(ソース側に <code>rss_anon</code>、<code>rss_file</code>、<code>rss_shmem</code> が加わっている)。<strong>自分のログのヘッダ行を先に読んで列位置を合わせなければならない。</strong></p>
+
+                    <pre><code># 保存しておいたログから表の部分だけ抜き出す
+# 列番号はカーネルバージョンごとに違うので、ヘッダ行も必ず一緒に出力する
+awk '/\[ *pid *\]/{print; f=1; next} f &amp;&amp; /^\[/{print} f &amp;&amp; !/^\[/{f=0}' oom.log | head -40
+
+# rss 列が何番目かをヘッダで数えてから並べ替える(以下は 4 番目の場合)
+awk '/^\[/{print $4, $NF, $0}' oom.log | sort -nr | head -20</code></pre>
+
+                    <h2 id="sec-5">なぜよりによってそのプロセスが死んだのか</h2>
+
+                    <p>カーネルは候補ごとに badness スコアを付けて最も高いものを選ぶ。現在のソースではその計算が、<strong>RSS とスワップエントリ数、そしてページテーブルの大きさをページ単位に換算した値を足すこと</strong>から出発する。「このプロセスを今終わらせたら何ページ戻ってくるか」に対する推定値だ。その次に <code>oom_score_adj</code> が加えられるが、そのまま加えられるのではなく<strong>全体のページ数を 1000 で割った値を掛けてから加えられる。</strong></p>
+
+                    <p>この掛け算が実務的に重要だ。<code>oom_score_adj</code> 1 点が全体メモリの 0.1 パーセントに当たるページ数に換算されるので、この値を 100 に上げてあるプロセスは<strong>全体メモリの 10 パーセントを余分に使っているかのように扱われる。</strong>128GiB のノードなら 13GiB 余分に使っている計算になる。「最も使っているプロセスが死ぬ」が常に正しいとは限らない算数的な理由がここにある。</p>
+
+                    <p>カーネルドキュメントによればこの値の範囲は -1000 から +1000 だ。ドキュメントは最も低い -1000 について<strong>そのタスクの OOM キリングを事実上無効にする値</strong>だと記す。常に badness スコア 0 を報告するようになるから、という説明である。<code>/proc/&lt;pid&gt;/oom_score</code> で露出される値にはこの重みがすでに含まれ、実質範囲が 0 から 2000 になるという点もドキュメントにある。</p>
+
+                    <pre><code># 特定プロセスの現在のスコアと重み
+cat /proc/&lt;pid&gt;/oom_score
+cat /proc/&lt;pid&gt;/oom_score_adj
+
+# 重みが 0 でないプロセスだけを洗い出す(誰が手を入れたかの確認)
+for p in /proc/[0-9]*; do
+  a=$(cat "$p/oom_score_adj" 2>/dev/null) || continue
+  [ "$a" = "0" ] &amp;&amp; continue
+  printf '%s\t%s\t%s\n' "${p#/proc/}" "$a" "$(tr -d '\0' &lt; "$p/comm")"
+done</code></pre>
+
+                    <ul>
+                        <li>カーネルは<strong>スレッド一つではなくスレッドグループ</strong>を単位として見る。表に <code>tgid</code> 列がある理由だ</li>
+                        <li><strong>監視エージェントやサイドカーはたいていスコアが低い。</strong>メモリを少ししか使わないからだ。だから死ぬのは本体で、死んだ後もエージェントは生きて「プロセスなし」を報告する</li>
+                        <li>逆に<strong>サイドカーに重みを上げたまま忘れている場合</strong>がある。はるかに少ないのに先に死ぬなら、この列を疑う</li>
+                        <li>オーケストレータがワークロードの等級に応じてこの値を設定することもある。<strong>触った覚えがなくても 0 でない場合がある</strong></li>
+                    </ul>
+
+                    <div class="callout">
+                        <strong>危険表示。</strong><code>oom_score_adj</code> を -1000 に下げるのはそのプロセスを候補から外す措置であって、メモリを増やしてやる措置ではない。不足はそのまま残り、<strong>代わりに別の何かが死ぬ。</strong>データベースを免除しておけばその隣の監視エージェントが死に、そうなると障害を誰も知らせてくれない。免除は対応ではなく<strong>死ぬ順番を変えること</strong>なので、何が代わりに死んでよいのかを先に決めてから触る値だ。
+                    </div>
+
+                    <h2 id="sec-6">システム OOM と cgroup OOM は別の事件だ</h2>
+
+                    <p>カーネルソースにはこの二つが分かれる地点が一行で入っている。OOM 処理関数を呼ぶときメッセージ文字列を三項演算子で選ぶのだが、メモリ cgroup の OOM でなければ <code>"Out of memory"</code>、そうなら <code>"Memory cgroup out of memory"</code> を渡す。この文字列が前節 (3) 番フォーマットの先頭の <code>%s</code> の位置に入る。<strong>ログの最初の単語が事件の種類を教えてくれる。</strong></p>
+
+                    <table>
+                        <thead>
+                            <tr><th>区分</th><th>システム(ノード)OOM</th><th>cgroup OOM</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>引き金</td><td>ノード全体で回収が失敗した</td><td>その cgroup が自分の上限に達した</td></tr>
+                            <tr><td>ログの先頭</td><td><code>Out of memory: Killed process ...</code></td><td><code>Memory cgroup out of memory: Killed process ...</code></td></tr>
+                            <tr><td>候補範囲</td><td>ノードのすべてのプロセス</td><td>その cgroup とその配下</td></tr>
+                            <tr><td>ノードの余裕</td><td>ない。だからこの事件が起きた</td><td><strong>余っている場合がある。</strong>ダッシュボードは穏やかに見える</td></tr>
+                            <tr><td>一緒に死ぬもの</td><td>無関係なワークロードまで揺れる</td><td>そのコンテナだけが死ぬ</td></tr>
+                            <tr><td>よくある誤診</td><td>アプリケーションのリークだと決めつける</td><td>ノードを増設する</td></tr>
+                            <tr><td>先に見る場所</td><td><code>/proc/meminfo</code>、カーネルログのメモリダンプ</td><td><code>memory.events</code>、<code>memory.max</code>、<code>memory.current</code></td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>カーネルの cgroup v2 ドキュメントは <code>memory.max</code> を<strong>メモリ使用量のハード上限</strong>と定義しつつ、cgroup の使用量がこの上限に達して減らせない場合、その cgroup 内で OOM キラーが呼び出されると記す。<code>memory.high</code> は違う。使用量が high 境界を越えるとその cgroup のプロセスがスロットリングされ強い回収圧力を受けるが、<strong>high 上限を越えることは決して OOM キラーを呼び出さない</strong>と同じドキュメントが記している。high はブレーキで、max は壁だ。</p>
+
+                    <pre><code># コンテナの中から - cgroup v2
+cat /sys/fs/cgroup/memory.max        # 壁。max なら上限なし
+cat /sys/fs/cgroup/memory.high       # ブレーキ
+cat /sys/fs/cgroup/memory.current    # 今どれだけ使っているか
+cat /sys/fs/cgroup/memory.events     # ここで low/high/max/oom/oom_kill を見る
+cat /sys/fs/cgroup/memory.stat | head -20
+
+# ノードから特定の cgroup パスを指定するとき
+cat /sys/fs/cgroup/kubepods.slice/.../memory.events</code></pre>
+
+                    <p><code>memory.events</code> の二つの値は意味が違い、この差が予報の役割を果たす。ドキュメントは <code>oom</code> を<strong>cgroup の使用量が上限に達して確保が失敗しかけた回数</strong>、<code>oom_kill</code> を<strong>この cgroup に属するプロセスが何らかの OOM キラーによって殺された回数</strong>と定義する。つまり <code>oom</code> は上がっているのに <code>oom_kill</code> が 0 ならまだ誰も死んでいないということで、それは<strong>次のデプロイか次のピークで死ぬという予告</strong>だ。この値をアラートに掛けておけば事後ではなく事前に手を入れられる。</p>
+
+                    <p>同じドキュメントに <code>memory.oom.group</code> もある。この cgroup を OOM キラーが<strong>分割できない一つのワークロード</strong>として扱うかを決める値で、設定するとその cgroup と配下のすべてのタスクが一緒に死ぬか誰も死なないかになる。プロセス一つだけが死んで残りが半分の状態で回り続ける事態を防ぐスイッチだ。</p>
+
+                    <p>ランタイムがメモリ上限をどう認識するかはまた別の層だ。JVM のようにヒープサイズをコンテナの上限から推測するランタイムには固有の罠があり、その話は<a href="jvm_container_resource_limits.html">コンテナの中の JVM が上限を読み違えるとき</a>で別に扱った。ここではカーネルと cgroup 側の一般論だけを見る。</p>
+
+                    <h2 id="sec-7">cgroup v1 と v2 で変わるもの</h2>
+
+                    <p>同じ「メモリ上限 512Mi」が二つのバージョンで違うものを意味しうる。ファイル名からして違い、スワップの数え方が違う。</p>
+
+                    <pre><code># どのバージョンで動いているか - v2 単独なら cgroup2fs と出る
+stat -fc %T /sys/fs/cgroup
+mount | grep -E 'cgroup|cgroup2'
+
+# v1 系で見るファイル
+cat /sys/fs/cgroup/memory/memory.limit_in_bytes
+cat /sys/fs/cgroup/memory/memory.usage_in_bytes
+cat /sys/fs/cgroup/memory/memory.failcnt
+cat /sys/fs/cgroup/memory/memory.memsw.limit_in_bytes
+cat /sys/fs/cgroup/memory/memory.oom_control
+grep -E '^(cache|rss|mapped_file) ' /sys/fs/cgroup/memory/memory.stat</code></pre>
+
+                    <ul>
+                        <li><strong>スワップの数え方。</strong>v1 は <code>memory.memsw.limit_in_bytes</code> でメモリとスワップを<strong>合わせて</strong>掛ける。v2 は <code>memory.swap.max</code> で別に掛ける。同じ数字を入れても意味が変わる代表的な場所だ</li>
+                        <li><strong>使用量の値の正確さ。</strong>v1 のドキュメントは <code>memory.usage_in_bytes</code> が正確な値を示さないと自ら明かしつつ、より精密に見るには <code>memory.stat</code> の RSS と CACHE(そして SWAP)を使えと案内する</li>
+                        <li><strong>失敗回数のカウンタ。</strong>v1 の <code>memory.failcnt</code> は上限にぶつかった回数を数える。v2 でこの位置を代わりに担うのが <code>memory.events</code> だ</li>
+                        <li><strong>上限に達したときの手順は同じ骨格だ。</strong>v1 のドキュメントは、cgroup が上限を超えるとまずその cgroup からメモリを回収しようと試み、成功しなければ OOM ルーチンが呼び出され最も大きいタスクを選んで殺すと記す</li>
+                        <li><strong>OOM キリングを切るスイッチ。</strong>v1 の <code>memory.oom_control</code> には <code>oom_kill_disable</code> と <code>under_oom</code> がある。ドキュメントは <code>under_oom</code> が 1 のときその cgroup が OOM 状態であり<strong>タスクが停止している場合がある</strong>と記す</li>
+                    </ul>
+
+                    <div class="callout">
+                        <strong>危険表示。</strong>v1 の <code>oom_kill_disable</code> を有効にすると、死なない代わりに<strong>止まる。</strong>プロセスは一覧に生きていてヘルスチェックの種類によっては通過することもあるのに、リクエストを一つも処理できない。死んで再起動されるほうがよい場合が多いので、<strong>この値はその状態を検知する別の手段があるときにだけ</strong>検討する。
+                    </div>
+
+                    <h2 id="sec-8">オーバーコミット - malloc が成功しても死ぬ仕組み</h2>
+
+                    <p>Linux は既定で実際に持っているより多くのメモリを約束する。そうするほうが大半の場合に得だからだ。<code>fork</code> の直後に <code>exec</code> を呼ぶプロセスはコピーされたアドレス空間をほとんど使わないし、大きな配列を先に確保して前のほうだけ使うコードもよくある。<strong>物理ページはそのアドレスへ最初に書き込むときに割り当てられる。</strong></p>
+
+                    <p>だから失敗が遅れて来る。確保関数はアドレス空間を得ることに成功し、死ぬのはそのアドレスへ最初に書き込む瞬間だ。コードで見れば<strong>成功した確保の次の行で死ぬ。</strong>確保失敗の処理をどれだけ緻密に書いても、その経路に来ない理由がここにある。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>vm.overcommit_memory</th><th>カーネルドキュメントの説明</th><th>実際に起こること</th><th>副作用</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>0 (既定)</td><td>カーネルがユーザ空間の要求サイズを全体メモリとスワップの合計と比較し、明白な過剰要求を拒否する</td><td>たいていの要求は通る</td><td>失敗が確保時点ではなく使用時点に OOM として現れる</td></tr>
+                            <tr><td>1</td><td>実際に尽きるまでカーネルがメモリは常に十分だというふりをする</td><td>ほぼすべての要求が成功する</td><td>確保失敗という信号が消え、すべての問題が OOM に収束する</td></tr>
+                            <tr><td>2</td><td>いかなるオーバーコミットも防ごうとする方針を使う</td><td><code>CommitLimit</code> を超えるコミット自体が拒否される</td><td>今まで成功していた確保が失敗し始める</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>オーバーコミット会計のドキュメントは 2 番モードの上限を<strong>スワップに物理 RAM の設定可能な割合(既定 50 パーセント)を足した値</strong>と説明する。この割合は <code>vm.overcommit_ratio</code>、絶対値は <code>vm.overcommit_kbytes</code> で決め、どちらも 2 番モードでのみ効力がある。現在の上限とコミット量は <code>/proc/meminfo</code> の <code>CommitLimit</code> と <code>Committed_AS</code> で見られると記されている。</p>
+
+                    <pre><code>sysctl vm.overcommit_memory vm.overcommit_ratio vm.overcommit_kbytes
+
+# 今どれだけ約束しているか - Committed_AS が CommitLimit にどこまで近いかを見る
+grep -E '^(MemTotal|SwapTotal|CommitLimit|Committed_AS):' /proc/meminfo</code></pre>
+
+                    <p><code>Committed_AS</code> はドキュメント上<strong>システムに現在割り当てられているメモリの量</strong>であり、プロセスが確保したすべてのメモリの合計で、まだ実際に使っていなくても含まれるという但し書きが付いている。したがってこの値が <code>MemTotal</code> を大きく超えるのは<strong>正常であり、オーバーコミットが働いている証拠</strong>だ。問題として見る値ではない。</p>
+
+                    <div class="callout">
+                        <strong>危険表示。</strong><code>vm.overcommit_memory</code> を 2 に変えると OOM の代わりに確保失敗が始まる。大きく予約して少しだけ使うプロセスは<strong>起動すらできない場合がある。</strong>稼働中のノードで <code>sysctl</code> によって即座に変えるのは全サービスを同時に揺らす措置なので、まず <code>Committed_AS</code> と <code>CommitLimit</code> の平常の推移を数日測り、ステージングで起動を確認してから行う。
+                    </div>
+
+                    <h2 id="sec-9">スワップが変えるもの</h2>
+
+                    <p>スワップがあればカーネルに回収する場所がもう一つできる。匿名ページをストレージへ追い出してその場所を再利用できるので OOM が遅れて来る。代わりにその区間が遅くなる。この「遅さ」が<strong>死ぬことよりましか</strong>はサービスの性質次第だ。</p>
+
+                    <p>カーネルの PSI ドキュメントはこの状態を二行に分けて見せる。<code>some</code> は<strong>一部のタスクがその資源を待って停滞していた時間の割合</strong>で、<code>full</code> は<strong>アイドルでないすべてのタスクが同時に停滞していた時間の割合</strong>だ。ドキュメントは <code>full</code> の状態を浪費された CPU サイクルとして説明し、スラッシングを指すと記す。<code>full</code> が上がっているなら、そのノードはまだ死んでいないだけで、すでに仕事をしていない。</p>
+
+                    <pre><code>swapon --show
+free -h
+grep -E '^(SwapTotal|SwapFree|SwapCached):' /proc/meminfo
+
+# 今止まっている割合 - some と full を分けて見る
+cat /proc/pressure/memory
+cat /sys/fs/cgroup/memory.pressure
+
+# どのプロセスがスワップに出ているか
+grep -H VmSwap /proc/[0-9]*/status | sort -t: -k3 -n -r | head -10</code></pre>
+
+                    <p>コンテナ環境でスワップを切る慣行にはこういう背景がある。応答遅延が死ぬことより悪いサービスがあるからだ。30 秒かかる応答はすでに失敗なのにプロセスは生きているのでヘルスチェックを通過し、そうするとトラフィックが入り続けて状態はさらに悪くなる。この場合は<strong>早く死んで早く再起動されるほう</strong>が全体の可用性に勝る。</p>
+
+                    <ul>
+                        <li>Kubernetes のドキュメントは、既定で kubelet が<strong>スワップの有効なリナックスノードでは起動しない</strong>と記す。起動させるには <code>failSwapOn: false</code> を明示しなければならない</li>
+                        <li>スワップの挙動は <code>memorySwap.swapBehavior</code> で決める。既定の <code>NoSwap</code> ではそのノードの Pod として回るワークロードはスワップを使わないし使えず、<code>LimitedSwap</code> では使える</li>
+                        <li>同じドキュメントに注目すべき手がかりがある。<code>NoSwap</code> にしてスワップを許可しても、<strong>Kubernetes が管理しないプロセス、つまり systemd のサービスや kubelet 自身はスワップを使える</strong>ということだ。ノードのスワップ使用量が 0 でないからといって Pod が使っているとは限らない</li>
+                        <li>kubelet はコンテナランタイム API で設定を指示し、cgroup v2 の場合の例としてドキュメントが挙げるのが <code>memory.swap.max</code> だ。前節のファイルとそのままつながる</li>
+                        <li>スワップを有効にすると決めたなら<strong>遅延がどこまで許容されるかを先に決める。</strong>決めないと「死なないがずっと遅い」状態が常態化し、その状態はアラートに掛かりにくい</li>
+                    </ul>
+
+                    <div class="callout">
+                        <strong>危険表示。</strong>稼働中のノードでの <code>swapoff -a</code> は、スワップに出ていたページを<strong>すべて物理メモリへ読み戻す</strong>動作だ。その瞬間の物理的な余裕がスワップ使用量より小さければ、その場で OOM を呼ぶ。切る前に <code>SwapTotal</code> から <code>SwapFree</code> を引いた値が <code>MemAvailable</code> に収まるかを確認し、トラフィックの少ない時間帯に一枚ずつ切る。
+                    </div>
+
+                    <h2 id="sec-10">RSS がすべてではない</h2>
+
+                    <p>メモリを見るとき最もよく読み違える値が <code>free</code> の free 列だ。<code>free</code> のマニュアルは free を<strong>使われていないメモリ</strong>としてのみ定義し、used を<strong>total から available を引いた値</strong>として計算すると記す。カーネル側でその available に当たるのが <code>/proc/meminfo</code> の <code>MemAvailable</code> であり、カーネルドキュメントはこの値を<strong>スワップせずに新しいアプリケーションを開始するためにどれだけのメモリが利用可能かの推定値</strong>と定義し、<code>MemFree</code> と <code>SReclaimable</code>、ファイル LRU リストの大きさ、各ゾーンの low watermark から計算されると記す。<strong>見るべき値は free ではなく available だ。</strong></p>
+
+                    <pre><code>free -h
+grep -E '^(MemTotal|MemFree|MemAvailable|Buffers|Cached|Shmem|Slab|SReclaimable|SUnreclaim):' /proc/meminfo
+
+# プロセス一つの内訳 - VmRSS は下の三つの合計だ
+grep -E '^(VmRSS|RssAnon|RssFile|RssShmem|VmSwap):' /proc/&lt;pid&gt;/status
+
+# ファイルのように見えてメモリである場所
+df -h /dev/shm</code></pre>
+
+                    <ul>
+                        <li><strong>ページキャッシュはロックされたメモリではない。</strong>必要なら回収される。キャッシュが大きくて free が小さく見えるのは正常であり、その状態をメモリ不足として報告すると見当違いの場所を直すことになる</li>
+                        <li><strong>共有メモリと tmpfs は違う。</strong><code>/dev/shm</code> に積まれたものはファイルのように見えるがメモリであり、キャッシュのようには回収されない。カーネルドキュメントは <code>Shmem</code> を共有メモリと tmpfs が使う総量と定義する</li>
+                        <li><strong>カーネルスラブもメモリを使う。</strong><code>SReclaimable</code> は回収されうる部分、<code>SUnreclaim</code> はメモリ圧迫でも回収されない部分だ。後者が大きく増えていれば、ユーザ空間をいくら漁っても答えは出ない</li>
+                        <li><strong>RSS は合算してはいけない。</strong>カーネルドキュメントによれば <code>VmRSS</code> は <code>RssAnon</code>、<code>RssFile</code>、<code>RssShmem</code> の合計だが、共有ライブラリのように複数のプロセスが一緒に使うページがプロセスごとに数えられる。プロセス別 RSS を足してノードの使用量を推定すると実際より大きくなる</li>
+                        <li><strong>ファイルを掴んでいるプロセスもメモリとして計上される。</strong>削除されたのに開かれたままのファイルや大きなマッピングを抱えているプロセスを探す方法は<a href="find_process_holding_file.html">どのプロセスがこのファイルを掴んでいるのか</a>にまとめてある</li>
+                    </ul>
+
+                    <h2 id="sec-11">OOM は症状であって原因ではない</h2>
+
+                    <p>OOM キリングはメモリが不足したという事実を伝えるだけで、なぜ不足したのかは伝えない。そしてなぜ不足したのかは、死んだ瞬間のスナップショットではなく<strong>その手前の区間の形</strong>に入っている。死んだ時点の値はすでに全部大きくなった後なので、原因と結果が区別できない。症状は一つなのに原因は複数あり、順番を決めて切り分ける必要があるという点で、<a href="no_space_left_but_disk_free.html">ディスクは空いているのに No space left on device</a> と同じ種類の問題だ。</p>
+
+                    <ul>
+                        <li><strong>リーク</strong> — 時間に比例して上がる。再起動した後も<strong>同じ傾き</strong>でまた上がる。トラフィックのない深夜にも上がるならほぼ確定だ</li>
+                        <li><strong>リクエストの急増</strong> — 階段状に上がり、トラフィックのグラフと時刻が重なる。ピークが過ぎれば下がる。下がらなければ急増とリークが重なっている</li>
+                        <li><strong>上限設定のミス</strong> — デプロイ直後から始まる。前回のデプロイとマニフェストを並べれば数分で終わるので、順番として前に置く</li>
+                        <li><strong>上限のないキャッシュ</strong> — ヒット率は良くなり続けメモリは際限なく上がる。低負荷では見えず、負荷が増えたときに一気に破裂する。最大項目数や最大バイト数が掛かっているかをまず見る</li>
+                        <li><strong>結果セットが大きくなる</strong> — ページネーションのない照会、関連データを一件ごとに読み直して膨らんだ一覧。<strong>コードは変わっていないのにある日破裂する</strong>類はたいていこれで、傾きが緩やかなので見落としやすい</li>
+                        <li><strong>並行度の数値</strong> — リクエストあたりのバッファサイズ掛ける同時リクエスト数だ。ワーカ数やコネクションプールを上げた翌日に破裂する。デプロイ履歴ではなく<strong>設定変更の履歴</strong>から探さなければならない</li>
+                        <li><strong>隣人</strong> — システム OOM なのに自分のプロセスが選ばれた場合。原因は同じノードの別のワークロードで、こちらは単に図体が大きかっただけなので、自分のコードをいくら見ても何も出てこない</li>
+                        <li><strong>ノードの他の消費者</strong> — ログ収集デーモン、バックアップエージェント、カーネルスラブのようなコンテナでないもの。Pod 使用量の合計とノード使用量が大きく開いていればこちらだ</li>
+                    </ul>
+
+                    <p>切り分けに最も役立つ一つを選ぶなら<strong>傾きの形</strong>だ。直線か階段かのこぎりかを見るだけで候補の半分が落ちる。だから事後調査で真っ先に確保すべきはログではなく<strong>死ぬ前の数時間のメモリ時系列</strong>である。これがなければ調査は推測になる。</p>
+
+                    <h2 id="sec-12">防ぎ方 - 上限とリクエスト、そして再起動ループ</h2>
+
+                    <p>上限を掛けることは必要だが、それだけでは足りない。スケジューラはリクエスト値を見て配置を決めるので、リクエスト値がないか実際よりはるかに小さいと一つのノードに過密配置が起こる。するとコンテナごとの上限は守られるのに<strong>ノード全体が先に崩れる。</strong>Kubernetes のドキュメントは、ノードが資源を使い切ると BestEffort の Pod をまず、次に Burstable、最後に Guaranteed を追い出すと記す。リクエストと上限をどう書いたかが<strong>追い出しの順番を決める。</strong></p>
+
+                    <ul>
+                        <li><strong>上限とリクエストを一緒に掛ける。</strong>上限だけならスケジューラが実消費を知らず、リクエストだけなら暴走を止められない</li>
+                        <li><strong>リクエスト値は平常の使用量、上限はピークに余裕を足した値</strong>から出発する。二つを同じにすると等級は上がるがノードの利用率が下がる</li>
+                        <li><strong>上限の引き上げは時間を買う措置だ。</strong>リークなら周期が延びるだけ。買うと決めたなら<strong>いつまで買うのかをチケットに書く。</strong>書かなければその上限は恒久になる</li>
+                        <li><strong>readiness がなければ再起動直後が危ない。</strong>ウォームアップ中のインスタンスにトラフィックが入り、その負荷がまたメモリを押し上げる</li>
+                        <li><strong>liveness が過度に攻撃的だと OOM でない死が混ざる。</strong>少し止まったのを死んだと見て再起動させる場合だが、こちらは SIGTERM なので 143 だ。<strong>137 と 143 が混ざっているなら二つの事件を一つとして見ている</strong></li>
+                        <li><strong>終了猶予を超えると 143 ではなく 137 になる。</strong>同じ 137 でもカーネルログにその時刻の OOM 記録がなければこちらだ</li>
+                        <li><strong>レプリカを増やす対応は原因によって分かれる。</strong>リクエストが分散する種類なら効くが、インスタンスごとに同じキャッシュを一つずつ増やす構造ならノードの総量はむしろ増える</li>
+                        <li><strong>多プロセスのコンテナは <code>memory.oom.group</code> を検討する。</strong>一つだけ死んで残りが残れば、コンテナは生きているのに機能は半分になり、この状態は再起動でも整理されない</li>
+                    </ul>
+
+                    <p>再起動ループへ広がる順番はたいていこうだ。死ぬ。再起動する。ウォームアップ中に溜まったリクエストを一度に受ける。また死ぬ。オーケストレータが再起動間隔を徐々に広げるので、最初の数分は連続して死に、その後は断続的に死ぬ。<strong>この後半を「断続的な障害」と呼んだ瞬間、原因から遠ざかる。</strong>再起動間隔が指数的に広がる形かどうかを確認すれば、同じ事件かどうかがすぐ分かれる。</p>
+
+                    <div class="callout">
+                        <strong>危険表示。</strong>メモリ上限をそもそも無くすのは問題を無くすことではなく、<strong>cgroup OOM をシステム OOM へ格上げすること</strong>だ。上限があれば死ぬ対象はそのコンテナに限られるが、上限を無くせばカーネルがノード全体から候補を選ぶ。そのとき選ばれるものはこちらで決められず、無関係なワークロードまで一緒に揺れる。
+                    </div>
+
+                    <h2 id="sec-13">点検の順番</h2>
+
+                    <p>順番を決めておく理由は、段階ごとに次の段階が絞られるからだ。前のものを飛ばすと後のものを見ても解釈できない。</p>
+
+                    <ol>
+                        <li><strong>本当に死んだのかを確認する。</strong>終了コードが 137 か 143 か、0 から 125 の間か。コンテナなら前回の終了の理由とコードを一緒に見る。143 や正常終了が出れば OOM の調査は畳む</li>
+                        <li><strong>カーネルが殺したのかを確認する。</strong>同じ時刻にカーネルログへ OOM の記録があるか。なければリングバッファが流れたのかをまず確認し、流れていなければカーネルではなくオーケストレータか監視者か人だ</li>
+                        <li><strong>システムか cgroup かを切り分ける。</strong>ログの先頭が <code>Out of memory</code> か <code>Memory cgroup out of memory</code> か。コンテナ側では <code>memory.events</code> の <code>oom_kill</code> が増えたかを見る。ここで対応の方向が完全に分かれる</li>
+                        <li><strong>誰が増えたのかを見る。</strong>カーネルが残した表を rss で並べ替える。死んだプロセスが一位でなければ <code>oom_score_adj</code> 列を、一位なら <code>rss_anon</code> と <code>rss_shmem</code> の比重を見る</li>
+                        <li><strong>いつから増えたのかを見る。</strong>死ぬ前の数時間の時系列を確保する。直線か階段かのこぎりかがここで決まる</li>
+                        <li><strong>なぜ増えたのかを突き合わせる。</strong>デプロイ時刻、設定変更の履歴、トラフィックのグラフ、データ増加量を時系列の上に重ねる。重なるものが一つならほぼ答えで、なければ一層下(キャッシュ上限、結果セットの大きさ、並行度)を見る</li>
+                        <li><strong>何を変えるかを決める。</strong>上限の引き上げは最後の選択肢だ。その手前にキャッシュ上限、ページサイズ、ワーカ数、コネクションプールがある。上げると決めたなら<strong>どれだけ長くその状態に置くのかも併せて書く</strong></li>
+                    </ol>
+
+                    <h2 id="sec-14">まとめ</h2>
+
+                    <p>アプリケーションログが空なのは情報がないという意味ではなく、<strong>記録の主体が変わったという意味</strong>だ。SIGKILL は捕捉できないのでアプリケーションは何も書けず、その事件はカーネル側に残る。調査の出発点がアプリケーションログを掘ることではなく、終了コードを確認してカーネルログへ移ることである理由だ。</p>
+
+                    <p>移った後の分かれ道は一つだ。<strong>ノードが不足したのか、上限に達したのか。</strong>ログの最初の単語がこれを教えてくれ、ここで対応が完全に変わる。ノードの問題に上限をいじったり、上限の問題にノードを増設したりするのは、どちらも何も変えない。そしてどちらであれ<strong>OOM 自体は原因ではない。</strong>原因は死ぬ前の数時間の傾きの中にあり、その傾きは事件が終わった後には確保できない。だから残すべきはコマンドの一覧ではなく順番だ。死んだのが本当か、カーネルが殺したのか、システムか cgroup か、誰が増えたのか、いつから、なぜ。<strong>この六つを順に通れば、最後の問いにはたいてい答えが一つしか残らない。</strong></p>
+
+                    <h2 id="sec-15">確認できなかったこと</h2>
+
+                    <ul>
+                        <li>この記事を書いた環境は Windows 10 に Git Bash(MSYS2、GNU bash 5.2.37(1)-release)であり、<strong>Linux カーネルがない。</strong><code>dmesg</code>、<code>journalctl</code>、<code>/proc/meminfo</code>、<code>/sys/fs/cgroup</code> の<strong>実際の出力を再現して貼っていない。</strong>本文のコマンドは公式ドキュメントとカーネルソースに基づいて書いたものだ</li>
+                        <li>実行して確認したのは正確に三つだ。<code>bash -c 'kill -9 $$'</code> の終了ステータスが 137、<code>kill -15</code> が 143、シェルのバージョンが GNU bash 5.2.37(1)-release。この三つだけが本文の出力ブロックに実際の結果として載っている</li>
+                        <li>カーネルドキュメント(<code>docs.kernel.org</code>)は直接開いたが、<strong>カーネルソースの原文は <code>git.kernel.org</code> が 403 を返して開けなかった。</strong>フォーマット文字列と badness 計算は公式ミラーである <code>raw.githubusercontent.com/torvalds/linux</code> の master ブランチで確認した。特定ディストリビューションのカーネルのコードではない</li>
+                        <li><code>dump_tasks</code> の<strong>列構成はカーネルバージョンによって違う。</strong>sysctl ドキュメントの一覧と master ソースのヘッダ文字列はすでに食い違っている。自分のカーネルのヘッダ行を直接確認する必要がある</li>
+                        <li>badness 計算の関数名はバージョンによって変わってきた。そのため名前は写さず<strong>構成と <code>oom_score_adj</code> の換算方式</strong>だけを書いた。細部の実装はカーネルバージョンごとに確認が必要だ</li>
+                        <li>ログファイルのパスはディストリビューションとログデーモンの設定によって違う。<code>/var/log/messages</code> と <code>/var/log/syslog</code> のどちらが使われるかは<strong>確認できなかった</strong></li>
+                        <li>コンテナランタイムが<strong>終了コード 137 を付ける正確な規則</strong>は公式ドキュメントで確認できなかった。128 足すシグナル番号はシェルの規則としてこの環境で確認したものであり、ランタイムが同じ規則に従うという文書上の根拠は見つからなかった。Bash マニュアルの当該条項も gnu.org がレート制限で応答せず原文を開けなかった</li>
+                        <li>Kubernetes の QoS ドキュメントは追い出しの順番だけを説明し、<strong><code>oom_score_adj</code> を等級別にどう設定するかには触れていない。</strong>本文で「オーケストレータが設定することもある」以上に書かなかった理由だ。<code>systemd-oomd</code> のようなユーザ空間で動く OOM 管理者も扱っていない</li>
+                    </ul>
+
+                    <h2 id="sec-16">参考資料</h2>
+
+                    <ul>
+                        <li><a href="https://docs.kernel.org/admin-guide/mm/concepts.html" target="_blank" rel="noopener">Concepts overview (Linux kernel documentation)</a> — カーネルが OOM キラーを呼び出し犠牲にするタスクを選ぶという説明、ページキャッシュと回収の定義</li>
+                        <li><a href="https://docs.kernel.org/admin-guide/sysctl/vm.html" target="_blank" rel="noopener">Documentation for /proc/sys/vm/ (Linux kernel documentation)</a> — <code>overcommit_memory</code> の三つの値、<code>overcommit_ratio</code> と <code>overcommit_kbytes</code>、<code>oom_dump_tasks</code> がダンプに含める項目の一覧</li>
+                        <li><a href="https://docs.kernel.org/mm/overcommit-accounting.html" target="_blank" rel="noopener">Overcommit Accounting (Linux kernel documentation)</a> — 2 番モードの上限がスワップに物理 RAM の設定可能な割合(既定 50 パーセント)を足した値であるという定義</li>
+                        <li><a href="https://docs.kernel.org/admin-guide/cgroup-v2.html" target="_blank" rel="noopener">Control Group v2 (Linux kernel documentation)</a> — <code>memory.max</code> と <code>memory.high</code> の定義、<code>memory.events</code> の <code>oom</code> と <code>oom_kill</code>、<code>memory.oom.group</code></li>
+                        <li><a href="https://docs.kernel.org/admin-guide/cgroup-v1/memory.html" target="_blank" rel="noopener">Memory Resource Controller (cgroup v1)</a> — <code>memory.limit_in_bytes</code>、<code>memory.memsw.limit_in_bytes</code>、<code>memory.failcnt</code>、<code>memory.oom_control</code> と上限超過時の手順</li>
+                        <li><a href="https://docs.kernel.org/filesystems/proc.html" target="_blank" rel="noopener">The /proc Filesystem (Linux kernel documentation)</a> — <code>oom_score_adj</code> の範囲と -1000 の意味、<code>MemAvailable</code>、<code>CommitLimit</code>、<code>Committed_AS</code>、<code>VmRSS</code> の定義</li>
+                        <li><a href="https://docs.kernel.org/accounting/psi.html" target="_blank" rel="noopener">PSI - Pressure Stall Information</a> — <code>some</code> と <code>full</code> の定義、<code>full</code> がスラッシングを指すという説明</li>
+                        <li><a href="https://raw.githubusercontent.com/torvalds/linux/master/mm/oom_kill.c" target="_blank" rel="noopener">linux/mm/oom_kill.c (torvalds/linux, master)</a> — 列名の文字列、終了メッセージのフォーマット、<code>dump_header()</code>、二つの OOM のメッセージを分ける三項演算子、badness 計算</li>
+                        <li><a href="https://man7.org/linux/man-pages/man1/free.1.html" target="_blank" rel="noopener">free(1) - Linux manual page</a> — used が total から available を引いた値であるという定義と available 列の説明</li>
+                        <li><a href="https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/" target="_blank" rel="noopener">Resource Management for Pods and Containers (Kubernetes)</a> — メモリ上限が反応的に強制されるという記述</li>
+                        <li><a href="https://kubernetes.io/docs/concepts/cluster-administration/swap-memory-management/" target="_blank" rel="noopener">Swap Memory Management (Kubernetes)</a> — kubelet の既定の挙動、<code>NoSwap</code> と <code>LimitedSwap</code>、管理外のプロセスはスワップを使えるという手がかり</li>
+                        <li><a href="https://kubernetes.io/docs/concepts/workloads/pods/pod-qos/" target="_blank" rel="noopener">Pod Quality of Service Classes (Kubernetes)</a> — BestEffort、Burstable、Guaranteed の順に追い出されるという記述</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>この記事をシェア</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">スレッズ</button>
+                        <button id="link-copy" class="share-btn link-btn">リンクをコピー</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">一覧に戻る</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">一緒に使うと便利な無料ツール</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/char_counter.html">文字数カウント</a></li>
+      <li><a href="../static/json_formatter.html">JSON フォーマッター</a></li>
+      <li><a href="../static/regex_tester.html">正規表現テスター</a></li>
+      <li><a href="../static/jwt_decoder.html">JWTデコーダー・生成器 2026</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">すべてのツールを見る &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">関連記事</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="jvm_container_resource_limits.html">JVMはコンテナの上限をどう見ているか - KubernetesのRequestとLimitがヒープ・GC・遅延を決める場所 2026</a></li>
+      <li><a href="find_process_holding_file.html">ファイルを掴んでいるプロセスを見つける - 消したのに容量が戻らないとき</a></li>
+      <li><a href="ai_generated_code_disclosure_license.html">AIが書いたとライセンスに記すと - 利用許諾と出所開示が分かれる場所</a></li>
+      <li><a href="always_available_terminal.html">ターミナルが常に開いていると何が変わるのか - 開くまでの数秒が変えるもの</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('リンクがコピーされました。Threadsアプリに貼り付けてシェアしてください！');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('リンクがコピーされました！'); });
+    });
+    </script>
+</body>
+</html>

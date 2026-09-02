@@ -1,0 +1,873 @@
+<!DOCTYPE html>
+<!--
+ * Tech blog post template
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="en">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Finding the Process Holding a File - When Deleting It Frees Nothing</title>
+    <meta name="description" content="rm removes a name, not data. How to separate the two counters and pin the holder with lsof +L1, fuser and a /proc sweep, plus the Windows locking side.">
+    <meta name="keywords" content="lsof, fuser, proc fd, deleted open file, link count, unlink, file locking, Restart Manager, openfiles, df du mismatch, log rotation, NFS sillyrename, dev, infra, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/en/posts/find_process_holding_file.html">
+
+    <meta property="og:title" content="Finding the Process Holding a File - When Deleting It Frees Nothing">
+    <meta property="og:description" content="How to pin down who is still holding a deleted file, on Linux and on Windows, with real command output rather than assertions.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/en/posts/find_process_holding_file.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="en_US">
+    <meta property="article:published_time" content="2026-09-02">
+    <meta property="article:section" content="Dev &amp; Infra">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Finding the Process Holding a File">
+    <meta name="twitter:description" content="rm removes a name. What removes the data is the kernel, at the moment the last reference closes.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "Finding the Process Holding a File - When Deleting It Frees Nothing",
+      "alternativeHeadline": "Two counters, link count and open references, and the order in which you pin the holder on Linux and Windows",
+      "datePublished": "2026-09-02",
+      "dateModified": "2026-09-02",
+      "inLanguage": "en-US",
+      "articleSection": "Dev & Infra",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "lsof, fuser, proc fd, deleted open file, link count, unlink, file locking, Restart Manager, openfiles, df du mismatch",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/en/posts/find_process_holding_file.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "I deleted the file, so why did the disk space not come back?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Because rm calls unlink, and unlink removes a directory entry rather than data. The POSIX specification puts it plainly: the link shall be removed before unlink returns, but the removal of the file contents shall be postponed until all references to the file are closed. So a file carries two counters. One is the link count, the number of names pointing at the inode. The other is the number of open file descriptors. rm drives only the first to zero. Blocks are returned at the moment the second reaches zero. That is why the fix is never to delete the file again but to make the holder let go."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How do I find which process is holding the file on Linux?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "There are three routes. lsof +L1 selects only open files whose link count is below one. The manual says that when +L is followed by a number, only files having a link count less than that number will be listed, and specifying +L adds an NLINK column. fuser -v takes a path and answers with the processes using it in a ps-like layout, where the ACCESS column marks f for an open file, F for a file open for writing, and m for an mmapped file or shared library. On a server with neither tool installed, sweep /proc directly. The kernel appends the marker (deleted) to the symlink target under each process fd directory, so filtering on that string is enough."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Can I reclaim the space without restarting the process?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "The widely known trick is to truncate the open file descriptor directly. It cannot be undone and there is no confirmation step. Pick one wrong descriptor number and a different file that process has open is emptied instead. It also works only on certain targets. A log that is appended to at the end survives truncation because the next write simply continues at the new end, but a data file or database file that computes offsets and reads specific positions will find its own view of the file out of step with reality the instant you cut it. Whenever a restart is possible, a restart is the safer path."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Why does Windows refuse to delete a file that is in use?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Windows does not refuse unconditionally. The process that opens the file chooses a share mode at open time and the kernel enforces it. The CreateFile documentation states that if the share parameter is zero the file cannot be shared and cannot be opened again until the handle is closed. If the opener instead passes FILE_SHARE_DELETE, deletion succeeds. Running both cases shows the split clearly: a file opened with no sharing rejects delete, rename and read alike, while a file opened with delete in its share list loses its name immediately even though the holder is still alive. The Unix flock is different in kind, because the manual says a process is free to ignore the use of flock and perform I/O on the file."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Why do deleted files on NFS linger as names beginning with .nfs?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "That is the NFS client faking POSIX behaviour, a trick usually called silly rename. A file whose name is gone must still be readable while open references remain, and the protocol does not support that directly, so the client kernel renames the file to a .nfsXXXX name instead of removing it. The Linux NFS wiki explains that the client removes the new name when the vnode becomes inactive, and that a crash between the rename and the remove leaves a garbage file on the server. So such a file is not litter to be scrubbed but a marker saying something still has it open. Find and clear the holder and the name disappears on its own."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/find_process_holding_file.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/find_process_holding_file.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/find_process_holding_file.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/find_process_holding_file.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/find_process_holding_file.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "Home",
+      "item": "https://braindetox.kr/en/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "Dev & Infra",
+      "item": "https://braindetox.kr/en/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "Finding the Process Holding a File - When Deleting It Frees Nothing",
+      "item": "https://braindetox.kr/en/posts/find_process_holding_file.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="Finding the Process Holding a File - When Deleting It Frees Nothing">
+                <meta itemprop="datePublished" content="2026-09-02">
+                <meta itemprop="dateModified" content="2026-09-02">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="lsof, fuser, proc fd, deleted open file, link count, unlink, file locking, Restart Manager, openfiles, df du mismatch">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/en/posts/find_process_holding_file.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">Finding the Process Holding a File - When Deleting It Frees Nothing</h1>
+                    <h2 class="post-subtitle">rm removes a name. The order in which you pin down whatever is still holding on, on Linux and on Windows</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-02">2026-09-02</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">Dev &amp; Infra</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>The sequence is almost always the same. An alert says the disk is full. You find a large log and remove it with <code>rm</code>. It no longer appears in <code>ls</code>. And yet <code>df</code> has not moved by a single digit. You wait a few minutes and it is still the same. So you go looking for more things to delete.</p>
+
+                    <p>The direction is already wrong at that point. The problem is not that there is too little left to delete, it is that <strong>what you already deleted is still alive</strong>. This article covers only one thing: <strong>the procedure for identifying who is holding it</strong>. The four-way classification of why the symptom appears at all lives in <a href="no_space_left_but_disk_free.html">No space left on device While the Disk Is Not Full</a>, and this piece picks up one branch of it.</p>
+
+                    <div class="callout">
+                        Two of the operations below, <strong>killing a process</strong> and <strong>truncating a file descriptor</strong>, cannot be undone. Each carries its own warning box in the relevant section, so on production hardware it is worth reading that paragraph before touching anything. Not mixing read-only commands with state-changing ones is very nearly the whole discipline of this task.
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>What this article covers</h3>
+                        <ol>
+                            <li><a href="#sec-1">There are two counters - names and references</a></li>
+                            <li><a href="#sec-2">The environment these outputs came from</a></li>
+                            <li><a href="#sec-3">The symptom - df and du disagree</a></li>
+                            <li><a href="#sec-4">The name goes, the inode stays</a></li>
+                            <li><a href="#sec-5">Route 1 - sweeping /proc by hand</a></li>
+                            <li><a href="#sec-6">Route 2 - lsof, the commands and how to read them</a></li>
+                            <li><a href="#sec-7">Route 3 - fuser, from a path to a process</a></li>
+                            <li><a href="#sec-8">When more than one holder exists</a></li>
+                            <li><a href="#sec-9">Windows - finding who locked it</a></li>
+                            <li><a href="#sec-10">Windows - the methods that do not work</a></li>
+                            <li><a href="#sec-11">Restart is the answer, but when you cannot restart</a></li>
+                            <li><a href="#sec-12">Locking is a different story</a></li>
+                            <li><a href="#sec-13">Containers - a pid depends on the vantage point</a></li>
+                            <li><a href="#sec-14">The .nfs files on network filesystems</a></li>
+                            <li><a href="#sec-15">Keeping it from happening at all</a></li>
+                            <li><a href="#sec-16">The order to follow under pressure</a></li>
+                            <li><a href="#sec-17">Summary</a></li>
+                            <li><a href="#sec-18">What I could not verify</a></li>
+                            <li><a href="#sec-19">References</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">There are two counters - names and references</h2>
+
+                    <p>The whole phenomenon follows from one sentence. <strong><code>rm</code> is not a command that deletes data.</strong> The system call it invokes is <code>unlink</code>, and that operation <strong>detaches one name written in a directory</strong>. The data lives in the inode, not in the name, and the inode does not vanish just because a name did.</p>
+
+                    <p>The POSIX specification nails this down with no room for misreading: the link is removed before <code>unlink</code> returns, but <strong>the removal of the file contents is postponed until all references to the file are closed</strong>. So a single file carries two counters of different character, and blocks come back only when both hit zero.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Counter</th><th>What it counts</th><th>What drives it to zero</th><th>Where you see it</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Link count</td><td>Directory entries pointing at this inode</td><td><code>rm</code> · <code>unlink</code> · overwrite by <code>mv</code></td><td><code>stat -c %h</code> · second column of <code>ls -l</code></td></tr>
+                            <tr><td>Open references</td><td>Descriptors and mappings holding this inode</td><td>Process exit · <code>close()</code> · log reopen signal</td><td><code>lsof</code> · <code>fuser</code> · <code>/proc/&lt;pid&gt;/fd</code></td></tr>
+                            <tr><td>Condition for release</td><td>The moment both reach zero</td><td>The kernel, all at once, at the last close</td><td><code>df</code> free space jumps like a step</td></tr>
+                            <tr><td>What the tools can see</td><td><code>du</code> walks names, <code>df</code> counts blocks</td><td>With no name left, <code>du</code> cannot see it</td><td>The gap between them is the held capacity</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>This behaviour is a safety mechanism rather than a defect. It would be intolerable for a reader to break simply because another process removed the file mid-read. The trouble is that the safety mechanism <strong>fires silently in production</strong>. No error is raised, nothing is logged, and space merely fails to return.</p>
+
+                    <h2 id="sec-2">The environment these outputs came from</h2>
+
+                    <p>The subject is Linux servers, but the environment that produced the output below is <strong>Git Bash on Windows 10</strong>. I state that up front because the reader needs to be able to tell <strong>which output actually happened and which command is printed here with no output at all</strong>.</p>
+
+                    <pre><code>$ bash --version | head -1
+GNU bash, version 5.2.37(1)-release (x86_64-pc-msys)
+
+$ uname -a
+MINGW64_NT-10.0-19045 3.5.7-882031da.x86_64 2025-01-30 11:14 UTC x86_64 Msys
+
+$ git --version
+git version 2.48.1.windows.1
+
+$ stat --version | head -1
+stat (GNU coreutils) 8.32
+
+$ stat -f -c 'bsize=%s' /tmp/demo
+bsize=4096
+
+# On the PowerShell side
+PS&gt; $PSVersionTable.PSVersion.ToString()
+5.1.19041.6456</code></pre>
+
+                    <p>coreutils here is the same GNU 8.32 as on Linux, so the option behaviour of <code>stat</code>, <code>df</code>, <code>du</code> and <code>truncate</code> is identical. MSYS supplies its own emulation of <code>/proc</code>, and <strong>the fact that this is not the Linux kernel procfs</strong> matters exactly once, later on. Here is the inventory of what ran and what did not.</p>
+
+                    <ul>
+                        <li><strong>Ran, Linux side</strong> — reproducing a deleted-but-open file, tracking inode and link count with <code>stat -c</code>, measuring free blocks with <code>stat -f</code>, reading <code>/proc/&lt;pid&gt;/fd</code> and sweeping all of it, the behaviour with two holders, an attempt at descriptor truncation, and the open-then-<code>unlink</code> idiom</li>
+                        <li><strong>Ran, Windows side</strong> — file locking reproduced under two different share modes, <code>Remove-Item</code>, <code>Rename-Item</code> and <code>Get-Content</code> against a locked file, <code>rm</code> and <code>cat</code> from Git Bash, identifying the holder through the Restart Manager API, <code>openfiles</code>, and a module search with <code>Get-Process</code></li>
+                        <li><strong>Did not run</strong> — <code>lsof</code> and <code>fuser</code> (neither is installed here), anything involving containers or namespaces, and NFS mounts</li>
+                        <li><strong>Not invented</strong> — <strong>there is not one line of output from a command I could not run.</strong> Only the command form and <strong>how to read it</strong> appear, on the authority of each tool's manual</li>
+                        <li><strong>Edited</strong> — paths were shortened to <code>/tmp/demo</code>. <strong>No number was changed.</strong> This is a personal machine with other work running on it, so free-block figures carry noise of a few hundred blocks, and that noise was left in place</li>
+                        <li>Block size is reported as 4,096 bytes. Multiply any free-block figure below by 4,096 to get bytes</li>
+                    </ul>
+
+                    <h2 id="sec-3">The symptom - df and du disagree</h2>
+
+                    <p>Diagnosis starts from <strong>two tools giving different answers</strong>. <code>du</code> walks directories and counts files that have names. A file whose name is gone is outside its field of view. <code>df</code> reads the block accounting of the filesystem, so it still counts the held space as <strong>used</strong>. They diverge, and <strong>the width of the divergence is the held capacity</strong>.</p>
+
+                    <p>Here a 200MiB file was created, held open by <code>tail -f</code>, deleted, and <code>df -h</code> printed verbatim at each stage.</p>
+
+                    <pre><code>--- before rm ---
+du -sh . = 200M
+  Filesystem   Size  Used Avail Use% Mounted on
+  /tmp/demo    931G  601G  331G  65% /tmp
+
+--- after rm ---
+du -sh . = 0
+  Filesystem   Size  Used Avail Use% Mounted on
+  /tmp/demo    931G  601G  331G  65% /tmp
+
+--- after killing the holder ---
+  Filesystem   Size  Used Avail Use% Mounted on
+  /tmp/demo    931G  600G  332G  65% /tmp</code></pre>
+
+                    <p>Read the three blocks side by side and the order is unmistakable. <code>rm</code> changed only <code>du</code>, from 200M to 0, while <code>df</code> <strong>did not move by a single digit</strong>. The shift in <code>df</code> from 601G/331G to 600G/332G came <strong>after the process was killed</strong>. What returned the space was not <code>rm</code> but <code>kill</code>.</p>
+
+                    <ul>
+                        <li>In the field this symptom usually shows up first as a <strong>graph</strong>. If a cleanup ran and the disk usage line stayed flat instead of stepping down, this cause is likely</li>
+                        <li>Comparing a <code>du -sh /</code> total against the Used column of <code>df</code> is the cheapest first test. A large gap means unnamed files exist</li>
+                        <li>The two values are never identical to begin with. Reserved blocks, journals and directories hidden under mounts make a few percent normal. The signal is a gap <strong>measured in tens of gibibytes</strong></li>
+                        <li>One trap deserves naming. Running <code>du</code> as a non-root account silently skips directories it cannot read. A gap produced that way has nothing to do with this phenomenon</li>
+                    </ul>
+
+                    <h2 id="sec-4">The name goes, the inode stays</h2>
+
+                    <p>If the previous section was the symptom, this one is the mechanism seen directly. A 512MiB file was created, held open by <code>tail -f</code>, deleted, and then <strong>the same inode was inspected again through the file descriptor</strong>.</p>
+
+                    <pre><code>[1] right after creation
+    name=app.log inode=4503599629412470 links=1 size=536870912 blocks=524288
+    free=86810586   du -sh . = 512M
+
+[2] tail -f (pid=1442) holds it open
+
+[3] right after rm - the name is gone
+    ls -A: []
+    du -sh . = 0    free=86811452
+
+[4] but through the fd the inode is still alive
+    /proc/1442/fd/3  inode=4503599629412470 links=0 size=536870912 blocks=524288
+    readlink        /tmp/demo/app.log (deleted)
+
+[5] the held fd still reads
+    $ head -c 16 /proc/1442/fd/3 | od -An -tx1
+      00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+[6] after kill: free=86939254</code></pre>
+
+                    <p>Read it in this order. <strong>The inode number is the same in [1] and [4].</strong> It is the same object after deletion. The only thing that changed is <code>links</code>, from 1 to 0. Meanwhile <code>size</code> and <code>blocks</code> are <strong>still 536870912 and 524288</strong>. The name is gone and not one byte of data has been returned.</p>
+
+                    <p>The free-block figures say the same thing. Across the <code>rm</code> they moved from 86810586 to 86811452, a shift of <strong>866 blocks</strong>. Multiplied by 4,096 that is about 3.4MiB, which is noise from other work on the same machine. 512MiB is 131,072 blocks and none of it came back. Then after <code>kill</code>, from 86811452 to 86939254, <strong>127,802 blocks arrived at once</strong>.</p>
+
+                    <ul>
+                        <li><code>links=0</code> together with a large <code>size</code> is <strong>the fingerprint of this situation</strong>. No other state produces that combination</li>
+                        <li>The <code>(deleted)</code> tail the kernel attaches is <strong>a marker, not part of the path string</strong>. Hand that string to <code>cat</code> and you get a missing file</li>
+                        <li>As [5] shows, <strong>the holder keeps reading and writing without any trouble</strong>. That is why the application never reports this as an error</li>
+                        <li>The all-at-once nature of the recovery is worth remembering too. Nothing trickles back and stalls; the entire amount arrives at <strong>the instant the last reference closes</strong></li>
+                    </ul>
+
+                    <h2 id="sec-5">Route 1 - sweeping /proc by hand</h2>
+
+                    <p>Production machines without <code>lsof</code> are more common than you would think. On minimal images, inside containers, and on air-gapped servers, adding a tool is itself a process. And you do not need one, because <strong>the kernel is already exposing the answer</strong>. Each process has a <code>/proc/&lt;pid&gt;/fd</code> directory of symlinks pointing at the files it has open, and when a target has been deleted, <code>(deleted)</code> is appended to the destination.</p>
+
+                    <pre><code># looking at one process
+$ ls -l /proc/1442/fd | grep -i deleted
+lrwx------ 3 -&gt; /tmp/demo/app.log (deleted)
+
+# sweeping everything, with nothing but the shell
+$ for p in /proc/[0-9]*; do
+    pid=${p##*/}
+    for fd in "$p"/fd/*; do
+      tgt=$(readlink "$fd" 2&gt;/dev/null) || continue
+      case "$tgt" in *"(deleted)") echo "pid=$pid fd=${fd##*/} -&gt; $tgt";; esac
+    done
+  done
+
+pid=318  fd=3  -&gt; /tmp/demo/app.log (deleted)
+pid=319  fd=3  -&gt; /tmp/demo/app.log (deleted)
+
+# to see the held size as well
+$ stat -L -c '%i %h %s %n' /proc/318/fd/3
+16607023627971255 0 268435456 /proc/318/fd/3</code></pre>
+
+                    <p>The value of this approach is not merely that <strong>nothing has to be installed</strong>. Adding <code>stat -L</code> gives you the held capacity right there, so when several candidates appear you can order them by size and know <strong>which one actually returns space when handled</strong>. Its limits are equally clear.</p>
+
+                    <ul>
+                        <li>Processes belonging to other users are <strong>invisible without privilege</strong>. The sweep above skips those lines silently, so an empty result is not proof of absence. Run it under <code>sudo</code> where you can</li>
+                        <li>Looking only at <code>fd</code> <strong>misses memory mappings</strong>. A file that was <code>mmap</code>ed and then had its descriptor closed remains referenced through the mapping, and that lives in <code>/proc/&lt;pid&gt;/maps</code></li>
+                        <li>If a process disappears mid-sweep, <code>readlink</code> fails. That is why the idiom above tolerates failures, and it is also why <strong>running the same command twice can give different results</strong></li>
+                        <li>With thousands of processes the sweep itself takes time. Under pressure, narrow the field first. The most common pairing is the application writing the log and <strong>the collector reading it for shipment</strong>, both holding the same file</li>
+                    </ul>
+
+                    <h2 id="sec-6">Route 2 - lsof, the commands and how to read them</h2>
+
+                    <p>The standard tool is <code>lsof</code>. <strong>It is not installed in this environment, so I never ran it.</strong> There is therefore no sample output below. What follows is the behaviour the manual specifies and which columns to read.</p>
+
+                    <pre><code># only files that are deleted yet open - the exact query for this situation
+$ sudo lsof +L1
+
+# narrowing to a mount (a full scan is slow)
+$ sudo lsof -nP +L1 /var
+
+# who has this specific path open
+$ sudo lsof /var/log/app.log
+
+# what does this specific process have open
+$ sudo lsof -p 1234
+
+# an entire directory tree, recursive (can be very slow)
+$ sudo lsof +D /var/log</code></pre>
+
+                    <p>The key option is <code>+L1</code>. The manual says that when <code>+L</code> is followed by a number, <strong>only files having a link count less than that number will be listed</strong>. So <code>+L1</code> selects exactly the files with a link count of zero, which is to say <strong>files whose every name is gone but which are still open</strong>. And specifying <code>+L</code> <strong>adds an NLINK column</strong> to the output.</p>
+
+                    <ul>
+                        <li>The default columns are COMMAND, PID, USER, FD, TYPE, DEVICE, SIZE/OFF, NODE and NAME. Reading just <strong>PID, SIZE/OFF and NAME</strong> gets you there most of the time</li>
+                        <li>Because <code>+L</code> inserts NLINK, <strong>the column positions shift</strong>. Positional handling such as <code>awk '{print $2}'</code> breaks the moment options change. If you automate this, re-check column positions per option set</li>
+                        <li>The FD column carries values other than numbers, among them <code>cwd</code>, <code>txt</code> and <code>mem</code>. <code>mem</code> means a memory mapping, precisely the reference a <code>/proc/&lt;pid&gt;/fd</code> sweep would have missed. <strong>That is where lsof beats sweeping <code>fd</code> by hand</strong></li>
+                        <li>The <code>r</code>, <code>w</code> and <code>u</code> suffixes on the number mean read, write and read-write. Whatever holds the log <strong>for writing</strong> is usually the thing you act on</li>
+                        <li><code>-n</code> and <code>-P</code> switch off name and port resolution, and the manual cites speed as the reason. <strong>On a full disk under time pressure it is worth adding them by reflex</strong></li>
+                        <li><code>+D</code> descends a directory tree recursively. Convenient, but slow on a large target. Try narrowing by mount first</li>
+                    </ul>
+
+                    <h2 id="sec-7">Route 3 - fuser, from a path to a process</h2>
+
+                    <p><code>fuser</code> is also <strong>absent here, so it too was never run</strong>. Its character differs from <code>lsof</code>. Where <code>lsof</code> produces listings, <code>fuser</code> <strong>takes one path and answers with the processes using it</strong>. When the file is already identified, it is faster.</p>
+
+                    <pre><code># who is using this file (in ps form)
+$ sudo fuser -v /var/log/app.log
+
+# who is using this whole filesystem - when unmount refuses
+$ sudo fuser -vm /var
+
+# the two lines below kill processes. do not type them unverified
+$ sudo fuser -k  /var/log/app.log     # kill immediately
+$ sudo fuser -ki /var/log/app.log     # ask before each kill</code></pre>
+
+                    <p>With <code>-v</code>, in the manual's own words the processes are shown <strong>in a ps-like style</strong> with PID, USER and COMMAND, and an <code>ACCESS</code> column sits between them. That column is the whole knack of reading <code>fuser</code>. The manual defines its letters as follows.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Letter</th><th>The manual's definition</th><th>What it means here</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>f</code></td><td>open file (omitted in default display mode)</td><td>Open for reading. Collectors and monitors, typically</td></tr>
+                            <tr><td><code>F</code></td><td>open file for writing (omitted in default display mode)</td><td><strong>The prime suspect.</strong> It is writing to this file right now</td></tr>
+                            <tr><td><code>m</code></td><td>mmap'ed file or shared library</td><td>Held through a mapping, the kind an <code>fd</code> sweep misses</td></tr>
+                            <tr><td><code>c</code></td><td>current directory</td><td>It merely runs there. Only blocks unmounting</td></tr>
+                            <tr><td><code>e</code></td><td>executable being run</td><td>The binary itself sits on that filesystem</td></tr>
+                            <tr><td><code>r</code></td><td>root directory</td><td>Seen with <code>chroot</code>ed processes</td></tr>
+                        </tbody>
+                    </table>
+
+                    <div class="callout">
+                        <strong>Danger</strong> — <code>fuser -k</code>, in the manual's words, <strong>kills processes accessing the file</strong>. Give it a broad path and <strong>everything</strong> writing under it becomes a target. Combine <code>-m</code> with <code>-k</code> and every process using that filesystem is terminated. Run <code>-v</code> first, confirm that the list matches exactly what you intend to kill, and only then add <code>-k</code>. If you want confirmation, add <code>-i</code>, though the manual notes that <strong><code>-i</code> is silently ignored unless <code>-k</code> is present too</strong>.
+                    </div>
+
+                    <h2 id="sec-8">When more than one holder exists</h2>
+
+                    <p>This is where most wasted effort happens in practice. If you found one holder, restarted it, and the space is unchanged, the tool was usually not wrong. <strong>There was more than one reference.</strong> Here a 256MiB file was held by two processes and they were killed one at a time.</p>
+
+                    <pre><code>[1] created 256MiB          free=86679271
+[2] rm complete             free=86680587   ls -A=[]
+[3] sweep for remaining references
+    pid=318  fd=3  -&gt; /tmp/demo/app.log (deleted)
+    pid=319  fd=3  -&gt; /tmp/demo/app.log (deleted)
+[4] killed only one (pid 318)  free=86682346   &lt;-- not yet
+[5] killed the other (pid 319) free=86748978   &lt;-- now it returns</code></pre>
+
+                    <p>The movement at [4] is 1,759 blocks, roughly 7MiB of noise. 256MiB is 65,536 blocks, and <strong>killing one holder returned none of it</strong>. Only at [5] do 66,632 blocks come back in one go. The kernel counts references, not processes.</p>
+
+                    <ul>
+                        <li>So the working order is <strong>complete the list first, then act</strong>. Finding one, killing it, and looking again changes the list each time and leaves your judgement unsteady</li>
+                        <li>A single process can hold <strong>the same file through several descriptors</strong>. Handling the process once is enough, but if you respond with descriptor truncation you must cut every number</li>
+                        <li>The classic multi-reference combination is fixed: the application writing the log, the collector reading it, and a <code>tail -f</code> session someone opened days ago and forgot</li>
+                        <li>A child <strong>inheriting</strong> a descriptor from its parent is common too. Restart only the parent and the child keeps holding on</li>
+                    </ul>
+
+                    <h2 id="sec-9">Windows - finding who locked it</h2>
+
+                    <p>On Windows the symptom itself presents differently. A deleted file does not sit on the space; <strong>the file will not delete in the first place</strong>. You get a message saying it is in use, and typically no indication of which program that is.</p>
+
+                    <p>What actually works here is the <strong>Restart Manager API</strong>. Microsoft's documentation describes its purpose as shutting down and restarting <strong>the applications using the files being updated</strong> during installation and servicing, in order to reduce reboots. The information that process needs is exactly what we want: <strong>who is holding this file right now</strong>. It works without administrator rights and needs nothing installed.</p>
+
+                    <pre><code>Add-Type -Namespace Rm -Name Api -MemberDefinition @'
+[StructLayout(LayoutKind.Sequential)]
+public struct RM_UNIQUE_PROCESS { public int dwProcessId;
+  public System.Runtime.InteropServices.ComTypes.FILETIME ProcessStartTime; }
+[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+public struct RM_PROCESS_INFO {
+  public RM_UNIQUE_PROCESS Process;
+  [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string strAppName;
+  [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)]  public string strServiceShortName;
+  public int ApplicationStatus; public uint TSSessionId;
+  [MarshalAs(UnmanagedType.Bool)] public bool bRestartable; }
+[DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+public static extern int RmStartSession(out uint h, int flags, string key);
+[DllImport("rstrtmgr.dll")] public static extern int RmEndSession(uint h);
+[DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+public static extern int RmRegisterResources(uint h, uint nFiles, string[] files,
+  uint nApps, RM_UNIQUE_PROCESS[] apps, uint nSvc, string[] svc);
+[DllImport("rstrtmgr.dll")]
+public static extern int RmGetList(uint h, out uint needed, ref uint count,
+  [In, Out] RM_PROCESS_INFO[] arr, ref uint reasons);
+'@
+
+$full = (Resolve-Path $Path).Path
+$h = 0
+[void][Rm.Api]::RmStartSession([ref]$h, 0, [guid]::NewGuid().ToString())
+[void][Rm.Api]::RmRegisterResources($h, 1, @($full), 0, $null, 0, $null)
+$needed = 0; $count = 0; $reason = 0
+$rc = [Rm.Api]::RmGetList($h, [ref]$needed, [ref]$count, $null, [ref]$reason)
+if ($rc -eq 234) {                       # ERROR_MORE_DATA - it told us the real count
+    $arr = New-Object 'Rm.Api+RM_PROCESS_INFO[]' $needed
+    $count = $needed
+    if ([Rm.Api]::RmGetList($h,[ref]$needed,[ref]$count,$arr,[ref]$reason) -eq 0) {
+        for ($i = 0; $i -lt $count; $i++) {
+            $pi = $arr[$i]
+            "  PID {0,-7} {1,-22} restartable={2}" -f `
+              $pi.Process.dwProcessId, $pi.strAppName, $pi.bRestartable
+        }
+    }
+}
+[void][Rm.Api]::RmEndSession($h)</code></pre>
+
+                    <p>This is what it actually produced here. The same file was queried twice, the second time while another process held it open with no sharing.</p>
+
+                    <pre><code>=== A. with nobody holding it ===
+holders of: C:\tmp\demo\locked.txt
+  (none - no process holds this file)
+
+=== B. with another process holding it ===
+holders of: C:\tmp\demo\locked.txt
+  PID 25328   Windows PowerShell     restartable=True</code></pre>
+
+                    <ul>
+                        <li>Getting <code>restartable</code> alongside the PID is the practical part. True <strong>means the program is registered to survive being shut down and restarted</strong>, which makes the decision about how to act much easier</li>
+                        <li>The first <code>RmGetList</code> call returning <code>234</code> (ERROR_MORE_DATA) is not a failure but <strong>the normal flow telling you the array size required</strong>. Treat that value as an error and your results will always look empty</li>
+                        <li>When Explorer's <strong>file in use</strong> dialog names the program, this API is what is behind it. All we are doing is pulling the same information from a script</li>
+                        <li>For the GUI equivalent, open <strong>Resource Monitor</strong> (<code>resmon</code>) and type the filename into the <strong>Associated Handles</strong> search box on the CPU tab. This article captured no screenshots, so the description of the screen stops there</li>
+                    </ul>
+
+                    <h2 id="sec-10">Windows - the methods that do not work</h2>
+
+                    <p>Two approaches turn up constantly in search results and rarely work. Both were run, and <strong>why they fail</strong> turns out to be the useful part.</p>
+
+                    <pre><code>PS&gt; openfiles /Local
+ERROR: The logged on user does not have administrative privileges.
+
+PS&gt; openfiles /Query /FO TABLE
+INFO: The system global flag 'maintain objects list' needs
+      to be enabled to see local opened files.
+Files opened remotely via local share points:
+ERROR: Access is denied.
+
+PS&gt; # searching Modules - DLLs do show up
+PS&gt; Get-Process | Where-Object { $_.Modules.FileName -contains
+      'C:\WINDOWS\System32\kernel32.dll' } | Select-Object -First 3 Id,ProcessName
+   Id ProcessName
+   -- -----------
+19744 AMDInstallManager
+11128 AMDRSSrcExt
+21760 ApplicationFrameHost
+
+PS&gt; # the same search for a data file
+PS&gt; Get-Process | Where-Object { $_.Modules.FileName -contains $target }
+(0 results)</code></pre>
+
+                    <p><code>openfiles</code> is blocked twice over. Seeing the local list requires a system-wide flag called <strong>maintain objects list</strong>, and turning it on with <code>openfiles /Local ON</code> itself demands administrator rights and a reboot to take effect. In other words <strong>it is not a tool you can enable after the incident has already started</strong>. With the flag off, all <code>/Query</code> answers about is files opened remotely through shares.</p>
+
+                    <p><code>Get-Process</code> and its <code>Modules</code> collection is a different case. It is not that it fails, it is that <strong>its subject is something else</strong>. That collection holds executable images loaded into the process, meaning EXEs and DLLs. In the output above it found <code>kernel32.dll</code> without difficulty. A log file or a data file is not a module, so the answer will be <strong>zero results forever</strong>.</p>
+
+                    <ul>
+                        <li>The rule of thumb, then: if <strong>a locked DLL is blocking an update</strong>, the <code>Modules</code> search is enough; for anything else, go to the Restart Manager route in the previous section</li>
+                        <li>The Sysinternals <code>handle</code> family is widely used, but <strong>it is not installed here and I could not run it</strong>. This article therefore quotes none of its output</li>
+                        <li>In real incidents the culprit behind a lock is quite often <strong>antivirus, backup or an indexing service</strong>. These open and close files briefly, so <strong>running the same query twice a few seconds apart</strong> separates them from a persistent holder</li>
+                    </ul>
+
+                    <h2 id="sec-11">Restart is the answer, but when you cannot restart</h2>
+
+                    <p>Once you have found the holder the remedy is simple. <strong>A restart is the surest thing.</strong> For a log file a reopen signal is often enough instead. But when it is a live service and neither is possible right now, there is one widely known workaround: <strong>truncating the open file descriptor directly</strong>.</p>
+
+                    <div class="callout">
+                        <strong>Danger</strong> — the method below <strong>cannot be undone and has no confirmation step</strong>. Pick one wrong descriptor number and <strong>a different file that process has open is emptied entirely</strong>. Before running it, confirm the destination with your own eyes using <code>readlink /proc/&lt;pid&gt;/fd/&lt;n&gt;</code>, check that it really is the log file carrying the <code>(deleted)</code> marker, and only then act. Whenever a restart is possible, a restart is the safer path.
+                    </div>
+
+                    <pre><code># 1) always first - see with your own eyes what you are about to cut
+$ readlink /proc/957/fd/3
+/tmp/demo/big.log (deleted)
+
+# 2) only then - truncate the descriptor (irreversible)
+$ : &gt; /proc/957/fd/3
+
+# what came out in this environment
+[A] after rm             free=86771292
+    fd: inode=16607023627971255 links=0 size=268435456 blocks=262144
+[B] : &gt; /proc/957/fd/3
+    tail: big.log: file truncated
+    after the attempt: size=0  blocks=262144
+    free=86770524                     &lt;-- nothing came back
+[C] truncate -s 0 /proc/957/fd/3
+    size=0  blocks=262144
+    free=86769107                     &lt;-- still nothing
+[D] after kill           free=86833972</code></pre>
+
+                    <p>The result deserves an honest reading. <strong>The truncation itself worked.</strong> <code>size</code> went from 268435456 to 0, and the <code>tail</code> holding the file reacted with <code>file truncated</code>, which is the proof. Yet <strong>free blocks did not come back</strong> and <code>blocks</code> stayed at 262144. The actual release happened after <code>kill</code>, at [D].</p>
+
+                    <p>Do not rush to a conclusion here. The <code>/proc</code> in this environment is not the Linux kernel procfs but an MSYS emulation, and NTFS sits underneath. <strong>This is not evidence about what happens on Linux.</strong> The lesson the failure does carry is environment-independent, though: <strong>whether truncation worked must be confirmed with <code>df</code>, not with <code>size</code>.</strong> A size display reaching zero and space actually returning are two separate facts.</p>
+
+                    <p>And the method has a restricted target. <strong>It works on logs and does not work on data files</strong>, because the two are handled differently.</p>
+
+                    <ul>
+                        <li><strong>Log files</strong> — usually opened in append mode and written only at the end. Losing the front does not stop the next write from continuing at the new end. Cutting it does not break the application's model of the file</li>
+                        <li><strong>Data and DB files</strong> — offsets are computed and specific positions are read and written. The moment you cut, <strong>the structure the process remembers no longer matches the file</strong>. If a later read interprets a zero-filled region as valid data, the damage spreads quietly</li>
+                        <li><strong>Logs not opened in append mode</strong> — an implementation that keeps its offset will let the file grow back to that offset after a cut, producing a <strong>sparse file</strong> whose apparent size is large while real usage stays small</li>
+                        <li><strong>Files open through several descriptors</strong> — cutting one leaves the others holding on, exactly as in the previous section</li>
+                    </ul>
+
+                    <h2 id="sec-12">Locking is a different story</h2>
+
+                    <p>Everything so far concerned <strong>files that are deleted yet open</strong>. <strong>File locking</strong> has a similar name and overlapping symptoms but is a separate mechanism. And this is precisely where Linux and Windows part ways.</p>
+
+                    <p>The Unix <code>flock</code> is <strong>advisory</strong>. The manual puts it like this: given suitable permissions on a file, <strong>a process is free to ignore the use of <code>flock</code> and perform I/O on the file</strong>. A lock is an agreement among programs that chose to participate, not a wall the kernel enforces. Which is why on Linux <strong><code>rm</code> never fails because something else holds a lock</strong>.</p>
+
+                    <p>Windows differs, though not in the way it is usually described. Windows does not refuse unconditionally; <strong>the process opening the file chooses a share mode at open time and the kernel enforces it</strong>. The <code>CreateFile</code> documentation states that when the share parameter is zero <strong>the file cannot be shared and cannot be opened again until the handle is closed</strong>, and that a conflicting request fails with <code>ERROR_SHARING_VIOLATION</code>. Run it and the same file splits into opposites depending on the share mode.</p>
+
+                    <pre><code>=== opened with share mode None ===
+PS&gt; Remove-Item $target
+ERR: IOException
+MSG: The process cannot access the file ... because it is being used by another process.
+PS&gt; Rename-Item $target renamed.txt      -&gt; same error
+PS&gt; Get-Content $target                  -&gt; same error
+
+$ stat -c 'inode=%i links=%h size=%s' locked.txt
+inode=6192449489676514 links=1 size=19       # metadata still readable
+$ cat locked.txt
+cat: locked.txt: Device or resource busy
+$ rm locked.txt
+rm: cannot remove 'locked.txt': Device or resource busy
+$ ls -l
+-rw-r--r-- 1 ... 19 Sep  2 09:12 locked.txt  # still sitting there
+
+=== the same file opened with share mode ReadWrite, Delete ===
+$ cat shared.txt
+share-delete payload
+$ rm -v shared.txt
+removed 'shared.txt'                          # succeeded. the holder is still alive
+$ ls -A
+(empty)</code></pre>
+
+                    <p>What differs between the two blocks is neither the file nor the deleting command. It is one thing: <strong>what the opener permitted</strong>. The file opened without sharing rejected delete, rename and read alike, while the file whose share list included delete <strong>lost its name instantly even with the holder still running</strong>. That second case looks essentially the same as Unix.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Aspect</th><th>Linux / Unix</th><th>Windows</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Nature of the lock</td><td>Advisory. An agreement among participants</td><td>The kernel enforces the share mode chosen at open</td></tr>
+                            <tr><td>Deleting a file in use</td><td>Always succeeds. Only the name goes</td><td>Succeeds only if the opener permitted deletion</td></tr>
+                            <tr><td>What you see on failure</td><td>It does not fail</td><td>An in-use message · <code>Device or resource busy</code></td></tr>
+                            <tr><td>The resulting problem</td><td>Space quietly fails to return</td><td>Deployments and updates are loudly blocked</td></tr>
+                            <tr><td>Tools for finding it</td><td><code>lsof</code> · <code>fuser</code> · <code>/proc</code></td><td>Restart Manager · Resource Monitor</td></tr>
+                            <tr><td>Common misconception</td><td>That <code>rm</code> deletes the data</td><td>That Windows can never delete a file in use</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>The practical residue is this. If a deployment on Windows is blocked by a file lock, <strong>the place to fix is the opener, not the deleter</strong>. Let the code that opens the log permit delete sharing and rotation stops jamming.</p>
+
+                    <h2 id="sec-13">Containers - a pid depends on the vantage point</h2>
+
+                    <p>What makes this work hard in containers is not missing tools but the fact that <strong>pids and paths differ by vantage point</strong>. Take a pid from <code>lsof</code> on the host, hand it to <code>kill</code> inside the container, and you kill the wrong process. The reverse holds too.</p>
+
+                    <p>Containers themselves were not run here. But <strong>a mismatch of the same nature</strong> shows up in this environment anyway: MSYS uses its own pids and the Windows kernel uses different ones.</p>
+
+                    <pre><code>$ tail -f hold.log &gt; /dev/null &amp;
+$ echo $!
+1410
+
+$ ls -l /proc/1410/fd | grep -i deleted
+lrwxrwxrwx 3 -&gt; /tmp/demo/hold.log (deleted)
+
+$ ps -W | head -1
+      PID    PPID    PGID     WINPID  TTY   UID    STIME COMMAND
+$ ps -W | grep 1410
+     1410    1405    1403        580  ?  197609 09:18:32 /usr/bin/tail</code></pre>
+
+                    <p>The pid the shell knows is <strong>1410</strong> and the pid the kernel knows is <strong>580</strong>. Same process, and neither number is wrong. The point is that <strong>you must not hand one side's number to the other without a translation table</strong>, and what happens inside a container pid namespace is the same in kind. Below are the places to check in that situation.</p>
+
+                    <ul>
+                        <li>Moving a host pid to a container pid <strong>requires translation</strong>. On Linux the <code>NSpid</code> line in <code>/proc/&lt;host-pid&gt;/status</code> lists both values side by side</li>
+                        <li>Paths diverge too. The container's <code>/var/log/app.log</code> is, from the host, some long path inside an overlay upper layer. <strong>Do not mistake a path from a host-side <code>lsof</code> for a container path</strong></li>
+                        <li>Often there is neither <code>lsof</code> nor <code>/proc</code> access inside the container. Then it is faster to look from the host, where that container's filesystem is visible under <code>/proc/&lt;pid&gt;/root/</code></li>
+                        <li>The most frequent mistake is <strong>assuming a container restart settles it while leaving the log volume alone</strong>. If the holder is a log collector outside the container, restarting the container any number of times returns nothing</li>
+                        <li>With an orchestrator in place, a process a human kills comes back. The action is not finished until you have checked <strong>whether the newly started process grabs the same file again</strong></li>
+                    </ul>
+
+                    <h2 id="sec-14">The .nfs files on network filesystems</h2>
+
+                    <p>On NFS the same situation appears <strong>in visible form</strong>. You have probably seen a deleted file refuse to disappear and instead sit there under a name beginning with <code>.nfs</code>. That is not a fault but <strong>the NFS client trying to imitate POSIX behaviour</strong>, usually called silly rename.</p>
+
+                    <p>The circumstances are these. On a local filesystem a file whose name is gone can still be read while references remain. The NFS protocol does not support that directly. So the client kernel <strong>renames the file to a <code>.nfsXXXX</code> name instead of removing it</strong>. As the Linux NFS wiki explains, the client removes that new name when the vnode becomes inactive. There is no NFS mount in this environment, so <strong>I could not reproduce this directly</strong>.</p>
+
+                    <ul>
+                        <li>So a <code>.nfs</code> file is <strong>a marker, not litter to be scrubbed</strong>. It means something still has the file open, so find and clear the holder and the name disappears on its own</li>
+                        <li>Trying to delete it does not go well either. While a reference lives, the client protects that name</li>
+                        <li>The same wiki notes one exception: <strong>if the client dies between the rename and the remove, a garbage file is left on the server</strong>. Only then is it genuinely something to delete, and the test is whether it survives a client reboot</li>
+                        <li>The imitation holds <strong>only while there is a single client</strong>. A client cannot know whether another client has the file open, so in layouts where several clients share a file, an open file can be deleted out from under them</li>
+                        <li>An <code>rmdir</code> <strong>failing on a directory that looks empty</strong> has the same cause. Run <code>ls -a</code> and the <code>.nfs</code> file is inside</li>
+                    </ul>
+
+                    <h2 id="sec-15">Keeping it from happening at all</h2>
+
+                    <p>The causes converge on essentially one thing: <strong>a log rotation configuration that has quietly gone out of step</strong>. Move or delete the file without signalling the process to reopen, and the process keeps writing to the old, nameless file. How rotation manufactures this state is covered separately in <a href="log_rotation_pitfalls.html">where log rotation fails quietly</a>.</p>
+
+                    <p>There is something to do on the design side too. When you need a temporary file, there is an idiom that <strong>removes the name immediately after opening</strong>. With no name, no other process can touch it, and however the process ends the kernel returns the space by itself. Cleanup code stops being necessary.</p>
+
+                    <pre><code># open then unlink - an anonymous temp file
+$ exec 9&gt; tmpdata
+$ rm tmpdata                      # the name disappears right here
+$ echo "hello anonymous" &gt;&amp;9      # writing still works
+$ ls -A
+(empty)
+$ stat -L -c 'inode=%i links=%h size=%s' /proc/self/fd/9
+inode=16325548651260599 links=0 size=16
+$ exec 9&gt;&amp;-                       # space returns at close. no cleanup code
+
+# a value to feed monitoring - the gap between df and du
+$ used_df=$(df -k --output=used /var | tail -1)
+$ used_du=$(du -sk /var 2&gt;/dev/null | cut -f1)
+$ echo "gap_kb=$(( used_df - used_du ))"</code></pre>
+
+                    <ul>
+                        <li>Putting <strong>the gap between <code>df</code> and <code>du</code></strong> into monitoring makes this visible before it becomes an incident. Watch the <strong>trend</strong>, not the absolute value. A gap widening beyond its usual band means held files are accumulating</li>
+                        <li><code>du</code> is expensive on large filesystems, so use a long interval. On something like CephFS, where a full walk is costly, avoid this approach entirely and use the recursive statistics the filesystem provides</li>
+                        <li>Verify that the reopen signal reaches <strong>both</strong> the writer and the reader. If only the application gets it and the collector does not, half the grip remains</li>
+                        <li>Rotating by <strong>emptying the file</strong> instead of renaming it removes the problem at the root. The price is that lines written at the moment of rotation can be lost</li>
+                        <li><code>tail -f</code> sessions left behind by people are a cause as well. Sessions opened for investigation are the kind of thing a single habit, <strong>close it when you are done</strong>, eliminates</li>
+                    </ul>
+
+                    <h2 id="sec-16">The order to follow under pressure</h2>
+
+                    <p>With a full disk there is no time to deliberate, so it is better to fix the order in advance. What follows runs from the cheapest check to the most dangerous action.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Step</th><th>What to do</th><th>What to read</th><th>What not to do here</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>1</td><td>Give the failing path to <code>df</code> directly</td><td>Is that path really on that filesystem</td><td>Judging from the root line alone</td></tr>
+                            <tr><td>2</td><td>Compare a <code>du -sh</code> total against <code>df</code> Used</td><td>Is the gap tens of gibibytes</td><td>Declaring the gap to be the cause outright</td></tr>
+                            <tr><td>3</td><td><code>lsof +L1</code> or a <code>/proc</code> sweep</td><td>pid · held size · path</td><td>Acting before the list is complete</td></tr>
+                            <tr><td>4</td><td>Collect <strong>every</strong> reference to that file</td><td>Parent, child, collector, human session</td><td>Killing one and re-counting</td></tr>
+                            <tr><td>5</td><td>Restart, or send the log reopen signal</td><td>Does <code>df</code> free space jump like a step</td><td>Reaching for <code>kill -9</code> first</td></tr>
+                            <tr><td>6</td><td>Only if you still cannot, truncate the fd</td><td>Only after <code>readlink</code> confirms the target</td><td>Applying it to data or DB files</td></tr>
+                        </tbody>
+                    </table>
+
+                    <div class="callout">
+                        <strong>Danger</strong> — <code>kill -9</code> (<code>SIGKILL</code>) gives a process no chance to clean up. It may cost nothing worse than buffered log lines, or it may leave a file that was mid-write in an intermediate state. <strong>Send the default termination signal first, wait a few seconds, and only force it if the process is still alive.</strong> Either way it is a last resort against a database or any process holding state.
+                    </div>
+
+                    <ul>
+                        <li>If step 3 returns <strong>zero candidates</strong>, suspect privilege before anything else. Other users' processes drop out silently</li>
+                        <li>If <code>df</code> does not move after step 5, go back to step 4. The tool was not wrong; <strong>a reference is still there</strong></li>
+                        <li>Under pressure, heading in the direction of <strong>finding more things to delete</strong> usually costs time. If <code>du</code> and <code>df</code> disagree, deleting will not resolve it</li>
+                        <li>Once the action is done, look once more at <strong>whether the same file gets grabbed again</strong>. Leave the rotation config as it was and you will be back in the same place in days</li>
+                        <li>When memory is the real cause the symptoms can look similar but the problem is different. That branch lives in <a href="oom_killer_diagnosis.html">how to read what the OOM killer chose</a></li>
+                    </ul>
+
+                    <h2 id="sec-17">Summary</h2>
+
+                    <p><code>rm</code> is a command that deletes a name. What deletes the data is <strong>the kernel, at the moment the last reference closes</strong>. So resolving this is never a matter of deleting the file again but of <strong>making the holder let go</strong>, and for that you first have to identify who is holding it.</p>
+
+                    <p>There are three routes to that. <code>lsof +L1</code> selects exactly the open files with a link count of zero. <code>fuser -v</code> takes one path and answers with processes, its ACCESS column describing the character of each grip. With neither available, sweep <code>/proc/&lt;pid&gt;/fd</code> from the shell and the <code>(deleted)</code> marker stands in for the answer. On Windows the symptom is inverted and the Restart Manager supplies the answer.</p>
+
+                    <p>Two things are easy to forget. References <strong>may not be singular</strong>, and descriptor truncation <strong>works on logs and not on data files</strong>. Miss either and you will act without <code>df</code> moving, or move it and break something else.</p>
+
+                    <h2 id="sec-18">What I could not verify</h2>
+
+                    <ul>
+                        <li><code>lsof</code> and <code>fuser</code> are <strong>not installed in this environment and were never once executed</strong>. The commands and column descriptions in those sections rest on each tool's manual, and <strong>no execution output for them appears in this article</strong>. Column layout can vary by version and distribution, so it is worth confirming on your own machine before automating</li>
+                        <li>Descriptor truncation in this environment <strong>reduced <code>size</code> to zero without returning free blocks</strong>. Because the MSYS <code>/proc</code> is not the Linux kernel procfs and NTFS lies underneath, <strong>whether the same result occurs on Linux ext4 or XFS was not verified.</strong> This article asserts nothing about that environment</li>
+                        <li>Containers and pid namespaces were <strong>not reproduced directly</strong>. The pid mismatch shown in the text is between MSYS and the Windows kernel, offered as <strong>an analogy of the same kind</strong> rather than as container output. The <code>NSpid</code> line in <code>/proc/&lt;pid&gt;/status</code> was likewise not confirmed here</li>
+                        <li>With no NFS mount available I <strong>could not create a <code>.nfsXXXX</code> file myself</strong>. That section rests on the Linux NFS wiki's description</li>
+                        <li>The Sysinternals <code>handle</code> family <strong>is not installed and was not run</strong>, so this article quotes none of its output. Resource Monitor is a GUI, so only the location of the control is described, with no screenshot</li>
+                        <li>I did not actually enable <code>openfiles /Local ON</code>, so <strong>its behaviour with the flag active was not verified</strong>, since that needs administrator rights and a reboot. The two error messages in the text are <strong>real output from the disabled state</strong></li>
+                        <li>The noise in the free-block figures <strong>was not removed</strong>. Other work runs on this machine, which is why the numbers wobble by hundreds to thousands of blocks. Reproducing this will not give the same figures</li>
+                    </ul>
+
+                    <h2 id="sec-19">References</h2>
+
+                    <ul>
+                        <li><a href="https://pubs.opengroup.org/onlinepubs/9699919799/functions/unlink.html" target="_blank" rel="noopener">unlink - POSIX.1-2017 (The Open Group Base Specifications Issue 7)</a> — the rule that the link is removed before unlink returns while removal of the file contents is postponed until all references are closed</li>
+                        <li><a href="https://linux.die.net/man/8/lsof" target="_blank" rel="noopener">lsof(8) manual</a> — that <code>+L</code> followed by a number lists only files with a link count below it, that specifying <code>+L</code> adds an NLINK column, and the behaviour of <code>-n</code>, <code>-P</code>, <code>+D</code> and <code>-p</code></li>
+                        <li><a href="https://man7.org/linux/man-pages/man1/fuser.1.html" target="_blank" rel="noopener">fuser(1) - Linux manual page</a> — the ps-like output of <code>-v</code>, the definitions of the ACCESS letters <code>c</code>, <code>e</code>, <code>f</code>, <code>F</code>, <code>r</code> and <code>m</code>, and the behaviour of <code>-m</code>, <code>-k</code> and <code>-i</code></li>
+                        <li><a href="https://man7.org/linux/man-pages/man2/flock.2.html" target="_blank" rel="noopener">flock(2) - Linux manual page</a> — the rule that these locks are advisory, the sentence that a process is free to ignore them and perform I/O, and the fact that locks are tied to the open file description</li>
+                        <li><a href="https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew" target="_blank" rel="noopener">CreateFileW function (fileapi.h) - Win32 apps</a> — that a <code>dwShareMode</code> of zero means the file cannot be shared or reopened until the handle closes, that conflicts fail with <code>ERROR_SHARING_VIOLATION</code>, and the meaning of <code>FILE_SHARE_DELETE</code></li>
+                        <li><a href="https://learn.microsoft.com/en-us/windows/win32/rstmgr/about-restart-manager" target="_blank" rel="noopener">About Restart Manager - Win32 apps</a> — the purpose of shutting down and restarting applications and services using files being updated in order to reduce reboots, and the shutdown order</li>
+                        <li><a href="https://wiki.linux-nfs.org/wiki/index.php/Server-side_silly_rename" target="_blank" rel="noopener">Server-side silly rename - Linux NFS</a> — the client behaviour of renaming rather than removing an open file, the removal of the new name when the vnode becomes inactive, and the garbage file left on the server if the client crashes in between</li>
+                        <li><a href="no_space_left_but_disk_free.html">No space left on device While the Disk Is Not Full - Inodes and Open Files</a> — the four-way classification of this symptom and the diagnostic order. This article picks up the second of those causes</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>Share this article</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">Copy Link</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">Back to list</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Free tools you may find useful</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/code_image.html">Code Image Generator</a></li>
+      <li><a href="../static/char_counter.html">Character Counter</a></li>
+      <li><a href="../static/json_formatter.html">JSON Formatter</a></li>
+      <li><a href="../static/regex_tester.html">Regex Tester</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">See all tools &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Related Posts</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="no_space_left_but_disk_free.html">No space left on device While the Disk Is Not Full - Inodes and Open Files</a></li>
+      <li><a href="oom_killer_diagnosis.html">The Process Died Without a Word - How to Read the OOM Killer</a></li>
+      <li><a href="git_credential_leak_prevention.html">The Token Is Sitting in Your Remote URL - Where Git Credentials Leak</a></li>
+      <li><a href="git_gitignore_already_tracked.html">You Added It to .gitignore and It Still Shows Up - The File Is Already Tracked</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('Link copied. Paste it into the Threads app to share.');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('Link copied!'); });
+    });
+    </script>
+</body>
+</html>

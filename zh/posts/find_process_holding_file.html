@@ -1,0 +1,873 @@
+<!DOCTYPE html>
+<!--
+ * 技术博客文章模板
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>找出正占着文件的进程 - 删了却不释放空间时</title>
+    <meta name="description" content="rm 删掉的只是名字。本文把链接数与打开引用这两个计数器拆开，讲清楚如何用 lsof +L1、fuser 与 /proc 扫描锁定持有方，并把 Windows 一侧的锁定确认与文件描述符截断的风险一并附上实际执行输出。">
+    <meta name="keywords" content="lsof, fuser, proc fd, 已删除文件, deleted, 链接数, unlink, 文件锁, Restart Manager, openfiles, df du 差异, 日志轮转, NFS sillyrename, 开发, 基础设施, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/find_process_holding_file.html">
+
+    <meta property="og:title" content="找出正占着文件的进程 - 删了却不释放空间时">
+    <meta property="og:description" content="删掉的文件仍咬着空间时，如何锁定是谁在占着。用真实执行输出把 Linux 与 Windows 两边拆开来看。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/find_process_holding_file.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-09-02">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="找出正占着文件的进程">
+    <meta name="twitter:description" content="rm 是删名字的命令。真正删掉数据的，是最后一个引用关闭那一刻的内核。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "找出正占着文件的进程 - 删了却不释放空间时",
+      "alternativeHeadline": "链接数与打开引用这两个计数器，以及在 Linux 和 Windows 上锁定持有方的顺序",
+      "datePublished": "2026-09-02",
+      "dateModified": "2026-09-02",
+      "inLanguage": "zh-CN",
+      "articleSection": "开发/基础设施",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "lsof, fuser, proc fd, 已删除文件, 链接数, unlink, 文件锁, Restart Manager, openfiles, df du 差异",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/find_process_holding_file.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "文件已经删了，为什么磁盘空间没有回来",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "因为 rm 调用的是 unlink，而 unlink 摘掉的是目录里的一个名字，不是数据。POSIX 规范写得很明白，链接会在 unlink 返回之前被移除，但文件内容的删除要推迟到该文件的所有引用都关闭之后。也就是说一个文件身上挂着两个计数器，一个是名字的数量即链接数，另一个是打开的文件描述符的数量。rm 只把前者变成 0，只有后者归零的那一刻块才会被归还。所以处理办法从来不是把文件再删一遍，而是让占着它的那一方松手。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "在 Linux 上怎么找出是谁占着这个文件",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "有三条路。lsof +L1 只挑出链接数小于 1 的已打开文件，手册写的是在 +L 后面给一个数字时只列出链接数小于该值的文件，并且指定 +L 会多出一个 NLINK 列。fuser -v 接受一个路径，用类似 ps 的形式回答哪些进程在用它，其中 ACCESS 列的 f 表示已打开的文件，F 表示以写方式打开的文件，m 表示 mmap 的文件或共享库。如果服务器上这两样都没有，就直接扫 /proc。每个进程的 fd 目录里是一堆符号链接，目标被删掉时内核会在末尾附上 deleted 这个标记，把它筛出来就够了。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "能不能不重启进程就把空间要回来",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "流传最广的办法是直接截断那个打开的文件描述符。但这件事无法撤销，也没有任何确认步骤，编号挑错一个，那个进程打开的另一个文件就会被整个清空。而且它适用的对象有限。像日志这样只往末尾追加的文件，截断之后程序还能继续写；但那些要计算偏移量、读写特定位置的数据文件或数据库文件，一旦被截断，进程记住的结构就和文件的实际内容对不上了。只要还能重启，重启永远是更安全的那一边。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Windows 为什么不让删正在使用的文件",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "并不是 Windows 一律不让，而是打开文件的一方在打开时就定下了共享模式，由内核来强制执行。CreateFile 文档写道，共享参数为 0 时该文件无法被共享，在句柄关闭之前也无法再次打开。反过来，如果打开方同时给出 FILE_SHARE_DELETE，删除就能成功。实际跑一遍会看到同一个文件因共享模式不同而走向相反的结果，不带共享打开的文件，删除、改名、读取全部失败；共享列表里含删除的文件，即使持有进程还活着，名字也会立刻消失。Unix 的 flock 性质不同，按手册所述，进程完全可以无视这种锁而照常进行输入输出。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "NFS 上删掉的文件为什么会留下 .nfs 开头的名字",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "这是 NFS 客户端在模仿 POSIX 行为，通常称作 sillyrename。名字没了但只要还有打开的引用就得能继续读，而协议并不直接支持这一点，于是客户端内核不去删除，而是把它改名成 .nfsXXXX 这种形式。按照 Linux NFS wiki 的说明，客户端会在对应的 vnode 变为非活动时删掉这个新名字，如果在改名和删除之间客户端崩溃，服务器上就会留下一个垃圾文件。所以这类文件不是要费劲清掉的垃圾，而是一个标记，说明还有人开着它。先找到并处理掉持有方，名字自己就会消失。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/find_process_holding_file.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/find_process_holding_file.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/find_process_holding_file.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/find_process_holding_file.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/find_process_holding_file.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "首页",
+      "item": "https://braindetox.kr/zh/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "开发/基础设施",
+      "item": "https://braindetox.kr/zh/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "找出正占着文件的进程 - 删了却不释放空间时",
+      "item": "https://braindetox.kr/zh/posts/find_process_holding_file.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="找出正占着文件的进程 - 删了却不释放空间时">
+                <meta itemprop="datePublished" content="2026-09-02">
+                <meta itemprop="dateModified" content="2026-09-02">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="lsof, fuser, proc fd, 已删除文件, 链接数, unlink, 文件锁, Restart Manager, openfiles, df du 差异">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/find_process_holding_file.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">找出正占着文件的进程 - 删了却不释放空间时</h1>
+                    <h2 class="post-subtitle">rm 删掉的只是名字。在 Linux 与 Windows 两边把仍在占着的那一方揪出来的顺序</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-02">2026-09-02</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">开发/基础设施</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>最常见的经过是这样的。磁盘满了的告警来了，找到一个大日志用 <code>rm</code> 删掉，<code>ls</code> 里已经看不见它了，可是 <code>df</code> 一位数都没动。等上几分钟还是一样，于是接着去找别的可删的东西。</p>
+
+                    <p>到这一步方向其实已经偏了。问题不是可删的东西不够，而是<strong>已经删掉的东西还活着</strong>。这篇文章只讲一件事，就是<strong>怎么把占着它的那一方锁定出来</strong>。至于这个症状为什么会出现的四类原因分类，在 <a href="no_space_left_but_disk_free.html">磁盘没满却报 No space left on device</a> 那边，本文接的是其中一条。</p>
+
+                    <div class="callout">
+                        本文出现的命令里，<strong>结束进程</strong>和<strong>截断文件描述符</strong>这两件事无法撤销。相应小节都单独加了危险提示，在生产机器上先把那一段读完再动手为好。不要把只做确认的命令和会改变状态的命令混着用，这几乎就是这项工作的全部纪律。
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>本文涵盖的内容</h3>
+                        <ol>
+                            <li><a href="#sec-1">计数器有两个 - 名字的数量与引用的数量</a></li>
+                            <li><a href="#sec-2">本文的执行环境与验证范围</a></li>
+                            <li><a href="#sec-3">症状 - df 与 du 对不上</a></li>
+                            <li><a href="#sec-4">名字没了，inode 还在</a></li>
+                            <li><a href="#sec-5">找法一 - 直接扫 /proc</a></li>
+                            <li><a href="#sec-6">找法二 - lsof 的命令与读法</a></li>
+                            <li><a href="#sec-7">找法三 - fuser 从路径到进程</a></li>
+                            <li><a href="#sec-8">占着的不止一个时</a></li>
+                            <li><a href="#sec-9">Windows - 查出是谁锁的</a></li>
+                            <li><a href="#sec-10">Windows - 那些行不通的办法</a></li>
+                            <li><a href="#sec-11">重启是答案，但重启不了的时候</a></li>
+                            <li><a href="#sec-12">锁是另一回事</a></li>
+                            <li><a href="#sec-13">容器 - pid 因视角而不同</a></li>
+                            <li><a href="#sec-14">网络文件系统上的 .nfs 文件</a></li>
+                            <li><a href="#sec-15">从源头上不让它发生</a></li>
+                            <li><a href="#sec-16">着急时的顺序</a></li>
+                            <li><a href="#sec-17">小结</a></li>
+                            <li><a href="#sec-18">未能确认的部分</a></li>
+                            <li><a href="#sec-19">参考资料</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">计数器有两个 - 名字的数量与引用的数量</h2>
+
+                    <p>整个现象都从一句话里出来。<strong><code>rm</code> 不是删除数据的命令。</strong><code>rm</code> 调用的系统调用是 <code>unlink</code>，它做的是<strong>把目录里写着的一个名字摘掉</strong>。数据在 inode 里而不在名字里，inode 不会因为名字没了就跟着消失。</p>
+
+                    <p>POSIX 规范把这个行为钉得没有误读余地，链接会在 <code>unlink</code> 返回之前被移除，但<strong>文件内容的删除要推迟到该文件的所有引用都关闭之后</strong>。也就是说一个文件身上挂着两个性质不同的计数器，两个都归零，块才会回来。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>计数器</th><th>数的是什么</th><th>什么让它归零</th><th>在哪里能看到</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>链接数</td><td>指向这个 inode 的目录项数量</td><td><code>rm</code>、<code>unlink</code>、<code>mv</code> 覆盖</td><td><code>stat -c %h</code>、<code>ls -l</code> 的第二列</td></tr>
+                            <tr><td>打开引用</td><td>打开着这个 inode 的描述符与映射数量</td><td>进程结束、<code>close()</code>、日志重开信号</td><td><code>lsof</code>、<code>fuser</code>、<code>/proc/&lt;pid&gt;/fd</code></td></tr>
+                            <tr><td>归还块的条件</td><td>两者同时为 0 的时刻</td><td>最后一个引用关闭的瞬间，内核一次性完成</td><td><code>df</code> 的可用量呈台阶式跳升</td></tr>
+                            <tr><td>观测工具的视野</td><td><code>du</code> 走名字，<code>df</code> 数块</td><td>没有名字，<code>du</code> 就看不见</td><td>两者之间的差额就是被咬住的容量</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>这个行为本身不是缺陷而是保护机制。一个进程正在读的时候另一个进程把文件删了，读的那一方要是就此崩掉那才叫麻烦。问题在于这个保护机制<strong>会在运行中悄无声息地生效</strong>，不报错，不留日志，只是空间不回来而已。</p>
+
+                    <h2 id="sec-2">本文的执行环境与验证范围</h2>
+
+                    <p>主题是 Linux 服务器，可是产出下面这些输出的环境是 <strong>Windows 10 上的 Git Bash</strong>。先把这一点讲清楚，是因为读者必须能分辨<strong>哪些输出是真的跑出来的，哪些命令是没有输出摆在这里的</strong>。</p>
+
+                    <pre><code>$ bash --version | head -1
+GNU bash, version 5.2.37(1)-release (x86_64-pc-msys)
+
+$ uname -a
+MINGW64_NT-10.0-19045 3.5.7-882031da.x86_64 2025-01-30 11:14 UTC x86_64 Msys
+
+$ git --version
+git version 2.48.1.windows.1
+
+$ stat --version | head -1
+stat (GNU coreutils) 8.32
+
+$ stat -f -c 'bsize=%s' /tmp/demo
+bsize=4096
+
+# PowerShell 一侧
+PS&gt; $PSVersionTable.PSVersion.ToString()
+5.1.19041.6456</code></pre>
+
+                    <p>这里的 coreutils 与 Linux 上一样是 GNU 8.32，所以 <code>stat</code>、<code>df</code>、<code>du</code>、<code>truncate</code> 的选项行为完全相同。MSYS 自己模拟提供了 <code>/proc</code>，而<strong>它并不是 Linux 内核的 procfs</strong> 这一点，在后文会关键一次。下面是本文真正跑过的和没能跑的清单。</p>
+
+                    <ul>
+                        <li><strong>跑过的（Linux 一侧）</strong> — 复现删除后仍打开的文件，用 <code>stat -c</code> 追踪 inode 与链接数，用 <code>stat -f</code> 计量可用块，读取 <code>/proc/&lt;pid&gt;/fd</code> 并做全量扫描，两个持有方时的表现，尝试截断文件描述符，以及打开后立刻 <code>unlink</code> 的惯用写法</li>
+                        <li><strong>跑过的（Windows 一侧）</strong> — 用不同共享模式复现文件锁定，对被锁文件执行 <code>Remove-Item</code>、<code>Rename-Item</code>、<code>Get-Content</code>，从 Git Bash 执行 <code>rm</code> 与 <code>cat</code>，用 Restart Manager API 锁定占用进程，<code>openfiles</code>，以及用 <code>Get-Process</code> 搜索模块列表</li>
+                        <li><strong>没能跑的</strong> — <code>lsof</code> 与 <code>fuser</code>（这个环境里没装），一切与容器和命名空间相关的内容，还有 NFS 挂载</li>
+                        <li><strong>没有编造的</strong> — 没能跑的命令，<strong>本文里一行输出都没有。</strong>只写了命令形式和<strong>读法</strong>，依据是各工具的手册</li>
+                        <li><strong>动过手脚的</strong> — 路径缩写成了 <code>/tmp/demo</code>。<strong>数字一个都没改。</strong>这台机器是同时跑着别的活的个人电脑，可用块数值里混着几百块量级的噪声，噪声也原样留着</li>
+                        <li>块大小报告为 4,096 字节。下文任何可用块数乘以 4,096 就是字节数</li>
+                    </ul>
+
+                    <h2 id="sec-3">症状 - df 与 du 对不上</h2>
+
+                    <p>诊断的起点是<strong>两个工具给出不同的答案</strong>。<code>du</code> 走目录、数有名字的文件，名字没了的文件在它的视野之外。<code>df</code> 读的是文件系统的块记账，所以把被咬住的空间仍算作<strong>已用</strong>。于是两者拉开，<strong>拉开的宽度就是被咬住的容量</strong>。</p>
+
+                    <p>造一个 200MiB 的文件，用 <code>tail -f</code> 咬着再删掉，每一步原样打印 <code>df -h</code>。</p>
+
+                    <pre><code>--- rm 之前 ---
+du -sh . = 200M
+  Filesystem   Size  Used Avail Use% Mounted on
+  /tmp/demo    931G  601G  331G  65% /tmp
+
+--- rm 之后 ---
+du -sh . = 0
+  Filesystem   Size  Used Avail Use% Mounted on
+  /tmp/demo    931G  601G  331G  65% /tmp
+
+--- 结束持有进程之后 ---
+  Filesystem   Size  Used Avail Use% Mounted on
+  /tmp/demo    931G  600G  332G  65% /tmp</code></pre>
+
+                    <p>把三段并排读，顺序就很清楚了。<code>rm</code> 只把 <code>du</code> 从 200M 变成了 0，<code>df</code> <strong>一位数都没动</strong>。<code>df</code> 从 601G/331G 变成 600G/332G，是在<strong>结束进程之后</strong>发生的。把空间还回来的不是 <code>rm</code> 而是 <code>kill</code>。</p>
+
+                    <ul>
+                        <li>在现场这个症状通常先在<strong>曲线图</strong>上露头。清理跑完了但磁盘用量的线没有台阶式下落而是平的，那多半就是这个原因</li>
+                        <li>拿 <code>du -sh /</code> 的合计跟 <code>df</code> 的 Used 比一比，是最便宜的一次判别。差得大就说明存在没有名字的文件</li>
+                        <li>不过这两个值本来也不会完全一致。保留块、日志区、被挂载遮住的目录都会让几个百分点的差异属于正常。信号是差距<strong>拉到几十 GiB 这个量级</strong>的时候</li>
+                        <li>有一个坑值得点名。用非 root 账号跑 <code>du</code>，读不了的目录会被静静跳过，这样产生的差异跟本文这个现象无关</li>
+                    </ul>
+
+                    <h2 id="sec-4">名字没了，inode 还在</h2>
+
+                    <p>上一节是症状，这一节是把原理直接看在眼里。造一个 512MiB 的文件，用 <code>tail -f</code> 咬住，删掉之后<strong>再通过文件描述符去看同一个 inode</strong>。</p>
+
+                    <pre><code>[1] 刚创建
+    name=app.log inode=4503599629412470 links=1 size=536870912 blocks=524288
+    free=86810586   du -sh . = 512M
+
+[2] tail -f (pid=1442) 打开着它
+
+[3] rm 之后 - 名字没了
+    ls -A: []
+    du -sh . = 0    free=86811452
+
+[4] 但通过 fd 看，inode 还活着
+    /proc/1442/fd/3  inode=4503599629412470 links=0 size=536870912 blocks=524288
+    readlink        /tmp/demo/app.log (deleted)
+
+[5] 用咬住的 fd 依然读得到
+    $ head -c 16 /proc/1442/fd/3 | od -An -tx1
+      00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+[6] kill 之后 free=86939254</code></pre>
+
+                    <p>读的顺序是这样。<strong>inode 号在 [1] 和 [4] 里是同一个</strong>，删掉之后仍是同一个对象。变的只有 <code>links</code> 一项，从 1 变成 0。而 <code>size</code> 与 <code>blocks</code> <strong>还是 536870912 和 524288</strong>，意思是名字没了但数据一个字节都没归还。</p>
+
+                    <p>可用块也在说同一件事。<code>rm</code> 前后从 86810586 变成 86811452，只动了 <strong>866 块</strong>。乘以 4,096 大约 3.4MiB，这是同一台机器上别的活带来的噪声。512MiB 是 131,072 块，其中什么都没回来。然后在 <code>kill</code> 之后，从 86811452 到 86939254，<strong>127,802 块一次性</strong>回来了。</p>
+
+                    <ul>
+                        <li><code>links=0</code> 而 <code>size</code> 很大，<strong>这就是这种情形的指纹</strong>。任何别的状态都不会给出这个组合</li>
+                        <li>内核附上的 <code>(deleted)</code> 尾巴是<strong>一个标记，不是路径字符串的一部分</strong>。把那串字符原样交给 <code>cat</code>，得到的是文件不存在</li>
+                        <li>正如 [5] 所示，<strong>占着的那一方读写毫无障碍</strong>。所以应用程序根本不会把这种情形报成错误</li>
+                        <li>回收是一次完成的，这点也值得记住。不是慢慢回来然后停住，而是在最后一个引用关闭的<strong>那一瞬间全部到位</strong></li>
+                    </ul>
+
+                    <h2 id="sec-5">找法一 - 直接扫 /proc</h2>
+
+                    <p>生产机器上没有 <code>lsof</code> 的情况比想象中多。最小化镜像里、容器里、内网隔离的服务器上，装一个新工具本身就要走流程。可是<strong>内核已经把答案摆出来了</strong>，所以没工具也行。每个进程的 <code>/proc/&lt;pid&gt;/fd</code> 是一串指向它所打开文件的符号链接，目标被删掉时，末尾会附上 <code>(deleted)</code>。</p>
+
+                    <pre><code># 只看某一个进程
+$ ls -l /proc/1442/fd | grep -i deleted
+lrwx------ 3 -&gt; /tmp/demo/app.log (deleted)
+
+# 全量扫描 - 只用 shell
+$ for p in /proc/[0-9]*; do
+    pid=${p##*/}
+    for fd in "$p"/fd/*; do
+      tgt=$(readlink "$fd" 2&gt;/dev/null) || continue
+      case "$tgt" in *"(deleted)") echo "pid=$pid fd=${fd##*/} -&gt; $tgt";; esac
+    done
+  done
+
+pid=318  fd=3  -&gt; /tmp/demo/app.log (deleted)
+pid=319  fd=3  -&gt; /tmp/demo/app.log (deleted)
+
+# 想连被咬住的大小一起看
+$ stat -L -c '%i %h %s %n' /proc/318/fd/3
+16607023627971255 0 268435456 /proc/318/fd/3</code></pre>
+
+                    <p>这个办法的价值不只在于<strong>不需要额外安装</strong>。加上 <code>stat -L</code> 就能当场看到被咬住的容量，候选有好几个时便可以按大小排序，知道<strong>先处理哪一个空间才真的会回来</strong>。它的局限同样清楚。</p>
+
+                    <ul>
+                        <li>别的用户的进程<strong>没有权限就看不到</strong>。上面的遍历会静静跳过那些行，所以结果为空并不等于不存在。能用 <code>sudo</code> 就用</li>
+                        <li>只看 <code>fd</code> 会<strong>漏掉内存映射</strong>。文件 <code>mmap</code> 之后即使关掉描述符，映射仍然作为引用留着，那部分在 <code>/proc/&lt;pid&gt;/maps</code> 里</li>
+                        <li>遍历过程中进程消失，<code>readlink</code> 就会失败。上面的写法容忍失败正是为此，也因此<strong>同一条命令跑两遍结果可能不一样</strong></li>
+                        <li>进程数上千时这个遍历本身也要花时间。着急就先缩小范围，最常见的是写日志的应用程序和<strong>读日志往外送的采集器</strong>两边都咬着同一个文件</li>
+                    </ul>
+
+                    <h2 id="sec-6">找法二 - lsof 的命令与读法</h2>
+
+                    <p>标准工具是 <code>lsof</code>。<strong>这个环境里没装，所以我一次都没跑过。</strong>因此下面没有示例输出，写的是手册规定的行为，以及输出里该看哪几列。</p>
+
+                    <pre><code># 只要已删除却仍打开的文件 - 针对这种情形的精确提问
+$ sudo lsof +L1
+
+# 按挂载点收窄（全量扫描很慢）
+$ sudo lsof -nP +L1 /var
+
+# 谁打开着这个具体路径
+$ sudo lsof /var/log/app.log
+
+# 这个进程打开着什么
+$ sudo lsof -p 1234
+
+# 整棵目录树（递归 - 可能非常慢）
+$ sudo lsof +D /var/log</code></pre>
+
+                    <p>核心选项是 <code>+L1</code>。手册写道，在 <code>+L</code> 后面给一个数字时，<strong>只列出链接数小于该值的文件</strong>。所以 <code>+L1</code> 精确地挑出链接数为 0 的文件，也就是<strong>所有名字都没了却仍打开着的文件</strong>。而且指定 <code>+L</code> 会在输出里<strong>加上一个 NLINK 列</strong>。</p>
+
+                    <ul>
+                        <li>默认的列构成是 COMMAND、PID、USER、FD、TYPE、DEVICE、SIZE/OFF、NODE、NAME。这里面只看 <strong>PID、SIZE/OFF 和 NAME</strong> 这三个，大多数时候就够了</li>
+                        <li>因为 <code>+L</code> 会插入 NLINK，<strong>列的位置会往后挪</strong>。像 <code>awk '{print $2}'</code> 这种按位置取值的写法，选项一变就崩。要自动化就按每套选项重新确认列位置</li>
+                        <li>FD 列里除了数字还会出现 <code>cwd</code>、<code>txt</code>、<code>mem</code> 之类的值。<code>mem</code> 表示内存映射，正是 <code>/proc/&lt;pid&gt;/fd</code> 遍历漏掉的那种引用。<strong>lsof 胜过手工扫 <code>fd</code> 的地方就在这里</strong></li>
+                        <li>数字后面跟的 <code>r</code>、<code>w</code>、<code>u</code> 表示读、写、读写。<strong>以写方式</strong>咬着日志文件的那一方，通常就是要处理的对象</li>
+                        <li><code>-n</code> 和 <code>-P</code> 关掉名称与端口的解析，手册也把速度列为理由。<strong>磁盘满了的急场上，养成随手加上的习惯更好</strong></li>
+                        <li><code>+D</code> 会递归遍历目录树，省事但对象大时会拖很久。先试按挂载点收窄</li>
+                    </ul>
+
+                    <h2 id="sec-7">找法三 - fuser 从路径到进程</h2>
+
+                    <p><code>fuser</code> 同样<strong>这里没有，所以也没跑过</strong>。它的性格与 <code>lsof</code> 不同。<code>lsof</code> 是出清单的工具，<code>fuser</code> 则是<strong>拿一个路径来问、回答哪些进程在用它</strong>的工具。文件已经锁定时，它更快。</p>
+
+                    <pre><code># 谁在用这个文件（以 ps 形式）
+$ sudo fuser -v /var/log/app.log
+
+# 谁在用这整个文件系统 - 卸载不掉的时候
+$ sudo fuser -vm /var
+
+# 下面两行会杀进程。没确认就不要敲
+$ sudo fuser -k  /var/log/app.log     # 立刻结束
+$ sudo fuser -ki /var/log/app.log     # 逐个确认后结束</code></pre>
+
+                    <p>加上 <code>-v</code>，按手册的说法就是以<strong>类似 ps 的形式</strong>给出 PID、USER、COMMAND，中间夹着一个 <code>ACCESS</code> 列。这一列就是读 <code>fuser</code> 的全部诀窍，手册对其中字母的定义如下。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>字母</th><th>手册的定义</th><th>在这种情形下的含义</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>f</code></td><td>已打开的文件（默认显示中省略）</td><td>以读打开，常见于采集器与监控</td></tr>
+                            <tr><td><code>F</code></td><td>以写方式打开的文件（默认显示中省略）</td><td><strong>头号嫌疑。</strong>此刻仍在往这个文件写</td></tr>
+                            <tr><td><code>m</code></td><td>mmap 的文件或共享库</td><td>靠映射咬着，扫 <code>fd</code> 抓不到的那一类</td></tr>
+                            <tr><td><code>c</code></td><td>当前目录</td><td>只是在那里跑着，仅妨碍卸载</td></tr>
+                            <tr><td><code>e</code></td><td>正在运行的可执行文件</td><td>二进制本身就在那个文件系统上</td></tr>
+                            <tr><td><code>r</code></td><td>根目录</td><td>在 <code>chroot</code> 过的进程上会看到</td></tr>
+                        </tbody>
+                    </table>
+
+                    <div class="callout">
+                        <strong>危险</strong> — <code>fuser -k</code> 按手册所述会<strong>杀掉正在访问该文件的进程</strong>。路径给得宽，底下所有在写的进程<strong>全都</strong>会成为目标。<code>-m</code> 与 <code>-k</code> 一起给，使用该文件系统的所有进程都会被结束。先用 <code>-v</code> 看清单，确认要杀的对象与清单完全一致，之后才加 <code>-k</code>。想要逐个确认就再加 <code>-i</code>，不过手册注明<strong>不带 <code>-k</code> 只给 <code>-i</code> 会被静默忽略</strong>。
+                    </div>
+
+                    <h2 id="sec-8">占着的不止一个时</h2>
+
+                    <p>这是实务中最容易做无用功的地方。找到一个、重启了、空间却纹丝不动，那多半不是工具错了，而是<strong>引用本来就不止一个</strong>。让两个进程咬住一个 256MiB 的文件，再一个一个地结束。</p>
+
+                    <pre><code>[1] 创建 256MiB          free=86679271
+[2] rm 完成              free=86680587   ls -A=[]
+[3] 全量扫描剩余引用
+    pid=318  fd=3  -&gt; /tmp/demo/app.log (deleted)
+    pid=319  fd=3  -&gt; /tmp/demo/app.log (deleted)
+[4] 只结束一个 (pid 318)  free=86682346   &lt;-- 还不行
+[5] 另一个也结束 (pid 319) free=86748978   &lt;-- 这下回来了</code></pre>
+
+                    <p>[4] 里动了 1,759 块，约 7MiB 的噪声。256MiB 是 65,536 块，可是<strong>杀掉其中一个什么都没回来</strong>。到 [5] 才有 66,632 块一次性归还。内核数的是引用，不是进程。</p>
+
+                    <ul>
+                        <li>所以处理顺序是<strong>先把清单做完整，再动手</strong>。找一个杀一个再看一遍，每次清单都在变，判断就跟着晃</li>
+                        <li>同一个进程<strong>用多个描述符打开同一个文件</strong>的情况也有。这时处理一个进程就够了，但若用 fd 截断来应对，就得把每个编号都截</li>
+                        <li>典型的多引用组合是固定的，写日志的应用程序、读它的采集器，再加上有人几天前开了又忘掉的 <code>tail -f</code> 会话</li>
+                        <li>子进程<strong>继承</strong>父进程打开的文件也很常见。只重启父进程，子进程照样咬着</li>
+                    </ul>
+
+                    <h2 id="sec-9">Windows - 查出是谁锁的</h2>
+
+                    <p>在 Windows 上症状本身就不一样。不是删掉的文件咬着空间，而是<strong>它根本删不掉</strong>。会弹出正在使用中的提示，而到底是哪个程序，通常不告诉你。</p>
+
+                    <p>这里真正能用的是 <strong>Restart Manager API</strong>。微软文档把这个 API 的用途说成是在安装与维护过程中<strong>关闭并重启正在使用待更新文件的应用程序</strong>，以减少重启次数。那个过程所需要的信息，恰恰就是我们想要的，<strong>此刻是谁握着这个文件</strong>。它不需要管理员权限，也不需要额外安装。</p>
+
+                    <pre><code>Add-Type -Namespace Rm -Name Api -MemberDefinition @'
+[StructLayout(LayoutKind.Sequential)]
+public struct RM_UNIQUE_PROCESS { public int dwProcessId;
+  public System.Runtime.InteropServices.ComTypes.FILETIME ProcessStartTime; }
+[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+public struct RM_PROCESS_INFO {
+  public RM_UNIQUE_PROCESS Process;
+  [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string strAppName;
+  [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)]  public string strServiceShortName;
+  public int ApplicationStatus; public uint TSSessionId;
+  [MarshalAs(UnmanagedType.Bool)] public bool bRestartable; }
+[DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+public static extern int RmStartSession(out uint h, int flags, string key);
+[DllImport("rstrtmgr.dll")] public static extern int RmEndSession(uint h);
+[DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+public static extern int RmRegisterResources(uint h, uint nFiles, string[] files,
+  uint nApps, RM_UNIQUE_PROCESS[] apps, uint nSvc, string[] svc);
+[DllImport("rstrtmgr.dll")]
+public static extern int RmGetList(uint h, out uint needed, ref uint count,
+  [In, Out] RM_PROCESS_INFO[] arr, ref uint reasons);
+'@
+
+$full = (Resolve-Path $Path).Path
+$h = 0
+[void][Rm.Api]::RmStartSession([ref]$h, 0, [guid]::NewGuid().ToString())
+[void][Rm.Api]::RmRegisterResources($h, 1, @($full), 0, $null, 0, $null)
+$needed = 0; $count = 0; $reason = 0
+$rc = [Rm.Api]::RmGetList($h, [ref]$needed, [ref]$count, $null, [ref]$reason)
+if ($rc -eq 234) {                       # ERROR_MORE_DATA - 它在告诉你真正的个数
+    $arr = New-Object 'Rm.Api+RM_PROCESS_INFO[]' $needed
+    $count = $needed
+    if ([Rm.Api]::RmGetList($h,[ref]$needed,[ref]$count,$arr,[ref]$reason) -eq 0) {
+        for ($i = 0; $i -lt $count; $i++) {
+            $pi = $arr[$i]
+            "  PID {0,-7} {1,-22} restartable={2}" -f `
+              $pi.Process.dwProcessId, $pi.strAppName, $pi.bRestartable
+        }
+    }
+}
+[void][Rm.Api]::RmEndSession($h)</code></pre>
+
+                    <p>这是在本环境里真正跑出来的结果。同一个文件问了两次，第二次是另一个进程以不共享的方式打开着它。</p>
+
+                    <pre><code>=== A. 没人占着的时候 ===
+holders of: C:\tmp\demo\locked.txt
+  (none - no process holds this file)
+
+=== B. 另一个进程占着的时候 ===
+holders of: C:\tmp\demo\locked.txt
+  PID 25328   Windows PowerShell     restartable=True</code></pre>
+
+                    <ul>
+                        <li>连同 PID 一起给出 <code>restartable</code> 这点很实用。为真就意味着<strong>那个程序已登记为可以被关掉再重启</strong>，处置的判断因此容易许多</li>
+                        <li>第一次调用 <code>RmGetList</code> 返回 <code>234</code>（ERROR_MORE_DATA）不是失败，而是<strong>在告诉你需要多大的数组，属于正常流程</strong>。把这个值当成错误处理，结果就会永远看起来是空的</li>
+                        <li>资源管理器那个<strong>文件正在使用</strong>的对话框有时会显示程序名，背后就是这个 API。我们做的只是用脚本把同样的信息取出来</li>
+                        <li>想用图形界面做同一件事，打开<strong>资源监视器</strong>（<code>resmon</code>），在 CPU 选项卡的<strong>关联的句柄</strong>搜索框里输入文件名即可。本文没有截图，所以界面的说明就到这里</li>
+                    </ul>
+
+                    <h2 id="sec-10">Windows - 那些行不通的办法</h2>
+
+                    <p>搜索时常见但实际上并不管用的办法有两个。两个都跑过了，而<strong>为什么不行</strong>反倒更有用。</p>
+
+                    <pre><code>PS&gt; openfiles /Local
+错误: 登录的用户不具有管理员权限。
+
+PS&gt; openfiles /Query /FO TABLE
+信息: 要查看本地打开的文件，需要启用系统全局标志
+      'maintain objects list'。
+通过本地共享点从远程打开的文件:
+错误: 拒绝访问。
+
+PS&gt; # 用 Modules 查 - DLL 是能查到的
+PS&gt; Get-Process | Where-Object { $_.Modules.FileName -contains
+      'C:\WINDOWS\System32\kernel32.dll' } | Select-Object -First 3 Id,ProcessName
+   Id ProcessName
+   -- -----------
+19744 AMDInstallManager
+11128 AMDRSSrcExt
+21760 ApplicationFrameHost
+
+PS&gt; # 用同样的方式去查数据文件
+PS&gt; Get-Process | Where-Object { $_.Modules.FileName -contains $target }
+(结果 0 条)</code></pre>
+
+                    <p><code>openfiles</code> 被堵了两层。要看本地清单就得打开名为 <strong>maintain objects list</strong> 的系统全局标志，而打开它的 <code>openfiles /Local ON</code> 本身要求管理员权限，生效还要重启。也就是说<strong>它不是问题已经发生之后再打开来用的工具</strong>。标志关闭时 <code>/Query</code> 能回答的只有通过共享从远程打开的文件。</p>
+
+                    <p><code>Get-Process</code> 的 <code>Modules</code> 是另一回事。它不是完全没用，而是<strong>对象不同</strong>。这个集合里装的是加载进进程的可执行映像，也就是 EXE 与 DLL。上面的输出里 <code>kernel32.dll</code> 查得好好的。但日志文件或数据文件不是模块，所以答案<strong>永远是 0 条</strong>。</p>
+
+                    <ul>
+                        <li>归纳起来就是，若是<strong>DLL 被锁住导致更新卡住</strong>的情形，<code>Modules</code> 搜索就够了；其他文件则走上一节的 Restart Manager</li>
+                        <li>Sysinternals 的 <code>handle</code> 系列工具用得很广，但<strong>本环境里没装，所以没能跑</strong>，因此本文没有引用它的输出</li>
+                        <li>实际场景里锁定的元凶是<strong>杀毒软件、备份或索引服务</strong>的情况相当多。它们打开文件很快又关掉，所以<strong>同一个查询隔几秒做两次</strong>就能把它们和持续占用者区分开</li>
+                    </ul>
+
+                    <h2 id="sec-11">重启是答案，但重启不了的时候</h2>
+
+                    <p>找到占着的那一方之后，处置很简单，<strong>重启最靠谱</strong>。若是日志文件，很多时候用日志重开信号代替重启就够了。可要是线上服务、两样眼下都做不了，还有一个流传很广的绕行办法，就是<strong>直接把打开的文件描述符截断</strong>。</p>
+
+                    <div class="callout">
+                        <strong>危险</strong> — 下面这个办法<strong>无法撤销，也没有任何确认步骤</strong>。文件描述符的编号挑错一个，那个进程打开的<strong>另一个文件就会被整个清空</strong>。执行之前先用 <code>readlink /proc/&lt;pid&gt;/fd/&lt;n&gt;</code> 亲眼确认目标，看清它确实是带着 <code>(deleted)</code> 标记的日志文件，之后才动手。只要还能重启，重启永远是更安全的那一边。
+                    </div>
+
+                    <pre><code># 1) 必须先做 - 亲眼确认要截的是什么
+$ readlink /proc/957/fd/3
+/tmp/demo/big.log (deleted)
+
+# 2) 之后才做 - 截断描述符（不可撤销）
+$ : &gt; /proc/957/fd/3
+
+# 本环境里跑出来的结果
+[A] rm 之后             free=86771292
+    fd: inode=16607023627971255 links=0 size=268435456 blocks=262144
+[B] : &gt; /proc/957/fd/3
+    tail: big.log: file truncated
+    截断尝试之后: size=0  blocks=262144
+    free=86770524                     &lt;-- 没有回来
+[C] truncate -s 0 /proc/957/fd/3
+    size=0  blocks=262144
+    free=86769107                     &lt;-- 依然没有
+[D] kill 之后           free=86833972</code></pre>
+
+                    <p>结果得老老实实地读。<strong>截断本身是成功的</strong>，<code>size</code> 从 268435456 变成了 0，咬着它的 <code>tail</code> 也回应了 <code>file truncated</code>，这就是证据。可是<strong>可用块没有回来</strong>，<code>blocks</code> 也还是 262144。真正的归还发生在 <code>kill</code> 之后的 [D]。</p>
+
+                    <p>这里不能急着下结论。本环境的 <code>/proc</code> 不是 Linux 内核的 procfs 而是 MSYS 模拟出来的，底下是 NTFS。<strong>这不构成 Linux 上会得到同样结果的依据。</strong>不过从这次失败里带走的教训与环境无关，<strong>截断有没有生效，要用 <code>df</code> 确认，不是用 <code>size</code></strong>。大小显示变成 0 和空间真的回来了，是两件不同的事实。</p>
+
+                    <p>而且这个办法有对象限制。<strong>对日志管用，对数据文件不管用</strong>，原因在于两者对待文件的方式不同。</p>
+
+                    <ul>
+                        <li><strong>日志文件</strong> — 通常以追加模式打开，只往末尾写。前面的部分没了，下一次写入照样从新的末尾接上，截断不会破坏应用程序对文件的认知</li>
+                        <li><strong>数据文件与数据库文件</strong> — 要计算偏移量、读写特定位置。截断的那一刻<strong>进程记住的结构就和文件的实际内容错开了</strong>。若后续的读取把补零的区域当成正常数据来解释，损坏会悄悄扩散</li>
+                        <li><strong>不是追加模式的日志</strong> — 若实现保持着偏移量继续写，截断之后文件大小会重新长到原来的偏移量，前段补零，变成<strong>稀疏文件</strong>，看上去很大而实际占用很小</li>
+                        <li><strong>被多个描述符打开的文件</strong> — 只截一个，其他描述符照样咬着，跟上一节看到的一样</li>
+                    </ul>
+
+                    <h2 id="sec-12">锁是另一回事</h2>
+
+                    <p>到这里为止讲的都是<strong>已删除却仍打开的文件</strong>。<strong>文件锁</strong>名字相近、症状看着也重叠，却是另一套机制。而正是在这一点上，Linux 与 Windows 精确地分道扬镳。</p>
+
+                    <p>Unix 的 <code>flock</code> 是<strong>建议性的</strong>。手册这样写道，只要对文件有合适的权限，<strong>进程完全可以无视别人对 <code>flock</code> 的使用而照常进行输入输出</strong>。也就是说锁是选择参与的程序之间的约定，不是内核强制的墙。所以在 Linux 上<strong><code>rm</code> 绝不会因为别人加了锁而失败</strong>。</p>
+
+                    <p>Windows 不同，但也不同于常见的误解。并不是 Windows 一律阻拦，而是<strong>打开文件的一方在打开时定下共享模式，由内核强制执行</strong>。<code>CreateFile</code> 文档写道，共享参数为 0 时<strong>该文件无法被共享，在句柄关闭之前也无法再次打开</strong>，冲突的请求会以 <code>ERROR_SHARING_VIOLATION</code> 失败。实际跑一遍，同一个文件会因共享模式而走向相反的结果。</p>
+
+                    <pre><code>=== 以共享模式 None 打开的文件 ===
+PS&gt; Remove-Item $target
+ERR: IOException
+MSG: The process cannot access the file ... because it is being used by another process.
+PS&gt; Rename-Item $target renamed.txt      -&gt; 同样的错误
+PS&gt; Get-Content $target                  -&gt; 同样的错误
+
+$ stat -c 'inode=%i links=%h size=%s' locked.txt
+inode=6192449489676514 links=1 size=19       # 元数据还读得到
+$ cat locked.txt
+cat: locked.txt: Device or resource busy
+$ rm locked.txt
+rm: cannot remove 'locked.txt': Device or resource busy
+$ ls -l
+-rw-r--r-- 1 ... 19 Sep  2 09:12 locked.txt  # 原样留在那里
+
+=== 同一个文件以共享模式 ReadWrite, Delete 打开时 ===
+$ cat shared.txt
+share-delete payload
+$ rm -v shared.txt
+removed 'shared.txt'                          # 成功。持有进程还活着
+$ ls -A
+(空)</code></pre>
+
+                    <p>两段之间的差别既不是文件也不是删除命令，只有一样，<strong>打开方允许了什么</strong>。不带共享打开的文件，删除、改名、读取全被挡住；共享列表里含删除的文件，<strong>持有进程还活着，名字却立刻消失了</strong>。后一种情形与 Unix 实质上是同一副样子。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>方面</th><th>Linux / Unix</th><th>Windows</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>锁的性质</td><td>建议性的，参与者之间的约定</td><td>内核强制执行打开时选定的共享模式</td></tr>
+                            <tr><td>删除使用中的文件</td><td>总能成功，消失的只是名字</td><td>只有打开方允许删除时才成功</td></tr>
+                            <tr><td>失败时看到什么</td><td>不会失败</td><td>正在使用的提示，或 <code>Device or resource busy</code></td></tr>
+                            <tr><td>由此产生的问题</td><td>空间悄无声息地不回来</td><td>发布与更新被吵吵嚷嚷地挡住</td></tr>
+                            <tr><td>查找用的工具</td><td><code>lsof</code>、<code>fuser</code>、<code>/proc</code></td><td>Restart Manager、资源监视器</td></tr>
+                            <tr><td>常见的误解</td><td>以为 <code>rm</code> 删的是数据</td><td>以为 Windows 使用中就绝对删不掉</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>落到实务上剩下的就是这一句。Windows 上发布被文件锁卡住时，<strong>要改的地方是打开方而不是删除方</strong>。让打开日志的代码允许删除共享，轮转就不会卡。</p>
+
+                    <h2 id="sec-13">容器 - pid 因视角而不同</h2>
+
+                    <p>容器里这项工作变难，不是因为没工具，而是因为<strong>pid 与路径随视角而不同</strong>。在宿主机上跑 <code>lsof</code> 拿到的 pid，拿进容器里交给 <code>kill</code>，杀掉的是风马牛不相及的进程。反过来也一样。</p>
+
+                    <p>容器本身在本环境跑不了。不过<strong>同一性质的错位</strong>在这里照样出得来，MSYS 用自己的一套 pid，Windows 内核用另一套。</p>
+
+                    <pre><code>$ tail -f hold.log &gt; /dev/null &amp;
+$ echo $!
+1410
+
+$ ls -l /proc/1410/fd | grep -i deleted
+lrwxrwxrwx 3 -&gt; /tmp/demo/hold.log (deleted)
+
+$ ps -W | head -1
+      PID    PPID    PGID     WINPID  TTY   UID    STIME COMMAND
+$ ps -W | grep 1410
+     1410    1405    1403        580  ?  197609 09:18:32 /usr/bin/tail</code></pre>
+
+                    <p>shell 知道的 pid 是 <strong>1410</strong>，内核知道的 pid 是 <strong>580</strong>。同一个进程，哪一边都没错。要点是<strong>没有对照表就不能把一边的数字交给另一边</strong>，容器 pid 命名空间里发生的事，性质完全相同。下面是那种场合下要确认的几处。</p>
+
+                    <ul>
+                        <li>把宿主机上看到的 pid 换算成容器内的 pid <strong>需要翻译</strong>。在 Linux 上，<code>/proc/&lt;host-pid&gt;/status</code> 的 <code>NSpid</code> 行会把两个值并排写出来</li>
+                        <li>路径也会错位。容器里的 <code>/var/log/app.log</code> 从宿主机看是叠加层上层某处的一条长路径。<strong>不要把宿主机侧 <code>lsof</code> 结果里的路径当成容器路径</strong></li>
+                        <li>容器里往往既没有 <code>lsof</code> 也没有访问 <code>/proc</code> 的权限。那时从宿主机看更快，宿主机的 <code>/proc/&lt;pid&gt;/root/</code> 下就能原样看到那个容器的文件系统</li>
+                        <li>最常见的错误是<strong>以为重启容器就能解决，而把日志卷原样留着</strong>。若占着的进程是容器之外的日志采集器，容器重启多少次空间都不会回来</li>
+                        <li>有编排系统在，人杀掉的进程会被重新拉起。要确认到<strong>新起来的进程会不会再咬住同一个文件</strong>，处置才算完</li>
+                    </ul>
+
+                    <h2 id="sec-14">网络文件系统上的 .nfs 文件</h2>
+
+                    <p>在 NFS 上同样的情形是<strong>以看得见的形式</strong>出现的。你多半见过删掉的文件没有消失，而是留下一个以 <code>.nfs</code> 开头的名字。这不是故障，而是<strong>NFS 客户端在设法模仿 POSIX 行为</strong>，通常称作 sillyrename。</p>
+
+                    <p>缘由是这样。在本地文件系统上，名字没了但只要还有打开的引用就能继续读。NFS 协议不直接支持这一点，于是客户端内核<strong>不去删除，而是把它改名成 <code>.nfsXXXX</code> 这种形式</strong>。按照 Linux NFS wiki 的说明，客户端会在对应的 vnode 变为非活动时删掉这个新名字。本环境没有 NFS 挂载，所以<strong>没能直接复现</strong>。</p>
+
+                    <ul>
+                        <li>所以 <code>.nfs</code> 文件是<strong>一个标记，不是该清掉的垃圾</strong>。它意味着还有人开着它，先找到并处理掉持有方，名字自己就会消失</li>
+                        <li>想删也删不动。只要引用还活着，客户端就会护着那个名字</li>
+                        <li>同一份 wiki 写了一个例外，<strong>若在改名和删除之间客户端崩溃，服务器上会留下一个垃圾文件</strong>。只有这种情况才是真该删的对象，判断依据是重启客户端之后它是否还在</li>
+                        <li>这套模仿<strong>只在客户端只有一个时</strong>成立。客户端无从知道别的客户端是否开着那个文件，所以在多个客户端共享同一文件的部署里，开着的文件被删掉是有可能发生的</li>
+                        <li><code>rmdir</code> 在<strong>看上去为空的目录里失败</strong>也是同一个原因，用 <code>ls -a</code> 看，<code>.nfs</code> 文件就在里面</li>
+                    </ul>
+
+                    <h2 id="sec-15">从源头上不让它发生</h2>
+
+                    <p>造成这种情形的原因实际上收敛到一件事，<strong>日志轮转的配置悄悄错位了</strong>。把文件挪走或删掉之后不给进程一个重新打开的信号，进程就会继续往那个没有名字的旧文件里写。轮转究竟怎么制造出这种局面，在 <a href="log_rotation_pitfalls.html">日志轮转悄悄失败的地方</a> 那边另讲。</p>
+
+                    <p>设计一侧也有能做的事。需要临时文件时，有一个<strong>打开之后立刻删名字</strong>的惯用写法。没有名字，别的进程就碰不到；进程无论以什么方式结束，内核都会自己把空间还回来，清理代码也就不必写了。</p>
+
+                    <pre><code># 打开后立刻 unlink - 匿名临时文件
+$ exec 9&gt; tmpdata
+$ rm tmpdata                      # 名字在这里就没了
+$ echo "hello anonymous" &gt;&amp;9      # 但写入照常
+$ ls -A
+(空)
+$ stat -L -c 'inode=%i links=%h size=%s' /proc/self/fd/9
+inode=16325548651260599 links=0 size=16
+$ exec 9&gt;&amp;-                       # 关闭的瞬间归还空间，无需清理代码
+
+# 放进监控的值 - df 与 du 的差
+$ used_df=$(df -k --output=used /var | tail -1)
+$ used_du=$(du -sk /var 2&gt;/dev/null | cut -f1)
+$ echo "gap_kb=$(( used_df - used_du ))"</code></pre>
+
+                    <ul>
+                        <li>把 <strong><code>df</code> 与 <code>du</code> 的差</strong>作为指标放进监控，这种情形在酿成事故之前就看得见。看的是<strong>趋势</strong>而不是绝对值，偏离平时的幅度并持续拉大，就说明被咬住的文件正在堆积</li>
+                        <li><code>du</code> 在大文件系统上开销很重，周期要拉长。像 CephFS 这类全量遍历代价高的文件系统，干脆避开这种做法，改用文件系统自带的递归统计</li>
+                        <li>确认重开信号是否<strong>同时</strong>送到了写日志的一方和读日志的一方。只有应用程序收到而采集器没收到，就只松开了一半</li>
+                        <li>把轮转从改名改成<strong>清空内容</strong>的方式，这个问题从原理上就不会发生。代价是轮转那一瞬间写进来的行可能丢失</li>
+                        <li>人留下的 <code>tail -f</code> 会话也是原因之一。为排查而开的会话，靠<strong>用完就关</strong>这一个习惯就能消掉</li>
+                    </ul>
+
+                    <h2 id="sec-16">着急时的顺序</h2>
+
+                    <p>磁盘满着的时候没有时间慢慢判断，所以把顺序事先定好更好。下面是从确认最便宜的到最危险的排列。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>顺序</th><th>要做的</th><th>要看的值</th><th>此处不该做的</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>1</td><td>把出错的路径直接给 <code>df</code></td><td>那条路径真的在那个文件系统上吗</td><td>只看根那一行就下判断</td></tr>
+                            <tr><td>2</td><td>比较 <code>du -sh</code> 合计与 <code>df</code> 的 Used</td><td>差距是不是几十 GiB</td><td>把差距立刻断定为原因</td></tr>
+                            <tr><td>3</td><td><code>lsof +L1</code> 或扫 <code>/proc</code></td><td>pid、被咬住的大小、路径</td><td>清单没做完就动手</td></tr>
+                            <tr><td>4</td><td>把同一文件的引用<strong>全部</strong>收集齐</td><td>父进程、子进程、采集器、人的会话</td><td>杀一个再重新数一遍</td></tr>
+                            <tr><td>5</td><td>重启，或发日志重开信号</td><td><code>df</code> 的可用量是否台阶式跳升</td><td>一上来就用 <code>kill -9</code></td></tr>
+                            <tr><td>6</td><td>仍然不行才截断 fd</td><td>只在 <code>readlink</code> 确认目标之后</td><td>用在数据文件或数据库文件上</td></tr>
+                        </tbody>
+                    </table>
+
+                    <div class="callout">
+                        <strong>危险</strong> — <code>kill -9</code>（<code>SIGKILL</code>）不给进程任何收尾的机会。代价可能只是缓冲区里的日志丢掉，也可能是正写到一半的文件停在中间状态。<strong>先发默认的结束信号，等上几秒仍然活着时才用</strong>强制结束。无论哪种情况，对数据库或任何带状态的进程而言，这都是最后手段。
+                    </div>
+
+                    <ul>
+                        <li>第 3 步候选为 <strong>0 条</strong>时，先怀疑权限。别的用户的进程会被静静漏掉</li>
+                        <li>做完第 5 步 <code>df</code> 还是不动，就回到第 4 步。不是工具错了，而是<strong>还有引用留着</strong></li>
+                        <li>急场上往<strong>再去找更多可删的东西</strong>这个方向走，通常是在丢时间。<code>du</code> 与 <code>df</code> 对不上时，删是解决不了的</li>
+                        <li>处置完之后再看一眼<strong>同一个文件是否又被咬住</strong>。轮转配置照旧，几天后还会回到同一个地方</li>
+                        <li>真正的原因在内存那一侧时，症状看着像但问题不同。那条线索在 <a href="oom_killer_diagnosis.html">怎么读懂 OOM Killer 选中了什么</a> 那边</li>
+                    </ul>
+
+                    <h2 id="sec-17">小结</h2>
+
+                    <p><code>rm</code> 是删名字的命令。真正删掉数据的是<strong>最后一个引用关闭那一刻的内核</strong>。所以这种情形的解决从来不是把文件再删一遍，而是<strong>让占着的那一方松手</strong>，为此得先锁定是谁在占着。</p>
+
+                    <p>锁定的路有三条。<code>lsof +L1</code> 精确挑出链接数为 0 的已打开文件。<code>fuser -v</code> 拿一个路径来问、回答哪些进程在用，ACCESS 列告诉你它们的性质。两样都没有就用 shell 扫 <code>/proc/&lt;pid&gt;/fd</code>，<code>(deleted)</code> 这个标记就替你给出答案。在 Windows 上症状是反过来的，答案由 Restart Manager 给出。</p>
+
+                    <p>还有两件容易忘的事。引用<strong>未必只有一个</strong>；文件描述符截断<strong>对日志管用，对数据文件不管用</strong>。这两点漏掉一个，就会出现处置做了 <code>df</code> 却不动，或者动了却把别的东西弄坏了。</p>
+
+                    <h2 id="sec-18">未能确认的部分</h2>
+
+                    <ul>
+                        <li><code>lsof</code> 与 <code>fuser</code> <strong>在本环境里没有安装，一次都没能执行</strong>。相应小节的命令与列说明依据的是各工具的手册，<strong>本文没有它们的执行输出</strong>。列的构成会随版本与发行版而变，自动化之前最好先在自己的机器上确认一遍</li>
+                        <li>文件描述符截断在本环境里<strong>只让 <code>size</code> 变成 0，可用块没有回来</strong>。由于 MSYS 的 <code>/proc</code> 不是 Linux 内核的 procfs 且底下是 NTFS，<strong>在 Linux 的 ext4 与 XFS 上是否得到同样结果，未能确认</strong>。本文不对那种环境的结果下断言</li>
+                        <li>容器与 pid 命名空间<strong>未能直接复现</strong>。正文里给出的 pid 错位是 MSYS 与 Windows 内核之间的，是<strong>作为性质相同的类比</strong>写的，不是从容器里取到的输出。<code>/proc/&lt;pid&gt;/status</code> 的 <code>NSpid</code> 行在本环境同样没能确认</li>
+                        <li>因为没有 NFS 挂载，<strong>没能自己造出一个 <code>.nfsXXXX</code> 文件</strong>。相应小节依据的是 Linux NFS wiki 的说明</li>
+                        <li>Sysinternals 的 <code>handle</code> 系列工具<strong>没有安装，因而没能运行</strong>，所以本文没有引用它的输出。资源监视器是图形界面，没有截图，只写了操作位置</li>
+                        <li>没有真的执行 <code>openfiles /Local ON</code>，因此<strong>标志启用状态下的行为未能确认</strong>，那需要管理员权限和一次重启。正文里的两条错误消息是<strong>标志关闭状态下真实的输出</strong></li>
+                        <li>可用块数值里混着的噪声<strong>没有清除</strong>。这是因为这台机器上还跑着别的活，几百到几千块量级的抖动由此而来。复现时不会得到相同的数字</li>
+                    </ul>
+
+                    <h2 id="sec-19">参考资料</h2>
+
+                    <ul>
+                        <li><a href="https://pubs.opengroup.org/onlinepubs/9699919799/functions/unlink.html" target="_blank" rel="noopener">unlink - POSIX.1-2017 (The Open Group Base Specifications Issue 7)</a> — 链接在 unlink 返回之前被移除，而文件内容的删除要推迟到所有引用关闭之后的规定</li>
+                        <li><a href="https://linux.die.net/man/8/lsof" target="_blank" rel="noopener">lsof(8) 手册</a> — 只列出链接数小于 <code>+L</code> 后所给数值的文件，指定 <code>+L</code> 会加上 NLINK 列，以及 <code>-n</code>、<code>-P</code>、<code>+D</code>、<code>-p</code> 的行为</li>
+                        <li><a href="https://man7.org/linux/man-pages/man1/fuser.1.html" target="_blank" rel="noopener">fuser(1) - Linux manual page</a> — <code>-v</code> 类似 ps 的输出、ACCESS 字母 <code>c</code>、<code>e</code>、<code>f</code>、<code>F</code>、<code>r</code>、<code>m</code> 的定义，以及 <code>-m</code>、<code>-k</code>、<code>-i</code> 的行为</li>
+                        <li><a href="https://man7.org/linux/man-pages/man2/flock.2.html" target="_blank" rel="noopener">flock(2) - Linux manual page</a> — 属于建议性锁的规定、进程可以无视锁而照常进行输入输出的那句话，以及锁与打开文件描述相绑定的说明</li>
+                        <li><a href="https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew" target="_blank" rel="noopener">CreateFileW function (fileapi.h) - Win32 apps</a> — <code>dwShareMode</code> 为 0 时无法共享且句柄关闭前无法再次打开的说明、冲突时的 <code>ERROR_SHARING_VIOLATION</code>，以及 <code>FILE_SHARE_DELETE</code> 的含义</li>
+                        <li><a href="https://learn.microsoft.com/en-us/windows/win32/rstmgr/about-restart-manager" target="_blank" rel="noopener">About Restart Manager - Win32 apps</a> — 关闭并重启正在使用待更新文件的应用程序与服务以减少重启次数这一目的，以及关闭的顺序</li>
+                        <li><a href="https://wiki.linux-nfs.org/wiki/index.php/Server-side_silly_rename" target="_blank" rel="noopener">Server-side silly rename - Linux NFS</a> — 删除打开中的文件时客户端改名而不删除的行为、在 vnode 变为非活动时删掉的说明，以及期间客户端崩溃会在服务器上留下垃圾文件的提法</li>
+                        <li><a href="no_space_left_but_disk_free.html">磁盘没满却报 No space left on device - inode 与仍被打开的文件</a> — 这一症状的四类原因分类与诊断顺序。本文接的是其中第二类原因</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>分享本文</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">返回列表</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/code_image.html">代码图片生成器</a></li>
+      <li><a href="../static/char_counter.html">字数统计</a></li>
+      <li><a href="../static/json_formatter.html">JSON 格式化工具</a></li>
+      <li><a href="../static/regex_tester.html">正则表达式测试器</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="no_space_left_but_disk_free.html">磁盘没满却报 No space left on device - inode 与仍被打开的文件</a></li>
+      <li><a href="oom_killer_diagnosis.html">进程无声无息地死了 - 读懂 OOM Killer</a></li>
+      <li><a href="git_credential_leak_prevention.html">远程 URL 里嵌着令牌 - git 凭据泄漏的地方</a></li>
+      <li><a href="git_gitignore_already_tracked.html">写进 .gitignore 了却还是一直被提交 - 已经在跟踪中的文件</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制。粘贴到 Threads 应用即可分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制!'); });
+    });
+    </script>
+</body>
+</html>

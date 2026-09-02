@@ -1,0 +1,886 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ko">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>로그 로테이션이 조용히 실패하는 자리 - 디스크는 차는데 아무도 모른다</title>
+    <meta name="description" content="회전은 이름을 바꾸는 일이고 프로세스는 이름이 아니라 파일 디스크립터를 붙잡는다. 그 어긋남이 만드는 조용한 실패를 실행 출력으로 보이고, 신호와 copytruncate 가 각각 무엇을 잃는지 정리한다.">
+    <meta name="keywords" content="로그 로테이션, logrotate, copytruncate, delaycompress, inode, 파일 디스크립터, postrotate, 디스크 가득참, journald, 컨테이너 로그, 리눅스, 서버 운영, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/posts/log_rotation_pitfalls.html">
+
+    <meta property="og:title" content="로그 로테이션이 조용히 실패하는 자리 - 디스크는 차는데 아무도 모른다">
+    <meta property="og:description" content="새 로그 파일은 0바이트인데 디스크는 계속 찬다. 회전이 이름만 바꾸고 프로세스는 옛 파일을 계속 붙잡고 있을 때 벌어지는 일.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/posts/log_rotation_pitfalls.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ko_KR">
+    <meta property="article:published_time" content="2026-09-02">
+    <meta property="article:section" content="개발/인프라">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="로그 로테이션이 조용히 실패하는 자리">
+    <meta name="twitter:description" content="프로세스는 이름이 아니라 파일 디스크립터를 붙잡고 있다. 모든 문제의 뿌리가 여기다.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "로그 로테이션이 조용히 실패하는 자리 - 디스크는 차는데 아무도 모른다",
+      "alternativeHeadline": "회전은 이름을 바꾸는 일이고, 프로세스는 이름이 아니라 파일 디스크립터를 붙잡고 있다",
+      "datePublished": "2026-09-02",
+      "dateModified": "2026-09-02",
+      "inLanguage": "ko-KR",
+      "articleSection": "개발/인프라",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "로그 로테이션, logrotate, copytruncate, delaycompress, inode, 파일 디스크립터, postrotate, 디스크 가득참, journald, 컨테이너 로그",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/posts/log_rotation_pitfalls.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "로그를 회전했는데 왜 디스크 여유가 돌아오지 않는가?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "회전은 이름을 바꾸는 일이지 파일을 없애는 일이 아니기 때문이다. 프로세스는 파일 이름이 아니라 open 이 돌려준 파일 디스크립터를 붙잡고 있고, 그 디스크립터는 이름이 아니라 inode 를 가리킨다. 그래서 mv 로 이름을 바꿔도 프로세스는 같은 파일에 계속 쓴다. 새로 만든 로그 파일은 0바이트로 남고 회전된 파일만 계속 자란다. 여기서 그 파일을 rm 으로 지우면 이름은 사라지지만 프로세스가 놓지 않는 한 블록은 반환되지 않는다. 즉 회전 뒤에 프로세스가 파일을 다시 열게 만들지 않으면 회전은 이름만 바꾸고 아무 공간도 돌려주지 못한다."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "postrotate 신호와 copytruncate 중 무엇을 써야 하는가?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "다시 열라는 신호를 받을 수 있는 프로세스라면 신호 쪽이 낫다. nginx 문서는 로그 회전 절차를 이름을 먼저 바꾸고 그 다음 마스터 프로세스에 USR1 을 보내는 것으로 설명한다. 이 방식은 한 줄도 잃지 않는다. 문제는 프로세스가 그 기능을 갖고 있어야 한다는 점이다. 그런 수단이 없으면 copytruncate 가 남는데, logrotate 매뉴얼 스스로 복사와 자르기 사이에 아주 짧은 시간 간격이 있어 일부 로그가 유실될 수 있다고 적어 두었다. 게다가 프로세스가 파일을 O_APPEND 로 열지 않았다면 자르기 뒤에도 옛 오프셋에 계속 쓰기 때문에 앞부분이 널 바이트로 채워진 파일이 만들어진다."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "회전 주기를 daily 로만 걸어 두면 무엇이 문제인가?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "사고가 났을 때 하루를 버티지 못한다. 이 글에서 만든 접근 로그의 평균 줄 길이는 122.2 바이트였다. 이 값을 그대로 쓰면 초당 1,000줄이 들어올 때 하루 증가량은 약 9.83 GiB 이고, 초당 5,000줄이면 4.9시간 만에 10 GiB 를 넘긴다. 오류 폭주로 로그가 평소의 수십 배가 되는 상황이 정확히 그런 순간이다. 그래서 시간 기준과 크기 기준을 같이 건다. 다만 크기 기준도 만능은 아니다. logrotate 는 스스로 도는 프로그램이 아니라 크론이나 타이머가 부를 때만 파일 크기를 확인하기 때문에, 하루 한 번만 불린다면 크기 조건도 하루 한 번만 검사된다."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "왜 delaycompress 가 필요한가?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "압축은 원본을 읽어 새 파일을 만들고 원본을 지우는 동작이기 때문이다. 프로세스가 아직 그 파일을 붙잡고 있는 상태에서 압축하면 압축본에는 그 시점까지의 내용만 들어가고, 그 뒤에 쓰인 줄은 이름이 사라진 파일로 흘러 들어가 어디에서도 읽을 수 없게 된다. 공간도 돌아오지 않는다. 실제로 재현해 보면 압축 전 두 줄만 gz 안에 남고 압축 뒤에 쓴 줄은 새 로그 파일에도 압축본에도 없다. delaycompress 는 매뉴얼 설명대로 직전 로그 파일의 압축을 다음 회전 주기로 미루는 것이고, 그 한 주기가 프로세스가 파일을 놓을 시간을 벌어 준다."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "회전이 실제로 되고 있는지 어떻게 확인하는가?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "가장 빠른 방법은 inode 두 개를 비교하는 것이다. 로그 경로의 inode 를 stat 으로 읽고, 그 로그를 쓰는 프로세스가 열어 둔 파일 디스크립터 뒤의 inode 를 stat 의 심볼릭 링크 추적 옵션으로 읽는다. 두 값이 같으면 프로세스는 지금 그 경로의 파일에 쓰고 있고, 다르면 회전이 깨진 상태다. 회전 직후에 새 로그 파일이 계속 0바이트에 머무는지, 회전된 파일의 수정 시각이 주기마다 계단처럼 찍히는지도 같이 본다. 실행 확인 결과 이 비교는 회전이 깨진 순간 즉시 두 값이 갈라졌다."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <script src="https://t1.kakaocdn.net/kakao_js_sdk/2.4.0/kakao.min.js" crossorigin="anonymous" defer></script>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/log_rotation_pitfalls.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/log_rotation_pitfalls.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/log_rotation_pitfalls.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/log_rotation_pitfalls.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/log_rotation_pitfalls.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "홈",
+      "item": "https://braindetox.kr/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "개발/인프라",
+      "item": "https://braindetox.kr/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "로그 로테이션이 조용히 실패하는 자리 - 디스크는 차는데 아무도 모른다",
+      "item": "https://braindetox.kr/posts/log_rotation_pitfalls.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="로그 로테이션이 조용히 실패하는 자리 - 디스크는 차는데 아무도 모른다">
+                <meta itemprop="datePublished" content="2026-09-02">
+                <meta itemprop="dateModified" content="2026-09-02">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="로그 로테이션, logrotate, copytruncate, delaycompress, inode, 파일 디스크립터, postrotate, 디스크 가득참, journald, 컨테이너 로그">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/posts/log_rotation_pitfalls.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">로그 로테이션이 조용히 실패하는 자리 - 디스크는 차는데 아무도 모른다</h1>
+                    <h2 class="post-subtitle">회전은 이름을 바꾸는 일이고, 프로세스는 이름이 아니라 파일 디스크립터를 붙잡고 있다</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-02">2026-09-02</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">개발/인프라</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>로그 회전은 서버에서 가장 조용한 장치다. 잘 돌 때는 아무도 그 존재를 모르고, 깨져도 한동안 아무도 모른다. 서비스는 정상 응답을 하고, 로그 디렉터리에는 <code>app.log</code> 와 <code>app.log.1</code> 이 나란히 있고, 파일 개수도 설정한 만큼이다. 겉으로 보이는 것 중 이상한 것은 하나도 없다. 그런데 디스크는 계속 찬다.</p>
+
+                    <p>이 상태의 정체는 대개 하나다. <strong>회전은 이름을 바꾸는 일인데, 프로세스는 이름을 붙잡고 있지 않다.</strong> 프로세스가 붙잡은 것은 <code>open</code> 이 돌려준 파일 디스크립터이고, 그 디스크립터는 파일 이름이 아니라 그 아래의 실체를 가리킨다. 이름을 바꾸든 지우든 그 실체는 그대로 있고, 프로세스는 거기에 계속 쓴다. 이 글은 그 어긋남이 만드는 실패들을 하나씩 실행해서 보인다.</p>
+
+                    <div class="callout">
+                        <strong>범위</strong> - 이 글의 대상은 리눅스 서버의 파일 로그와 <code>logrotate</code> 설정이다. 뒤에 붙는 출력 중 일부는 <strong>Windows 위의 Git Bash</strong> 에서 실제로 돌린 것이고, 리눅스 전용 도구가 필요한 대목은 <strong>돌리지 못했다고 밝히고 명령과 읽는 법만</strong> 적었다. 출력을 지어낸 곳은 한 줄도 없다. 아래 예제에는 파일을 되돌릴 수 없게 만드는 명령이 섞여 있으므로, 운영 서버가 아닌 곳에서 확인한다.
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>이 글에서 다루는 것</h3>
+                        <ol>
+                            <li><a href="#sec-1">증상 - 새 로그는 0바이트인데 디스크는 찬다</a></li>
+                            <li><a href="#sec-2">이 글의 실행 환경과 검증 범위</a></li>
+                            <li><a href="#sec-3">회전이 실제로 하는 일 - 이름을 떼고 붙이는 것</a></li>
+                            <li><a href="#sec-4">그래서 조용히 실패한다</a></li>
+                            <li><a href="#sec-5">다시 열게 하는 두 방법</a></li>
+                            <li><a href="#sec-6">copytruncate 가 잃는 것</a></li>
+                            <li><a href="#sec-7">&gt; 와 &gt;&gt; 의 차이가 여기서 중요해진다</a></li>
+                            <li><a href="#sec-8">크기 기준과 시간 기준</a></li>
+                            <li><a href="#sec-9">압축의 함정 - 아직 열려 있는 파일</a></li>
+                            <li><a href="#sec-10">rotate N 이 실제로 남기는 양</a></li>
+                            <li><a href="#sec-11">권한과 소유자 - 회전 뒤에 못 쓰게 되는 사고</a></li>
+                            <li><a href="#sec-12">회전 자체가 안 도는 경우</a></li>
+                            <li><a href="#sec-13">애플리케이션이 스스로 회전하는 경우</a></li>
+                            <li><a href="#sec-14">컨테이너에서는 다르다</a></li>
+                            <li><a href="#sec-15">점검 목록 - 회전이 정말 되고 있는가</a></li>
+                            <li><a href="#sec-16">정리</a></li>
+                            <li><a href="#sec-17">확인하지 못한 것</a></li>
+                            <li><a href="#sec-18">참고 자료</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">증상 - 새 로그는 0바이트인데 디스크는 찬다</h2>
+
+                    <p>이 고장에는 알아보기 쉬운 얼굴이 있다. 세 가지가 동시에 보이면 거의 확실하다. 첫째, 회전된 파일이 정상적으로 늘어나 있다. 둘째, 현재 로그 파일이 <strong>0바이트이거나 며칠째 크기가 그대로</strong>다. 셋째, 디스크 사용량 그래프가 회전 시각마다 계단처럼 내려가지 않고 <strong>일직선으로 올라간다</strong>.</p>
+
+                    <p>여기에 하나가 더 붙으면 결정적이다. <code>du</code> 로 로그 디렉터리를 합산한 값과 <code>df</code> 가 보고하는 사용량이 크게 어긋난다. 회전된 파일을 정리 스크립트가 이미 지웠는데 프로세스가 놓지 않고 있으면, 그 파일은 이름이 없으므로 <code>du</code> 의 눈에 보이지 않는다. 이 두 숫자가 벌어지는 상황 자체는 <a href="no_space_left_but_disk_free.html">디스크는 안 찼는데 No space left on device</a> 에서 원인 ②로 다룬 그것이고, <strong>그 상황을 실무에서 가장 많이 만들어 내는 것이 회전 설정 실수</strong>다. 그래서 이 글은 회전 쪽을 판다.</p>
+
+                    <p>범인이 되는 프로세스를 실제로 특정하는 절차는 <a href="find_process_holding_file.html">파일을 붙잡고 있는 프로세스 찾기</a> 쪽에 있다. 여기서는 <strong>왜 붙잡힌 상태가 만들어지는가</strong>까지만 본다. 참고로 로그가 폭주해서 메모리 쪽이 먼저 터지는 경우는 또 다른 얼굴을 하고 있는데, 그건 <a href="oom_killer_diagnosis.html">OOM Killer 가 무엇을 죽였는지 읽는 법</a> 쪽 이야기다.</p>
+
+                    <h2 id="sec-2">이 글의 실행 환경과 검증 범위</h2>
+
+                    <p>주제는 리눅스 서버인데, 아래 출력을 만들어 낸 환경은 <strong>Windows 10 위의 Git Bash</strong> 다. 이걸 먼저 밝히는 이유는 <strong>어떤 출력을 그대로 믿어도 되고 어떤 출력이 여기 없는지</strong>를 구분할 수 있어야 하기 때문이다.</p>
+
+                    <pre><code>$ bash --version | head -1
+GNU bash, version 5.2.37(1)-release (x86_64-pc-msys)
+
+$ uname -a
+MINGW64_NT-10.0-19045 3.5.7-882031da.x86_64 2025-01-30 11:14 UTC x86_64 Msys
+
+$ stat --version | head -1
+stat (GNU coreutils) 8.32
+$ gzip --version | head -1
+gzip 1.13
+
+$ for c in logrotate lsof systemctl journalctl gzip stat ln truncate; do
+&gt;   printf '%-12s %s\n' "$c" "$(command -v $c || echo '(not found)')"
+&gt; done
+logrotate    (not found)
+lsof         (not found)
+systemctl    (not found)
+journalctl   (not found)
+gzip         /usr/bin/gzip
+stat         /usr/bin/stat
+ln           /usr/bin/ln
+truncate     /usr/bin/truncate</code></pre>
+
+                    <p>즉 <code>logrotate</code> 자체가 이 환경에 없다. 그런데 이 글이 다루는 문제의 <strong>뿌리는 logrotate 가 아니라 커널의 파일 처리 방식</strong>이고, 그 부분은 여기서도 그대로 재현된다. 이름과 실체가 어떻게 분리되는지, 열린 디스크립터가 어디를 가리키는지, 자르기 뒤에 쓰기가 어디로 가는지는 전부 돌려 볼 수 있었다.</p>
+
+                    <ul>
+                        <li><strong>실제로 돌린 것</strong> - <code>rename</code> 전후의 inode 비교, 하드링크로 본 이름과 실체의 분리, <strong>회전 뒤에도 옛 파일에 계속 쓰는 상황 전체</strong>, 삭제된 파일의 <code>(deleted)</code> 표시, <code>&gt;</code> 와 <code>&gt;&gt;</code> 의 차이, 두 디스크립터가 같은 파일을 볼 때의 덮어쓰기, 자르기 뒤 널 바이트가 생기는 과정, 복사와 자르기 사이의 유실, 열린 파일을 압축했을 때의 결과, 번호 방식 개명 연쇄, 압축률 실측</li>
+                        <li><strong>돌리지 못한 것</strong> - <code>logrotate -d</code>(프로그램 자체가 없다), <code>lsof +L1</code>, <code>systemctl</code>·<code>journalctl</code>, 컨테이너 런타임 관련 전부, 소유자·권한 변경</li>
+                        <li><strong>지어내지 않은 것</strong> - 돌리지 못한 명령의 출력은 이 글에 한 줄도 없다. 명령과 <strong>읽는 법</strong>만 적었다</li>
+                        <li><strong>손댄 것</strong> - 출력의 긴 경로를 짧게 줄인 것뿐이다. <strong>숫자는 하나도 고치지 않았다</strong></li>
+                        <li>설정 문법과 지시자의 동작은 <code>logrotate</code> 매뉴얼 원문에서 확인했다. 그 대목은 실행이 아니라 <strong>문서 근거</strong>다</li>
+                        <li>이 환경의 파일시스템은 NTFS 다. <strong>inode 번호가 리눅스보다 훨씬 큰 값</strong>으로 나오는 것은 그 때문이고, 값 자체가 아니라 <strong>같은지 다른지</strong>만 보면 된다</li>
+                    </ul>
+
+                    <h2 id="sec-3">회전이 실제로 하는 일 - 이름을 떼고 붙이는 것</h2>
+
+                    <p>회전은 대단한 일을 하지 않는다. <code>app.log</code> 를 <code>app.log.1</code> 로 개명하고, 같은 자리에 새 <code>app.log</code> 를 만든다. 그게 전부다. 여기서 핵심은 <strong>개명이 파일을 바꾸지 않는다</strong>는 점이다. 디렉터리에 적힌 이름표만 옮겨 붙일 뿐이고, 그 이름표가 가리키는 실체는 손대지 않는다.</p>
+
+                    <pre><code>$ echo "line 1" &gt; app.log
+$ echo "line 2" &gt;&gt; app.log
+$ stat -c 'inode=%i  size=%s  links=%h  name=%n' app.log
+inode=3096224745851500  size=14  links=1  name=app.log
+
+$ mv app.log app.log.1
+$ stat -c 'inode=%i  size=%s  links=%h  name=%n' app.log.1
+inode=3096224745851500  size=14  links=1  name=app.log.1        # 같은 inode
+
+$ : &gt; app.log            # 회전 뒤 새 파일 생성
+$ stat -c 'inode=%i  size=%s  links=%h  name=%n' app.log app.log.1
+inode=5066549582825943  size=0   links=1  name=app.log          # 새 inode
+inode=3096224745851500  size=14  links=1  name=app.log.1</code></pre>
+
+                    <p>이름은 바뀌었는데 inode 번호는 그대로다. 그리고 새로 만든 <code>app.log</code> 는 <strong>완전히 다른 파일</strong>이다. 이름이 파일이 아니라는 사실은 하드링크로 보면 더 분명해진다. 같은 실체에 이름표를 두 개 달아 두고 하나를 지워도, 남은 이름으로 내용은 그대로 읽힌다.</p>
+
+                    <pre><code>$ echo "payload" &gt; one.txt
+$ ln one.txt two.txt
+$ stat -c 'inode=%i  links=%h  name=%n' one.txt two.txt
+inode=3940649675983497  links=2  name=one.txt
+inode=3940649675983497  links=2  name=two.txt
+
+$ rm one.txt                     # 되돌릴 수 없는 명령이다
+$ stat -c 'inode=%i  links=%h  name=%n' two.txt
+inode=3940649675983497  links=1  name=two.txt
+$ cat two.txt
+payload</code></pre>
+
+                    <p><code>rm</code> 이 한 일은 링크 수를 2에서 1로 줄인 것뿐이다. 파일은 <strong>이름이 전부 사라지고 열어 둔 프로세스도 없을 때</strong>에만 없어진다. 이 두 조건 중 하나라도 남아 있으면 데이터도 남고, 그 데이터가 차지한 블록도 남는다. 회전 문제의 전부가 이 문장에서 나온다.</p>
+
+                    <h2 id="sec-4">그래서 조용히 실패한다</h2>
+
+                    <p>이제 서비스 쪽을 붙여 보자. 로그를 쓰는 프로세스는 시작할 때 파일을 한 번 열고, 그 뒤로는 열려 있는 디스크립터에 계속 쓴다. 매번 이름을 다시 찾아가지 않는다. 그래서 회전이 이름을 바꿔도 <strong>프로세스는 그 사실을 알 방법이 없다</strong>. 아래는 셸이 그 프로세스 역할을 하도록 만들어 실제로 돌린 것이다.</p>
+
+                    <pre><code>$ : &gt; svc.log
+$ exec 9&gt;&gt; svc.log                       # 서비스가 로그를 연 상태
+$ echo "[1] 회전 전에 쓴 줄" &gt;&amp;9
+
+$ ls -l /proc/$$/fd/9
+lrwxrwxrwx ... /proc/1725/fd/9 -&gt; /tmp/demo/svc.log
+
+$ mv svc.log svc.log.1                   # 회전
+$ : &gt; svc.log                            # 새 파일 생성. 신호는 보내지 않았다
+$ echo "[2] 회전 후에 쓴 줄" &gt;&amp;9
+$ echo "[3] 그 다음 줄"      &gt;&amp;9
+
+$ wc -c svc.log svc.log.1
+ 0 svc.log
+71 svc.log.1
+
+$ cat svc.log                            # 새 로그 파일
+$ cat svc.log.1                          # 회전된 옛 파일
+[1] 회전 전에 쓴 줄
+[2] 회전 후에 쓴 줄
+[3] 그 다음 줄</code></pre>
+
+                    <p>세 줄 모두 <code>svc.log.1</code> 에 들어갔다. 회전 <strong>이후</strong>에 쓴 두 줄까지 옛 파일로 갔고, 새로 만든 <code>svc.log</code> 는 0바이트 그대로다. 디렉터리를 <code>ls</code> 로 보면 파일이 둘 다 있으니 정상으로 보인다. 다음 주기가 되면 <code>svc.log.1</code> 은 <code>svc.log.2</code> 가 되고, 프로세스는 여전히 같은 실체에 쓴다. 그렇게 <strong>회전 번호만 밀려 가는 하나의 파일</strong>이 계속 자란다.</p>
+
+                    <p>여기서 정리 스크립트가 오래된 파일을 지우면 상황이 나빠진다. 이름이 사라져도 프로세스가 붙잡고 있으므로 공간은 돌아오지 않고, 이제는 <code>ls</code> 로도 안 보인다.</p>
+
+                    <pre><code>$ : &gt; svc.log
+$ exec 9&gt;&gt; svc.log
+$ echo "[1] 삭제 전" &gt;&amp;9
+$ rm svc.log                             # 되돌릴 수 없는 명령이다
+$ echo "[2] 삭제 후에도 계속 쓴다" &gt;&amp;9
+$ echo "[3] 그리고 계속"           &gt;&amp;9
+
+$ ls -l /proc/$$/fd/9
+lrwxrwxrwx ... /proc/1725/fd/9 -&gt; /tmp/demo/svc.log (deleted)
+
+$ ls -l .
+total 0                                  # 아무것도 없다
+
+$ wc -c /proc/$$/fd/9
+71 /proc/1725/fd/9                       # 그런데 내용은 살아 있다</code></pre>
+
+                    <p>디렉터리는 비어 있는데 71바이트가 디스크에 남아 있다. 커널이 <code>(deleted)</code> 라고 표시해 주는 이 상태가 <strong>디스크가 차는데 아무도 모르는 상태</strong>의 정확한 정의다. 실제 서버에서는 71바이트가 아니라 수십 GB 다.</p>
+
+                    <h2 id="sec-5">다시 열게 하는 두 방법</h2>
+
+                    <p>고치는 방향은 하나뿐이다. <strong>프로세스가 파일을 다시 열게 만드는 것.</strong> 방법은 둘이고, 각각 다른 것을 요구하고 각각 다른 것을 잃는다.</p>
+
+                    <p>첫째는 회전 뒤에 신호를 보내는 것이다. nginx 문서는 이 절차를 명시적으로 적어 두었다. 로그 파일의 이름을 먼저 바꾸고, 그 다음 마스터 프로세스에 <code>USR1</code> 을 보내면 마스터가 모든 로그 파일을 다시 열고 워커에게도 다시 열라고 시킨다. 문서는 그 결과로 <strong>옛 파일이 거의 즉시 압축 같은 후처리에 쓸 수 있는 상태가 된다</strong>고 설명한다. 순서가 중요하다. 이름을 바꾸는 것이 먼저고 신호가 나중이다.</p>
+
+                    <pre><code># logrotate 설정에서 이 방식은 이렇게 생겼다
+/var/log/nginx/*.log {
+    daily
+    maxsize 100M
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    create 0640 nginx adm
+    sharedscripts                 # 와일드카드로 몇 개가 잡히든 스크립트는 한 번만
+    postrotate
+        [ -f /run/nginx.pid ] &amp;&amp; kill -USR1 "$(cat /run/nginx.pid)"
+    endscript
+}</code></pre>
+
+                    <p><code>sharedscripts</code> 를 빼면 매뉴얼 설명대로 <strong>와일드카드에 걸린 파일 수만큼 스크립트가 반복 실행</strong>된다. 로그 파일이 여섯 개면 신호가 여섯 번 간다. nginx 는 견디지만, 재시작 명령을 넣어 둔 설정이라면 서비스가 연달아 재시작한다.</p>
+
+                    <p>둘째는 <code>copytruncate</code> 다. 매뉴얼 문장 그대로 옮기면 <strong>옛 로그를 옮기고 새 파일을 만드는 대신, 복사본을 만든 뒤 원본을 제자리에서 0으로 자르는</strong> 방식이다. 프로세스 입장에서는 파일이 바뀌지 않았으므로 아무것도 할 필요가 없다. 신호를 받을 줄 모르는 프로그램에 쓸 수 있는 거의 유일한 수단이다.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>방식</th><th>성립 조건</th><th>잃는 것</th><th>쓰는 자리</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>개명 + 신호(postrotate)</td><td>프로세스가 다시 열기 신호를 지원한다</td><td>없음. 한 줄도 잃지 않는다</td><td>nginx·rsyslog 등 신호 규약이 있는 서비스</td></tr>
+                            <tr><td>개명 + 재시작</td><td>재시작이 허용되는 서비스다</td><td>재시작 시간 동안의 가용성</td><td>다시 열기가 없고 무중단이 필수가 아닌 경우</td></tr>
+                            <tr><td>copytruncate</td><td>없음. 프로세스는 아무것도 안 해도 된다</td><td>복사와 자르기 사이의 로그. 그리고 O_APPEND 가 아니면 파일 앞부분이 널 바이트로 채워진다</td><td>신호도 재시작도 불가능할 때의 마지막 수단</td></tr>
+                            <tr><td>앱이 스스로 회전</td><td>로거가 회전 기능을 갖고 있다</td><td>외부 회전과 겹치면 서로의 파일을 잃는다</td><td>회전 주체를 앱 하나로 통일할 수 있을 때</td></tr>
+                            <tr><td>stdout 으로 내보내기</td><td>런타임·수퍼바이저가 받아 준다</td><td>파일 로그의 세밀한 제어. 런타임 설정에 종속된다</td><td>컨테이너 환경의 기본값</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2 id="sec-6">copytruncate 가 잃는 것</h2>
+
+                    <p>매뉴얼은 <code>copytruncate</code> 의 대가를 스스로 적어 두었다. <strong>복사와 자르기 사이에 아주 짧은 시간 간격이 있어 일부 로그 데이터가 유실될 수 있다</strong>는 문장이다. 이 문장은 추상적으로 읽히지만, 실제로 무슨 일이 벌어지는지는 그 틈에 한 줄을 끼워 넣어 보면 바로 보인다.</p>
+
+                    <pre><code>$ exec 9&gt;&gt; gap.log
+$ echo "복사 전에 쓴 줄" &gt;&amp;9
+
+$ cp gap.log gap.log.1                       # 1) 복사
+$ echo "★복사와 자르기 사이에 쓴 줄" &gt;&amp;9      # 2) 그 틈에 들어온 로그
+$ : &gt; gap.log                                # 3) 자르기. 되돌릴 수 없다
+$ echo "자른 뒤에 쓴 줄" &gt;&amp;9
+
+$ cat gap.log.1
+복사 전에 쓴 줄
+$ cat gap.log
+자른 뒤에 쓴 줄
+
+$ grep -l "복사와 자르기 사이" gap.log gap.log.1
+없음</code></pre>
+
+                    <p>그 틈에 쓰인 줄은 <strong>보관본에도 없고 새 파일에도 없다</strong>. 어디에도 없다. 초당 수천 줄이 들어오는 서비스에서 이 틈이 수십 밀리초라면 회전 한 번에 수백 줄이 사라진다. 결제나 감사 로그처럼 한 줄도 잃으면 안 되는 데이터를 <code>copytruncate</code> 로 돌리면 안 되는 이유가 이것이다.</p>
+
+                    <p>대가가 하나 더 있다. 훨씬 덜 알려져 있고 훨씬 이상하게 생겼다. <strong>프로세스가 파일을 추가 모드로 열지 않았다면</strong>, 자르기 뒤에도 그 프로세스는 <strong>자기가 기억하는 옛 오프셋</strong>에 계속 쓴다. 파일 앞부분은 아무도 쓰지 않았으므로 널 바이트로 채워진다.</p>
+
+                    <pre><code># 추가 모드(&gt;&gt;, O_APPEND)로 연 경우
+$ exec 9&gt;&gt; ok.log
+$ echo "0123456789" &gt;&amp;9          # 11바이트
+$ cp ok.log ok.log.1
+$ : &gt; ok.log                     # 자르기
+$ echo "after" &gt;&amp;9
+$ stat -c 'size=%s' ok.log
+size=6
+$ od -c ok.log
+0000000   a   f   t   e   r  \n
+
+# 추가 모드가 아닌 경우 (&gt;)
+$ exec 9&gt; bad.log
+$ echo "0123456789" &gt;&amp;9          # 11바이트, 이제 오프셋은 11
+$ cp bad.log bad.log.1
+$ : &gt; bad.log                    # 자르기
+$ echo "after" &gt;&amp;9               # 오프셋 11 에 그대로 쓴다
+$ stat -c 'size=%s' bad.log
+size=17
+$ od -c bad.log
+0000000  \0  \0  \0  \0  \0  \0  \0  \0  \0  \0  \0   a   f   t   e   r
+0000020  \n</code></pre>
+
+                    <p>17바이트 중 앞의 11바이트가 널이다. 로그 뷰어로 열면 앞부분이 깨져 보이고, <code>grep</code> 은 줄 하나로 세고, 파일 크기는 실제 내용보다 크게 보고된다. 리눅스의 ext4·XFS 라면 이 앞부분은 보통 <strong>희소 영역</strong>이 되어 실제 블록을 쓰지 않지만, 그건 이 환경에서 확인하지 못했다. 다만 <strong>읽는 쪽 입장에서 널 바이트가 실제로 들어 있다는 사실</strong>은 위 출력 그대로다.</p>
+
+                    <ul>
+                        <li>대부분의 로깅 라이브러리는 파일을 추가 모드로 연다. 그래서 이 증상은 <strong>직접 <code>open</code> 을 호출하는 코드</strong>나 리다이렉션으로 로그를 받는 스크립트에서 나온다</li>
+                        <li><code>copytruncate</code> 를 쓸 때 <code>create</code> 는 의미가 없다. 파일을 새로 만들지 않기 때문이다. 매뉴얼도 이 둘을 다른 갈래로 설명한다</li>
+                        <li>복사하는 동안 <strong>디스크에 원본 크기만큼의 여유</strong>가 잠시 더 필요하다. 이미 가득 찬 디스크에서 이 방식은 실패한다</li>
+                        <li>매뉴얼에 따르면 <code>olddir</code> 로 지정한 디렉터리는 원래 <strong>같은 물리 장치</strong>에 있어야 하는데, <code>copy</code>·<code>copytruncate</code>·<code>renamecopy</code> 를 쓰면 그 제약이 없어진다. 다른 장치로 보관본을 옮기고 싶을 때의 우회로가 여기다</li>
+                    </ul>
+
+                    <h2 id="sec-7">&gt; 와 &gt;&gt; 의 차이가 여기서 중요해진다</h2>
+
+                    <p>스크립트가 로그를 리다이렉션으로 받는 경우는 흔하다. <code>cron</code> 항목이나 <code>ExecStart</code> 뒤에 붙는 그 기호가 정확히 무슨 일을 하는지가 회전 결과를 가른다. <code>&gt;</code> 는 <strong>열면서 파일을 0으로 자르고</strong>, <code>&gt;&gt;</code> 는 <strong>매번 파일 끝으로 이동한 뒤 쓴다</strong>.</p>
+
+                    <pre><code>$ echo "첫 줄" &gt; t1.log
+$ echo "둘째 줄" &gt; t1.log
+$ cat t1.log
+둘째 줄                       # 앞의 것이 사라졌다
+
+$ echo "첫 줄" &gt; t2.log
+$ echo "둘째 줄" &gt;&gt; t2.log
+$ cat t2.log
+첫 줄
+둘째 줄
+
+# 같은 파일을 두 디스크립터가 볼 때 - 추가 모드가 아니면
+$ exec 7&gt; noappend.log
+$ exec 8&gt; noappend.log
+$ echo "AAAAAAAAAA" &gt;&amp;7       # 11바이트를 0번지부터
+$ echo "BBB"        &gt;&amp;8       # 4바이트를 다시 0번지부터
+$ od -c noappend.log
+0000000   B   B   B  \n   A   A   A   A   A   A  \n
+
+# 추가 모드면 서로를 덮지 않는다
+$ exec 7&gt;&gt; append.log
+$ exec 8&gt;&gt; append.log
+$ echo "AAAAAAAAAA" &gt;&amp;7
+$ echo "BBB"        &gt;&amp;8
+$ od -c append.log
+0000000   A   A   A   A   A   A   A   A   A   A  \n   B   B   B  \n</code></pre>
+
+                    <p>두 번째 실험이 중요하다. <code>&gt;</code> 로 연 디스크립터는 <strong>각자 자기 오프셋</strong>을 갖는다. 그래서 두 프로세스가 같은 로그 파일을 그렇게 열면 서로의 내용을 덮어쓴다. 워커 프로세스를 여러 개 띄우고 각자 <code>&gt;</code> 로 같은 파일에 쓰게 하면 로그가 조각조각 사라진다. 원인을 찾기 매우 어려운 종류의 손실이다.</p>
+
+                    <p>회전과 관련해서 더 중요한 사실은 <strong>리다이렉션이 프로세스 시작 시 딱 한 번 열린다</strong>는 것이다. 오래 도는 데몬을 <code>&gt;&gt; /var/log/job.log</code> 로 띄웠다면 그 디스크립터는 프로세스가 죽을 때까지 살아 있고, 회전은 위의 <a href="#sec-4">4장</a>과 똑같이 깨진다. 반대로 <code>cron</code> 이 5분마다 새로 실행하는 스크립트는 매번 새로 열기 때문에 회전이 저절로 맞아 들어간다. <strong>같은 회전 설정이 어떤 서비스에서만 깨지는 이유</strong>가 대개 이 차이다.</p>
+
+                    <h2 id="sec-8">크기 기준과 시간 기준</h2>
+
+                    <p>매뉴얼의 정의는 짧고 분명하다. <code>size</code> 는 파일이 지정 크기보다 커졌을 때만 회전한다. <code>daily</code>·<code>weekly</code>·<code>monthly</code> 는 시간 간격이다. <code>maxsize</code> 는 <strong>지정한 시간 간격이 되기 전이라도</strong> 크기를 넘으면 회전하고, <code>minsize</code> 는 반대로 <strong>크기를 넘어도 시간 간격 전에는</strong> 회전하지 않는다.</p>
+
+                    <p>시간 기준만 걸어 두는 설정이 왜 위험한지는 산수로 나온다. 이 글에서 만든 접근 로그 20만 줄의 평균 줄 길이는 <strong>122.2 바이트</strong>였다. 이 값으로 계산하면 이렇다.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>초당 줄 수</th><th>1시간</th><th>24시간</th><th>10 GiB 에 닿는 시간</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>10</td><td>0.00 GiB</td><td>0.10 GiB</td><td>101.7일</td></tr>
+                            <tr><td>100</td><td>0.04 GiB</td><td>0.98 GiB</td><td>10.2일</td></tr>
+                            <tr><td>1,000</td><td>0.41 GiB</td><td>9.83 GiB</td><td>1.0일</td></tr>
+                            <tr><td>5,000</td><td>2.05 GiB</td><td>49.16 GiB</td><td>4.9시간</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>평상시 초당 100줄이던 서비스가 장애 때 초당 5,000줄을 뱉는 것은 드문 일이 아니다. 스택 트레이스가 섞이면 줄 길이도 몇 배가 된다. <code>daily</code> 만 걸린 설정은 그날 자정까지 아무것도 하지 않는다. <strong>그래서 시간 기준과 크기 기준을 같이 건다.</strong></p>
+
+                    <pre><code>/var/log/app/*.log {
+    daily              # 평소에는 하루 한 번
+    maxsize 200M       # 그 전이라도 200M 을 넘으면 즉시 회전
+    rotate 14
+    missingok          # 파일이 없어도 오류 없이 넘어간다
+    notifempty         # 비어 있으면 회전하지 않는다
+    compress
+    delaycompress
+    create 0640 app app
+}
+
+# ★ 크기 조건은 logrotate 가 불렸을 때만 검사된다.
+#    하루 한 번만 부르면 maxsize 도 하루 한 번만 검사된다.
+#    자주 검사하려면 부르는 쪽을 자주 만들어야 한다.
+$ systemctl list-timers logrotate.timer      # 이 환경에서는 확인하지 못했다
+$ cat /usr/lib/systemd/system/logrotate.timer</code></pre>
+
+                    <p>마지막 주석이 실무에서 가장 자주 놓치는 대목이다. <code>logrotate</code> 는 상주하는 프로그램이 아니라 <strong>불려야 도는 프로그램</strong>이다. 배포판이 제공하는 타이머 유닛은 <code>OnCalendar=daily</code> 에 최대 한 시간의 무작위 지연과 <code>Persistent=true</code> 로 되어 있다. 하루 한 번 불린다는 뜻이고, 그러면 <code>maxsize</code> 를 아무리 작게 잡아도 <strong>검사 간격은 하루</strong>다. 폭주 로그를 잡으려면 별도의 타이머나 크론 항목으로 더 자주 불러야 한다.</p>
+
+                    <h2 id="sec-9">압축의 함정 - 아직 열려 있는 파일</h2>
+
+                    <p>압축은 겉보기와 다른 동작을 한다. <code>gzip</code> 은 원본을 읽어 새 파일을 만들고 <strong>원본을 지운다</strong>. 앞에서 본 규칙이 여기서 다시 걸린다. 프로세스가 아직 그 파일을 붙잡고 있는데 압축해 버리면, 압축본에는 그 시점까지만 들어가고 그 뒤의 줄은 이름 없는 파일로 흘러 들어간다.</p>
+
+                    <pre><code>$ exec 9&gt;&gt; svc.log
+$ echo "[1] 회전 전에 쓴 줄" &gt;&amp;9
+$ mv svc.log svc.log.1
+$ : &gt; svc.log
+$ echo "[2] 회전 후에 쓴 줄 (아직 옛 inode)" &gt;&amp;9
+
+$ gzip svc.log.1                 # 압축하면 원본은 사라진다
+$ echo "[3] 압축이 끝난 뒤에 쓴 줄" &gt;&amp;9
+
+$ ls -l /proc/$$/fd/9
+lrwxrwxrwx ... -&gt; /tmp/demo/svc.log (deleted)
+
+$ ls -l
+   0  svc.log
+  85  svc.log.1.gz
+
+$ zcat svc.log.1.gz
+[1] 회전 전에 쓴 줄
+[2] 회전 후에 쓴 줄 (아직 옛 inode)
+
+$ zcat svc.log.1.gz | grep -c "\[3\]"
+0
+$ grep -c "\[3\]" svc.log
+0</code></pre>
+
+                    <p>세 번째 줄은 <strong>압축본에도 없고 새 로그 파일에도 없다</strong>. 그리고 그 줄이 들어간 파일은 이름이 없으므로 읽을 방법도 없고 지울 방법도 없다. 프로세스가 죽어야 공간이 돌아온다. <code>delaycompress</code> 가 하는 일이 정확히 이 상황을 피하는 것이다. 매뉴얼 표현대로 <strong>직전 로그 파일의 압축을 다음 회전 주기로 미루는</strong> 것이고, 그 한 주기가 프로세스가 파일을 놓을 시간을 벌어 준다.</p>
+
+                    <p>압축 자체의 비용도 짚어 둘 값이 있다. 같은 파일을 압축 수준만 바꿔 돌린 실측이다.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>대상</th><th>원본</th><th>압축 후</th><th>비율</th><th>소요</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>접근 로그 20만 줄, <code>gzip -1</code></td><td>24,447,614 B</td><td>5,700,988 B</td><td>23.32%</td><td>581 ms</td></tr>
+                            <tr><td>같은 파일, <code>gzip -6</code>(기본)</td><td>24,447,614 B</td><td>4,453,030 B</td><td>18.21%</td><td>920 ms</td></tr>
+                            <tr><td>같은 파일, <code>gzip -9</code></td><td>24,447,614 B</td><td>4,235,905 B</td><td>17.33%</td><td>2,290 ms</td></tr>
+                            <tr><td>완전히 같은 줄만 20만 번</td><td>26,400,000 B</td><td>102,537 B</td><td>0.39%</td><td>-</td></tr>
+                            <tr><td>무작위 바이트 4 MB</td><td>4,000,000 B</td><td>4,000,639 B</td><td>100.02%</td><td>-</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>읽을 것이 두 가지다. 첫째, <code>-9</code> 는 기본값보다 0.88퍼센트포인트를 더 줄이려고 <strong>2.5배의 시간</strong>을 쓴다. 회전 시각에 CPU 를 물어 오는 값으로는 대개 손해다. 둘째, <strong>합성 로그의 압축률을 그대로 믿으면 안 된다</strong>. 같은 줄만 반복한 파일은 0.39퍼센트까지 줄었지만 필드가 실제로 변하는 로그는 18퍼센트였다. 이미 압축된 데이터나 무작위에 가까운 데이터는 오히려 커진다.</p>
+
+                    <h2 id="sec-10">rotate N 이 실제로 남기는 양</h2>
+
+                    <p><code>rotate</code> 는 매뉴얼 표현대로 <strong>제거되기 전까지 회전되는 횟수</strong>다. 개수는 명확한데 용량은 그렇지 않다. 압축 전 크기로 곱하면 크게 과대 추정하고, 압축률을 낙관하면 과소 추정한다. 게다가 <code>delaycompress</code> 를 쓰면 <strong>압축되지 않은 파일이 항상 하나 더</strong> 남는다. 아래는 <code>size 100M</code> 기준으로 계산한 최대 점유다.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>설정</th><th>압축률 12%</th><th>압축률 25%</th><th>계산식</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>rotate 7</code> + <code>delaycompress</code></td><td>0.27 GiB</td><td>0.34 GiB</td><td>현재 + 비압축 1개 + 압축 6개</td></tr>
+                            <tr><td><code>rotate 7</code> 압축만</td><td>0.18 GiB</td><td>0.27 GiB</td><td>현재 + 압축 7개</td></tr>
+                            <tr><td><code>rotate 14</code> + <code>delaycompress</code></td><td>0.35 GiB</td><td>0.51 GiB</td><td>현재 + 비압축 1개 + 압축 13개</td></tr>
+                            <tr><td><code>rotate 30</code> + <code>delaycompress</code></td><td>0.54 GiB</td><td>0.90 GiB</td><td>현재 + 비압축 1개 + 압축 29개</td></tr>
+                            <tr><td><code>rotate 30</code> 압축 없음</td><td colspan="2">3.03 GiB</td><td>현재 + 비압축 30개</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>실측한 18.21퍼센트는 이 두 열 사이에 들어온다. 여기에 빠진 항이 하나 있다. <strong><code>size</code> 는 하한이지 상한이 아니다.</strong> 회전은 검사 시점에만 일어나므로, 하루 한 번 검사하는 설정에서 폭주가 나면 파일은 200M 이 아니라 몇 GB 가 된 상태로 발견된다. 계산에는 그만큼의 여유를 곱해야 한다.</p>
+
+                    <p>보관 방식도 용량에 영향을 준다. 번호 방식은 회전 때마다 <strong>모든 파일의 이름을 한 칸씩 민다</strong>. 실제로 흉내 내 보면 이렇게 움직인다.</p>
+
+                    <pre><code># rotate 4 로 여섯 번 회전시켰을 때의 마지막 상태
+$ for f in app.log*; do
+&gt;   printf '%-12s inode=%-18s %s\n' "$f" "$(stat -c %i "$f")" "$(cat "$f")"
+&gt; done
+app.log      inode=4785074606123239
+app.log.1    inode=4222124652701929   day 6 의 로그
+app.log.2    inode=3940649675991270   day 5 의 로그
+app.log.3    inode=4785074606123229   day 4 의 로그
+app.log.4    inode=3940649675991267   day 3 의 로그
+
+# day 1, day 2 는 rotate 4 를 넘겨 삭제됐다.
+# 파일마다 inode 가 다르다 = 회전 때 개명만 일어났고 내용은 복사되지 않았다.</code></pre>
+
+                    <p>파일 수만큼 개명이 일어나므로 파일이 수백 개인 디렉터리에서는 이것만으로도 부하가 된다. <code>dateext</code> 를 쓰면 매뉴얼 설명대로 번호 대신 <strong>날짜 확장자</strong>가 붙고, 개명 연쇄가 사라진다. 대신 파일 이름이 매번 달라지므로 <strong>이름 패턴으로 수집하는 도구</strong>의 설정을 같이 바꿔야 한다.</p>
+
+                    <h2 id="sec-11">권한과 소유자 - 회전 뒤에 못 쓰게 되는 사고</h2>
+
+                    <p><code>create</code> 는 매뉴얼 설명대로 <strong>회전 직후, postrotate 스크립트가 돌기 전에</strong> 같은 이름의 파일을 만든다. 문법은 <code>create mode owner group</code> 이고, 생략한 항목은 원래 파일의 값을 물려받는다. 여기서 사고가 난다. <code>logrotate</code> 는 보통 root 로 돌기 때문에, 모드와 소유자를 적지 않거나 잘못 적으면 <strong>서비스 계정이 새 파일에 쓸 수 없는 상태</strong>가 만들어진다.</p>
+
+                    <pre><code>/var/log/app/*.log {
+    daily
+    rotate 14
+    create 0640 app app        # 모드 · 소유자 · 그룹. 셋 다 적는 편이 안전하다
+    su app app                 # 회전 작업 자체를 이 사용자·그룹으로 수행
+    postrotate
+        systemctl reload app.service &gt;/dev/null 2&gt;&amp;1 || true
+    endscript
+}
+
+# 매뉴얼: create 에 지정한 소유권으로 파일을 만들 권한이 su 로 지정한
+# 사용자·그룹에 없으면 오류가 난다.
+#
+# 이 환경에서는 소유자·권한을 확인할 수 없었다. umask 를 바꿔도
+# stat 은 두 파일 모두 644 로 보고했고 그룹은 UNKNOWN 이었다.
+$ stat -c '%a  %U:%G  %n' u027.log u022.log
+644  &lt;user&gt;:UNKNOWN  u027.log
+644  &lt;user&gt;:UNKNOWN  u022.log</code></pre>
+
+                    <p>이 사고의 증상은 회전 직후가 아니라 <strong>몇 시간 뒤</strong>에 나타나는 일이 많다. 로그가 안 쌓이는데 서비스는 돌아가니 알아채기까지 시간이 걸린다. 로그를 못 쓰는 상태에서 프로세스가 오류를 뱉으며 CPU 를 먹는 경우도 있다.</p>
+
+                    <ul>
+                        <li><code>su</code> 지시자는 로그 디렉터리가 <strong>root 가 아닌 계정이 쓸 수 있는 디렉터리</strong>일 때 필요하다. 이 조건에서 <code>su</code> 없이 돌리면 회전이 거부된다</li>
+                        <li><code>postrotate</code> 에서 pid 파일을 읽는다면 그 파일의 권한도 같이 본다. 회전은 성공했는데 신호가 안 가는 경우의 흔한 원인이다</li>
+                        <li>신호 대신 <code>reload</code> 를 쓰는 경우, 그 명령이 <strong>실패해도 회전은 이미 끝난 뒤</strong>다. 스크립트의 종료 코드를 삼켜 버리면 실패가 조용해진다</li>
+                        <li>SELinux 나 AppArmor 가 걸린 환경에서는 파일 모드가 맞아도 <strong>레이블 때문에</strong> 쓰기가 막힐 수 있다. 이 글은 그 부분을 다루지 않는다</li>
+                    </ul>
+
+                    <h2 id="sec-12">회전 자체가 안 도는 경우</h2>
+
+                    <p>지금까지는 회전이 돌지만 잘못 도는 경우였다. 아예 안 도는 경우도 그만큼 흔하고, 이쪽이 더 조용하다. 오류 메시지가 로그에 남는데 그 로그를 아무도 안 본다.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>원인</th><th>겉으로 보이는 것</th><th>확인하는 법</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>타이머·크론이 꺼져 있다</td><td>회전 파일의 날짜가 어느 시점에서 멈춰 있다</td><td>타이머 목록에서 마지막 실행과 다음 실행 시각을 본다</td></tr>
+                            <tr><td>설정 파일 하나의 문법 오류</td><td>그 파일뿐 아니라 <strong>다른 로그까지</strong> 회전이 멈춘다</td><td>디버그 모드로 전체 설정을 파싱시켜 본다</td></tr>
+                            <tr><td>같은 파일을 두 설정이 잡는다</td><td>중복 항목 오류로 처리가 중단된다</td><td>설정 디렉터리 전체에서 그 경로를 검색한다</td></tr>
+                            <tr><td>상태 파일에 처음 등록된 직후</td><td>새로 추가한 설정이 첫날에는 돌지 않는다</td><td>상태 파일에서 그 경로의 기록된 시각을 본다</td></tr>
+                            <tr><td><code>notifempty</code> + 회전이 이미 깨진 상태</td><td>현재 파일이 0바이트라 회전 대상에서 빠진다</td><td>현재 파일의 크기와 프로세스의 디스크립터를 대조한다</td></tr>
+                            <tr><td>디버그 모드로만 확인했다</td><td>돌려 보면 정상인데 실제로는 안 돈다</td><td>디버그는 상태 파일을 갱신하지 않는다는 점을 기억한다</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>네 번째 줄이 특히 함정이다. 매뉴얼에 따르면 <strong>상태 파일에 항목이 없는 파일을 처음 만나면 그 시각을 마지막 회전 시각으로 기록</strong>한다. 즉 설정을 새로 추가한 날에는 <code>daily</code> 조건이 성립하지 않는다. 급해서 설정을 넣고 <code>logrotate</code> 를 수동으로 돌렸는데 아무 일도 안 일어나는 이유가 대개 이것이다.</p>
+
+                    <p>여섯 번째 줄도 같은 성격이다. 매뉴얼은 디버그 옵션이 <strong>로그를 변경하지 않고 상태 파일도 갱신하지 않는다</strong>고 명시한다. 문법 검사에는 좋지만 <strong>실제로 돌았다는 증거는 되지 않는다</strong>. 아래 명령들은 이 환경에 <code>logrotate</code> 자체가 없어 돌리지 못했다.</p>
+
+                    <pre><code># 이 환경에서 돌리지 못한 명령들 - 출력을 싣지 않는다
+$ logrotate -d /etc/logrotate.conf            # 전체 설정 파싱. 아무것도 바꾸지 않는다
+$ logrotate -d /etc/logrotate.d/app           # 한 설정만
+$ logrotate -v -f /etc/logrotate.d/app        # 강제 회전. 실제로 바꾼다
+$ cat /var/lib/logrotate/logrotate.status     # 경로별 마지막 회전 시각
+$ grep -rn "/var/log/app" /etc/logrotate.conf /etc/logrotate.d/   # 중복 잡기
+$ systemctl list-timers logrotate.timer
+$ journalctl -u logrotate.service --since "-7d"
+
+# 읽는 법
+#  -d 는 검사용이다. 이걸로 확인했다고 실제 회전이 돈 것은 아니다.
+#  -f 는 시간·크기 조건을 무시하고 지금 회전한다. 운영에서는 신중히.
+#  상태 파일의 날짜가 오늘이 아니면 그 경로는 오늘 회전하지 않았다.</code></pre>
+
+                    <h2 id="sec-13">애플리케이션이 스스로 회전하는 경우</h2>
+
+                    <p>요즘 프레임워크의 로거는 대부분 회전 기능을 내장하고 있다. 크기가 차면 스스로 개명하고 새 파일을 연다. 이 방식은 <a href="#sec-4">4장</a>의 문제를 아예 만들지 않는다. 파일을 여는 주체와 개명하는 주체가 같기 때문이다.</p>
+
+                    <p>문제는 <strong>같은 파일에 회전 주체가 둘</strong>일 때 생긴다. 앱이 자기 파일을 개명하는 순간 <code>logrotate</code> 도 개명하면, 둘 다 자기가 만든 파일을 잃는다. 앱은 자기가 만든 새 파일에 쓰는데 <code>logrotate</code> 가 만든 파일이 그 자리를 덮고, 보관 개수도 양쪽 규칙이 섞여 예측할 수 없어진다.</p>
+
+                    <ul>
+                        <li><strong>규칙은 하나다. 한 파일에 회전 주체는 하나.</strong> 앱이 돈다면 그 경로를 <code>logrotate</code> 설정에서 뺀다. <code>logrotate</code> 를 쓴다면 앱의 회전을 끄고 크기 제한도 푼다</li>
+                        <li>워커 프로세스를 여러 개 띄우는 구성에서 각 워커가 <strong>같은 파일에 각자의 회전 로직</strong>을 갖고 있으면, 워커들끼리도 같은 충돌을 일으킨다. 이 경우 파일을 워커별로 나누거나 회전을 외부로 넘긴다</li>
+                        <li>앱 내장 회전은 대개 <strong>기록하는 순간에만</strong> 크기를 확인한다. 트래픽이 멎으면 아무리 커도 회전하지 않는다. 야간에 조용한 서비스에서 이 차이가 드러난다</li>
+                        <li>보관 개수 설정이 양쪽에 다 있으면 <strong>작은 쪽이 이기지 않는다</strong>. 서로 다른 이름 규칙을 쓰기 때문에 양쪽 개수만큼 파일이 남는다</li>
+                    </ul>
+
+                    <h2 id="sec-14">컨테이너에서는 다르다</h2>
+
+                    <p>컨테이너 안에서 파일로 로그를 남기고 <code>logrotate</code> 로 돌리려는 시도는 대개 막힌다. 컨테이너에는 크론이 없으므로 아무도 <code>logrotate</code> 를 불러 주지 않고, 사이드카로 붙여도 프로세스 네임스페이스가 달라 <strong>신호를 보낼 대상 자체에 닿지 못한다</strong>. 남는 수단은 <code>copytruncate</code> 뿐이고, 그러면 <a href="#sec-6">6장</a>의 대가를 그대로 치른다.</p>
+
+                    <p>그래서 컨테이너의 표준 방식은 표준 출력과 표준 오류로 내보내고 런타임이 받게 하는 것이다. 다만 여기에도 기본값의 함정이 있다. Docker 의 <code>json-file</code> 드라이버 문서에 따르면 <code>max-size</code> 의 기본값은 <strong>-1, 즉 무제한</strong>이고 <code>max-file</code> 의 기본값은 <strong>1</strong> 이며, <code>max-file</code> 은 <code>max-size</code> 가 설정되어 있을 때만 유효하다. 정리하면 <strong>기본 설정에서는 회전이 없다</strong>. 컨테이너 로그가 호스트 디스크를 채우는 사고의 출처가 여기다.</p>
+
+                    <p>systemd 쪽은 스스로 관리한다. journald 매뉴얼에 따르면 <code>SystemMaxUse</code> 와 <code>SystemKeepFree</code> 는 각각 파일시스템 크기의 <strong>10퍼센트와 15퍼센트</strong>를 기본값으로 삼되 계산된 값을 <strong>4G 로 상한</strong>한다. 개별 파일 크기는 <code>SystemMaxUse</code> 의 8분의 1을 128M 로 상한한 값이고, 그 결과 대체로 <strong>일곱 개의 회전된 저널 파일</strong>이 유지된다. <code>SystemMaxFiles</code> 의 기본값은 100 이다.</p>
+
+                    <ul>
+                        <li>journald 의 정리에는 단서가 있다. 매뉴얼은 <strong>보관된 파일만 지운다</strong>고 적는다. 활성 파일은 남으므로 정리가 끝난 뒤에도 한도보다 더 쓰고 있을 수 있다</li>
+                        <li>컨테이너 로그의 크기 제한은 <strong>컨테이너를 다시 만들 때</strong> 적용되는 것이 보통이다. 데몬 기본값을 바꿔도 이미 도는 컨테이너에는 반영되지 않는다</li>
+                        <li>런타임이 회전을 맡으면 <strong>보관본의 위치가 호스트</strong>다. 애플리케이션이 자기 로그를 다시 읽는 구조라면 그 경로가 사라진다</li>
+                        <li>표준 출력으로 내보낼 때 애플리케이션이 <strong>버퍼링</strong>을 하면 로그가 뭉쳐서 늦게 나온다. 장애 시각과 로그 시각이 어긋나는 원인이 되므로 줄 단위 플러시를 켜 둔다</li>
+                    </ul>
+
+                    <h2 id="sec-15">점검 목록 - 회전이 정말 되고 있는가</h2>
+
+                    <p>가장 빠른 확인은 <strong>inode 두 개를 비교하는 것</strong>이다. 경로가 가리키는 파일과, 프로세스가 열어 둔 디스크립터 뒤의 파일이 같은지 본다. 같으면 정상이고 다르면 회전이 깨진 것이다. 이 비교는 이 환경에서 그대로 동작했다.</p>
+
+                    <pre><code>$ : &gt; live.log
+$ exec 9&gt;&gt; live.log
+$ echo "정상" &gt;&amp;9
+$ stat -c %i live.log              ; stat -Lc %i /proc/$$/fd/9
+4222124652701932
+4222124652701932                   # 같다 = 지금 그 경로에 쓰고 있다
+
+$ mv live.log live.log.1 ; : &gt; live.log     # 신호를 주지 않은 회전
+$ stat -c %i live.log              ; stat -Lc %i /proc/$$/fd/9
+4503599629412593
+4222124652701932                   # 갈라졌다 = 회전이 깨졌다
+
+$ echo "[깨진 뒤에도 계속 쓴다]" &gt;&amp;9
+$ stat -c %s live.log   ; stat -c %s live.log.1
+0                                  # 새 파일은 0바이트
+40                                 # 쓰기는 여기로 간다</code></pre>
+
+                    <p>실제 서버에서는 디스크립터 번호를 먼저 찾아야 한다. 순서는 이렇다.</p>
+
+                    <ol>
+                        <li>로그를 쓰는 프로세스의 pid 를 찾는다</li>
+                        <li><code>ls -l /proc/&lt;pid&gt;/fd</code> 에서 그 로그 경로를 가리키는 번호를 고른다. <code>(deleted)</code> 가 붙어 있으면 그 자체로 답이 나온 것이다</li>
+                        <li><code>stat -c %i &lt;로그경로&gt;</code> 와 <code>stat -Lc %i /proc/&lt;pid&gt;/fd/&lt;번호&gt;</code> 를 비교한다</li>
+                        <li>두 값이 다르면 회전 뒤 다시 열기가 안 된 것이다. 신호를 보내거나 재시작한다</li>
+                        <li>회전된 파일들의 수정 시각이 <strong>주기마다 계단처럼</strong> 찍히는지 본다. 어느 시점부터 멈춰 있으면 회전 자체가 안 도는 것이다</li>
+                        <li>상태 파일에서 그 경로의 마지막 회전 시각을 확인한다. 오늘이 아니면 오늘 돌지 않았다</li>
+                    </ol>
+
+                    <p>설정을 새로 넣거나 고쳤을 때 확인해야 할 것도 정리해 둔다. 아래 중 하나라도 걸리면 그 설정은 아직 완성이 아니다.</p>
+
+                    <ul>
+                        <li>다시 열기 수단이 있는가. <code>postrotate</code> 도 <code>copytruncate</code> 도 없으면 그 설정은 <strong>첫 회전에서 깨진다</strong></li>
+                        <li>시간 기준과 크기 기준이 <strong>둘 다</strong> 있는가. 그리고 크기 기준을 검사할 만큼 자주 불리는가</li>
+                        <li><code>compress</code> 를 켰다면 <code>delaycompress</code> 도 켰는가</li>
+                        <li><code>create</code> 에 모드·소유자·그룹이 <strong>셋 다</strong> 적혀 있는가</li>
+                        <li>와일드카드를 썼다면 <code>sharedscripts</code> 가 있는가</li>
+                        <li>같은 경로를 잡는 다른 설정이 없는가. 패키지가 설치한 설정과 손으로 만든 설정이 겹치는 일이 흔하다</li>
+                        <li>보관 개수를 압축률로 환산했을 때 그 파일시스템에 들어가는가. <strong>폭주 여유를 곱했는가</strong></li>
+                        <li>앱이 자체 회전을 하고 있지 않은가</li>
+                    </ul>
+
+                    <h2 id="sec-16">정리</h2>
+
+                    <p>이 글의 모든 실패는 한 문장에서 갈라져 나온다. <strong>회전은 이름을 바꾸고, 프로세스는 이름을 붙잡고 있지 않다.</strong> 그래서 회전 설정의 절반은 파일을 어떻게 옮길지가 아니라 <strong>프로세스가 새 파일을 열게 하는 수단</strong>에 관한 것이다. 그 수단이 없으면 회전은 이름만 바꾸고 아무 공간도 돌려주지 못한다.</p>
+
+                    <p>선택지는 둘뿐이고 둘 다 대가가 있다. 신호는 프로세스가 그 기능을 갖고 있어야 하고, <code>copytruncate</code> 는 복사와 자르기 사이의 로그를 잃으며 추가 모드가 아닌 디스크립터에서는 널 바이트가 섞인 파일을 만든다. 어느 쪽을 고르든 <strong>무엇을 포기했는지 알고 고르는 것</strong>과 기본값을 그대로 둔 것은 다르다.</p>
+
+                    <p>확인은 생각보다 싸다. inode 두 개를 비교하는 데 몇 초면 되고, 그 비교는 회전이 깨진 순간 곧바로 답을 준다. 로그 회전은 평소에 아무도 보지 않는 장치이므로, <strong>깨졌을 때 알아채는 방법을 미리 정해 두는 것</strong>이 설정을 잘 쓰는 것보다 실질적으로 더 중요하다.</p>
+
+                    <h2 id="sec-17">확인하지 못한 것</h2>
+
+                    <ul>
+                        <li><code>logrotate</code> 자체를 <strong>한 번도 실행하지 못했다</strong>. 이 환경에 프로그램이 없다. 설정 문법과 지시자의 동작은 전부 매뉴얼 원문 근거이고, <code>-d</code> 출력이나 실제 회전 결과는 이 글에 없다</li>
+                        <li><code>lsof +L1</code>, <code>systemctl</code>, <code>journalctl</code>, 컨테이너 런타임 명령도 돌리지 못했다. journald 와 Docker 관련 수치는 각각의 문서에서 확인한 값이며 <strong>실제 동작으로 검증하지 않았다</strong></li>
+                        <li>회전 뒤 <code>/proc/&lt;pid&gt;/fd</code> 의 심볼릭 링크가 이 환경에서는 <strong>옛 경로 문자열을 그대로</strong> 보여 줬다. 리눅스에서 개명 뒤 새 이름으로 갱신되는지는 확인하지 못했다. 다만 <code>(deleted)</code> 표시와 <code>stat -Lc %i</code> 비교는 여기서 그대로 동작했고, 점검 절차는 그쪽에 기대고 있다</li>
+                        <li>자르기 뒤 앞부분이 <strong>희소 영역</strong>이 되는지는 확인하지 못했다. 이 환경의 블록 계정은 두 파일 모두 1로 보고해 쓸 수 없는 값이었다. 널 바이트가 실제로 들어 있다는 사실만 출력으로 확인했다</li>
+                        <li>소유자·권한은 확인하지 못했다. umask 를 바꿔도 두 파일 모두 644 로 나왔고 그룹은 <code>UNKNOWN</code> 이었다. 이 환경의 권한 표현이 리눅스와 다르기 때문이다</li>
+                        <li>같은 파일을 두 설정이 잡을 때 나오는 <strong>정확한 오류 문구</strong>는 재현하지 못했다. 그 상황에서 처리가 중단된다는 점만 적었다</li>
+                        <li>압축률은 이 글에서 만든 <strong>합성 로그 기준</strong>이다. 실제 로그의 압축률은 필드 구성에 따라 크게 달라지므로 용량 계산에는 자기 로그로 잰 값을 쓴다</li>
+                        <li>애플리케이션 내장 로거의 동작은 <strong>구현마다 다르다</strong>. 이 글은 특정 라이브러리의 동작을 검증하지 않았고, 회전 주체가 둘일 때 충돌한다는 일반적인 구조만 적었다</li>
+                    </ul>
+
+                    <h2 id="sec-18">참고 자료</h2>
+
+                    <ul>
+                        <li><a href="https://raw.githubusercontent.com/logrotate/logrotate/main/logrotate.8.in" target="_blank" rel="noopener">logrotate(8) 매뉴얼 원문 (logrotate 저장소)</a> - <code>copytruncate</code>·<code>delaycompress</code>·<code>create</code>·<code>su</code>·<code>size</code>·<code>maxsize</code>·<code>minsize</code>·<code>rotate</code>·<code>sharedscripts</code>·<code>olddir</code>·<code>dateext</code>·<code>-d</code> 와 상태 파일 동작의 근거</li>
+                        <li><a href="https://raw.githubusercontent.com/logrotate/logrotate/main/examples/logrotate.timer" target="_blank" rel="noopener">logrotate.timer (logrotate 저장소 예제)</a> - <code>OnCalendar=daily</code>·<code>RandomizedDelaySec=1h</code>·<code>Persistent=true</code>. 크기 조건의 검사 간격이 하루가 되는 근거</li>
+                        <li><a href="https://nginx.org/en/docs/control.html" target="_blank" rel="noopener">nginx - Controlling nginx</a> - 신호 목록과 로그 회전 절차. 이름을 먼저 바꾸고 <code>USR1</code> 을 보낸다는 순서의 출처</li>
+                        <li><a href="https://man7.org/linux/man-pages/man5/journald.conf.5.html" target="_blank" rel="noopener">journald.conf(5)</a> - <code>SystemMaxUse</code> 10퍼센트·<code>SystemKeepFree</code> 15퍼센트·4G 상한, <code>SystemMaxFiles</code> 기본 100, 보관된 파일만 지운다는 설명</li>
+                        <li><a href="https://docs.docker.com/engine/logging/drivers/json-file/" target="_blank" rel="noopener">Docker - JSON File logging driver</a> - <code>max-size</code> 기본 -1(무제한), <code>max-file</code> 기본 1, <code>max-file</code> 은 <code>max-size</code> 가 있어야 유효하다는 설명</li>
+                        <li><a href="no_space_left_but_disk_free.html">디스크는 안 찼는데 No space left on device</a> - 이 글이 만드는 상태를 반대편에서 다룬 글. <code>df</code> 와 <code>du</code> 가 어긋나는 이유와 inode 고갈</li>
+                        <li><a href="find_process_holding_file.html">파일을 붙잡고 있는 프로세스 찾기</a> - 회전이 깨졌을 때 범인을 특정하는 절차</li>
+                        <li><a href="oom_killer_diagnosis.html">OOM Killer 가 무엇을 죽였는지 읽는 법</a> - 로그 폭주가 디스크가 아니라 메모리 쪽으로 터졌을 때</li>
+                        <li>systemd 공식 사이트의 journald.conf 페이지는 접근이 거부되어(HTTP 403) 열지 못했다. 위 항목은 <strong>man7.org 판</strong>에서 확인한 것이다</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>이 글 공유하기</h3>
+                    <div class="social-share">
+                        <button id="kakao-share" class="share-btn kakao-btn"><img src="https://developers.kakao.com/assets/img/about/logos/kakaolink/kakaolink_btn_small.png" alt="카카오톡" loading="lazy" decoding="async" width="34" height="35">카카오톡</button>
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(트위터)</button>
+                        <button id="threads-share" class="share-btn threads-btn">쓰레드</button>
+                        <button id="link-copy" class="share-btn link-btn">링크 복사</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">목록으로 돌아가기</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">함께 쓰면 좋은 무료 도구</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/base64_encoder.html">Base64 인코더/디코더</a></li>
+      <li><a href="../static/yaml_json_converter.html">YAML JSON 변환기 2026</a></li>
+      <li><a href="../static/curl_builder.html">curl 명령어 생성기 2026</a></li>
+      <li><a href="../static/http_status_codes.html">HTTP 상태 코드 완전 정리 2026</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">전체 도구 보기 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">관련 글</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="linux_server_guide_08_logging.html">Linux 서버 관리 완전 정복 8편: 로그 관리와 모니터링</a></li>
+      <li><a href="codex_cli_disk_bloat_2026.html">Codex CLI 세션 로그가 수백 GB로 폭증 - AI 코딩 CLI 디스크 소진 원인과 대응 수칙 2026</a></li>
+      <li><a href="linux_server_guide_01_basics.html">Linux 서버 관리 완전 정복 1편: 기초와 파일 시스템 이해</a></li>
+      <li><a href="git_bisect_practical.html">git bisect - 버그가 들어온 커밋을 이분 탐색으로 찾기</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const kakaoShareBtn = document.getElementById('kakao-share');
+        if (kakaoShareBtn) {
+            kakaoShareBtn.addEventListener('click', function() {
+                if (!window.Kakao) return;
+                if (!window.Kakao.isInitialized()) window.Kakao.init('e06d0ee93e450a11bc6451d46e09cd88');
+                if (window.Kakao.Share) {
+                    window.Kakao.Share.sendDefault({
+                        objectType: 'feed',
+                        content: { title: document.title, description: document.querySelector('meta[name="description"]')?.content || '', imageUrl: 'https://braindetox.kr/site_logo.png', link: { mobileWebUrl: location.href, webUrl: location.href } },
+                        buttons: [{ title: '웹으로 보기', link: { mobileWebUrl: location.href, webUrl: location.href } }]
+                    });
+                }
+            });
+        }
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('링크가 복사되었습니다. 쓰레드 앱에 붙여넣기하여 공유하세요!');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('링크가 복사되었습니다!'); });
+    });
+    </script>
+</body>
+</html>

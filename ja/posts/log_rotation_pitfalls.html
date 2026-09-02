@@ -1,0 +1,869 @@
+<!DOCTYPE html>
+<!--
+ * 技術ブログ記事テンプレート
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ja">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ログローテーションが静かに失敗する場所 - ディスクは埋まるのに誰も気づかない</title>
+    <meta name="description" content="ローテーションは名前を変える作業で、プロセスは名前ではなくファイル記述子を掴んでいる。そのずれが生む静かな失敗を実際の実行出力で示し、シグナルと copytruncate がそれぞれ何を失うのか、そして壊れたことに気づく方法までを整理する。">
+    <meta name="keywords" content="ログローテーション, logrotate, copytruncate, delaycompress, inode, ファイル記述子, postrotate, ディスク満杯, journald, コンテナログ, Linux, サーバ運用, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/ja/posts/log_rotation_pitfalls.html">
+
+    <meta property="og:title" content="ログローテーションが静かに失敗する場所 - ディスクは埋まるのに誰も気づかない">
+    <meta property="og:description" content="新しいログファイルは0バイトなのにディスクは埋まり続ける。ローテーションが名前だけを変え、プロセスが古いファイルを掴んだままのときに起きること。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/ja/posts/log_rotation_pitfalls.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ja_JP">
+    <meta property="article:published_time" content="2026-09-02">
+    <meta property="article:section" content="開発・インフラ">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="ログローテーションが静かに失敗する場所">
+    <meta name="twitter:description" content="プロセスは名前ではなくファイル記述子を掴んでいる。すべての問題の根がここにある。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "ログローテーションが静かに失敗する場所 - ディスクは埋まるのに誰も気づかない",
+      "alternativeHeadline": "ローテーションは名前を変える作業で、プロセスは名前ではなくファイル記述子を掴んでいる",
+      "datePublished": "2026-09-02",
+      "dateModified": "2026-09-02",
+      "inLanguage": "ja-JP",
+      "articleSection": "開発・インフラ",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "ログローテーション, logrotate, copytruncate, delaycompress, inode, ファイル記述子, postrotate, ディスク満杯, journald, コンテナログ",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/ja/posts/log_rotation_pitfalls.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "ログをローテーションしたのにディスクの空きが戻らないのはなぜか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "ローテーションはファイルを消す作業ではなく名前を変える作業だからだ。プロセスが掴んでいるのはファイル名ではなく open が返したファイル記述子であり、その記述子は名前ではなく inode を指している。だから mv で名前を変えてもプロセスは同じファイルに書き続ける。新しく作ったログファイルは0バイトのまま残り、ローテーションされたファイルだけが育つ。ここでそのファイルを rm で消すと名前は消えるが、プロセスが離さない限りブロックは返らない。つまりローテーションの後にプロセスがファイルを開き直すようにしなければ、ローテーションは名前を変えただけで空き容量を一切返せない。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "postrotate のシグナルと copytruncate のどちらを使うべきか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "開き直しのシグナルを受け取れるプロセスならシグナル側がよい。nginx のドキュメントはログローテーションの手順を、まず名前を変えてから master プロセスに USR1 を送ることだと説明している。この方式は一行も失わない。問題はプロセス側にその機能が必要な点だ。手段がない場合に残るのが copytruncate だが、logrotate のマニュアル自身が、コピーと切り詰めの間にごく短い時間差があるため一部のログデータが失われる可能性があると書いている。さらにプロセスがファイルを O_APPEND で開いていなければ、切り詰めの後も古いオフセットに書き続けるため、先頭がヌルバイトで埋まったファイルができる。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "ローテーション周期を daily だけにすると何が問題か",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "障害が起きたとき一日もたない。この記事で作ったアクセスログの平均行長は 122.2 バイトだった。この値をそのまま使うと、毎秒1,000行なら24時間で約 9.83 GiB 増え、毎秒5,000行なら 4.9 時間で 10 GiB を超える。エラーの暴走でログが平時の数十倍になる状況がまさにその瞬間だ。だから時間基準と容量基準を一緒に設定する。ただし容量基準も万能ではない。logrotate は常駐するプログラムではなく cron やタイマーが呼んだときだけファイルサイズを確認するので、一日一回しか呼ばれないなら容量条件も一日一回しか検査されない。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "なぜ delaycompress が必要なのか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "圧縮は元のファイルを読んで新しいファイルを作り、元を消す動作だからだ。プロセスがまだそのファイルを掴んでいる状態で圧縮すると、圧縮結果にはその時点までの内容しか入らず、その後に書かれた行は名前の消えたファイルへ流れ込んでどこからも読めなくなる。空き容量も戻らない。実際に再現すると圧縮前の二行だけが gz の中に残り、圧縮後に書いた行は新しいログファイルにも圧縮結果にも存在しない。delaycompress はマニュアルの説明どおり直前のログファイルの圧縮を次のローテーション周期へ先送りするもので、その一周期がプロセスがファイルを離す時間を稼いでくれる。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "ローテーションが本当に動いているかどうかをどう確認するか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "いちばん速いのは inode を二つ比べることだ。ログパスの inode を stat で読み、そのログを書くプロセスが開いているファイル記述子の先にある inode をシンボリックリンク追跡付きの stat で読む。二つが同じならプロセスは今そのパスのファイルに書いており、違うならローテーションが壊れている。あわせて新しいログファイルが0バイトのまま止まっていないか、ローテーション済みファイルの更新時刻が周期ごとに階段状に並んでいるかも見る。実行して確かめたところ、この比較はローテーションが壊れた瞬間にすぐ二つの値が分かれた。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/log_rotation_pitfalls.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/log_rotation_pitfalls.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/log_rotation_pitfalls.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/log_rotation_pitfalls.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/log_rotation_pitfalls.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "ホーム",
+      "item": "https://braindetox.kr/ja/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "開発・インフラ",
+      "item": "https://braindetox.kr/ja/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "ログローテーションが静かに失敗する場所 - ディスクは埋まるのに誰も気づかない",
+      "item": "https://braindetox.kr/ja/posts/log_rotation_pitfalls.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="ログローテーションが静かに失敗する場所 - ディスクは埋まるのに誰も気づかない">
+                <meta itemprop="datePublished" content="2026-09-02">
+                <meta itemprop="dateModified" content="2026-09-02">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="ログローテーション, logrotate, copytruncate, delaycompress, inode, ファイル記述子, postrotate, ディスク満杯, journald, コンテナログ">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/ja/posts/log_rotation_pitfalls.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">ログローテーションが静かに失敗する場所 - ディスクは埋まるのに誰も気づかない</h1>
+                    <h2 class="post-subtitle">ローテーションは名前を変える作業で、プロセスは名前ではなくファイル記述子を掴んでいる</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-02">2026-09-02</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">開発・インフラ</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>ログローテーションはサーバでいちばん静かな仕組みだ。うまく回っている間は誰もその存在に気づかず、壊れてもしばらくは誰も気づかない。サービスは正常に応答し、ログディレクトリには <code>app.log</code> と <code>app.log.1</code> が並び、ファイル数も設定どおりだ。見える範囲におかしなところはひとつもない。それでもディスクは埋まり続ける。</p>
+
+                    <p>この状態の正体はたいてい一つだ。<strong>ローテーションは名前を変える作業なのに、プロセスは名前を掴んでいない。</strong>プロセスが掴んでいるのは <code>open</code> が返したファイル記述子で、その記述子は名前ではなくその下にある実体を指している。名前を変えようが消そうが実体はそのままで、プロセスはそこへ書き続ける。この記事は、そのずれが生む失敗を一つずつ実行して見せる。</p>
+
+                    <div class="callout">
+                        <strong>範囲</strong> - この記事の対象は Linux サーバのファイルログと <code>logrotate</code> の設定だ。以下に載せた出力の一部は <strong>Windows 上の Git Bash</strong> で実際に走らせたもので、Linux 専用ツールが必要な箇所は <strong>実行できなかったと明記し、コマンドと読み方だけ</strong>を書いた。出力を作り話にした箇所は一行もない。以下の例にはファイルを元に戻せなくするコマンドが混じっているので、本番サーバではない場所で確認すること。
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>この記事で扱うこと</h3>
+                        <ol>
+                            <li><a href="#sec-1">症状 - 新しいログは0バイトなのにディスクは埋まる</a></li>
+                            <li><a href="#sec-2">この記事の実行環境と検証範囲</a></li>
+                            <li><a href="#sec-3">ローテーションが実際にしていること - 名前の付け外し</a></li>
+                            <li><a href="#sec-4">だから静かに失敗する</a></li>
+                            <li><a href="#sec-5">開き直させる二つの方法</a></li>
+                            <li><a href="#sec-6">copytruncate が失うもの</a></li>
+                            <li><a href="#sec-7">&gt; と &gt;&gt; の違いがここで効いてくる</a></li>
+                            <li><a href="#sec-8">容量基準と時間基準</a></li>
+                            <li><a href="#sec-9">圧縮の罠 - まだ開かれているファイル</a></li>
+                            <li><a href="#sec-10">rotate N が実際に残す量</a></li>
+                            <li><a href="#sec-11">権限と所有者 - ローテーション後に書けなくなる事故</a></li>
+                            <li><a href="#sec-12">ローテーションそのものが回らない場合</a></li>
+                            <li><a href="#sec-13">アプリケーションが自分でローテーションする場合</a></li>
+                            <li><a href="#sec-14">コンテナでは事情が違う</a></li>
+                            <li><a href="#sec-15">点検リスト - ローテーションは本当に回っているか</a></li>
+                            <li><a href="#sec-16">まとめ</a></li>
+                            <li><a href="#sec-17">確認できなかったこと</a></li>
+                            <li><a href="#sec-18">参考資料</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">症状 - 新しいログは0バイトなのにディスクは埋まる</h2>
+
+                    <p>この故障には見分けやすい顔がある。三つが同時に見えたらほぼ確実だ。第一に、ローテーション済みのファイルは正常に増えている。第二に、現在のログファイルが <strong>0バイト、あるいは何日もサイズが変わらない</strong>。第三に、ディスク使用量のグラフがローテーション時刻ごとに階段状に下がらず <strong>まっすぐ上がり続ける</strong>。</p>
+
+                    <p>ここにもう一つ加わると決定的だ。<code>du</code> でログディレクトリを合計した値と <code>df</code> が報告する使用量が大きく食い違う。ローテーション済みのファイルを整理スクリプトがすでに消したのにプロセスが離していなければ、そのファイルは名前がないので <code>du</code> の目には映らない。この二つの数字が開く状況そのものは <a href="no_space_left_but_disk_free.html">ディスクは空いているのに No space left on device</a> で原因②として扱ったもので、<strong>その状況を実務でいちばん多く作り出すのがローテーション設定のミス</strong>だ。だからこの記事はローテーション側を掘る。</p>
+
+                    <p>犯人となるプロセスを実際に特定する手順は <a href="find_process_holding_file.html">ファイルを掴んでいるプロセスを探す</a> のほうにある。ここでは <strong>なぜ掴まれた状態ができるのか</strong> までを見る。ちなみにログの暴走がディスクより先にメモリ側で破裂する場合はまた別の顔をしていて、それは <a href="oom_killer_diagnosis.html">OOM Killer が何を殺したかを読む</a> の話だ。</p>
+
+                    <h2 id="sec-2">この記事の実行環境と検証範囲</h2>
+
+                    <p>テーマは Linux サーバだが、以下の出力を作り出した環境は <strong>Windows 10 上の Git Bash</strong> だ。先にこれを明かす理由は、読む側が <strong>どの出力をそのまま信じてよく、どの出力がここにないのか</strong> を区別できる必要があるからだ。</p>
+
+                    <pre><code>$ bash --version | head -1
+GNU bash, version 5.2.37(1)-release (x86_64-pc-msys)
+
+$ uname -a
+MINGW64_NT-10.0-19045 3.5.7-882031da.x86_64 2025-01-30 11:14 UTC x86_64 Msys
+
+$ stat --version | head -1
+stat (GNU coreutils) 8.32
+$ gzip --version | head -1
+gzip 1.13
+
+$ for c in logrotate lsof systemctl journalctl gzip stat ln truncate; do
+&gt;   printf '%-12s %s\n' "$c" "$(command -v $c || echo '(not found)')"
+&gt; done
+logrotate    (not found)
+lsof         (not found)
+systemctl    (not found)
+journalctl   (not found)
+gzip         /usr/bin/gzip
+stat         /usr/bin/stat
+ln           /usr/bin/ln
+truncate     /usr/bin/truncate</code></pre>
+
+                    <p>つまり <code>logrotate</code> 自体がこの環境にない。ところがこの記事が扱う問題の <strong>根は logrotate ではなくカーネルのファイルの扱い方</strong> であり、その部分はここでもそのまま再現する。名前と実体がどう分かれるか、開かれた記述子がどこを指すか、切り詰めの後に書き込みがどこへ行くかは全部走らせることができた。</p>
+
+                    <ul>
+                        <li><strong>実際に走らせたもの</strong> - <code>rename</code> 前後の inode 比較、ハードリンクで見る名前と実体の分離、<strong>ローテーション後も古いファイルに書き続ける状況の全体</strong>、削除済みファイルの <code>(deleted)</code> 表示、<code>&gt;</code> と <code>&gt;&gt;</code> の違い、二つの記述子が同じファイルを見るときの上書き、切り詰めの後にヌルバイトが生じる過程、コピーと切り詰めの間の欠落、開かれたままのファイルを圧縮したときの結果、番号方式の改名の連鎖、圧縮率の実測</li>
+                        <li><strong>走らせられなかったもの</strong> - <code>logrotate -d</code>(プログラム自体がない)、<code>lsof +L1</code>、<code>systemctl</code> と <code>journalctl</code>、コンテナランタイム関連すべて、所有者と権限の変更</li>
+                        <li><strong>作り話にしなかったもの</strong> - 走らせられなかったコマンドの出力はこの記事に一行もない。コマンドと <strong>読み方</strong> だけを書いた</li>
+                        <li><strong>手を入れたもの</strong> - 出力の長いパスを短くしただけだ。<strong>数字は一つも直していない</strong></li>
+                        <li>設定の文法と各指示子の動作は <code>logrotate</code> のマニュアル原文で確認した。その箇所は実行ではなく <strong>文書の根拠</strong> だ</li>
+                        <li>この環境のファイルシステムは NTFS だ。<strong>inode 番号が Linux よりずっと大きな値</strong>で出るのはそのためで、値そのものではなく <strong>同じか違うか</strong> だけを見ればよい</li>
+                    </ul>
+
+                    <h2 id="sec-3">ローテーションが実際にしていること - 名前の付け外し</h2>
+
+                    <p>ローテーションは大したことをしていない。<code>app.log</code> を <code>app.log.1</code> に改名し、同じ場所に新しい <code>app.log</code> を作る。それだけだ。ここで肝心なのは <strong>改名がファイルを変えない</strong> という点だ。ディレクトリに書かれた名札を貼り替えるだけで、その名札が指す実体には触れていない。</p>
+
+                    <pre><code>$ echo "line 1" &gt; app.log
+$ echo "line 2" &gt;&gt; app.log
+$ stat -c 'inode=%i  size=%s  links=%h  name=%n' app.log
+inode=3096224745851500  size=14  links=1  name=app.log
+
+$ mv app.log app.log.1
+$ stat -c 'inode=%i  size=%s  links=%h  name=%n' app.log.1
+inode=3096224745851500  size=14  links=1  name=app.log.1        # 同じ inode
+
+$ : &gt; app.log            # ローテーション後の新しいファイル生成
+$ stat -c 'inode=%i  size=%s  links=%h  name=%n' app.log app.log.1
+inode=5066549582825943  size=0   links=1  name=app.log          # 新しい inode
+inode=3096224745851500  size=14  links=1  name=app.log.1</code></pre>
+
+                    <p>名前は変わったのに inode 番号はそのままだ。そして新しく作った <code>app.log</code> は <strong>まったく別のファイル</strong> だ。名前がファイルではないという事実はハードリンクで見るともっとはっきりする。同じ実体に名札を二つ付けて片方を消しても、残った名前で中身はそのまま読める。</p>
+
+                    <pre><code>$ echo "payload" &gt; one.txt
+$ ln one.txt two.txt
+$ stat -c 'inode=%i  links=%h  name=%n' one.txt two.txt
+inode=3940649675983497  links=2  name=one.txt
+inode=3940649675983497  links=2  name=two.txt
+
+$ rm one.txt                     # 元に戻せないコマンドだ
+$ stat -c 'inode=%i  links=%h  name=%n' two.txt
+inode=3940649675983497  links=1  name=two.txt
+$ cat two.txt
+payload</code></pre>
+
+                    <p><code>rm</code> がしたのはリンク数を2から1に減らしたことだけだ。ファイルは <strong>名前がすべて消え、開いているプロセスもないとき</strong> にだけ消える。この二つの条件のどちらかが残っていればデータも残り、そのデータが占めたブロックも残る。ローテーション問題のすべてがこの一文から出てくる。</p>
+
+                    <h2 id="sec-4">だから静かに失敗する</h2>
+
+                    <p>ここにサービス側をつないでみる。ログを書くプロセスは起動時にファイルを一度開き、その後は開いたままの記述子に書き続ける。毎回名前を辿り直したりはしない。だからローテーションが名前を変えても <strong>プロセスにはそれを知る手段がない</strong>。以下はシェルにそのプロセス役をさせて実際に走らせたものだ。</p>
+
+                    <pre><code>$ : &gt; svc.log
+$ exec 9&gt;&gt; svc.log                       # サービスがログを開いた状態
+$ echo "[1] ローテーション前に書いた行" &gt;&amp;9
+
+$ ls -l /proc/$$/fd/9
+lrwxrwxrwx ... /proc/1725/fd/9 -&gt; /tmp/demo/svc.log
+
+$ mv svc.log svc.log.1                   # ローテーション
+$ : &gt; svc.log                            # 新しいファイル生成。シグナルは送っていない
+$ echo "[2] ローテーション後に書いた行" &gt;&amp;9
+$ echo "[3] その次の行"                  &gt;&amp;9
+
+$ wc -c svc.log svc.log.1
+ 0 svc.log
+71 svc.log.1
+
+$ cat svc.log                            # 新しいログファイル
+$ cat svc.log.1                          # ローテーションされた古いファイル
+[1] ローテーション前に書いた行
+[2] ローテーション後に書いた行
+[3] その次の行</code></pre>
+
+                    <p>三行とも <code>svc.log.1</code> に入った。ローテーション <strong>以後</strong> に書いた二行まで古いファイルへ行き、新しく作った <code>svc.log</code> は0バイトのままだ。ディレクトリを <code>ls</code> で見るとファイルは両方あるので正常に見える。次の周期になれば <code>svc.log.1</code> は <code>svc.log.2</code> になり、プロセスは相変わらず同じ実体に書く。こうして <strong>ローテーション番号だけがずれていく一つのファイル</strong> が育ち続ける。</p>
+
+                    <p>ここで整理スクリプトが古いファイルを消すと状況は悪くなる。名前が消えてもプロセスが掴んでいるので容量は戻らず、今度は <code>ls</code> でも見えない。</p>
+
+                    <pre><code>$ : &gt; svc.log
+$ exec 9&gt;&gt; svc.log
+$ echo "[1] 削除前" &gt;&amp;9
+$ rm svc.log                             # 元に戻せないコマンドだ
+$ echo "[2] 削除後も書き続ける" &gt;&amp;9
+$ echo "[3] そして続く"         &gt;&amp;9
+
+$ ls -l /proc/$$/fd/9
+lrwxrwxrwx ... /proc/1725/fd/9 -&gt; /tmp/demo/svc.log (deleted)
+
+$ ls -l .
+total 0                                  # 何もない
+
+$ wc -c /proc/$$/fd/9
+71 /proc/1725/fd/9                       # ところが中身は生きている</code></pre>
+
+                    <p>ディレクトリは空なのに71バイトがディスクに残っている。カーネルが <code>(deleted)</code> と表示してくれるこの状態が <strong>ディスクが埋まるのに誰も知らない状態</strong> の正確な定義だ。実際のサーバでは71バイトではなく数十GBだ。</p>
+
+                    <h2 id="sec-5">開き直させる二つの方法</h2>
+
+                    <p>直す方向は一つしかない。<strong>プロセスにファイルを開き直させること。</strong>方法は二つで、それぞれ違うものを要求し、それぞれ違うものを失う。</p>
+
+                    <p>一つ目はローテーションの後にシグナルを送ることだ。nginx のドキュメントはこの手順を明示している。ログファイルの名前をまず変え、それから master プロセスに <code>USR1</code> を送ると、master がすべてのログファイルを開き直し、ワーカーにも開き直すよう指示する。ドキュメントはその結果として <strong>古いファイルがほぼ即座に圧縮などの後処理に使える状態になる</strong> と説明している。順序が重要だ。名前を変えるのが先でシグナルが後だ。</p>
+
+                    <pre><code># logrotate の設定でこの方式はこう書く
+/var/log/nginx/*.log {
+    daily
+    maxsize 100M
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    create 0640 nginx adm
+    sharedscripts                 # ワイルドカードに何個当たってもスクリプトは一度だけ
+    postrotate
+        [ -f /run/nginx.pid ] &amp;&amp; kill -USR1 "$(cat /run/nginx.pid)"
+    endscript
+}</code></pre>
+
+                    <p><code>sharedscripts</code> を外すとマニュアルの説明どおり <strong>ワイルドカードに当たったファイルの数だけスクリプトが繰り返し実行</strong>される。ログファイルが六つならシグナルが六回飛ぶ。nginx は耐えるが、再起動コマンドを入れておいた設定ならサービスが連続で再起動する。</p>
+
+                    <p>二つ目は <code>copytruncate</code> だ。マニュアルの文をそのまま移すと、<strong>古いログを移動して新しいファイルを作る代わりに、コピーを作ってから元のファイルをその場でゼロに切り詰める</strong>方式だ。プロセスから見ればファイルは変わっていないので何もする必要がない。シグナルを受け取れないプログラムに使えるほぼ唯一の手段だ。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>方式</th><th>成立条件</th><th>失うもの</th><th>使う場面</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>改名 + シグナル(postrotate)</td><td>プロセスが開き直しシグナルに対応している</td><td>なし。一行も失わない</td><td>nginx や rsyslog などシグナル規約のあるサービス</td></tr>
+                            <tr><td>改名 + 再起動</td><td>再起動が許されるサービスである</td><td>再起動の間の可用性</td><td>開き直しがなく無停止が必須でない場合</td></tr>
+                            <tr><td>copytruncate</td><td>なし。プロセスは何もしなくてよい</td><td>コピーと切り詰めの間のログ。さらに O_APPEND でなければファイル先頭がヌルバイトで埋まる</td><td>シグナルも再起動も不可能なときの最後の手段</td></tr>
+                            <tr><td>アプリが自分でローテーション</td><td>ロガーにローテーション機能がある</td><td>外部のローテーションと重なると互いのファイルを失う</td><td>ローテーションの主体をアプリ一つに統一できるとき</td></tr>
+                            <tr><td>標準出力へ出す</td><td>ランタイムやスーパーバイザが受け取る</td><td>ファイルログの細かい制御。ランタイム設定に従属する</td><td>コンテナ環境の既定</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2 id="sec-6">copytruncate が失うもの</h2>
+
+                    <p>マニュアルは <code>copytruncate</code> の代償を自分で書いている。<strong>コピーと切り詰めの間にごく短い時間差があるため一部のログデータが失われる可能性がある</strong>という一文だ。この文は抽象的に読めるが、実際に何が起きるかはその隙間に一行差し込んでみればすぐ見える。</p>
+
+                    <pre><code>$ exec 9&gt;&gt; gap.log
+$ echo "コピー前に書いた行" &gt;&amp;9
+
+$ cp gap.log gap.log.1                       # 1) コピー
+$ echo "★コピーと切り詰めの間に書いた行" &gt;&amp;9   # 2) その隙間に入ったログ
+$ : &gt; gap.log                                # 3) 切り詰め。元に戻せない
+$ echo "切り詰めた後に書いた行" &gt;&amp;9
+
+$ cat gap.log.1
+コピー前に書いた行
+$ cat gap.log
+切り詰めた後に書いた行
+
+$ grep -l "コピーと切り詰めの間" gap.log gap.log.1
+なし</code></pre>
+
+                    <p>その隙間に書かれた行は <strong>保管本にもなく新しいファイルにもない</strong>。どこにもない。毎秒数千行が入るサービスでこの隙間が数十ミリ秒なら、ローテーション一回で数百行が消える。決済や監査ログのように一行も失ってはならないデータを <code>copytruncate</code> で回してはいけない理由がこれだ。</p>
+
+                    <p>代償はもう一つある。はるかに知られておらず、はるかに奇妙な見た目をしている。<strong>プロセスがファイルを追記モードで開いていなければ</strong>、切り詰めの後もそのプロセスは <strong>自分が覚えている古いオフセット</strong> に書き続ける。ファイルの先頭は誰も書いていないのでヌルバイトで埋まる。</p>
+
+                    <pre><code># 追記モード(&gt;&gt;, O_APPEND)で開いた場合
+$ exec 9&gt;&gt; ok.log
+$ echo "0123456789" &gt;&amp;9          # 11バイト
+$ cp ok.log ok.log.1
+$ : &gt; ok.log                     # 切り詰め
+$ echo "after" &gt;&amp;9
+$ stat -c 'size=%s' ok.log
+size=6
+$ od -c ok.log
+0000000   a   f   t   e   r  \n
+
+# 追記モードでない場合 (&gt;)
+$ exec 9&gt; bad.log
+$ echo "0123456789" &gt;&amp;9          # 11バイト、オフセットは11になった
+$ cp bad.log bad.log.1
+$ : &gt; bad.log                    # 切り詰め
+$ echo "after" &gt;&amp;9               # オフセット11にそのまま書く
+$ stat -c 'size=%s' bad.log
+size=17
+$ od -c bad.log
+0000000  \0  \0  \0  \0  \0  \0  \0  \0  \0  \0  \0   a   f   t   e   r
+0000020  \n</code></pre>
+
+                    <p>17バイトのうち先頭の11バイトがヌルだ。ログビューアで開くと先頭が壊れて見え、<code>grep</code> は一行として数え、ファイルサイズは実際の中身より大きく報告される。Linux の ext4 や XFS ならこの先頭は普通 <strong>スパース領域</strong> になって実ブロックを使わないが、それはこの環境で確認できなかった。ただし <strong>読む側にとってヌルバイトが実際に入っているという事実</strong> は上の出力のとおりだ。</p>
+
+                    <ul>
+                        <li>ほとんどのロギングライブラリはファイルを追記モードで開く。だからこの症状は <strong>直接 <code>open</code> を呼ぶコード</strong> や、リダイレクトでログを受けるスクリプトで出る</li>
+                        <li><code>copytruncate</code> を使うとき <code>create</code> は意味がない。ファイルを新しく作らないからだ。マニュアルもこの二つを別の系統として説明している</li>
+                        <li>コピーの間、ディスクに <strong>元のサイズ分の空き</strong> が一時的にもう一つ必要になる。すでに満杯のディスクではこの方式は失敗する</li>
+                        <li>マニュアルによると <code>olddir</code> で指定したディレクトリは本来 <strong>同じ物理デバイス</strong> になければならないが、<code>copy</code>・<code>copytruncate</code>・<code>renamecopy</code> を使うとその制約がなくなる。保管本を別デバイスへ移したいときの迂回路がここだ</li>
+                    </ul>
+
+                    <h2 id="sec-7">&gt; と &gt;&gt; の違いがここで効いてくる</h2>
+
+                    <p>スクリプトがログをリダイレクトで受ける場面はよくある。<code>cron</code> の行や <code>ExecStart</code> の後ろに付くあの記号が正確に何をするかがローテーションの結果を分ける。<code>&gt;</code> は <strong>開くときにファイルをゼロに切り詰め</strong>、<code>&gt;&gt;</code> は <strong>毎回ファイル末尾へ移動してから書く</strong>。</p>
+
+                    <pre><code>$ echo "一行目" &gt; t1.log
+$ echo "二行目" &gt; t1.log
+$ cat t1.log
+二行目                        # 前のものが消えた
+
+$ echo "一行目" &gt; t2.log
+$ echo "二行目" &gt;&gt; t2.log
+$ cat t2.log
+一行目
+二行目
+
+# 同じファイルを二つの記述子が見るとき - 追記モードでない場合
+$ exec 7&gt; noappend.log
+$ exec 8&gt; noappend.log
+$ echo "AAAAAAAAAA" &gt;&amp;7       # 11バイトを0番地から
+$ echo "BBB"        &gt;&amp;8       # 4バイトをまた0番地から
+$ od -c noappend.log
+0000000   B   B   B  \n   A   A   A   A   A   A  \n
+
+# 追記モードなら互いを上書きしない
+$ exec 7&gt;&gt; append.log
+$ exec 8&gt;&gt; append.log
+$ echo "AAAAAAAAAA" &gt;&amp;7
+$ echo "BBB"        &gt;&amp;8
+$ od -c append.log
+0000000   A   A   A   A   A   A   A   A   A   A  \n   B   B   B  \n</code></pre>
+
+                    <p>二つ目の実験が重要だ。<code>&gt;</code> で開いた記述子は <strong>それぞれ自分のオフセット</strong> を持つ。だから二つのプロセスが同じログファイルをそう開くと互いの内容を上書きする。ワーカープロセスを複数立ち上げてそれぞれ <code>&gt;</code> で同じファイルに書かせると、ログが断片的に消える。原因を追うのが非常に難しい種類の欠落だ。</p>
+
+                    <p>ローテーションに関してもっと重要なのは <strong>リダイレクトがプロセス起動時に一度だけ開かれる</strong> ことだ。長く回るデーモンを <code>&gt;&gt; /var/log/job.log</code> で起動したなら、その記述子はプロセスが死ぬまで生きており、ローテーションは上の <a href="#sec-4">第4節</a> とまったく同じに壊れる。逆に <code>cron</code> が5分ごとに新しく実行するスクリプトは毎回開き直すのでローテーションが自然に噛み合う。<strong>同じローテーション設定が特定のサービスでだけ壊れる理由</strong> はたいていこの違いだ。</p>
+
+                    <h2 id="sec-8">容量基準と時間基準</h2>
+
+                    <p>マニュアルの定義は短く明快だ。<code>size</code> はファイルが指定した容量より大きくなったときだけローテーションする。<code>daily</code>・<code>weekly</code>・<code>monthly</code> は時間間隔だ。<code>maxsize</code> は <strong>指定した時間間隔が来る前でも</strong> 容量を超えればローテーションし、<code>minsize</code> は逆に <strong>容量を超えても時間間隔の前には</strong> ローテーションしない。</p>
+
+                    <p>時間基準だけを設定するのがなぜ危ないかは算数で出る。この記事で作ったアクセスログ20万行の平均行長は <strong>122.2 バイト</strong> だった。この値で計算するとこうなる。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>毎秒の行数</th><th>1時間</th><th>24時間</th><th>10 GiB に届く時間</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>10</td><td>0.00 GiB</td><td>0.10 GiB</td><td>101.7日</td></tr>
+                            <tr><td>100</td><td>0.04 GiB</td><td>0.98 GiB</td><td>10.2日</td></tr>
+                            <tr><td>1,000</td><td>0.41 GiB</td><td>9.83 GiB</td><td>1.0日</td></tr>
+                            <tr><td>5,000</td><td>2.05 GiB</td><td>49.16 GiB</td><td>4.9時間</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>平時は毎秒100行だったサービスが障害時に毎秒5,000行を吐くのは珍しいことではない。スタックトレースが混じれば行長も数倍になる。<code>daily</code> だけの設定はその日の深夜まで何もしない。<strong>だから時間基準と容量基準を一緒に設定する。</strong></p>
+
+                    <pre><code>/var/log/app/*.log {
+    daily              # 平常時は一日一回
+    maxsize 200M       # その前でも 200M を超えたら即ローテーション
+    rotate 14
+    missingok          # ファイルがなくてもエラーにせず次へ
+    notifempty         # 空なら回さない
+    compress
+    delaycompress
+    create 0640 app app
+}
+
+# ★ 容量条件は logrotate が呼ばれたときにだけ検査される。
+#    一日一回しか呼ばなければ maxsize も一日一回しか検査されない。
+#    頻繁に検査したいなら呼ぶ側を頻繁にする必要がある。
+$ systemctl list-timers logrotate.timer      # この環境では確認できなかった
+$ cat /usr/lib/systemd/system/logrotate.timer</code></pre>
+
+                    <p>最後のコメントが実務でいちばんよく見落とされる箇所だ。<code>logrotate</code> は常駐するプログラムではなく <strong>呼ばれて回るプログラム</strong> だ。ディストリビューションが用意するタイマーユニットは <code>OnCalendar=daily</code> に最大一時間のランダム遅延と <code>Persistent=true</code> が付いている。一日一回という意味であり、そうなると <code>maxsize</code> をいくら小さく設定しても <strong>検査間隔は一日</strong> だ。暴走ログを捕まえたいなら別のタイマーか cron の行でもっと頻繁に呼ぶ必要がある。</p>
+
+                    <h2 id="sec-9">圧縮の罠 - まだ開かれているファイル</h2>
+
+                    <p>圧縮は見た目と違う動作をする。<code>gzip</code> は元を読んで新しいファイルを作り <strong>元を消す</strong>。さきほどの規則がここでまた効く。プロセスがまだそのファイルを掴んでいるのに圧縮してしまうと、圧縮結果にはその時点までしか入らず、その後の行は名前のないファイルへ流れ込む。</p>
+
+                    <pre><code>$ exec 9&gt;&gt; svc.log
+$ echo "[1] ローテーション前に書いた行" &gt;&amp;9
+$ mv svc.log svc.log.1
+$ : &gt; svc.log
+$ echo "[2] ローテーション後に書いた行 (まだ古い inode)" &gt;&amp;9
+
+$ gzip svc.log.1                 # 圧縮すると元は消える
+$ echo "[3] 圧縮が終わった後に書いた行" &gt;&amp;9
+
+$ ls -l /proc/$$/fd/9
+lrwxrwxrwx ... -&gt; /tmp/demo/svc.log (deleted)
+
+$ ls -l
+   0  svc.log
+  85  svc.log.1.gz
+
+$ zcat svc.log.1.gz
+[1] ローテーション前に書いた行
+[2] ローテーション後に書いた行 (まだ古い inode)
+
+$ zcat svc.log.1.gz | grep -c "\[3\]"
+0
+$ grep -c "\[3\]" svc.log
+0</code></pre>
+
+                    <p>三行目は <strong>圧縮結果にもなく新しいログファイルにもない</strong>。そしてその行が入ったファイルは名前がないので読む方法も消す方法もない。プロセスが死んではじめて容量が戻る。<code>delaycompress</code> がしているのはまさにこの状況を避けることだ。マニュアルの表現どおり <strong>直前のログファイルの圧縮を次のローテーション周期へ先送りする</strong> もので、その一周期がプロセスがファイルを離す時間を稼ぐ。</p>
+
+                    <p>圧縮そのもののコストも押さえておく価値がある。同じファイルを圧縮レベルだけ変えて回した実測だ。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>対象</th><th>元</th><th>圧縮後</th><th>比率</th><th>所要</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>アクセスログ20万行、<code>gzip -1</code></td><td>24,447,614 B</td><td>5,700,988 B</td><td>23.32%</td><td>581 ms</td></tr>
+                            <tr><td>同じファイル、<code>gzip -6</code>(既定)</td><td>24,447,614 B</td><td>4,453,030 B</td><td>18.21%</td><td>920 ms</td></tr>
+                            <tr><td>同じファイル、<code>gzip -9</code></td><td>24,447,614 B</td><td>4,235,905 B</td><td>17.33%</td><td>2,290 ms</td></tr>
+                            <tr><td>まったく同じ行を20万回</td><td>26,400,000 B</td><td>102,537 B</td><td>0.39%</td><td>-</td></tr>
+                            <tr><td>ランダムなバイト 4 MB</td><td>4,000,000 B</td><td>4,000,639 B</td><td>100.02%</td><td>-</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>読み取ることは二つだ。第一に、<code>-9</code> は既定より 0.88 ポイント多く削るために <strong>2.5倍の時間</strong> を使う。ローテーション時刻に CPU を取られる対価としてはたいてい損だ。第二に、<strong>合成ログの圧縮率をそのまま信じてはいけない</strong>。同じ行だけを繰り返したファイルは 0.39 パーセントまで縮んだが、フィールドが実際に変わるログは18パーセントだった。すでに圧縮されたデータやランダムに近いデータはむしろ大きくなる。</p>
+
+                    <h2 id="sec-10">rotate N が実際に残す量</h2>
+
+                    <p><code>rotate</code> はマニュアルの表現どおり <strong>削除されるまでにローテーションされる回数</strong> だ。個数は明確だが容量はそうではない。圧縮前のサイズで掛ければ大きく過大評価し、圧縮率を楽観すれば過小評価する。しかも <code>delaycompress</code> を使うと <strong>圧縮されていないファイルが常にもう一つ</strong> 残る。以下は <code>size 100M</code> を前提に計算した最大占有量だ。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>設定</th><th>圧縮率12%</th><th>圧縮率25%</th><th>計算式</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>rotate 7</code> + <code>delaycompress</code></td><td>0.27 GiB</td><td>0.34 GiB</td><td>現在 + 非圧縮1個 + 圧縮6個</td></tr>
+                            <tr><td><code>rotate 7</code> 圧縮のみ</td><td>0.18 GiB</td><td>0.27 GiB</td><td>現在 + 圧縮7個</td></tr>
+                            <tr><td><code>rotate 14</code> + <code>delaycompress</code></td><td>0.35 GiB</td><td>0.51 GiB</td><td>現在 + 非圧縮1個 + 圧縮13個</td></tr>
+                            <tr><td><code>rotate 30</code> + <code>delaycompress</code></td><td>0.54 GiB</td><td>0.90 GiB</td><td>現在 + 非圧縮1個 + 圧縮29個</td></tr>
+                            <tr><td><code>rotate 30</code> 圧縮なし</td><td colspan="2">3.03 GiB</td><td>現在 + 非圧縮30個</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>実測した 18.21 パーセントはこの二列の間に入る。ここに抜けている項が一つある。<strong><code>size</code> は下限であって上限ではない。</strong>ローテーションは検査時点にしか起きないので、一日一回検査する設定で暴走が起きればファイルは200Mではなく数GBになった状態で見つかる。計算にはその分の余裕を掛ける必要がある。</p>
+
+                    <p>保管方式も容量に影響する。番号方式はローテーションのたびに <strong>すべてのファイルの名前を一つずつずらす</strong>。実際に真似てみるとこう動く。</p>
+
+                    <pre><code># rotate 4 で六回ローテーションさせたときの最終状態
+$ for f in app.log*; do
+&gt;   printf '%-12s inode=%-18s %s\n' "$f" "$(stat -c %i "$f")" "$(cat "$f")"
+&gt; done
+app.log      inode=4785074606123239
+app.log.1    inode=4222124652701929   day 6 のログ
+app.log.2    inode=3940649675991270   day 5 のログ
+app.log.3    inode=4785074606123229   day 4 のログ
+app.log.4    inode=3940649675991267   day 3 のログ
+
+# day 1, day 2 は rotate 4 を超えて削除された。
+# ファイルごとに inode が違う = ローテーション時に改名だけが起き、中身は複製されていない。</code></pre>
+
+                    <p>ファイル数だけ改名が起きるので、ファイルが数百個あるディレクトリではこれだけでも負荷になる。<code>dateext</code> を使うとマニュアルの説明どおり番号ではなく <strong>日付の拡張子</strong> が付き、改名の連鎖が消える。代わりにファイル名が毎回変わるので、<strong>名前のパターンで収集するツール</strong> の設定も一緒に変える必要がある。</p>
+
+                    <h2 id="sec-11">権限と所有者 - ローテーション後に書けなくなる事故</h2>
+
+                    <p><code>create</code> はマニュアルの説明どおり <strong>ローテーション直後、postrotate スクリプトが走る前に</strong> 同じ名前のファイルを作る。文法は <code>create mode owner group</code> で、省略した項目は元のファイルの値を引き継ぐ。ここで事故が起きる。<code>logrotate</code> はふつう root で回るので、モードや所有者を書かなかったり間違えたりすると <strong>サービスアカウントが新しいファイルに書けない状態</strong> ができる。</p>
+
+                    <pre><code>/var/log/app/*.log {
+    daily
+    rotate 14
+    create 0640 app app        # モード・所有者・グループ。三つとも書くほうが安全
+    su app app                 # ローテーション作業自体をこのユーザとグループで行う
+    postrotate
+        systemctl reload app.service &gt;/dev/null 2&gt;&amp;1 || true
+    endscript
+}
+
+# マニュアル: create に指定した所有権でファイルを作る権限が su で指定した
+# ユーザとグループにない場合はエラーになる。
+#
+# この環境では所有者と権限を確認できなかった。umask を変えても
+# stat は両方のファイルを 644 と報告し、グループは UNKNOWN だった。
+$ stat -c '%a  %U:%G  %n' u027.log u022.log
+644  &lt;user&gt;:UNKNOWN  u027.log
+644  &lt;user&gt;:UNKNOWN  u022.log</code></pre>
+
+                    <p>この事故の症状はローテーション直後ではなく <strong>数時間後</strong> に現れることが多い。ログが溜まらないのにサービスは回っているので気づくまでに時間がかかる。ログを書けない状態でプロセスがエラーを吐きながら CPU を食う場合もある。</p>
+
+                    <ul>
+                        <li><code>su</code> 指示子はログディレクトリが <strong>root 以外のアカウントで書けるディレクトリ</strong> のときに必要になる。この条件で <code>su</code> なしに回すとローテーションが拒否される</li>
+                        <li><code>postrotate</code> で pid ファイルを読むならそのファイルの権限も一緒に見る。ローテーションは成功したのにシグナルが届かない場合のよくある原因だ</li>
+                        <li>シグナルの代わりに <code>reload</code> を使う場合、そのコマンドが <strong>失敗してもローテーションはすでに終わった後</strong> だ。スクリプトの終了コードを飲み込むと失敗が静かになる</li>
+                        <li>SELinux や AppArmor が有効な環境では、ファイルモードが正しくても <strong>ラベルのせいで</strong> 書き込みが止められることがある。この記事はその層を扱わない</li>
+                    </ul>
+
+                    <h2 id="sec-12">ローテーションそのものが回らない場合</h2>
+
+                    <p>ここまではローテーションが回っているが間違って回る場合だった。まったく回らない場合も同じくらい多く、こちらのほうが静かだ。エラーメッセージはログに残るが、そのログを誰も見ない。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>原因</th><th>見えるもの</th><th>確認の仕方</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>タイマーや cron が止まっている</td><td>ローテーション済みファイルの日付がある時点で止まっている</td><td>タイマー一覧で最終実行と次回実行の時刻を見る</td></tr>
+                            <tr><td>設定ファイル一つの文法エラー</td><td>そのファイルだけでなく <strong>他のログまで</strong> ローテーションが止まる</td><td>デバッグモードで設定全体をパースさせる</td></tr>
+                            <tr><td>同じファイルを二つの設定が掴む</td><td>重複エントリのエラーで処理が中断する</td><td>設定ディレクトリ全体でそのパスを検索する</td></tr>
+                            <tr><td>状態ファイルに登録された直後</td><td>新しく追加した設定が初日は回らない</td><td>状態ファイルでそのパスの記録時刻を見る</td></tr>
+                            <tr><td><code>notifempty</code> + すでに壊れたローテーション</td><td>現在のファイルが0バイトなので対象から外れる</td><td>現在のファイルのサイズとプロセスの記述子を突き合わせる</td></tr>
+                            <tr><td>デバッグモードでしか確認していない</td><td>回してみると正常なのに実際には回らない</td><td>デバッグは状態ファイルを更新しないことを覚えておく</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>四行目がとくに罠だ。マニュアルによると <strong>状態ファイルに項目のないファイルに初めて出会うと、その時刻を最後のローテーション時刻として記録</strong>する。つまり設定を新しく追加した日には <code>daily</code> の条件が成立しない。急いで設定を入れて <code>logrotate</code> を手動で回したのに何も起きない理由はたいていこれだ。</p>
+
+                    <p>六行目も同じ性質だ。マニュアルはデバッグオプションが <strong>ログを変更せず状態ファイルも更新しない</strong> と明記している。文法の検査には良いが <strong>実際に回ったという証拠にはならない</strong>。以下のコマンドはこの環境に <code>logrotate</code> 自体がないので走らせられなかった。</p>
+
+                    <pre><code># この環境で走らせられなかったコマンド - 出力は載せない
+$ logrotate -d /etc/logrotate.conf            # 設定全体のパース。何も変えない
+$ logrotate -d /etc/logrotate.d/app           # 一つの設定だけ
+$ logrotate -v -f /etc/logrotate.d/app        # 強制ローテーション。実際に変える
+$ cat /var/lib/logrotate/logrotate.status     # パスごとの最終ローテーション時刻
+$ grep -rn "/var/log/app" /etc/logrotate.conf /etc/logrotate.d/   # 重複を捕まえる
+$ systemctl list-timers logrotate.timer
+$ journalctl -u logrotate.service --since "-7d"
+
+# 読み方
+#  -d は検査用だ。これで確認したからといって実際にローテーションが回ったわけではない。
+#  -f は時間と容量の条件を無視して今すぐ回す。本番では慎重に。
+#  状態ファイルの日付が今日でなければ、そのパスは今日回っていない。</code></pre>
+
+                    <h2 id="sec-13">アプリケーションが自分でローテーションする場合</h2>
+
+                    <p>最近のフレームワークのロガーはたいていローテーション機能を内蔵している。容量が埋まれば自分で改名して新しいファイルを開く。この方式は <a href="#sec-4">第4節</a> の問題をそもそも作らない。ファイルを開く主体と改名する主体が同じだからだ。</p>
+
+                    <p>問題は <strong>同じファイルにローテーションの主体が二つ</strong> あるときに起きる。アプリが自分のファイルを改名する瞬間に <code>logrotate</code> も改名すると、両方が自分の作ったファイルを失う。アプリは自分が作った新しいファイルに書くのに <code>logrotate</code> が作ったファイルがその位置を占め、保管個数も両方の規則が混ざって予測できなくなる。</p>
+
+                    <ul>
+                        <li><strong>規則は一つだ。一つのファイルにローテーションの主体は一つ。</strong>アプリが回すならそのパスを <code>logrotate</code> の設定から外す。<code>logrotate</code> を使うならアプリのローテーションを切り容量制限も外す</li>
+                        <li>ワーカープロセスを複数立てる構成で各ワーカーが <strong>同じファイルにそれぞれのローテーション処理</strong> を持っていると、ワーカー同士でも同じ衝突が起きる。この場合はファイルをワーカーごとに分けるかローテーションを外部へ渡す</li>
+                        <li>アプリ内蔵のローテーションはたいてい <strong>書き込む瞬間にだけ</strong> 容量を確認する。トラフィックが止まればどれだけ大きくても回らない。夜間に静かなサービスでこの違いが表に出る</li>
+                        <li>保管個数の設定が両方にあると <strong>小さいほうが勝つわけではない</strong>。互いに違う命名規則を使うので両方の個数分だけファイルが残る</li>
+                    </ul>
+
+                    <h2 id="sec-14">コンテナでは事情が違う</h2>
+
+                    <p>コンテナの中でファイルにログを残して <code>logrotate</code> で回そうとする試みはたいてい行き詰まる。コンテナには cron がないので誰も <code>logrotate</code> を呼んでくれず、サイドカーで付けてもプロセス名前空間が違うので <strong>シグナルを送る相手そのものに届かない</strong>。残る手段は <code>copytruncate</code> だけで、そうすると <a href="#sec-6">第6節</a> の代償をそのまま払うことになる。</p>
+
+                    <p>だからコンテナの標準的な方式は標準出力と標準エラーへ出してランタイムに受けさせることだ。ただしここにも既定値の罠がある。Docker の <code>json-file</code> ドライバのドキュメントによると <code>max-size</code> の既定値は <strong>-1、つまり無制限</strong> で <code>max-file</code> の既定値は <strong>1</strong>、そして <code>max-file</code> は <code>max-size</code> が設定されているときにだけ有効だ。まとめると <strong>既定の設定ではローテーションがない</strong>。コンテナログがホストのディスクを埋める事故の出どころがここだ。</p>
+
+                    <p>systemd 側は自分で管理する。journald のマニュアルによると <code>SystemMaxUse</code> と <code>SystemKeepFree</code> はそれぞれファイルシステムの容量の <strong>10パーセントと15パーセント</strong> を既定値としつつ、計算された値を <strong>4G で上限</strong> にする。個別ファイルのサイズは <code>SystemMaxUse</code> の8分の1を128Mで上限にした値で、その結果おおむね <strong>七つのローテーション済みジャーナルファイル</strong> が履歴として維持される。<code>SystemMaxFiles</code> の既定値は100だ。</p>
+
+                    <ul>
+                        <li>journald の整理には但し書きがある。マニュアルは <strong>アーカイブされたファイルだけを消す</strong> と書く。アクティブなファイルは残るので、整理が終わった後も上限より多く使っている可能性がある</li>
+                        <li>コンテナログの容量制限は <strong>コンテナを作り直すとき</strong> に適用されるのがふつうだ。デーモンの既定値を変えてもすでに回っているコンテナには反映されない</li>
+                        <li>ランタイムがローテーションを担うと <strong>保管本の場所はホスト</strong> だ。アプリケーションが自分のログを読み返す構造ならそのパスが消える</li>
+                        <li>標準出力へ出すときアプリケーションが <strong>バッファリング</strong> をするとログがまとまって遅れて出る。障害時刻とログ時刻がずれる原因になるので行単位のフラッシュを有効にしておく</li>
+                    </ul>
+
+                    <h2 id="sec-15">点検リスト - ローテーションは本当に回っているか</h2>
+
+                    <p>いちばん速い確認は <strong>inode を二つ比べること</strong> だ。パスが指すファイルと、プロセスが開いている記述子の先のファイルが同じかを見る。同じなら正常で、違えばローテーションが壊れている。この比較はこの環境でそのまま動いた。</p>
+
+                    <pre><code>$ : &gt; live.log
+$ exec 9&gt;&gt; live.log
+$ echo "正常" &gt;&amp;9
+$ stat -c %i live.log              ; stat -Lc %i /proc/$$/fd/9
+4222124652701932
+4222124652701932                   # 同じ = 今そのパスに書いている
+
+$ mv live.log live.log.1 ; : &gt; live.log     # シグナルを送らないローテーション
+$ stat -c %i live.log              ; stat -Lc %i /proc/$$/fd/9
+4503599629412593
+4222124652701932                   # 分かれた = ローテーションが壊れた
+
+$ echo "[壊れた後も書き続ける]" &gt;&amp;9
+$ stat -c %s live.log   ; stat -c %s live.log.1
+0                                  # 新しいファイルは0バイト
+40                                 # 書き込みはこちらへ行く</code></pre>
+
+                    <p>実際のサーバでは記述子の番号を先に探す必要がある。順序はこうだ。</p>
+
+                    <ol>
+                        <li>ログを書くプロセスの pid を探す</li>
+                        <li><code>ls -l /proc/&lt;pid&gt;/fd</code> でそのログパスを指す番号を選ぶ。<code>(deleted)</code> が付いていればそれ自体が答えだ</li>
+                        <li><code>stat -c %i &lt;ログパス&gt;</code> と <code>stat -Lc %i /proc/&lt;pid&gt;/fd/&lt;番号&gt;</code> を比べる</li>
+                        <li>二つの値が違えばローテーション後の開き直しができていない。シグナルを送るか再起動する</li>
+                        <li>ローテーション済みファイルの更新時刻が <strong>周期ごとに階段状に</strong> 並んでいるか見る。ある時点から止まっていればローテーション自体が回っていない</li>
+                        <li>状態ファイルでそのパスの最終ローテーション時刻を確認する。今日でなければ今日は回っていない</li>
+                    </ol>
+
+                    <p>設定を新しく入れたり直したりしたときに確認すべきことも整理しておく。以下のどれか一つでも引っかかればその設定はまだ完成していない。</p>
+
+                    <ul>
+                        <li>開き直しの手段があるか。<code>postrotate</code> も <code>copytruncate</code> もなければその設定は <strong>最初のローテーションで壊れる</strong></li>
+                        <li>時間基準と容量基準が <strong>両方</strong> あるか。そして容量基準を検査できるだけ頻繁に呼ばれているか</li>
+                        <li><code>compress</code> を有効にしたなら <code>delaycompress</code> も有効にしたか</li>
+                        <li><code>create</code> にモード・所有者・グループが <strong>三つとも</strong> 書かれているか</li>
+                        <li>ワイルドカードを使ったなら <code>sharedscripts</code> があるか</li>
+                        <li>同じパスを掴む別の設定はないか。パッケージが入れた設定と手で作った設定が重なることはよくある</li>
+                        <li>保管個数を圧縮率で換算したときそのファイルシステムに収まるか。<strong>暴走の余裕を掛けたか</strong></li>
+                        <li>アプリが自前のローテーションをしていないか</li>
+                    </ul>
+
+                    <h2 id="sec-16">まとめ</h2>
+
+                    <p>この記事のすべての失敗は一つの文から枝分かれしている。<strong>ローテーションは名前を変え、プロセスは名前を掴んでいない。</strong>だからローテーション設定の半分は、ファイルをどう動かすかではなく <strong>プロセスに新しいファイルを開かせる手段</strong> の話だ。その手段がなければローテーションは名前を変えるだけで容量を一切返せない。</p>
+
+                    <p>選択肢は二つしかなく、どちらにも代償がある。シグナルはプロセス側にその機能が必要で、<code>copytruncate</code> はコピーと切り詰めの間のログを失い、追記モードでない記述子ではヌルバイトの混じったファイルを作る。どちらを選ぶにせよ <strong>何を諦めたかを知って選ぶこと</strong> と既定値のまま置くことは違う。</p>
+
+                    <p>確認は思ったより安い。inode を二つ比べるのに数秒あれば足り、その比較はローテーションが壊れた瞬間にすぐ答えを出す。ログローテーションは平常時に誰も見ない仕組みなので、<strong>壊れたときに気づく方法をあらかじめ決めておくこと</strong> のほうが、設定をうまく書くことより実質的に重要だ。</p>
+
+                    <h2 id="sec-17">確認できなかったこと</h2>
+
+                    <ul>
+                        <li><code>logrotate</code> 自体を <strong>一度も実行できなかった</strong>。この環境にプログラムがない。設定の文法と指示子の動作はすべてマニュアル原文が根拠で、<code>-d</code> の出力や実際のローテーション結果はこの記事にない</li>
+                        <li><code>lsof +L1</code>、<code>systemctl</code>、<code>journalctl</code>、コンテナランタイムのコマンドも走らせられなかった。journald と Docker 関連の数値はそれぞれのドキュメントで確認した値で <strong>実動作では検証していない</strong></li>
+                        <li>ローテーション後の <code>/proc/&lt;pid&gt;/fd</code> のシンボリックリンクは、この環境では <strong>古いパス文字列をそのまま</strong> 表示した。Linux で改名後に新しい名前へ更新されるかは確認できなかった。ただし <code>(deleted)</code> 表示と <code>stat -Lc %i</code> の比較はここでそのまま動き、点検手順はそちらに頼っている</li>
+                        <li>切り詰めの後に先頭が <strong>スパース領域</strong> になるかは確認できなかった。この環境のブロック集計は両方のファイルとも1と報告し、使える値ではなかった。ヌルバイトが実際に入っている事実だけを出力で確認した</li>
+                        <li>所有者と権限は確認できなかった。umask を変えても両方のファイルが 644 で出て、グループは <code>UNKNOWN</code> だった。この環境の権限表現が Linux と違うためだ</li>
+                        <li>同じファイルを二つの設定が掴むときに出る <strong>正確なエラー文言</strong> は再現できなかった。その状況で処理が中断するという点だけを書いた</li>
+                        <li>圧縮率はこの記事で作った <strong>合成ログが基準</strong> だ。実際のログの圧縮率はフィールド構成によって大きく変わるので、容量計算には自分のログで測った値を使う</li>
+                        <li>アプリケーション内蔵ロガーの動作は <strong>実装ごとに違う</strong>。この記事は特定のライブラリの動作を検証しておらず、ローテーションの主体が二つあるときに衝突するという一般的な構造だけを書いた</li>
+                    </ul>
+
+                    <h2 id="sec-18">参考資料</h2>
+
+                    <ul>
+                        <li><a href="https://raw.githubusercontent.com/logrotate/logrotate/main/logrotate.8.in" target="_blank" rel="noopener">logrotate(8) マニュアル原文 (logrotate リポジトリ)</a> - <code>copytruncate</code>・<code>delaycompress</code>・<code>create</code>・<code>su</code>・<code>size</code>・<code>maxsize</code>・<code>minsize</code>・<code>rotate</code>・<code>sharedscripts</code>・<code>olddir</code>・<code>dateext</code>・<code>-d</code> と状態ファイルの動作の根拠</li>
+                        <li><a href="https://raw.githubusercontent.com/logrotate/logrotate/main/examples/logrotate.timer" target="_blank" rel="noopener">logrotate.timer (logrotate リポジトリの例)</a> - <code>OnCalendar=daily</code>・<code>RandomizedDelaySec=1h</code>・<code>Persistent=true</code>。容量条件の検査間隔が一日になる根拠</li>
+                        <li><a href="https://nginx.org/en/docs/control.html" target="_blank" rel="noopener">nginx - Controlling nginx</a> - シグナル一覧とログローテーションの手順。名前を先に変えて <code>USR1</code> を送るという順序の出典</li>
+                        <li><a href="https://man7.org/linux/man-pages/man5/journald.conf.5.html" target="_blank" rel="noopener">journald.conf(5)</a> - <code>SystemMaxUse</code> 10パーセント・<code>SystemKeepFree</code> 15パーセント・4G の上限、<code>SystemMaxFiles</code> 既定100、アーカイブされたファイルだけを消すという説明</li>
+                        <li><a href="https://docs.docker.com/engine/logging/drivers/json-file/" target="_blank" rel="noopener">Docker - JSON File logging driver</a> - <code>max-size</code> 既定 -1(無制限)、<code>max-file</code> 既定1、<code>max-file</code> は <code>max-size</code> があってはじめて有効という説明</li>
+                        <li><a href="no_space_left_but_disk_free.html">ディスクは空いているのに No space left on device</a> - この記事が作る状態を反対側から扱った記事。<code>df</code> と <code>du</code> が食い違う理由と inode 枯渇</li>
+                        <li><a href="find_process_holding_file.html">ファイルを掴んでいるプロセスを探す</a> - ローテーションが壊れたときに犯人を特定する手順</li>
+                        <li><a href="oom_killer_diagnosis.html">OOM Killer が何を殺したかを読む</a> - ログの暴走がディスクではなくメモリ側で破裂したとき</li>
+                        <li>systemd 公式サイトの journald.conf ページはアクセスを拒否され(HTTP 403)開けなかった。上の項目は <strong>man7.org 版</strong> で確認したものだ</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>この記事をシェア</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">スレッズ</button>
+                        <button id="link-copy" class="share-btn link-btn">リンクをコピー</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">一覧に戻る</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">一緒に使うと便利な無料ツール</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/base64_encoder.html">Base64 エンコーダー/デコーダー</a></li>
+      <li><a href="../static/yaml_json_converter.html">YAML JSON変換器 2026</a></li>
+      <li><a href="../static/curl_builder.html">curlコマンド生成器 2026</a></li>
+      <li><a href="../static/http_status_codes.html">HTTPステータスコード完全ガイド 2026</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">すべてのツールを見る &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">関連記事</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="linux_server_guide_08_logging.html">Linuxサーバー管理完全攻略 第8編：ログ管理とモニタリング</a></li>
+      <li><a href="codex_cli_disk_bloat_2026.html">Codex CLIのセッションログが数百GBまで膨張 - AIコーディングCLIのディスク枯渇の原因と対策 2026</a></li>
+      <li><a href="linux_server_guide_01_basics.html">Linuxサーバー管理完全攻略 第1編：基礎とファイルシステムの理解</a></li>
+      <li><a href="git_bisect_practical.html">git bisect - バグが入り込んだコミットを二分探索で見つける</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('リンクをコピーしました。スレッズアプリに貼り付けて共有してください。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('リンクをコピーしました!'); });
+    });
+    </script>
+</body>
+</html>

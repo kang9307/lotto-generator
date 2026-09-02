@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<!--
+ * 技術ブログ記事テンプレート
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ja">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JVMはコンテナの上限をどう見ているか - KubernetesのRequestとLimitがヒープ・GC・遅延を決める場所 2026</title>
+    <meta name="description" content="上限を設けてもJVMはそれを自分のやり方で読む。MaxRAMPercentageの既定値25パーセント、ヒープ外のメモリ、availableProcessorsが決めるGCスレッド、CFSスロットリングまで公式文書で確認した範囲だけを整理した。">
+    <meta name="keywords" content="JVM コンテナ, Kubernetes Request Limit, MaxRAMPercentage, ActiveProcessorCount, UseContainerSupport, CPUスロットリング, CFSクォータ, OOMKilled, QoSクラス, G1 GC, メタスペース, 開発, インフラ, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/ja/posts/jvm_container_resource_limits.html">
+
+    <meta property="og:title" content="JVMはコンテナの上限をどう見ているか - KubernetesのRequestとLimitがヒープ・GC・遅延を決める場所 2026">
+    <meta property="og:description" content="-Xmxをlimitと同じにするとなぜ死ぬのか、availableProcessorsひとつがGCスレッドと並列度まで決める経路。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/ja/posts/jvm_container_resource_limits.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ja_JP">
+    <meta property="article:published_time" content="2026-09-02">
+    <meta property="article:section" content="開発・インフラ">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="JVMはコンテナの上限をどう見ているか">
+    <meta name="twitter:description" content="JVMは上限を守るプログラムではなく、上限を見て自分の計画を立てるプログラムだ。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "JVMはコンテナの上限をどう見ているか - KubernetesのRequestとLimitがヒープ・GC・遅延を決める場所 2026",
+      "alternativeHeadline": "-Xmxをlimitと同じにするとなぜ死ぬのか、availableProcessorsひとつがGCスレッドと並列度まで決める経路",
+      "datePublished": "2026-09-02",
+      "dateModified": "2026-09-02",
+      "inLanguage": "ja-JP",
+      "articleSection": "開発・インフラ",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "JVM コンテナ, Kubernetes Request Limit, MaxRAMPercentage, ActiveProcessorCount, UseContainerSupport, CPUスロットリング, CFSクォータ, OOMKilled, QoSクラス, G1 GC",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/ja/posts/jvm_container_resource_limits.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "メモリlimitを設定しているのに、なぜJavaコンテナがその上限を超えて死ぬのか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "JVMが使うメモリはヒープだけではないからだ。ヒープの外にメタスペース、JITコードキャッシュ、スレッドスタック、ダイレクトバッファ、ガベージコレクタ自身の内部構造があり、これらは -Xmx に含まれない。Java 21のman page によれば -XX:MaxMetaspaceSize は既定でサイズが制限されず、-XX:ReservedCodeCacheSize の既定の最大値は240MB、Linux x64の -Xss の既定値はスレッドあたり1024KBである。したがって -Xmx をコンテナのlimitと同じにすると、ヒープが埋まる前にコンテナが先に上限へ達する。そのとき殺すのはJVMではなくカーネルであり、Kubernetesの文書は memory limit がカーネルのOOM killで強制されると記している。Java例外もヒープダンプも残らない理由がそれだ。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "コンテナでは -Xmx と -XX:MaxRAMPercentage のどちらを使うべきか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "比率のほうが管理しやすい。-Xmx は絶対値なのでPodスペックのlimitを変えるたびにJVM引数も直す必要があり、片方だけ直した瞬間に事故になる。-XX:MaxRAMPercentage は -XX:MaxRAM が定めた値の比率として最大ヒープを決め、Java 21のman page は MaxRAM の既定値を「JVMプロセスが使える最大メモリまたは128GBのうち小さいほう」とし、その最大メモリが「マシンの物理メモリと環境(例えばコンテナ)が課した制約のうち小さいほう」だと明記している。つまりコンテナのlimitが自動的に基準になる。ただし既定値は25パーセントなので、何も指定しなければ1Giのコンテナで最大ヒープは約256Miに留まる。何パーセントが妥当かは測って決める話だ。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "CPU limitを設定するなという助言は正しいのか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "両方に文書で裏づけられる根拠があり、答えはワークロードによって割れる。設定しない側の根拠は、Kubernetesが cpu limit をCPUスロットリングで強制する点、そしてkubeletのCFS周期の既定値が100msなので周期内で割り当てを使い切ると残りの時間は止まる点だ。退避シグナルの一覧にもメモリとファイルシステムとpidだけがあり、CPUはない。設定する側の根拠はQoSクラスである。Guaranteedになるにはすべてのコンテナのcpu limitがrequestと等しくなければならず、退避はBestEffort、Burstable、Guaranteedの順に起きる。static CPU管理ポリシーで専用CPUを受け取る条件もGuaranteed Pod かつ整数のCPU requestだ。判断は実際のスロットリング指標を見て行う。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "CPU limitを低くするとなぜGCが遅くなるのか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "二つの経路が重なる。第一に、JVMが見るプロセッサ数が減る。OpenJDKのcgroup処理コードは、quotaが指定されていればquotaをperiodで割ってプロセッサ数を求め、除算の結果はすべて切り上げると記している。その値がGCワーカースレッド数とForkJoinPoolの並列度を決める。第二に、値が十分小さくなるとコレクタの選択自体が変わる。OracleのGCチューニングガイドは、プロセッサ2個以上かつ物理メモリ1792MB以上のときだけサーバークラスと見なし、そこではG1、それ以外ではSerialを選ぶと記す。さらにstop-the-worldの最中に割り当てが尽きるとGCスレッドが次の周期を待つことになり、停止時間が周期の境界まで伸びる。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "コンテナ内でJVMの設定が効いているかどうやって確認するのか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "推測せずJVMに直接尋ねるほうが速い。-Xlog:os+container=trace はコンテナ情報の認識に関するログを最大限に残し、Java 21のman page がコンテナ対応の診断用としてこのオプションを案内している。ヒープ外のメモリがどこへ行ったかは -XX:NativeMemoryTracking=summary で追跡を有効にし、jcmd で確認する。既定値は off だ。そして見るべき数字を区別する必要がある。ヒープサイズの根拠はGC直後の使用量であって鋸歯グラフの頂点ではなく、コンテナが死ぬかどうかはcgroupが見る値が決め、CPUは使用率ではなくスロットリングされた時間を見る。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/jvm_container_resource_limits.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/jvm_container_resource_limits.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/jvm_container_resource_limits.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/jvm_container_resource_limits.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/jvm_container_resource_limits.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "ホーム",
+      "item": "https://braindetox.kr/ja/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "開発・インフラ",
+      "item": "https://braindetox.kr/ja/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "JVMはコンテナの上限をどう見ているか - KubernetesのRequestとLimitがヒープ・GC・遅延を決める場所 2026",
+      "item": "https://braindetox.kr/ja/posts/jvm_container_resource_limits.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="JVMはコンテナの上限をどう見ているか - KubernetesのRequestとLimitがヒープ・GC・遅延を決める場所 2026">
+                <meta itemprop="datePublished" content="2026-09-02">
+                <meta itemprop="dateModified" content="2026-09-02">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="JVM コンテナ, Kubernetes Request Limit, MaxRAMPercentage, ActiveProcessorCount, UseContainerSupport, CPUスロットリング, CFSクォータ, OOMKilled, QoSクラス, G1 GC">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/ja/posts/jvm_container_resource_limits.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">JVMはコンテナの上限をどう見ているか - KubernetesのRequestとLimitがヒープ・GC・遅延を決める場所 2026</h1>
+                    <h2 class="post-subtitle">-Xmxをlimitと同じにするとなぜ死ぬのか、availableProcessorsひとつがGCスレッドと並列度まで決める経路</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-02">2026年9月2日</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">開発・インフラ</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>Podスペックに <code>limits.memory: 1Gi</code> と書けば、そのコンテナは実際にその線を越えられない。問題は中で動くJVMがその数字を<strong>どう読むか</strong>だ。JVMは上限を守るプログラムではなく、上限を見て自分の計画を立てるプログラムであり、計画が狂ったとき上限を守るのはカーネルである。カーネルが守るやり方はプロセスを殺すことだ。</p>
+
+                    <p>CPU側はもっと静かに狂う。平均使用率は低いのにp99だけが跳ねる。その間JVMの中では、コレクタの選択とスレッドプールの大きさが<strong>Podスペックの数字ひとつ</strong>に従って変わっている。</p>
+
+                    <div class="callout">
+                        基準はJava 21の <code>java</code> man page、Java 25のGCチューニングガイド、OpenJDKのソースとバグデータベース、2026年9月時点のKubernetes公式文書だ。Linuxコンテナで直接実行して確認できなかったため<strong>コマンド出力は載せていない。</strong>本文の既定値と挙動はすべて上記の文書で確認したものである。
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>この記事で扱うこと</h3>
+                        <ol>
+                            <li><a href="#sec-1">きっかけ - 上限を設けてもずれる場所</a></li>
+                            <li><a href="#sec-2">JVMはもともとホストを見ていた</a></li>
+                            <li><a href="#sec-3">コンテナ認識が実際に読む値</a></li>
+                            <li><a href="#sec-4">-Xmxではなく比率で与える理由</a></li>
+                            <li><a href="#sec-5">ヒープだけがメモリではない</a></li>
+                            <li><a href="#sec-6">availableProcessorsひとつが決めるもの</a></li>
+                            <li><a href="#sec-7">CPU Limitはなぜ遅延を作るのか</a></li>
+                            <li><a href="#sec-8">CPU limitを設定するか、しないか</a></li>
+                            <li><a href="#sec-9">RequestとLimitは別の仕事をする</a></li>
+                            <li><a href="#sec-10">JITウォームアップがreadinessを崩す場所</a></li>
+                            <li><a href="#sec-11">何を見て決めるのか</a></li>
+                            <li><a href="#sec-12">よくある失敗の五つ</a></li>
+                            <li><a href="#sec-13">どのバージョンを基準にした話か</a></li>
+                            <li><a href="#sec-14">まとめ</a></li>
+                            <li><a href="#sec-15">確認できなかったこと</a></li>
+                            <li><a href="#sec-16">参考資料</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">きっかけ - 上限を設けてもずれる場所</h2>
+
+                    <p>2026年9月初め、韓国の開発者コミュニティにKubernetes上のJava JVMのCPU・メモリRequestとLimitを扱った記事が紹介された。論旨はひとつだった。<strong>コンテナ内のJavaプロセスにはメモリの境界が二つある。</strong>ヒープの境界とコンテナの境界であり、この二つを同じものとして扱った瞬間に事故が起きる。</p>
+
+                    <p>同じ構造がCPU側にもある。PodスペックのCPUの数字はスケジューラへの申告であると同時に<strong>JVMが自分の並列度を計算する入力</strong>でもあるのに、ダッシュボードには片方しか出てこない。コンテナがなぜ <code>OOMKilled</code> で終わったのかという一般的な診断は<a href="oom_killer_diagnosis.html">別記事</a>に、障害中に管制画面が答えを出せない理由は<a href="k8s_control_room_questions.html">あの記事</a>にある。ここでは<strong>JVM固有の問題</strong>だけを扱う。</p>
+
+                    <h2 id="sec-2">JVMはもともとホストを見ていた</h2>
+
+                    <p>根はJVMが自分のヒープサイズを自分で決めるところにある。OracleのGCチューニングガイドが記す既定の選択はこうだ。初期ヒープは物理メモリの64分の1、最大ヒープは4分の1、コレクタはサーバークラスのマシンではG1、それ以外ではSerialである。サーバークラスの定義も注記されている。<strong>プロセッサ2個以上かつ物理メモリ1792MB以上</strong>のときだ。</p>
+
+                    <p>ここで「物理メモリ」が問題になる。コンテナ認識がなかった頃のJVMにとって、それは<strong>ホスト全体</strong>だった。64GBのノードにlimit 512MiのPodを載せると、中のJVMは最大ヒープを16GBとして計画した。計画が間違っているのでGCはまだ余裕があると見て回収を先送りし、その間にコンテナは512Miを超えてカーネルに殺される。</p>
+
+                    <p>直された時点ははっきりしている。JDK 10リリースノートの <code>JDK-8146115</code> の項目だ。JVMはコンテナ内で動いていることを認識するよう修正され、オペレーティングシステムに問う代わりに<strong>コンテナ固有の設定情報を取り出す</strong>。取り出すのは割り当てられたCPU数と総メモリである。Linuxでのみ動作し、既定で有効で、<code>-XX:-UseContainerSupport</code> で無効にできる。</p>
+
+                    <ul>
+                        <li>同じ変更で <code>-XX:ActiveProcessorCount</code> が追加された。リリースノートはこの値が<strong>JVMの他のすべてのCPU自動検出ロジックを上書きする</strong>と記す</li>
+                        <li>同じ箇所の <code>JDK-8186248</code> で <code>InitialRAMPercentage</code>・<code>MaxRAMPercentage</code>・<code>MinRAMPercentage</code> が追加された。従来の <code>Fraction</code> 形式を置き換えるものだ</li>
+                        <li>この項目は<strong>Oracle JDK 8u191のリリースノートにも同じ内容で載っている。</strong>JDK 8系列も8u191以上ならコンテナ認識が入っている</li>
+                        <li>言い換えれば<strong>8u190以下とJDK 9にはない。</strong>そうしたイメージを使っているなら、昔ながらに <code>-Xmx</code> を手で打ち込むしかない</li>
+                    </ul>
+
+                    <h2 id="sec-3">コンテナ認識が実際に読む値</h2>
+
+                    <p>メモリ側の経路は <code>-XX:MaxRAM</code> の文書にそのまま書かれている。既定値は「JVMプロセスが使える最大メモリまたは128GBのうち小さいほう」で、次の一文が肝心だ。その最大メモリとは<strong>マシンの物理メモリと環境(例えばコンテナ)が課した制約のうち小さいほう</strong>である。コンテナのmemory limitがここに入り、その上に比率のフラグが乗る。</p>
+
+                    <p>CPU側のアルゴリズムはman pageではなくOpenJDKのソースコメントにある。<code>cgroupSubsystem_linux.cpp</code> の <code>active_processor_count</code> の説明は三行だ。<code>sched_getaffinity</code> で使えるCPU数を求める。quotaが指定されていればquotaをperiodで割る。そして<strong>除算の結果はすべて次の整数へ切り上げる。</strong>結果は活性プロセッサ数を超えない。</p>
+
+                    <p>切り上げが実際には大きい。CPU limitが <code>500m</code> なら0.5が上がって1、<code>1500m</code> なら2だ。<strong>1 CPU未満を与えてもJVMは最低1個として見る。</strong>逆に <code>2100m</code> のような値は3になり、実際に使えるより多いスレッドを作らせる。</p>
+
+                    <p>見落としやすいのは<strong>limitがないとき</strong>だ。quotaがなければ上のアルゴリズムはシステムの活性プロセッサ数をそのまま使う。96コアのノードに <code>requests.cpu: 500m</code> のPodだけを載せると、そのJVMは96コアの計画を立てる。</p>
+
+                    <h2 id="sec-4">-Xmxではなく比率で与える理由</h2>
+
+                    <p>絶対値と比率の違いは好みではなく管理点の数だ。<code>-Xmx2g</code> はPodスペックとは<strong>別に生きている数字</strong>である。limitを3Giに上げてJVM引数を直さなければ増やしたメモリが遊び、1Giに下げて直さなければそのPodはデプロイ直後から死ぬ。比率で与えれば直す場所はひとつだ。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>フラグ</th><th>何を決めるか</th><th>Java 21 man page基準の既定値</th><th>注意</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>-XX:InitialRAMPercentage</code></td><td>初期ヒープ</td><td>1.5625パーセント</td><td>起動直後のヒープが非常に小さい。増える間GCが頻繁に回る</td></tr>
+                            <tr><td><code>-XX:MaxRAMPercentage</code></td><td>最大ヒープ</td><td>25パーセント</td><td>指定しなければ1Giのコンテナで最大ヒープが約256Miになる</td></tr>
+                            <tr><td><code>-XX:MinRAMPercentage</code></td><td>小さいヒープでの最大ヒープ</td><td>50パーセント</td><td>最小値ではない。文書は「約125MB以下の小さいヒープ」に適用されると記す</td></tr>
+                            <tr><td><code>-XX:MaxRAM</code></td><td>上の比率の分母</td><td>利用可能メモリと128GBのうち小さいほう</td><td>ここでの利用可能メモリがコンテナのlimitだ</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>既定値25パーセントが実務でいちばん多く事故を起こす。コンテナに4Giを与えたのにヒープは1Giしか取られず、残りの3Giは誰も使わない。「メモリを増やしたのになぜまだGCがひどいのか」の半分はここから出てくる。<strong>MaxRAMPercentageはコンテナでは事実上の必須指定項目だ。</strong></p>
+
+                    <p>名前の罠もひとつある。<code>MinRAMPercentage</code> は「最低何パーセントはヒープに与える」ではなく<strong>小さいヒープ区間での最大比率</strong>である。250Miのサイドカー Javaプロセスで MaxRAMPercentage だけを触って、なぜ効かないのかと言う場合がこれに当たる。</p>
+
+                    <pre><code class="language-yaml">resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    memory: 1Gi          # 比率の分母になる値
+env:
+  - name: JAVA_TOOL_OPTIONS
+    value: &gt;-
+      -XX:MaxRAMPercentage=70.0
+      -XX:InitialRAMPercentage=70.0
+      -XX:+ExitOnOutOfMemoryError</code></pre>
+
+                    <p>70という数字に根拠はない。公式文書のどこにも<strong>「ヒープはlimitの何パーセント」という推奨はない。</strong>きっかけになった記事は50から75の間で始めて検証せよと記しており、その程度が正直な表現だ。残りの分が何に使われるのかは次の節が説明する。</p>
+
+                    <h2 id="sec-5">ヒープだけがメモリではない</h2>
+
+                    <p>この節ひとつだけ持ち帰ってもよい。<strong><code>-Xmx</code> をコンテナのlimitと同じにすると、そのPodは必ず死ぬ。</strong>ヒープの外にもJVMが使うメモリがいくつもあり、それらは <code>-Xmx</code> に入らないままコンテナの使用量にはそのまま入るからだ。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>領域</th><th>何が決めるか</th><th>公式文書上の既定値</th><th>コンテナ使用量に含まれる</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Javaヒープ</td><td><code>-Xmx</code> / <code>MaxRAMPercentage</code></td><td>MaxRAMの25パーセント</td><td>含まれる</td></tr>
+                            <tr><td>メタスペース</td><td><code>-XX:MaxMetaspaceSize</code></td><td>サイズが制限されない</td><td>含まれる</td></tr>
+                            <tr><td>JITコードキャッシュ</td><td><code>-XX:ReservedCodeCacheSize</code></td><td>240MB、階層コンパイルを切ると48MB</td><td>含まれる</td></tr>
+                            <tr><td>スレッドスタック</td><td><code>-Xss</code> × スレッド数</td><td>Linux x64はスレッドあたり1024KB</td><td>含まれる</td></tr>
+                            <tr><td>ダイレクトバッファ(NIO)</td><td><code>-XX:MaxDirectMemorySize</code></td><td>未指定ならJVMが自動で決める</td><td>含まれる</td></tr>
+                            <tr><td>GC内部構造・JVM自体・ネイティブライブラリ</td><td>フラグなし</td><td>文書化された固定値なし</td><td>含まれる</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>表で目を引くのは<strong>メタスペースが既定で無制限</strong>だという点だ。クラスを大量に作るフレームワークでこの値が増えると、ヒープは健全なのにコンテナだけが上限に達する。ただし<strong>予約と実際のコミットは別物だ。</strong>表の数字は上限であって常時の占有量ではない。</p>
+
+                    <p>死に方が違う点のほうが重要だ。ヒープが足りなければJVMが <code>OutOfMemoryError</code> を投げ、スタックトレースとヒープダンプが残る。一方コンテナの上限を超えると、Kubernetesの文書の表現どおり<strong>memory limitはカーネルのOOM killで強制される。</strong>例外もダンプもない。同じ文書は、この終了がカーネルがメモリ圧迫を検知したときにだけ起きるため<strong>上限を超えたコンテナがすぐには殺されない場合がある</strong>と付け加える。同じコード、同じ負荷なのに死ぬ時点が違う理由だ。</p>
+
+                    <p>ヒープの外がどこへ行ったのかを知るJVM内蔵の手段はネイティブメモリトラッキングだ。<code>-XX:NativeMemoryTracking</code> の既定値は <code>off</code> で、<code>summary</code> にすればサブシステム別の使用量を追跡する。</p>
+
+                    <pre><code class="language-bash"># ヒープ外メモリの内訳 (追跡を有効にして起動したプロセスでのみ有効)
+jcmd 1 VM.native_memory summary
+
+# JVMがコンテナをどう認識したかの最大ロギング
+java -Xlog:os+container=trace -XX:MaxRAMPercentage=70 -version
+
+# 最終的に確定したフラグ値の確認
+java -XX:+PrintFlagsFinal -version | grep -E 'MaxHeapSize|ActiveProcessorCount'</code></pre>
+
+                    <h2 id="sec-6">availableProcessorsひとつが決めるもの</h2>
+
+                    <p><code>Runtime.availableProcessors()</code> のjavadocは短い。JVMが使用できるプロセッサ数を返し、この値は実行中に<strong>変わり得て</strong>、1より小さくならない。コンテナでこの値は前節の切り上げ計算の結果だ。この数字ひとつが以下を連鎖的に決める。</p>
+
+                    <h3>コレクタの選択とGCスレッド数</h3>
+
+                    <p>サーバークラス判定の条件がここに掛かる。プロセッサ2個未満またはメモリ1792MB未満ならサーバークラスではなく、既定のコレクタは<strong>G1ではなくSerial</strong>になる。CPU limitが <code>500m</code> のコンテナはプロセッサ1個として計算されるので、この条件に掛かる。その状態でG1専用のチューニングフラグを付けても何も起きない。</p>
+
+                    <p>サーバークラスを通過してもGCワーカー数はプロセッサ数に従う。ガイドは「最大GCスレッド数はヒープサイズと利用可能なCPU資源によって制限される」とだけ記し、算式は明かさない。それでも方向ははっきりしている。<strong>プロセッサを少なく見ればGCも遅く回る。</strong></p>
+
+                    <h3>ActiveProcessorCountで上書きする</h3>
+
+                    <p>man pageがこのフラグの範囲を教えてくれる。「VMがガベージコレクションやForkJoinPoolのような作業に使う<strong>スレッドプールのサイズを計算するときに</strong>使うCPU数を上書きする」。「<code>UseContainerSupport</code> が有効でなくても尊重される」という但し書きと、<strong>複数のJavaプロセスをコンテナで動かすときCPU資源を分けるのに有用だ</strong>という用途まで書かれている。</p>
+
+                    <ul>
+                        <li>このフラグは<strong>JVMが見る値だけを変える。</strong>cgroupのquotaはそのままだ。1に下げてもコンテナは依然としてlimit分だけ使える</li>
+                        <li>だから低く取ればGCワーカーと並列処理が減るのに、肝心のスロットリングは減らない。<strong>スロットリングの解決策ではない</strong></li>
+                        <li>逆に高く取ればスレッドだけ増えてquotaはそのままなのでスロットリングが悪化する。「コアを増やしたことにする」は成り立たない</li>
+                        <li>正しく使える場所は<strong>ひとつのPodにJavaプロセスが二つ以上</strong>あるときだ。それぞれがPod全体を自分のものとして計算するのを防ぐ</li>
+                    </ul>
+
+                    <p>並列ストリームも同じ値に縛られる。<code>ForkJoinPool</code> のjavadocは、引数なしのコンストラクタが <code>Runtime.availableProcessors()</code> と同じ並列度でプールを作ると記し、共通プールの並列度は <code>java.util.concurrent.ForkJoinPool.common.parallelism</code> プロパティで指定できると案内する。CPU limitを変えることは<strong>アプリケーションコードの並列度を変えること</strong>でもある。</p>
+
+                    <h2 id="sec-7">CPU Limitはなぜ遅延を作るのか</h2>
+
+                    <p>Kubernetes文書の一文が明確だ。cpu limitは<strong>CPUスロットリングで強制</strong>され、コンテナがlimitに近づくとカーネルがその分までCPUへのアクセスを制限する。カーネルが強制するハードリミットである。メモリのように「超えたら死ぬ」ではなく「超えようとすると止まる」だ。</p>
+
+                    <p>止まる単位が肝心だ。kubeletは既定でCFS quotaによってPodのCPU limitを強制し、周期値を定めるオプション <code>--cpu-cfs-quota-period</code> の<strong>既定値は100ms</strong> である。スロットリングは秒単位で滑らかに起きるのではなく、<strong>100msの窓の中で割り当てを使い切ればその窓が終わるまで止まる</strong>という形で起きる。</p>
+
+                    <p>ここで平均の罠が出る。CPU limitが1でスレッドが4個なら、100ms分が25msで尽き、残りの75msの間そのコンテナの<strong>すべてのスレッド</strong>が止まる。1秒で平均すれば使用率は100パーセント未満なのでグラフは穏やかだ。その1秒の中に最大75msの停止が何度も入っているのにそうなる。<strong>平均使用率が低いのにp99だけ跳ねる現象の正体はたいていこれだ。</strong></p>
+
+                    <p>GCと重なるともっと悪くなる。stop-the-worldの区間で割り当てが尽きるとGCスレッドも一緒に止まり、次の周期が開かないと再開しない。短かったはずの停止が<strong>周期の境界まで伸びる。</strong>GCログの停止時間とスロットリング指標を並べて見なければならない理由だ。</p>
+
+                    <h2 id="sec-8">CPU limitを設定するか、しないか</h2>
+
+                    <p>この話題は結論が割れる。双方が別のものを最適化していて、双方に文書で裏づけられる根拠がある。並べて置くほうが正確だ。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>設定しない側</th><th>根拠</th><th>設定する側</th><th>根拠</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>スロットリングが実際の遅延を作る</td><td>カーネルが強制するハードリミットで周期の既定値が100msだ</td><td>Guaranteed QoSの条件だ</td><td>すべてのコンテナのCPU limitがrequestと等しくなければならない</td></tr>
+                            <tr><td>CPUが足りなくてもPodは死なない</td><td>退避シグナルはメモリ・ファイルシステム・pidだけでCPUがない</td><td>退避順で後ろに回る</td><td>退避はBestEffort、Burstable、Guaranteedの順だ</td></tr>
+                            <tr><td>ノードが空いていれば余りを使える</td><td>資源が余ればrequest以上を使うことが許される</td><td>CPU固定を使うには必須だ</td><td>staticポリシーの専用CPUはGuaranteed Podかつ整数requestにだけ割り当てられる</td></tr>
+                            <tr><td>requestだけでも配置は決まる</td><td>requestはスケジューラが配置を決めるのに使われる</td><td>隣人の遅延が予測可能になる</td><td>文書上の根拠ではなく運用方針に近い理由だ</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>まとめると<strong>遅延が重要な少数のサービス</strong>と<strong>密度が重要な多数のバッチ作業</strong>が違う答えを出す。前者はスロットリングを避けるためlimitを外すか大きく取り、後者は予測可能性と退避順位のために設定する。判断基準は好みではなく指標だ。<strong>スロットリング指標が実際に上がっているか</strong>をまず見る。</p>
+
+                    <p>ひとつはっきり区別しなければならない。<strong>メモリlimitを外すことはCPU limitを外すことと同じ性質の決定ではない。</strong>CPUは足りなければ遅くなるだけだが、メモリは圧縮されない。メモリlimitがなければそのPodはノード全体を危険にさらし、JVMはノードのメモリを基準にヒープを計画する。</p>
+
+                    <h2 id="sec-9">RequestとLimitは別の仕事をする</h2>
+
+                    <p>Kubernetes文書の定義は短い。requestを指定すると<strong>kube-schedulerがその情報でPodをどのノードに置くかを決める。</strong>limitを指定すると<strong>kubeletがそれを強制して</strong>実行中のコンテナがそれ以上使えないようにする。ひとつは配置段階の数字、もうひとつは実行段階の数字だ。</p>
+
+                    <p>JVMの観点で決定的なのは<strong>JVMがrequestを見ない</strong>という点だ。<code>MaxRAM</code> が参照するのは「環境が課した制約」、すなわちcgroupのlimitである。requestだけ大きく取ってlimitを空けたPodは、スケジューラの目には余裕をもって配置されたPodなのに、中のJVMはありもしないメモリを前提に動く。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>QoSクラス</th><th>条件</th><th>退避順</th><th>JVMの観点での意味</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Guaranteed</td><td>すべてのコンテナがCPU・メモリのlimitとrequestを持ち、二つの値が等しい</td><td>最も遅く退避される</td><td>ヒープ比率の分母が確定的だ。ずれる余地が最も少ない</td></tr>
+                            <tr><td>Burstable</td><td>Guaranteedの条件を満たさず、コンテナのどれかにrequestかlimitがある</td><td>BestEffortの次</td><td>limitがあればそれが分母。なければノードのメモリが分母だ</td></tr>
+                            <tr><td>BestEffort</td><td>どのコンテナにもCPU・メモリのrequestとlimitがない</td><td>最も先に退避される</td><td>JVMがノード全体を自分のものとして計算する。Javaには事実上禁止</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>文書が付け加える条件も知っておく価値がある。資源圧迫による退避のとき<strong>候補になるのはrequestを超えて使っているPod</strong>だ。requestを現実的に取っておくことが単なる書類作業ではない理由である。</p>
+
+                    <h2 id="sec-10">JITウォームアップがreadinessを崩す場所</h2>
+
+                    <p>HotSpotは既定でC1とC2を併用する階層コンパイラで起動する。コンパイル自体がCPUを使う。だからJavaアプリケーションのCPU使用量は<strong>起動直後が最も高く</strong>定常状態で下がる。ところがCPU limitはたいてい定常状態を基準に取られる。<strong>最もCPUが必要な区間が最も強くスロットリングされる。</strong></p>
+
+                    <p>次は決まった手順だ。起動が遅れるとreadiness probeが失敗し、文書の表現どおりkubeletがコンテナを準備できていないと表示すると、エンドポイントコントローラが<strong>そのPodのIPを一致するすべてのサービスエンドポイントから取り除く</strong>。ここまでは正常動作だ。問題はliveness probeまで同じ閾値で設定した場合である。livenessが失敗すると再起動ポリシーに従ってコンテナが死に、再び起動して同じ区間をまた通る。再起動ループができる。</p>
+
+                    <p>公式の処方はstartup probeだ。文書はこのプローブが<strong>起動の遅いコンテナを保護し</strong>、通常のliveness・readinessに影響を与えずに起動専用の成功基準を定義できるようにすると記す。推奨の形まで案内する。livenessと同じ検査を使いつつ<strong>失敗閾値だけ高く</strong>取ることだ。liveness自体を緩めれば本当の故障を捕まえられなくなる。</p>
+
+                    <ul>
+                        <li>起動区間だけCPUを多く与えることは<strong>標準のrequest・limitだけではできない。</strong>startup probeで時間を稼ぐか、limitを上げる方向に行く</li>
+                        <li>limitを上げたくないなら、クラスデータ共有や事前コンパイルのような起動最適化が次の選択肢だ。その効果はこの記事では確認していない</li>
+                        <li>起動が遅くて最初の要求が遅いことと、スロットリングのせいで常時p99が高いことは<strong>別の問題</strong>だ。起動区間と定常区間を分けて見なければ混ざる</li>
+                    </ul>
+
+                    <h2 id="sec-11">何を見て決めるのか</h2>
+
+                    <p>最もよくある間違いは数字ひとつで決めることだ。ヒープ使用量のグラフひとつでlimitを決めたり、CPU使用率ひとつでスロットリングの有無を判断したりする。以下の五つは別のことを言っている。</p>
+
+                    <ul>
+                        <li><strong>GC直後のヒープ使用量</strong> — ヒープサイズ算定の根拠だ。鋸歯グラフの頂点は「必要な大きさ」ではなく「回収直前のゴミ込みの大きさ」である</li>
+                        <li><strong>コミット済みヒープ</strong> — JVMが実際に確保した大きさ。コレクタによっては使わない部分をオペレーティングシステムに返すこともある</li>
+                        <li><strong>プロセスRSS</strong> — 物理メモリに載っている量。ここからヒープを引けばヒープ外がどれくらいか大まかに見える</li>
+                        <li><strong>コンテナのメモリ使用量</strong> — cgroupが見る値でOOM判断の基準だ。ページキャッシュが混ざる</li>
+                        <li><strong>CPUスロットリング指標</strong> — 使用率ではなく<strong>スロットリングされた周期数と時間</strong>を見る。使用率はスロットリングを隠す</li>
+                    </ul>
+
+                    <p>順序は単純だ。limitを決め、比率でヒープを与え、実際のトラフィックで上の五つを一緒に見て、戻って直す。特に<strong>合成負荷だけではヒープ外のメモリがよく現れない。</strong>クラスローディングとコードキャッシュは実際のコード経路が多様に踏まれてこそ増える。</p>
+
+                    <h2 id="sec-12">よくある失敗の五つ</h2>
+
+                    <p>同じ失敗が繰り返される理由は、症状が原因から遠く離れて現れるからだ。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>失敗</th><th>実際に起きること</th><th>症状</th><th>何を見るか</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>limitをまったく設定していない</td><td>JVMがノードのメモリとノードのCPU数で計画する</td><td>ノードが圧迫を受け、無関係なPodが退避される</td><td>QoSクラスとノードの退避イベント</td></tr>
+                            <tr><td><code>-Xmx</code> をlimitと同じにした</td><td>ヒープ外の分が0になる</td><td>例外なしの <code>OOMKilled</code>、ダンプもない</td><td>RSSとヒープの差、ネイティブメモリトラッキング</td></tr>
+                            <tr><td>requestだけあってlimitがない</td><td>Burstableになり、JVMはノード基準で計画する</td><td>配置は余裕なのに実行中に死ぬ</td><td>requestとlimitを並べて確認</td></tr>
+                            <tr><td>CPU limitが低すぎる</td><td>プロセッサ1個と計算されサーバークラス判定に届かない</td><td>GC停止が長くなりチューニングフラグが効かない</td><td>選ばれたコレクタ、GC停止時間、スロットリング指標</td></tr>
+                            <tr><td>複数コンテナのPodで合算を忘れた</td><td>サイドカーが同じ上限を分け合う</td><td>サイドカーを入れてから死ぬようになる</td><td>Pod内すべてのコンテナのrequest・limit合計</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>四つ目には逆方向の罠もある。<code>-XX:ActiveProcessorCount</code> でプロセッサ数だけ上げて取ると、コレクタの選択は変わるがquotaはそのままだ。<strong>スレッドが増えた分だけスロットリングが悪化する。</strong>コレクタを変えたいならプロセッサ数を偽る代わりに <code>-XX:+UseG1GC</code> のように直接指定するほうが正直だ。</p>
+
+                    <h2 id="sec-13">どのバージョンを基準にした話か</h2>
+
+                    <p>この領域はバージョンによって挙動が実際に違う。古い記事をそのまま持ち込んで適用してずれる代表的な場所なので、基準を明かしておく。</p>
+
+                    <ul>
+                        <li><strong>JDK 8u190以下とJDK 9</strong> — コンテナ認識がない。ホスト基準でヒープとプロセッサ数を決めるので、<code>-Xmx</code> を手で打ち込むしかない</li>
+                        <li><strong>JDK 8u191以上とJDK 10以上</strong> — <code>UseContainerSupport</code> が既定で有効で、RAMPercentageの三つのフラグと <code>ActiveProcessorCount</code> が使える</li>
+                        <li><strong>JDK 19</strong> — OpenJDKのバグ <code>JDK-8281181</code>「Do not use CPU Shares to compute active processor count」がこのバージョンに入った。それ以前はquotaがないときcpu sharesでプロセッサ数を計算しており、Kubernetesでcpu sharesは<strong>CPU requestから来る。</strong>古いJDKではrequestがJVMの並列度に影響したという意味だ</li>
+                        <li><strong>本文のフラグ既定値</strong> — Java 21の <code>java</code> man page基準だ。コレクタの選択とサーバークラス判定はJava 25のGCチューニングガイド基準である</li>
+                        <li><strong>Kubernetes側</strong> — 2026年9月時点の公式文書だ。cgroup v1とv2の違いは扱っていない</li>
+                    </ul>
+
+                    <p>三つ目が特に厄介だ。ランタイムを上げながらCPU設定をそのままにしたのに並列度が変わることが起こり得る。<strong>フラグをそのままにすること自体が変更</strong>であり得るという意味だ。</p>
+
+                    <h2 id="sec-14">まとめ</h2>
+
+                    <p>骨格は一文だ。<strong>Podスペックの数字はコンテナを制約する値であると同時に、JVMが自分の計画を立てる入力である。</strong>メモリlimitはヒープ比率の分母になり、CPU limitはプロセッサ数になってコレクタの選択とスレッドプールの大きさを決める。</p>
+
+                    <p>実務的に残るのは三つだ。<code>-Xmx</code> をlimitと同じにしない。ヒープ外の分を残さなければカーネルが静かに殺す。比率で与える。管理する数字がひとつに減り、既定値25パーセントはたいてい小さすぎる。CPU limitは遅延予算と一緒に決める。100msの周期の中の停止は秒単位の平均に現れない。そしてどの比率も他人が決めてはくれない。ヒープ外のメモリはフレームワークとスレッド数によってサービスごとに違う。<strong>測って決め、ランタイムを上げるたびに見直す。</strong></p>
+
+                    <h2 id="sec-15">確認できなかったこと</h2>
+
+                    <ul>
+                        <li><strong>Linuxコンテナで直接実行して検証していない。</strong>本文のコマンドは文書に基づいて書いたもので、実行出力はひとつも載せていない</li>
+                        <li><code>ForkJoinPool</code> <strong>共通プールの既定並列度</strong>の算式はjavadocにない。引数なしのコンストラクタが <code>availableProcessors()</code> と同じであることだけを確認した</li>
+                        <li><code>-XX:ParallelGCThreads</code> と <code>-XX:ConcGCThreads</code> の<strong>既定の算式</strong>もman pageにない。ガイドは「ヒープサイズと利用可能なCPU資源によって制限される」とだけ記す</li>
+                        <li><code>JDK-8281181</code> の<strong>バックポートの有無</strong>は確認できなかった。バグデータベースに記録された修正バージョンは19ひとつだった</li>
+                        <li><strong>cgroup v1とv2の違い</strong>が上の計算に及ぼす影響は扱っていない。ファイル名と単位が異なる</li>
+                        <li>Podの資源を<strong>再起動なしで変える機能</strong>と、その際JVMが値を読み直すかどうかは確認範囲の外だ</li>
+                        <li>起動最適化の技法が<strong>スロットリング区間でどれだけ役に立つか</strong>は測定していない</li>
+                    </ul>
+
+                    <h2 id="sec-16">参考資料</h2>
+
+                    <ul>
+                        <li><a href="https://news.hada.io/topic?id=33103" target="_blank" rel="noopener">GeekNews トピック 33103</a> — この記事のきっかけになった紹介</li>
+                        <li><a href="https://learnkube.com/java-jvm-kubernetes-requests-limits" target="_blank" rel="noopener">Java JVM in Kubernetes: CPU and Memory Requests and Limits (learnkube.com)</a> — きっかけになった原文。最大ヒープをコンテナメモリの50から75パーセントの間で始めて検証せよという勧めの出典</li>
+                        <li><a href="https://docs.oracle.com/en/java/javase/21/docs/specs/man/java.html" target="_blank" rel="noopener">java Command Reference (Java SE 21, Oracle)</a> — <code>MaxRAM</code>・<code>MaxRAMPercentage</code>(25パーセント)・<code>MinRAMPercentage</code>(50パーセント)・<code>InitialRAMPercentage</code>(1.5625パーセント)・<code>ActiveProcessorCount</code>・<code>UseContainerSupport</code>・<code>MaxMetaspaceSize</code>・<code>ReservedCodeCacheSize</code>(240MB)・<code>Xss</code>・<code>NativeMemoryTracking</code> の出典</li>
+                        <li><a href="https://docs.oracle.com/en/java/javase/25/gctuning/ergonomics.html" target="_blank" rel="noopener">Ergonomics (HotSpot GC Tuning Guide, Java SE 25)</a> — サーバークラス判定1792MB・プロセッサ2個、既定コレクタ、初期ヒープ64分の1・最大ヒープ4分の1</li>
+                        <li><a href="https://www.oracle.com/java/technologies/javase/10-relnote-issues.html" target="_blank" rel="noopener">JDK 10 Release Notes (Oracle)</a> — <code>JDK-8146115</code> コンテナ認識、<code>JDK-8186248</code> RAMPercentage</li>
+                        <li><a href="https://www.oracle.com/java/technologies/javase/8u191-relnotes.html" target="_blank" rel="noopener">Java SE 8u191 Release Notes (Oracle)</a> — 同じ項目が8u191にも載っている</li>
+                        <li><a href="https://raw.githubusercontent.com/openjdk/jdk/master/src/hotspot/os/linux/cgroupSubsystem_linux.cpp" target="_blank" rel="noopener">OpenJDK cgroupSubsystem_linux.cpp</a> — <code>active_processor_count</code> のアルゴリズムと切り上げ規則</li>
+                        <li><a href="https://bugs.openjdk.org/browse/JDK-8281181" target="_blank" rel="noopener">JDK-8281181 Do not use CPU Shares to compute active processor count</a> — 修正バージョン19</li>
+                        <li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/Runtime.html" target="_blank" rel="noopener">Runtime (Java SE 21 API)</a> — <code>availableProcessors()</code> の定義</li>
+                        <li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ForkJoinPool.html" target="_blank" rel="noopener">ForkJoinPool (Java SE 21 API)</a> — コンストラクタの並列度と共通プールのシステムプロパティ</li>
+                        <li><a href="https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/" target="_blank" rel="noopener">Resource Management for Pods and Containers (Kubernetes)</a> — requestとlimitの役割、cpuスロットリング、memory limitのカーネルOOM kill</li>
+                        <li><a href="https://kubernetes.io/docs/concepts/workloads/pods/pod-qos/" target="_blank" rel="noopener">Pod Quality of Service Classes (Kubernetes)</a> — 三つのQoSクラスと退避順</li>
+                        <li><a href="https://kubernetes.io/docs/reference/command-line-tools-reference/kubelet/" target="_blank" rel="noopener">kubelet Command Line Reference (Kubernetes)</a> — <code>--cpu-cfs-quota-period</code> の既定値100ms</li>
+                        <li><a href="https://kubernetes.io/docs/tasks/administer-cluster/cpu-management-policies/" target="_blank" rel="noopener">Control CPU Management Policies on the Node (Kubernetes)</a> — CFS quotaによる強制とstaticポリシーの専用CPU条件</li>
+                        <li><a href="https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/" target="_blank" rel="noopener">Node-pressure Eviction (Kubernetes)</a> — 退避シグナルの一覧にCPUがない根拠</li>
+                        <li><a href="https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/" target="_blank" rel="noopener">Pod Lifecycle (Kubernetes)</a> — readiness失敗時のエンドポイント除去、startup probeの役割</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>この記事をシェア</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">リンクをコピー</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">一覧に戻る</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">一緒に使うと便利な無料ツール</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/code_image.html">コード画像ジェネレーター</a></li>
+      <li><a href="../static/char_counter.html">文字数カウント</a></li>
+      <li><a href="../static/json_formatter.html">JSON フォーマッター</a></li>
+      <li><a href="../static/regex_tester.html">正規表現テスター</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">すべてのツールを見る &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">関連記事</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="oom_killer_diagnosis.html">プロセスが黙って死んだ - OOM キラーの読み方</a></li>
+      <li><a href="agent_behavior_spec.html">長く走るエージェントを何で採点するのか - 行動を仕様として書くという発想の実体</a></li>
+      <li><a href="vector_db_selection_criteria.html">ベクトル検索を何の上に載せるか - 既存の検索エンジンに載せる道と専用エンジンを立てる道</a></li>
+      <li><a href="bug_blindness.html">「元からそういうものです」はどこで作られるのか - 欠陥が背景に沈む過程と、もう一度見えるようにする方法</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('リンクをコピーしました。Threadsアプリに貼り付けて共有してください。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('リンクをコピーしました。'); });
+    });
+    </script>
+</body>
+</html>

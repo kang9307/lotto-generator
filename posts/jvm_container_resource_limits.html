@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ko">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JVM은 컨테이너 한도를 어떻게 보는가 - 쿠버네티스 Request와 Limit이 힙·GC·지연을 정하는 자리 2026</title>
+    <meta name="description" content="한도를 걸어도 JVM은 그것을 제 방식으로 읽는다. MaxRAMPercentage 기본값 25퍼센트, 힙 밖 메모리, availableProcessors가 정하는 GC 스레드와 CFS 스로틀링까지 공식 문서로 확인한 것만 정리했다.">
+    <meta name="keywords" content="JVM 컨테이너, 쿠버네티스 Request Limit, MaxRAMPercentage, ActiveProcessorCount, UseContainerSupport, CPU 스로틀링, CFS 쿼터, OOMKilled, QoS 클래스, G1 GC, 메타스페이스, 개발, 인프라, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/posts/jvm_container_resource_limits.html">
+
+    <meta property="og:title" content="JVM은 컨테이너 한도를 어떻게 보는가 - 쿠버네티스 Request와 Limit이 힙·GC·지연을 정하는 자리 2026">
+    <meta property="og:description" content="-Xmx를 limit과 같게 주면 왜 죽는지, availableProcessors 하나가 GC 스레드와 병렬도까지 정하는 경로.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/posts/jvm_container_resource_limits.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ko_KR">
+    <meta property="article:published_time" content="2026-09-02">
+    <meta property="article:section" content="개발/인프라">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="JVM은 컨테이너 한도를 어떻게 보는가">
+    <meta name="twitter:description" content="JVM은 limit을 준수하는 프로그램이 아니라 limit을 보고 자기 계획을 세우는 프로그램이다.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "JVM은 컨테이너 한도를 어떻게 보는가 - 쿠버네티스 Request와 Limit이 힙·GC·지연을 정하는 자리 2026",
+      "alternativeHeadline": "-Xmx를 limit과 같게 주면 왜 죽는지, availableProcessors 하나가 GC 스레드와 병렬도까지 정하는 경로",
+      "datePublished": "2026-09-02",
+      "dateModified": "2026-09-02",
+      "inLanguage": "ko-KR",
+      "articleSection": "개발/인프라",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "JVM 컨테이너, 쿠버네티스 Request Limit, MaxRAMPercentage, ActiveProcessorCount, UseContainerSupport, CPU 스로틀링, CFS 쿼터, OOMKilled, QoS 클래스, G1 GC",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/posts/jvm_container_resource_limits.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "메모리 limit을 걸었는데도 자바 컨테이너가 왜 그 한도를 넘겨 죽는가?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "JVM 이 쓰는 메모리는 힙만이 아니기 때문이다. 힙 밖에 메타스페이스, JIT 코드 캐시, 스레드 스택, 다이렉트 버퍼, 가비지 컬렉터 자체의 내부 구조가 따로 있고, 이것들은 -Xmx 에 포함되지 않는다. Java 21 man page 기준으로 -XX:MaxMetaspaceSize 는 기본적으로 크기가 제한되지 않고, -XX:ReservedCodeCacheSize 의 기본 최대치는 240MB, Linux x64 의 -Xss 기본값은 스레드당 1024KB 다. 그래서 -Xmx 를 컨테이너 limit 과 같게 주면 힙이 다 차기 전에 컨테이너가 먼저 한도에 닿는다. 이때 죽이는 주체는 JVM 이 아니라 커널이고, 쿠버네티스 문서는 memory limit 이 커널의 OOM kill 로 강제된다고 적고 있다. 자바 예외도 힙 덤프도 남지 않는 이유가 그것이다."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "-Xmx 와 -XX:MaxRAMPercentage 중 컨테이너에서는 무엇을 써야 하는가?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "비율 쪽이 관리하기 쉽다. -Xmx 는 절대값이라 파드 스펙의 limit 을 바꿀 때마다 JVM 인자도 같이 고쳐야 하고, 한쪽만 고치는 순간 사고가 난다. -XX:MaxRAMPercentage 는 -XX:MaxRAM 이 정한 값의 비율로 최대 힙을 잡고, Java 21 man page 는 MaxRAM 의 기본값을 「JVM 프로세스가 쓸 수 있는 최대 메모리 또는 128GB 중 작은 쪽」이라고 적으면서 그 최대 메모리가 「머신의 물리 메모리와 환경(예: 컨테이너)이 건 제약 중 작은 쪽」이라고 밝혀 둔다. 즉 컨테이너 limit 이 자동으로 기준이 된다. 다만 기본값이 25퍼센트라서 아무것도 지정하지 않으면 1Gi 컨테이너에서 최대 힙이 약 256Mi 에 머문다. 몇 퍼센트가 맞는지는 측정해서 정할 문제다."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "CPU limit 을 걸지 말라는 조언은 맞는 말인가?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "양쪽 다 문서로 뒷받침되는 근거가 있고, 답은 워크로드에 따라 갈린다. 걸지 말자는 쪽의 근거는 쿠버네티스가 cpu limit 을 CPU 스로틀링으로 강제한다는 점, 그리고 kubelet 의 CFS 주기 기본값이 100ms 라서 주기 안에서 할당량을 다 쓰면 남은 시간 동안 멈춘다는 점이다. 또 축출 신호 목록에는 memory 와 파일시스템과 pid 만 있고 CPU 는 없다. 걸자는 쪽의 근거는 QoS 클래스다. Guaranteed 가 되려면 모든 컨테이너의 CPU limit 이 request 와 같아야 하고, 축출은 BestEffort 다음 Burstable 다음 Guaranteed 순서로 일어난다. static CPU 관리 정책에서 전용 CPU 를 받는 조건도 Guaranteed 파드 + 정수 CPU request 다. 결정은 스로틀 지표를 실제로 보고 한다."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "CPU limit 을 낮게 잡으면 GC 가 왜 느려지는가?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "두 경로가 겹친다. 첫째, JVM 이 보는 프로세서 수가 줄어든다. OpenJDK 의 cgroup 처리 코드는 quota 가 지정돼 있으면 quota 를 period 로 나눠 프로세서 수를 구하고 나눗셈 결과를 모두 올림한다고 적어 두었다. 그 값이 GC 워커 스레드 수와 ForkJoinPool 병렬도를 정한다. 둘째, 값이 충분히 작아지면 컬렉터 선택 자체가 바뀐다. Oracle 의 GC 튜닝 가이드는 프로세서 2개 이상이면서 물리 메모리 1792MB 이상일 때만 서버급으로 보고 G1 을 고르며 그 밖에는 Serial 을 고른다고 적는다. 여기에 stop-the-world 도중 할당량이 소진되면 GC 스레드가 다음 주기를 기다리게 되어 정지 시간이 주기 경계까지 늘어난다."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "컨테이너 안에서 JVM 설정이 제대로 먹었는지 어떻게 확인하는가?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "짐작하지 말고 JVM 에 직접 물어보는 편이 빠르다. -Xlog:os+container=trace 는 컨테이너 정보 인식에 대한 로그를 최대치로 남기며, Java 21 man page 가 컨테이너 지원 진단용으로 이 옵션을 안내한다. 힙 밖 메모리가 어디로 갔는지는 -XX:NativeMemoryTracking=summary 로 추적을 켜고 jcmd 로 확인한다. 기본값은 off 다. 그리고 볼 숫자를 구분해야 한다. 힙 크기 산정의 근거는 GC 직후의 사용량이지 톱니 그래프의 꼭대기가 아니고, 컨테이너가 죽을지는 cgroup 이 보는 사용량이 정하며, CPU 는 사용률이 아니라 스로틀된 시간을 봐야 한다."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <script src="https://t1.kakaocdn.net/kakao_js_sdk/2.4.0/kakao.min.js" crossorigin="anonymous" defer></script>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/jvm_container_resource_limits.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/jvm_container_resource_limits.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/jvm_container_resource_limits.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/jvm_container_resource_limits.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/jvm_container_resource_limits.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "홈",
+      "item": "https://braindetox.kr/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "개발/인프라",
+      "item": "https://braindetox.kr/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "JVM은 컨테이너 한도를 어떻게 보는가 - 쿠버네티스 Request와 Limit이 힙·GC·지연을 정하는 자리 2026",
+      "item": "https://braindetox.kr/posts/jvm_container_resource_limits.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="JVM은 컨테이너 한도를 어떻게 보는가 - 쿠버네티스 Request와 Limit이 힙·GC·지연을 정하는 자리 2026">
+                <meta itemprop="datePublished" content="2026-09-02">
+                <meta itemprop="dateModified" content="2026-09-02">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="JVM 컨테이너, 쿠버네티스 Request Limit, MaxRAMPercentage, ActiveProcessorCount, UseContainerSupport, CPU 스로틀링, CFS 쿼터, OOMKilled, QoS 클래스, G1 GC">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/posts/jvm_container_resource_limits.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">JVM은 컨테이너 한도를 어떻게 보는가 - 쿠버네티스 Request와 Limit이 힙·GC·지연을 정하는 자리 2026</h1>
+                    <h2 class="post-subtitle">-Xmx를 limit과 같게 주면 왜 죽는지, availableProcessors 하나가 GC 스레드와 병렬도까지 정하는 경로</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-02">2026-09-02</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">개발/인프라</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>파드 스펙에 <code>limits.memory: 1Gi</code> 를 적으면 그 컨테이너는 실제로 그 선을 넘지 못한다. 문제는 안에서 도는 JVM 이 그 숫자를 <strong>어떻게 읽느냐</strong>다. JVM 은 한도를 준수하는 프로그램이 아니라 한도를 보고 자기 계획을 세우는 프로그램이고, 계획이 어긋나면 한도를 지키는 쪽은 커널이다. 커널이 지키는 방식은 프로세스를 죽이는 것이다.</p>
+
+                    <p>CPU 쪽은 더 조용히 어긋난다. 평균 사용률은 낮은데 p99 만 튄다. 그 사이 JVM 안에서는 컬렉터 선택과 스레드 풀 크기가 <strong>파드 스펙의 숫자 하나</strong>를 따라 바뀌어 있다.</p>
+
+                    <div class="callout">
+                        기준은 Java 21 의 <code>java</code> man page, Java 25 GC 튜닝 가이드, OpenJDK 소스와 버그 데이터베이스, 2026년 9월 기준 쿠버네티스 공식 문서다. 리눅스 컨테이너에서 직접 실행해 확인하지 못했으므로 <strong>명령 출력은 붙이지 않았다.</strong> 본문의 기본값과 동작은 전부 위 문서에서 확인한 것이다.
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>이 글에서 다루는 것</h3>
+                        <ol>
+                            <li><a href="#sec-1">계기 - 한도를 걸었는데도 어긋나는 자리</a></li>
+                            <li><a href="#sec-2">JVM 은 원래 호스트를 봤다</a></li>
+                            <li><a href="#sec-3">컨테이너 인식이 실제로 읽는 값</a></li>
+                            <li><a href="#sec-4">-Xmx 대신 비율로 주는 이유</a></li>
+                            <li><a href="#sec-5">힙만 메모리가 아니다</a></li>
+                            <li><a href="#sec-6">availableProcessors 하나가 정하는 것들</a></li>
+                            <li><a href="#sec-7">CPU Limit 은 왜 지연을 만드는가</a></li>
+                            <li><a href="#sec-8">CPU limit 을 걸 것인가 말 것인가</a></li>
+                            <li><a href="#sec-9">Request 와 Limit 은 다른 일을 한다</a></li>
+                            <li><a href="#sec-10">JIT 워밍업이 readiness 를 무너뜨리는 자리</a></li>
+                            <li><a href="#sec-11">무엇을 보고 정하는가</a></li>
+                            <li><a href="#sec-12">흔한 실패 다섯 가지</a></li>
+                            <li><a href="#sec-13">어느 버전을 기준으로 한 이야기인가</a></li>
+                            <li><a href="#sec-14">정리</a></li>
+                            <li><a href="#sec-15">확인하지 못한 것</a></li>
+                            <li><a href="#sec-16">참고 자료</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">계기 - 한도를 걸었는데도 어긋나는 자리</h2>
+
+                    <p>2026년 9월 초 국내 개발자 커뮤니티에 쿠버네티스에서 자바 JVM 의 CPU·메모리 Request 와 Limit 을 다룬 글이 소개됐다. 요지는 하나였다. <strong>컨테이너 안의 자바 프로세스에는 메모리 경계가 둘 있다.</strong> 힙 경계와 컨테이너 경계인데, 둘을 같은 것으로 취급하는 순간 사고가 난다.</p>
+
+                    <p>같은 구조가 CPU 쪽에도 있다. 파드 스펙의 CPU 숫자는 스케줄러에게 하는 말이면서 동시에 <strong>JVM 이 자기 병렬도를 계산하는 입력</strong>인데, 대시보드에는 한쪽만 나온다. 컨테이너가 왜 <code>OOMKilled</code> 로 끝났는지의 일반적인 진단은 <a href="oom_killer_diagnosis.html">따로 쓴 글</a>에, 장애 중에 관제 화면이 답을 주지 못하는 이유는 <a href="k8s_control_room_questions.html">그 글</a>에 있다. 여기서는 <strong>JVM 고유의 문제</strong>만 다룬다.</p>
+
+                    <h2 id="sec-2">JVM 은 원래 호스트를 봤다</h2>
+
+                    <p>뿌리는 JVM 이 자기 힙 크기를 스스로 정한다는 데 있다. Oracle 의 GC 튜닝 가이드가 적어 둔 기본 선택은 이렇다. 초기 힙은 물리 메모리의 64분의 1, 최대 힙은 4분의 1, 컬렉터는 서버급 머신에서 G1 이고 그 밖에는 Serial 이다. 서버급의 정의도 각주로 붙어 있다. <strong>프로세서 2개 이상이면서 물리 메모리 1792MB 이상</strong>일 때다.</p>
+
+                    <p>여기서 「물리 메모리」가 문제다. 컨테이너 인식이 없던 시절의 JVM 에게 그것은 <strong>호스트 전체</strong>였다. 64GB 노드에 limit 512Mi 짜리 파드를 띄우면 그 안의 JVM 은 최대 힙을 16GB 로 계획했다. 계획이 틀렸으니 GC 는 여유가 많다고 보고 수거를 미루고, 그 사이 컨테이너는 512Mi 를 넘어 커널에게 죽는다.</p>
+
+                    <p>고쳐진 시점은 명확하다. JDK 10 릴리스 노트의 <code>JDK-8146115</code> 항목이다. JVM 이 컨테이너 안에서 돌고 있음을 인지하도록 수정됐고, 운영체제에 묻는 대신 <strong>컨테이너별 설정 정보를 추출</strong>한다. 추출하는 것은 할당된 CPU 수와 총 메모리다. 리눅스에서만 동작하며 기본으로 켜져 있고 <code>-XX:-UseContainerSupport</code> 로 끌 수 있다.</p>
+
+                    <ul>
+                        <li>같은 변경에서 <code>-XX:ActiveProcessorCount</code> 가 추가됐다. 릴리스 노트는 이 값이 <strong>JVM 의 다른 모든 CPU 자동 탐지 로직을 덮어쓴다</strong>고 적는다</li>
+                        <li>같은 자리의 <code>JDK-8186248</code> 로 <code>InitialRAMPercentage</code>·<code>MaxRAMPercentage</code>·<code>MinRAMPercentage</code> 가 추가됐다. 이전의 <code>Fraction</code> 형태를 대체한 것이다</li>
+                        <li>이 항목은 <strong>Oracle JDK 8u191 릴리스 노트에도 같은 내용으로 실려 있다.</strong> JDK 8 계열도 8u191 이상이면 컨테이너 인식이 들어 있다</li>
+                        <li>바꿔 말하면 <strong>8u190 이하와 JDK 9 에는 없다.</strong> 그런 이미지를 쓰고 있다면 옛날 방식대로 <code>-Xmx</code> 를 손으로 못 박아야 한다</li>
+                    </ul>
+
+                    <h2 id="sec-3">컨테이너 인식이 실제로 읽는 값</h2>
+
+                    <p>메모리 쪽 경로는 <code>-XX:MaxRAM</code> 문서에 그대로 있다. 기본값은 「JVM 프로세스가 쓸 수 있는 최대 메모리 또는 128GB 중 작은 쪽」이고, 다음 문장이 핵심이다. 그 최대 메모리란 <strong>머신의 물리 메모리와 환경(예: 컨테이너)이 건 제약 중 작은 쪽</strong>이다. 컨테이너 memory limit 이 여기로 들어오고, 그 위에 비율 플래그가 얹힌다.</p>
+
+                    <p>CPU 쪽 알고리즘은 man page 가 아니라 OpenJDK 소스 주석에 있다. <code>cgroupSubsystem_linux.cpp</code> 의 <code>active_processor_count</code> 설명은 세 줄이다. <code>sched_getaffinity</code> 로 쓸 수 있는 CPU 수를 구한다. quota 가 지정돼 있으면 quota 를 period 로 나눈다. 그리고 <strong>나눗셈 결과는 모두 다음 정수로 올림한다.</strong> 결과는 활성 프로세서 수를 넘지 않는다.</p>
+
+                    <p>올림이 실제로는 크다. CPU limit 이 <code>500m</code> 이면 0.5 가 올라가 1 이고, <code>1500m</code> 이면 2 다. <strong>1 CPU 미만을 줘도 JVM 은 최소 1개로 본다.</strong> 반대로 <code>2100m</code> 같은 값은 3이 되어, 실제로 쓸 수 있는 것보다 많은 스레드를 만들게 한다.</p>
+
+                    <p>놓치기 쉬운 것은 <strong>limit 이 없을 때</strong>다. quota 가 없으면 위 알고리즘은 시스템의 활성 프로세서 수를 그대로 쓴다. 96코어 노드에 <code>requests.cpu: 500m</code> 짜리 파드만 올리면 그 JVM 은 96코어짜리 계획을 세운다.</p>
+
+                    <h2 id="sec-4">-Xmx 대신 비율로 주는 이유</h2>
+
+                    <p>절대값과 비율의 차이는 취향이 아니라 관리 지점의 개수다. <code>-Xmx2g</code> 는 파드 스펙과 <strong>따로 사는 숫자</strong>다. limit 을 3Gi 로 올리면서 JVM 인자를 안 고치면 늘린 메모리가 놀고, 1Gi 로 줄이면서 안 고치면 그 파드는 배포 직후부터 죽는다. 비율로 주면 고칠 곳이 한 군데다.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>플래그</th><th>무엇을 정하는가</th><th>Java 21 man page 기준 기본값</th><th>주의</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>-XX:InitialRAMPercentage</code></td><td>초기 힙</td><td>1.5625 퍼센트</td><td>기동 직후 힙이 아주 작다. 늘어나는 동안 GC 가 자주 돈다</td></tr>
+                            <tr><td><code>-XX:MaxRAMPercentage</code></td><td>최대 힙</td><td>25 퍼센트</td><td>지정하지 않으면 1Gi 컨테이너의 최대 힙이 약 256Mi 다</td></tr>
+                            <tr><td><code>-XX:MinRAMPercentage</code></td><td>작은 힙에서의 최대 힙</td><td>50 퍼센트</td><td>최솟값이 아니다. 문서는 「약 125MB 이하의 작은 힙」에 적용된다고 적는다</td></tr>
+                            <tr><td><code>-XX:MaxRAM</code></td><td>위 비율들의 분모</td><td>사용 가능 메모리와 128GB 중 작은 쪽</td><td>여기서 사용 가능 메모리가 컨테이너 limit 이다</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>기본값 25퍼센트가 실무에서 가장 자주 사고를 낸다. 컨테이너에 4Gi 를 줬는데 힙은 1Gi 만 잡히고 나머지 3Gi 는 아무도 쓰지 않는다. 「메모리를 늘렸는데 왜 여전히 GC 가 심한가」의 절반은 여기서 나온다. <strong>MaxRAMPercentage 는 컨테이너에서 사실상 필수 지정 항목</strong>이다.</p>
+
+                    <p>이름 함정도 하나 있다. <code>MinRAMPercentage</code> 는 「최소 몇 퍼센트는 힙에 준다」가 아니라 <strong>작은 힙 구간에서의 최대 비율</strong>이다. 250Mi 짜리 사이드카 자바 프로세스에서 MaxRAMPercentage 만 만지고 왜 안 먹느냐고 하는 경우가 여기 걸린다.</p>
+
+                    <pre><code class="language-yaml">resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    memory: 1Gi          # 비율의 분모가 되는 값
+env:
+  - name: JAVA_TOOL_OPTIONS
+    value: &gt;-
+      -XX:MaxRAMPercentage=70.0
+      -XX:InitialRAMPercentage=70.0
+      -XX:+ExitOnOutOfMemoryError</code></pre>
+
+                    <p>70이라는 숫자에 근거는 없다. 공식 문서 어디에도 <strong>「힙은 limit 의 몇 퍼센트」라는 권고는 없다.</strong> 계기가 된 글은 50에서 75 사이에서 시작해 검증하라고 적었고, 그 정도가 정직한 표현이다. 남은 몫이 무엇에 쓰이는지는 다음 절이 설명한다.</p>
+
+                    <h2 id="sec-5">힙만 메모리가 아니다</h2>
+
+                    <p>이 절 하나만 가져가도 된다. <strong><code>-Xmx</code> 를 컨테이너 limit 과 같게 주면 그 파드는 반드시 죽는다.</strong> 힙 밖에도 JVM 이 쓰는 메모리가 여럿 있고, 그것들은 <code>-Xmx</code> 에 안 들어가면서 컨테이너 사용량에는 그대로 들어가기 때문이다.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>영역</th><th>무엇이 정하는가</th><th>공식 문서상 기본값</th><th>컨테이너 사용량에 포함</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Java 힙</td><td><code>-Xmx</code> / <code>MaxRAMPercentage</code></td><td>MaxRAM 의 25 퍼센트</td><td>포함</td></tr>
+                            <tr><td>메타스페이스</td><td><code>-XX:MaxMetaspaceSize</code></td><td>크기가 제한되지 않음</td><td>포함</td></tr>
+                            <tr><td>JIT 코드 캐시</td><td><code>-XX:ReservedCodeCacheSize</code></td><td>240MB, 계층 컴파일을 끄면 48MB</td><td>포함</td></tr>
+                            <tr><td>스레드 스택</td><td><code>-Xss</code> × 스레드 수</td><td>Linux x64 는 스레드당 1024KB</td><td>포함</td></tr>
+                            <tr><td>다이렉트 버퍼(NIO)</td><td><code>-XX:MaxDirectMemorySize</code></td><td>미지정 시 JVM 이 자동으로 정함</td><td>포함</td></tr>
+                            <tr><td>GC 내부 구조·JVM 자체·네이티브 라이브러리</td><td>플래그 없음</td><td>문서화된 고정값 없음</td><td>포함</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>표에서 눈에 띄는 것은 <strong>메타스페이스가 기본적으로 무제한</strong>이라는 점이다. 클래스를 많이 찍어 내는 프레임워크에서 이 값이 늘어나면 힙은 멀쩡한데 컨테이너만 한도에 닿는다. 다만 <strong>예약과 실제 커밋은 다르다.</strong> 표의 숫자는 상한이지 상시 점유량이 아니다.</p>
+
+                    <p>죽는 방식이 다르다는 점이 더 중요하다. 힙이 부족하면 JVM 이 <code>OutOfMemoryError</code> 를 던지고 스택 트레이스와 힙 덤프가 남는다. 반면 컨테이너 한도를 넘기면 쿠버네티스 문서의 표현대로 <strong>memory limit 은 커널의 OOM kill 로 강제된다.</strong> 예외도 덤프도 없다. 같은 문서는 이 종료가 커널이 메모리 압박을 감지할 때만 일어나므로 <strong>한도를 넘긴 컨테이너가 즉시 죽지 않을 수도 있다</strong>고 덧붙인다. 같은 코드, 같은 부하인데 죽는 시점이 다른 이유다.</p>
+
+                    <p>힙 밖이 어디로 갔는지 알아내는 JVM 내장 수단은 네이티브 메모리 추적이다. <code>-XX:NativeMemoryTracking</code> 의 기본값은 <code>off</code> 이고 <code>summary</code> 로 켜면 하위 시스템별 사용량을 추적한다.</p>
+
+                    <pre><code class="language-bash"># 힙 밖 메모리 내역 (추적을 켜고 뜬 프로세스에서만 유효)
+jcmd 1 VM.native_memory summary
+
+# JVM 이 컨테이너를 어떻게 인식했는지 최대치 로깅
+java -Xlog:os+container=trace -XX:MaxRAMPercentage=70 -version
+
+# 최종적으로 확정된 플래그 값 확인
+java -XX:+PrintFlagsFinal -version | grep -E 'MaxHeapSize|ActiveProcessorCount'</code></pre>
+
+                    <h2 id="sec-6">availableProcessors 하나가 정하는 것들</h2>
+
+                    <p><code>Runtime.availableProcessors()</code> 의 javadoc 은 짧다. JVM 이 사용할 수 있는 프로세서 수를 반환하고, 이 값은 실행 중에 <strong>바뀔 수 있으며</strong>, 1보다 작지 않다. 컨테이너에서 이 값은 앞 절의 올림 계산 결과다. 이 숫자 하나가 아래 것들을 연쇄로 정한다.</p>
+
+                    <h3>컬렉터 선택과 GC 스레드 수</h3>
+
+                    <p>서버급 판정 조건이 여기 걸린다. 프로세서 2개 미만이거나 메모리 1792MB 미만이면 서버급이 아니고, 기본 컬렉터는 <strong>G1 이 아니라 Serial</strong> 이 된다. CPU limit 이 <code>500m</code> 인 컨테이너는 프로세서 1개로 계산되므로 이 조건에 걸린다. 그 상태에서 G1 전용 튜닝 플래그를 붙여 봐야 아무 일도 일어나지 않는다.</p>
+
+                    <p>서버급을 통과하더라도 GC 워커 수가 프로세서 수를 따라간다. 가이드는 「최대 GC 스레드 수는 힙 크기와 가용 CPU 자원에 의해 제한된다」고만 적고 산식은 밝히지 않는다. 그래도 방향은 분명하다. <strong>프로세서를 적게 보면 GC 도 느리게 돈다.</strong></p>
+
+                    <h3>ActiveProcessorCount 로 덮어쓰기</h3>
+
+                    <p>man page 가 이 플래그의 범위를 알려 준다. 「VM 이 가비지 컬렉션이나 ForkJoinPool 같은 작업에 쓸 <strong>스레드 풀 크기를 계산할 때</strong> 사용하는 CPU 수를 덮어쓴다」. 「<code>UseContainerSupport</code> 가 켜져 있지 않아도 존중된다」는 단서와, <strong>여러 자바 프로세스를 컨테이너에서 돌릴 때 CPU 자원을 나누는 데 유용하다</strong>는 용도까지 적혀 있다.</p>
+
+                    <ul>
+                        <li>이 플래그는 <strong>JVM 이 보는 값만 바꾼다.</strong> cgroup 의 quota 는 그대로다. 1로 낮춰도 컨테이너는 여전히 limit 만큼 쓸 수 있다</li>
+                        <li>그래서 낮게 잡으면 GC 워커와 병렬 처리가 줄어드는데 정작 스로틀링은 줄지 않는다. <strong>스로틀링 해결책이 아니다</strong></li>
+                        <li>반대로 높게 잡으면 스레드만 늘고 quota 는 그대로라 스로틀링이 심해진다. 「코어를 더 준 셈 치자」는 성립하지 않는다</li>
+                        <li>제대로 쓰이는 자리는 <strong>한 파드에 자바 프로세스가 둘 이상</strong>일 때다. 각자가 파드 전체를 자기 것으로 계산하는 것을 막는다</li>
+                    </ul>
+
+                    <p>병렬 스트림도 같은 값에 묶인다. <code>ForkJoinPool</code> 의 javadoc 은 인자 없는 생성자가 <code>Runtime.availableProcessors()</code> 와 같은 병렬도로 풀을 만든다고 적고, 공용 풀의 병렬도는 <code>java.util.concurrent.ForkJoinPool.common.parallelism</code> 속성으로 지정할 수 있다고 안내한다. CPU limit 을 바꾸는 일은 <strong>애플리케이션 코드의 병렬도를 바꾸는 일</strong>이기도 하다.</p>
+
+                    <h2 id="sec-7">CPU Limit 은 왜 지연을 만드는가</h2>
+
+                    <p>쿠버네티스 문서의 문장이 명확하다. cpu limit 은 <strong>CPU 스로틀링으로 강제</strong>되며, 컨테이너가 limit 에 가까워지면 커널이 그만큼으로 CPU 접근을 제한한다. 커널이 강제하는 하드 리밋이다. 메모리처럼 「넘으면 죽는다」가 아니라 「넘으려 하면 멈춘다」다.</p>
+
+                    <p>멈추는 단위가 핵심이다. kubelet 은 기본적으로 CFS quota 로 파드 CPU limit 을 강제하고, 주기값을 정하는 옵션 <code>--cpu-cfs-quota-period</code> 의 <strong>기본값은 100ms</strong> 다. 스로틀링은 초 단위로 매끄럽게 일어나지 않고 <strong>100ms 짜리 창 안에서 할당량을 다 쓰면 그 창이 끝날 때까지 멈추는</strong> 방식으로 일어난다.</p>
+
+                    <p>여기서 평균의 함정이 나온다. CPU limit 이 1이고 스레드가 4개면 100ms 분량이 25ms 만에 소진되고, 남은 75ms 동안 그 컨테이너의 <strong>모든 스레드</strong>가 멈춘다. 1초로 평균 내면 사용률은 100퍼센트 미만이라 그래프는 평온하다. 그 1초 안에 최대 75ms 짜리 정지가 여러 번 들어 있는데도 그렇다. <strong>평균 사용률이 낮은데 p99 만 튀는 현상의 정체가 대개 이것이다.</strong></p>
+
+                    <p>GC 와 겹치면 더 나빠진다. stop-the-world 구간에서 할당량이 소진되면 GC 스레드도 같이 멈추고, 다음 주기가 열려야 재개된다. 짧았을 정지가 <strong>주기 경계까지 늘어난다.</strong> GC 로그의 정지 시간과 스로틀 지표를 같이 놓고 봐야 하는 이유다.</p>
+
+                    <h2 id="sec-8">CPU limit 을 걸 것인가 말 것인가</h2>
+
+                    <p>이 주제는 결론이 갈린다. 양쪽이 다른 것을 최적화하고 있고, 양쪽 다 문서로 뒷받침되는 근거가 있다. 나란히 두는 편이 정확하다.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>걸지 말자는 쪽</th><th>근거</th><th>걸자는 쪽</th><th>근거</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>스로틀링이 실제 지연을 만든다</td><td>커널이 강제하는 하드 리밋이고 주기 기본값이 100ms 다</td><td>Guaranteed QoS 의 조건이다</td><td>모든 컨테이너의 CPU limit 이 request 와 같아야 Guaranteed 가 된다</td></tr>
+                            <tr><td>CPU 가 모자라도 파드는 죽지 않는다</td><td>축출 신호는 memory·파일시스템·pid 뿐이고 CPU 가 없다</td><td>축출 순서에서 뒤로 밀린다</td><td>축출은 BestEffort, Burstable, Guaranteed 순서다</td></tr>
+                            <tr><td>노드가 한가하면 남는 CPU 를 쓸 수 있다</td><td>자원이 남으면 request 이상을 쓰는 것이 허용된다</td><td>CPU 고정을 쓰려면 필수다</td><td>static 정책의 전용 CPU 는 Guaranteed 파드 + 정수 request 에만 배정된다</td></tr>
+                            <tr><td>request 만으로도 배치는 정해진다</td><td>request 는 스케줄러가 배치를 정하는 데 쓰인다</td><td>이웃의 지연이 예측 가능해진다</td><td>문서 근거가 아니라 운영 방침에 가까운 이유다</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>정리하면 <strong>지연이 중요한 소수 서비스</strong>와 <strong>밀도가 중요한 다수 배치 작업</strong>이 다른 답을 낸다. 앞쪽은 스로틀링을 피하려 limit 을 빼거나 크게 잡고, 뒤쪽은 예측 가능성과 축출 순위를 위해 건다. 판단 기준은 취향이 아니라 지표다. <strong>스로틀 지표가 실제로 올라가고 있는가</strong>를 먼저 본다.</p>
+
+                    <p>한 가지는 분명히 구분해야 한다. <strong>메모리 limit 을 빼는 것은 CPU limit 을 빼는 것과 같은 성질의 결정이 아니다.</strong> CPU 는 모자라면 느려질 뿐이지만 메모리는 압축되지 않는다. 메모리 limit 이 없으면 그 파드는 노드 전체를 위험에 빠뜨리고, JVM 은 노드 메모리를 기준으로 힙을 계획한다.</p>
+
+                    <h2 id="sec-9">Request 와 Limit 은 다른 일을 한다</h2>
+
+                    <p>쿠버네티스 문서의 정의는 짧다. request 를 지정하면 <strong>kube-scheduler 가 그 정보로 파드를 어느 노드에 놓을지 정한다.</strong> limit 을 지정하면 <strong>kubelet 이 그것을 강제해서</strong> 실행 중인 컨테이너가 그 이상 쓰지 못하게 한다. 하나는 배치 단계의 숫자, 다른 하나는 실행 단계의 숫자다.</p>
+
+                    <p>JVM 관점에서 결정적인 것은 <strong>JVM 이 request 를 보지 않는다</strong>는 점이다. <code>MaxRAM</code> 이 참조하는 것은 「환경이 건 제약」, 즉 cgroup 의 limit 이다. request 만 크게 잡고 limit 을 비워 둔 파드는 스케줄러 눈에 여유 있게 배치된 파드인데, 그 안의 JVM 은 있지도 않은 메모리를 전제로 움직인다.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>QoS 클래스</th><th>조건</th><th>축출 순서</th><th>JVM 관점에서의 뜻</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Guaranteed</td><td>모든 컨테이너가 CPU·메모리의 limit 과 request 를 갖고 두 값이 같다</td><td>가장 늦게 축출된다</td><td>힙 비율의 분모가 확정적이다. 어긋날 여지가 가장 적다</td></tr>
+                            <tr><td>Burstable</td><td>Guaranteed 조건을 못 채우면서 컨테이너 중 하나라도 request 나 limit 이 있다</td><td>BestEffort 다음</td><td>limit 이 있으면 그것이 분모다. 없으면 노드 메모리가 분모다</td></tr>
+                            <tr><td>BestEffort</td><td>어떤 컨테이너에도 CPU·메모리의 request 와 limit 이 없다</td><td>가장 먼저 축출된다</td><td>JVM 이 노드 전체를 자기 것으로 계산한다. 자바에는 사실상 금지</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>문서가 덧붙이는 조건도 알아 둘 만하다. 자원 압박으로 인한 축출일 때 <strong>후보가 되는 것은 request 를 초과해 쓰고 있는 파드</strong>다. request 를 현실적으로 잡아 두는 일이 단순한 서류 작업이 아닌 이유다.</p>
+
+                    <h2 id="sec-10">JIT 워밍업이 readiness 를 무너뜨리는 자리</h2>
+
+                    <p>HotSpot 은 기본으로 C1 과 C2 를 함께 쓰는 계층 컴파일러로 뜬다. 컴파일 자체가 CPU 를 쓴다. 그래서 자바 애플리케이션의 CPU 사용량은 <strong>기동 직후가 가장 높고</strong> 정상 상태에서 내려간다. 그런데 CPU limit 은 대개 정상 상태를 기준으로 잡힌다. <strong>가장 CPU 가 필요한 구간이 가장 심하게 스로틀링된다.</strong></p>
+
+                    <p>다음은 정해진 수순이다. 기동이 늦어지면 readiness probe 가 실패하고, 문서의 표현대로 kubelet 이 컨테이너를 준비되지 않음으로 표시하면 엔드포인트 컨트롤러가 <strong>그 파드의 IP 를 매칭되는 서비스 엔드포인트에서 제거</strong>한다. 여기까지는 정상 동작이다. 문제는 liveness probe 까지 같은 임계값으로 걸어 둔 경우다. liveness 가 실패하면 재시작 정책에 따라 컨테이너가 죽고, 다시 기동하며 같은 구간을 또 지나간다. 재시작 루프가 만들어진다.</p>
+
+                    <p>공식 처방은 startup probe 다. 문서는 이 프로브가 <strong>느리게 시작하는 컨테이너를 보호</strong>하며 liveness·readiness 를 건드리지 않고 기동 전용 성공 기준을 정의하게 해 준다고 적는다. 권장 형태까지 안내한다. liveness 와 같은 검사를 쓰되 <strong>실패 임계값만 높게</strong> 잡는 것이다. liveness 자체를 헐겁게 풀면 진짜 고장을 못 잡는다.</p>
+
+                    <ul>
+                        <li>기동 구간에만 CPU 를 더 주는 것은 <strong>표준 request·limit 만으로는 되지 않는다.</strong> startup probe 로 시간을 벌거나 limit 을 올리는 쪽으로 간다</li>
+                        <li>limit 을 올리기 싫다면 클래스 데이터 공유나 사전 컴파일 같은 기동 최적화가 다음 선택지다. 그 효과는 이 글에서 확인하지 않았다</li>
+                        <li>기동이 느려 첫 요청이 느린 것과 스로틀링 때문에 상시 p99 가 높은 것은 <strong>다른 문제</strong>다. 기동 구간과 정상 구간을 나눠 보지 않으면 섞인다</li>
+                    </ul>
+
+                    <h2 id="sec-11">무엇을 보고 정하는가</h2>
+
+                    <p>가장 흔한 실수는 숫자 하나로 결정하는 것이다. 힙 사용량 그래프 하나로 limit 을 정하거나 CPU 사용률 하나로 스로틀링 여부를 판단한다. 아래 다섯 개는 서로 다른 것을 말한다.</p>
+
+                    <ul>
+                        <li><strong>GC 직후의 힙 사용량</strong> — 힙 크기 산정의 근거다. 톱니 그래프의 꼭대기는 「필요한 크기」가 아니라 「수거 직전의 쓰레기 포함 크기」다</li>
+                        <li><strong>커밋된 힙</strong> — JVM 이 실제로 확보해 둔 크기. 컬렉터에 따라 쓰지 않는 부분을 운영체제에 돌려주기도 한다</li>
+                        <li><strong>프로세스 RSS</strong> — 물리 메모리에 올라와 있는 양. 여기서 힙을 빼면 힙 밖이 얼마인지 대략 보인다</li>
+                        <li><strong>컨테이너 메모리 사용량</strong> — cgroup 이 보는 값이고 OOM 판단의 기준이다. 페이지 캐시가 섞인다</li>
+                        <li><strong>CPU 스로틀 지표</strong> — 사용률이 아니라 <strong>스로틀된 주기 수와 시간</strong>을 본다. 사용률은 스로틀링을 숨긴다</li>
+                    </ul>
+
+                    <p>순서는 단순하다. limit 을 정하고, 비율로 힙을 주고, 실제 트래픽에서 위 다섯을 같이 보고, 되돌아가 고친다. 특히 <strong>합성 부하만으로는 힙 밖 메모리가 잘 드러나지 않는다.</strong> 클래스 로딩과 코드 캐시는 실제 코드 경로가 다양하게 밟혀야 늘어난다.</p>
+
+                    <h2 id="sec-12">흔한 실패 다섯 가지</h2>
+
+                    <p>같은 실패가 반복되는 이유는 증상이 원인과 멀리 떨어져 나타나기 때문이다.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>실패</th><th>실제로 일어나는 일</th><th>증상</th><th>무엇을 보나</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>limit 을 아예 걸지 않았다</td><td>JVM 이 노드 메모리와 노드 CPU 수로 계획한다</td><td>노드가 압박을 받고 엉뚱한 파드가 축출된다</td><td>QoS 클래스와 노드 축출 이벤트</td></tr>
+                            <tr><td><code>-Xmx</code> 를 limit 과 같게 줬다</td><td>힙 밖 몫이 0 이 된다</td><td>예외 없이 <code>OOMKilled</code>, 덤프도 없다</td><td>RSS 와 힙의 차이, 네이티브 메모리 추적</td></tr>
+                            <tr><td>request 만 있고 limit 이 없다</td><td>Burstable 이 되고 JVM 은 노드 기준으로 계획한다</td><td>배치는 여유로운데 실행 중에 죽는다</td><td>request 와 limit 을 나란히 확인</td></tr>
+                            <tr><td>CPU limit 이 너무 낮다</td><td>프로세서 1개로 계산되어 서버급 판정에 미달한다</td><td>GC 정지가 길어지고 튜닝 플래그가 안 먹는다</td><td>선택된 컬렉터, GC 정지 시간, 스로틀 지표</td></tr>
+                            <tr><td>다중 컨테이너 파드에서 합산을 잊었다</td><td>사이드카가 같은 한도를 나눠 쓴다</td><td>사이드카를 넣은 뒤부터 죽는다</td><td>파드 안 모든 컨테이너의 request·limit 합계</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>네 번째에는 반대 방향의 함정도 있다. <code>-XX:ActiveProcessorCount</code> 로 프로세서 수만 올려 잡으면 컬렉터 선택은 바뀌지만 quota 는 그대로다. <strong>스레드가 늘어난 만큼 스로틀링만 심해진다.</strong> 컬렉터를 바꾸고 싶으면 프로세서 수를 속이는 대신 <code>-XX:+UseG1GC</code> 처럼 직접 지정하는 편이 정직하다.</p>
+
+                    <h2 id="sec-13">어느 버전을 기준으로 한 이야기인가</h2>
+
+                    <p>이 영역은 버전에 따라 동작이 실제로 다르다. 오래된 글을 그대로 옮겨 적용했다가 어긋나는 대표적인 자리라서 기준을 밝혀 둔다.</p>
+
+                    <ul>
+                        <li><strong>JDK 8u190 이하와 JDK 9</strong> — 컨테이너 인식이 없다. 호스트 기준으로 힙과 프로세서 수를 정하므로 <code>-Xmx</code> 를 손으로 못 박는 것 외에 방법이 없다</li>
+                        <li><strong>JDK 8u191 이상과 JDK 10 이상</strong> — <code>UseContainerSupport</code> 가 기본으로 켜져 있고 RAMPercentage 세 플래그와 <code>ActiveProcessorCount</code> 를 쓸 수 있다</li>
+                        <li><strong>JDK 19</strong> — OpenJDK 버그 <code>JDK-8281181</code> 「Do not use CPU Shares to compute active processor count」 가 이 버전에 반영됐다. 그 전에는 quota 가 없을 때 cpu shares 로 프로세서 수를 계산했고, 쿠버네티스에서 cpu shares 는 <strong>CPU request 에서 나온다.</strong> 옛 JDK 에서는 request 가 JVM 병렬도에 영향을 줬다는 뜻이다</li>
+                        <li><strong>본문의 플래그 기본값</strong> — Java 21 의 <code>java</code> man page 기준이다. 컬렉터 선택과 서버급 판정은 Java 25 GC 튜닝 가이드 기준이다</li>
+                        <li><strong>쿠버네티스 쪽</strong> — 2026년 9월 기준 공식 문서다. cgroup v1 과 v2 의 차이는 다루지 않았다</li>
+                    </ul>
+
+                    <p>세 번째가 특히 성가시다. 런타임을 올리면서 CPU 설정을 그대로 뒀는데 병렬도가 달라지는 일이 생길 수 있다. <strong>플래그를 그대로 두는 것 자체가 변경</strong>일 수 있다는 뜻이다.</p>
+
+                    <h2 id="sec-14">정리</h2>
+
+                    <p>뼈대는 한 문장이다. <strong>파드 스펙의 숫자는 컨테이너를 제약하는 값이면서 동시에 JVM 이 자기 계획을 세우는 입력이다.</strong> 메모리 limit 은 힙 비율의 분모가 되고, CPU limit 은 프로세서 수가 되어 컬렉터 선택과 스레드 풀 크기를 정한다.</p>
+
+                    <p>실무적으로 남는 것은 셋이다. <code>-Xmx</code> 를 limit 과 같게 두지 않는다. 힙 밖 몫을 남기지 않으면 커널이 조용히 죽인다. 비율로 준다. 관리할 숫자가 하나로 줄고 기본값 25퍼센트는 대개 너무 작다. CPU limit 은 지연 예산과 함께 정한다. 100ms 주기 안의 정지는 초 단위 평균에 나타나지 않는다. 그리고 어떤 비율도 남이 정해 줄 수 없다. 힙 밖 메모리는 프레임워크와 스레드 수에 따라 서비스마다 다르다. <strong>측정해서 정하고, 런타임을 올릴 때마다 다시 본다.</strong></p>
+
+                    <h2 id="sec-15">확인하지 못한 것</h2>
+
+                    <ul>
+                        <li><strong>리눅스 컨테이너에서 직접 실행해 검증하지 못했다.</strong> 본문의 명령은 문서에 근거해 적은 것이고, 실행 출력은 하나도 붙이지 않았다</li>
+                        <li><code>ForkJoinPool</code> <strong>공용 풀의 기본 병렬도</strong> 산식은 javadoc 에 없다. 인자 없는 생성자가 <code>availableProcessors()</code> 와 같다는 것만 확인했다</li>
+                        <li><code>-XX:ParallelGCThreads</code> 와 <code>-XX:ConcGCThreads</code> 의 <strong>기본 산식</strong>도 man page 에 없다. 가이드는 「힙 크기와 가용 CPU 자원에 의해 제한된다」고만 적는다</li>
+                        <li><code>JDK-8281181</code> 의 <strong>백포트 여부</strong>는 확인하지 못했다. 버그 데이터베이스에 기록된 수정 버전은 19 하나였다</li>
+                        <li><strong>cgroup v1 과 v2 의 차이</strong>가 위 계산에 미치는 영향은 다루지 않았다. 파일 이름과 단위가 다르다</li>
+                        <li>파드 자원을 <strong>재시작 없이 바꾸는 기능</strong>과, 그때 JVM 이 값을 다시 읽는지는 확인 범위 밖이다</li>
+                        <li>기동 최적화 기법이 <strong>스로틀링 구간에서 얼마나 도움이 되는지</strong>는 측정하지 않았다</li>
+                    </ul>
+
+                    <h2 id="sec-16">참고 자료</h2>
+
+                    <ul>
+                        <li><a href="https://news.hada.io/topic?id=33103" target="_blank" rel="noopener">GeekNews 토픽 33103</a> — 이 글의 계기가 된 소개</li>
+                        <li><a href="https://learnkube.com/java-jvm-kubernetes-requests-limits" target="_blank" rel="noopener">Java JVM in Kubernetes: CPU and Memory Requests and Limits (learnkube.com)</a> — 계기가 된 원문. 최대 힙을 컨테이너 메모리의 50에서 75퍼센트 사이에서 시작해 검증하라는 권고의 출처</li>
+                        <li><a href="https://docs.oracle.com/en/java/javase/21/docs/specs/man/java.html" target="_blank" rel="noopener">java Command Reference (Java SE 21, Oracle)</a> — <code>MaxRAM</code>·<code>MaxRAMPercentage</code>(25퍼센트)·<code>MinRAMPercentage</code>(50퍼센트)·<code>InitialRAMPercentage</code>(1.5625퍼센트)·<code>ActiveProcessorCount</code>·<code>UseContainerSupport</code>·<code>MaxMetaspaceSize</code>·<code>ReservedCodeCacheSize</code>(240MB)·<code>Xss</code>·<code>NativeMemoryTracking</code> 의 출처</li>
+                        <li><a href="https://docs.oracle.com/en/java/javase/25/gctuning/ergonomics.html" target="_blank" rel="noopener">Ergonomics (HotSpot GC Tuning Guide, Java SE 25)</a> — 서버급 판정 1792MB·2 프로세서, 기본 컬렉터, 초기 힙 64분의 1·최대 힙 4분의 1</li>
+                        <li><a href="https://www.oracle.com/java/technologies/javase/10-relnote-issues.html" target="_blank" rel="noopener">JDK 10 Release Notes (Oracle)</a> — <code>JDK-8146115</code> 컨테이너 인식, <code>JDK-8186248</code> RAMPercentage</li>
+                        <li><a href="https://www.oracle.com/java/technologies/javase/8u191-relnotes.html" target="_blank" rel="noopener">Java SE 8u191 Release Notes (Oracle)</a> — 같은 항목이 8u191 에도 실려 있다</li>
+                        <li><a href="https://raw.githubusercontent.com/openjdk/jdk/master/src/hotspot/os/linux/cgroupSubsystem_linux.cpp" target="_blank" rel="noopener">OpenJDK cgroupSubsystem_linux.cpp</a> — <code>active_processor_count</code> 알고리즘과 올림 규칙</li>
+                        <li><a href="https://bugs.openjdk.org/browse/JDK-8281181" target="_blank" rel="noopener">JDK-8281181 Do not use CPU Shares to compute active processor count</a> — 수정 버전 19</li>
+                        <li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/Runtime.html" target="_blank" rel="noopener">Runtime (Java SE 21 API)</a> — <code>availableProcessors()</code> 의 정의</li>
+                        <li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ForkJoinPool.html" target="_blank" rel="noopener">ForkJoinPool (Java SE 21 API)</a> — 생성자의 병렬도와 공용 풀 시스템 속성</li>
+                        <li><a href="https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/" target="_blank" rel="noopener">Resource Management for Pods and Containers (Kubernetes)</a> — request 와 limit 의 역할, cpu 스로틀링, memory limit 의 커널 OOM kill</li>
+                        <li><a href="https://kubernetes.io/docs/concepts/workloads/pods/pod-qos/" target="_blank" rel="noopener">Pod Quality of Service Classes (Kubernetes)</a> — 세 QoS 클래스와 축출 순서</li>
+                        <li><a href="https://kubernetes.io/docs/reference/command-line-tools-reference/kubelet/" target="_blank" rel="noopener">kubelet Command Line Reference (Kubernetes)</a> — <code>--cpu-cfs-quota-period</code> 기본값 100ms</li>
+                        <li><a href="https://kubernetes.io/docs/tasks/administer-cluster/cpu-management-policies/" target="_blank" rel="noopener">Control CPU Management Policies on the Node (Kubernetes)</a> — CFS quota 강제와 static 정책의 전용 CPU 조건</li>
+                        <li><a href="https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/" target="_blank" rel="noopener">Node-pressure Eviction (Kubernetes)</a> — 축출 신호 목록에 CPU 가 없다는 근거</li>
+                        <li><a href="https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/" target="_blank" rel="noopener">Pod Lifecycle (Kubernetes)</a> — readiness 실패 시 엔드포인트 제거, startup probe 의 역할</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>이 글 공유하기</h3>
+                    <div class="social-share">
+                        <button id="kakao-share" class="share-btn kakao-btn"><img src="https://developers.kakao.com/assets/img/about/logos/kakaolink/kakaolink_btn_small.png" alt="카카오톡" loading="lazy" decoding="async" width="34" height="35">카카오톡</button>
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(트위터)</button>
+                        <button id="threads-share" class="share-btn threads-btn">쓰레드</button>
+                        <button id="link-copy" class="share-btn link-btn">링크 복사</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">목록으로 돌아가기</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">함께 쓰면 좋은 무료 도구</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/code_image.html">코드 이미지 생성기</a></li>
+      <li><a href="../static/char_counter.html">글자수 세기</a></li>
+      <li><a href="../static/json_formatter.html">JSON 포맷터</a></li>
+      <li><a href="../static/regex_tester.html">정규식 테스트기</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">전체 도구 보기 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">관련 글</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="oom_killer_diagnosis.html">프로세스가 말없이 죽었다 - OOM 킬러를 읽는 법</a></li>
+      <li><a href="agent_behavior_spec.html">오래 도는 에이전트는 무엇으로 채점하는가 - 행동을 명세로 적는다는 발상의 실체</a></li>
+      <li><a href="vector_db_selection_criteria.html">벡터 검색을 무엇 위에 올릴 것인가 - 쓰던 검색 엔진에 얹는 길과 전용 엔진을 세우는 길</a></li>
+      <li><a href="bug_blindness.html">「원래 그래요」는 어떻게 만들어지는가 - 결함이 배경으로 내려앉는 과정과 다시 보이게 만드는 법</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const kakaoShareBtn = document.getElementById('kakao-share');
+        if (kakaoShareBtn) {
+            kakaoShareBtn.addEventListener('click', function() {
+                if (!window.Kakao) return;
+                if (!window.Kakao.isInitialized()) window.Kakao.init('e06d0ee93e450a11bc6451d46e09cd88');
+                if (window.Kakao.Share) {
+                    window.Kakao.Share.sendDefault({
+                        objectType: 'feed',
+                        content: { title: document.title, description: document.querySelector('meta[name="description"]')?.content || '', imageUrl: 'https://braindetox.kr/site_logo.png', link: { mobileWebUrl: location.href, webUrl: location.href } },
+                        buttons: [{ title: '웹으로 보기', link: { mobileWebUrl: location.href, webUrl: location.href } }]
+                    });
+                }
+            });
+        }
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('링크가 복사되었습니다. 쓰레드 앱에 붙여넣기하여 공유하세요!');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('링크가 복사되었습니다!'); });
+    });
+    </script>
+</body>
+</html>

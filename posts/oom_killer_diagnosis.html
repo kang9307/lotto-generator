@@ -1,0 +1,718 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ko">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>프로세스가 말없이 죽었다 - OOM 킬러를 읽는 법</title>
+    <meta name="description" content="애플리케이션 로그가 비어 있는데 프로세스만 사라졌다면 죽은 게 아니라 죽임당한 것이다. 종료 코드 137, 커널이 찍는 OOM 표를 읽는 순서, 시스템 OOM 과 cgroup OOM 의 차이, 오버커밋과 스왑이 바꾸는 것을 정리했다.">
+    <meta name="keywords" content="OOM killer, OOMKilled, 종료 코드 137, SIGKILL, dmesg, journalctl, oom_score_adj, oom_badness, cgroup v2, memory.max, memory.events, 오버커밋, vm.overcommit_memory, CommitLimit, MemAvailable, 스왑, PSI, CrashLoopBackOff, 개발, 인프라, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/posts/oom_killer_diagnosis.html">
+
+    <meta property="og:title" content="프로세스가 말없이 죽었다 - OOM 킬러를 읽는 법">
+    <meta property="og:description" content="애플리케이션 로그에는 아무것도 남지 않는다. 커널 쪽 기록에서 무엇을 보고, 시스템 OOM 과 cgroup OOM 을 어떻게 가르는가.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/posts/oom_killer_diagnosis.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ko_KR">
+    <meta property="article:published_time" content="2026-09-02">
+    <meta property="article:section" content="개발/인프라">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="프로세스가 말없이 죽었다 - OOM 킬러를 읽는 법">
+    <meta name="twitter:description" content="종료 코드 137 에서 시작해, 커널이 남긴 표에서 범인을 고르고, 노드 문제인지 한도 문제인지를 가르는 순서.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "프로세스가 말없이 죽었다 - OOM 킬러를 읽는 법",
+      "alternativeHeadline": "애플리케이션 로그가 비어 있을 때 커널이 남긴 기록에서 무엇을 보는가",
+      "datePublished": "2026-09-02",
+      "dateModified": "2026-09-02",
+      "inLanguage": "ko-KR",
+      "articleSection": "개발/인프라",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "OOM killer, OOMKilled, 종료 코드 137, SIGKILL, dmesg, oom_score_adj, cgroup v2, memory.max, 오버커밋, 스왑, CrashLoopBackOff",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/posts/oom_killer_diagnosis.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "종료 코드 137 이면 무조건 OOM 인가?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "아니다. 137 은 셸이 보고하는 128 더하기 신호 번호의 결과이고, 9 번 신호는 SIGKILL 이다. 즉 137 이 말해 주는 것은 「강제 종료됐다」까지이고, 누가 보냈는지는 말해 주지 않는다. 커널의 OOM 킬러일 수도 있고, 종료 유예 시간을 넘겨 오케스트레이터가 보낸 것일 수도 있고, 사람이 보낸 것일 수도 있다. 다음 단계는 같은 시각에 커널 로그에 OOM 기록이 있는지 확인하는 것이다. 기록이 없으면 커널이 죽인 것이 아니다."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "노드에 메모리가 남아 있는데 컨테이너가 OOMKilled 되는 이유는?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "cgroup 한도에 닿았기 때문이다. 커널 cgroup v2 문서는 memory.max 에 대해 「cgroup 의 메모리 사용량이 이 한도에 도달하고 줄일 수 없으면 그 cgroup 안에서 OOM 킬러가 호출된다」고 적고 있다. 판단 범위가 그 cgroup 과 하위로 한정되므로 노드 전체에 여유가 있어도 죽는다. 커널 소스에서도 이 둘은 로그 머리말로 갈린다. 시스템 OOM 은 Out of memory 로, cgroup OOM 은 Memory cgroup out of memory 로 시작한다. 이 경우 노드를 증설해도 아무것도 바뀌지 않는다."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "가장 메모리를 많이 쓰는 프로세스가 죽는 것 아닌가?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "대개 그렇지만 항상 그렇지는 않다. 커널의 badness 계산은 RSS 와 스왑 엔트리와 페이지 테이블 크기를 더한 값에서 시작하고, 여기에 oom_score_adj 를 전체 메모리 크기에 비례하도록 환산해 더한다. 그래서 oom_score_adj 를 100 올려 둔 프로세스는 전체 메모리의 10 퍼센트를 더 쓰고 있는 것처럼 취급된다. 커널 문서 기준으로 이 값의 범위는 -1000 부터 +1000 이며, -1000 은 그 태스크의 OOM 킬링을 사실상 끄는 값이다. 커널이 남긴 표에서 oom_score_adj 열을 봐야 왜 그 프로세스가 골라졌는지 설명된다."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "malloc 이 성공했는데 나중에 죽는 것은 왜인가?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "리눅스는 기본적으로 실제 메모리보다 많이 약속하기 때문이다. 커널 sysctl 문서는 vm.overcommit_memory 가 0 일 때 「커널이 사용자 공간의 메모리 요청 크기를 전체 메모리와 스왑의 합과 비교해 명백한 과요청만 거절한다」고 적는다. 할당은 주소 공간을 얻는 일이고, 물리 페이지는 그 주소에 처음 쓸 때 붙는다. 그래서 실패는 malloc 이 아니라 그 뒤 첫 쓰기 시점에 나타나고, 그 시점의 처리는 예외가 아니라 SIGKILL 이다. 애플리케이션이 잡을 방법이 없는 이유가 여기에 있다."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "메모리 한도를 올리면 해결되는가?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "원인이 누수라면 주기만 길어진다. 한도를 올리는 것은 고치는 일이 아니라 시간을 사는 일이므로, 산다면 언제까지 사는지를 같이 적어 두는 편이 낫다. 그리고 한도만 올리고 요청값을 그대로 두면 스케줄러가 배치를 잘못 판단해 cgroup OOM 이 노드 전체의 시스템 OOM 으로 옮겨 갈 수 있다. 먼저 볼 것은 사용량이 오르는 모양이다. 시간에 비례해 오르면 누수 쪽이고, 계단으로 오르면 트래픽이나 배포 쪽이며, 데이터 증가만큼만 오르면 결과 집합 크기 쪽이다."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <script src="https://t1.kakaocdn.net/kakao_js_sdk/2.4.0/kakao.min.js" crossorigin="anonymous" defer></script>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/oom_killer_diagnosis.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/oom_killer_diagnosis.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/oom_killer_diagnosis.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/oom_killer_diagnosis.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/oom_killer_diagnosis.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "홈",
+      "item": "https://braindetox.kr/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "개발/인프라",
+      "item": "https://braindetox.kr/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "프로세스가 말없이 죽었다 - OOM 킬러를 읽는 법",
+      "item": "https://braindetox.kr/posts/oom_killer_diagnosis.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="프로세스가 말없이 죽었다 - OOM 킬러를 읽는 법">
+                <meta itemprop="datePublished" content="2026-09-02">
+                <meta itemprop="dateModified" content="2026-09-02">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="OOM killer, OOMKilled, 종료 코드 137, SIGKILL, dmesg, oom_score_adj, cgroup v2, memory.max, 오버커밋, 스왑, CrashLoopBackOff">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/posts/oom_killer_diagnosis.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">프로세스가 말없이 죽었다 - OOM 킬러를 읽는 법</h1>
+                    <h2 class="post-subtitle">애플리케이션 로그가 비어 있을 때, 커널이 남긴 기록에서 범인을 고르는 순서</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-02">2026-09-02</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">개발/인프라</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>프로세스가 사라졌다. 애플리케이션 로그의 마지막 줄은 평범한 요청 처리 기록이고 그 뒤로는 아무것도 없다. 예외 스택도 없고 종료 훅이 남기는 인사말도 없다. 감시 도구는 프로세스가 더 이상 존재하지 않는다는 사실만 알려 준다.</p>
+
+                    <p>여기서 가장 많이 낭비되는 시간은 애플리케이션 로그를 더 자세히 뒤지는 데 쓰인다. 거기에는 없다. 있을 수가 없다. <strong>SIGKILL 은 프로세스가 받아서 처리하는 신호가 아니라 프로세스를 그 자리에서 끝내는 동작</strong>이라, 그 시점에 애플리케이션은 한 글자도 쓸 기회를 갖지 못한다. 그래서 첫 단추는 로그를 더 파는 것이 아니라 가설을 바꾸는 것이다. 죽은 것이 아니라 <strong>죽임당한 것</strong>이다.</p>
+
+                    <div class="callout">
+                        이 글을 쓴 환경은 Windows 10 에 Git Bash(MSYS2, GNU bash 5.2.37(1)-release)다. <strong>리눅스 커널도 cgroup 도 <code>dmesg</code> 도 없는 환경</strong>이므로, 아래에 나오는 커널 동작·필드 정의·파일 경로는 전부 kernel.org 공식 문서와 커널 소스에서 확인한 것이고 실제 OOM 로그를 재현해 붙인 것이 아니다. 이 환경에서 직접 실행해 확인한 것은 종료 코드 규칙 하나뿐이며 그 출력은 본문에 그대로 있다. <strong>확인한 것과 확인하지 못한 것의 경계는 마지막에서 두 번째 절에 모아 두었다.</strong>
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>이 글에서 다루는 것</h3>
+                        <ol>
+                            <li><a href="#sec-1">애플리케이션 로그가 아무 말도 하지 않는 이유</a></li>
+                            <li><a href="#sec-2">죽은 게 아니라 죽임당했다 - 137 과 OOMKilled</a></li>
+                            <li><a href="#sec-3">어디를 보는가</a></li>
+                            <li><a href="#sec-4">커널이 찍는 표를 읽는 법</a></li>
+                            <li><a href="#sec-5">왜 하필 그 프로세스가 죽었나</a></li>
+                            <li><a href="#sec-6">시스템 OOM 과 cgroup OOM 은 다른 사건이다</a></li>
+                            <li><a href="#sec-7">cgroup v1 과 v2 에서 달라지는 것</a></li>
+                            <li><a href="#sec-8">오버커밋 - malloc 이 성공해도 죽는 구조</a></li>
+                            <li><a href="#sec-9">스왑이 바꾸는 것</a></li>
+                            <li><a href="#sec-10">RSS 가 전부가 아니다</a></li>
+                            <li><a href="#sec-11">OOM 은 증상이지 원인이 아니다</a></li>
+                            <li><a href="#sec-12">막는 법 - 한도와 요청, 그리고 재시작 루프</a></li>
+                            <li><a href="#sec-13">점검 순서</a></li>
+                            <li><a href="#sec-14">정리</a></li>
+                            <li><a href="#sec-15">확인하지 못한 것</a></li>
+                            <li><a href="#sec-16">참고 자료</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">애플리케이션 로그가 아무 말도 하지 않는 이유</h2>
+
+                    <p>커널 메모리 관리 문서는 OOM 킬러를 이렇게 설명한다. 부하가 걸린 머신에서 메모리가 고갈되고 커널이 동작을 계속할 만큼 메모리를 회수하지 못하는 상황이 생길 수 있으며, 나머지 시스템을 살리기 위해 커널이 OOM 킬러를 호출한다는 것이다. 그리고 <strong>전체의 건강을 위해 희생시킬 태스크 하나를 고른다</strong>고 적혀 있다. 중요한 것은 「고른다」다. 선택은 커널 쪽에서 일어나고 선택당한 쪽은 통보를 받지 않는다.</p>
+
+                    <p>그래서 애플리케이션이 평소에 남기던 것들이 통째로 빠진다. 예외 스택은 예외가 발생해야 생기는데 예외가 발생하지 않았다. 종료 훅은 신호를 잡을 수 있어야 도는데 SIGKILL 은 잡을 수 없다. 버퍼에 남아 있던 로그는 플러시되지 않고 사라진다. <strong>「마지막 로그 줄이 평범하다」는 것 자체가 신호</strong>이지 정보가 없다는 뜻이 아니다.</p>
+
+                    <ul>
+                        <li><strong>남지 않는 것</strong> — 예외 스택, 종료 훅 실행 흔적, 플러시되지 않은 로그 버퍼, 애플리케이션이 스스로 기록하는 종료 코드</li>
+                        <li><strong>남는 것</strong> — 커널 링 버퍼의 OOM 기록, 부모 프로세스가 받은 종료 상태, 컨테이너 런타임이 붙인 종료 사유, 메트릭 수집기가 마지막으로 긁어 간 값</li>
+                        <li><strong>순서가 뒤집혀 있다</strong> — 평소에는 애플리케이션 로그가 1차 자료이고 커널 로그가 보조다. 이 사건에서는 반대다</li>
+                        <li><strong>메트릭이 끊긴 지점이 힌트다</strong> — 수집 주기가 15초면 죽기 직전 15초의 값은 없다. 마지막 점이 평온해도 그 사이에 급등이 있었을 수 있다</li>
+                    </ul>
+
+                    <h2 id="sec-2">죽은 게 아니라 죽임당했다 - 137 과 OOMKilled</h2>
+
+                    <p>가설 전환의 근거는 종료 코드다. 셸은 명령이 치명적 신호로 끝났을 때 128 에 신호 번호를 더한 값을 종료 상태로 보고한다. 이 규칙은 리눅스가 아닌 환경에서도 같은 셸이라면 동일하게 동작하므로, 이 글을 쓴 Git Bash 에서 그대로 확인할 수 있었다.</p>
+
+                    <pre><code>$ bash --version | head -1
+GNU bash, version 5.2.37(1)-release (x86_64-pc-msys)
+
+$ bash -c 'kill -9 $$'; echo "exit=$?"
+/usr/bin/bash: line 1:  1419 Killed                  bash -c 'kill -9 $$'
+exit=137
+
+$ bash -c 'kill -15 $$'; echo "term_exit=$?"
+Terminated
+term_exit=143</code></pre>
+
+                    <p>9 번이 SIGKILL 이라 128 더하기 9 는 137 이고, 15 번이 SIGTERM 이라 143 이다. 짚어야 할 것은 <strong>137 이 말해 주는 범위가 생각보다 좁다</strong>는 점이다. 137 은 「강제 종료됐다」까지만 말한다. 누가 SIGKILL 을 보냈는지는 여기 들어 있지 않다. 커널의 OOM 킬러일 수도, 종료 유예를 넘겨 오케스트레이터가 마무리로 보낸 것일 수도, 배치 스크립트일 수도 있다.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>신호</th><th>번호</th><th>셸이 보고하는 종료 코드</th><th>이 코드가 말해 주는 것</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>SIGTERM</td><td>15</td><td>143</td><td>정리할 기회가 있었다. 무엇을 했는지는 애플리케이션 로그에 남는다</td></tr>
+                            <tr><td>SIGKILL</td><td>9</td><td>137</td><td>즉시 종료됐다. 보낸 주체는 커널 로그와 대조해야 알 수 있다</td></tr>
+                            <tr><td>SIGSEGV</td><td>11</td><td>139</td><td>잘못된 메모리 접근. 메모리 부족과는 다른 사건이다</td></tr>
+                            <tr><td>SIGABRT</td><td>6</td><td>134</td><td>런타임 자신이 포기했다. 할당 실패를 abort 로 처리하는 구현에서 나온다</td></tr>
+                            <tr><td>정상 종료</td><td>-</td><td>0 ~ 125</td><td>애플리케이션이 정한 값. 강제 종료가 아니다</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>신호 번호는 플랫폼의 신호 표를 따른다. 위의 6, 9, 11, 15 는 리눅스에서 안정적으로 같지만 모든 번호가 그렇지는 않다. 이 글을 쓴 MSYS 환경에서 <code>kill -l</code> 을 찍으면 7 번이 SIGEMT 로 나오는데 리눅스 x86 에서 7 번은 SIGBUS 다. <strong>번호를 외워 쓰기보다 그 시스템의 표를 한 번 찍어 보는 편이 안전하다.</strong></p>
+
+                    <p>컨테이너에서는 라벨이 하나 더 붙는다. 런타임이 종료 사유를 <code>OOMKilled</code> 로 기록하고 오케스트레이터가 그것을 파드 상태에 노출한다. 종료 코드보다 명시적이지만 <strong>「어떤 OOM 인지」는 여전히 말해 주지 않는다.</strong> 노드 전체가 부족했던 것과 컨테이너 한도에 닿은 것이 같은 라벨을 달고 나온다.</p>
+
+                    <p>덧붙여 쿠버네티스 문서는 메모리 한도가 <strong>반응적으로</strong> 강제된다고 적는다. 한도를 넘겨 쓰면 커널이 종료시킬 수 있지만 종료는 커널이 메모리 압박을 감지했을 때만 일어나므로 과다 할당한 컨테이너가 즉시 죽지 않을 수 있다는 설명이다. <strong>「어제도 한도를 넘겼는데 왜 오늘 죽었나」의 답이 여기 있다.</strong></p>
+
+                    <h2 id="sec-3">어디를 보는가</h2>
+
+                    <p>커널이 남기는 곳은 하나지만 읽는 창구는 여럿이고 창구마다 보존 기간이 다르다. 이 차이 때문에 「기록이 없다」는 결론이 자주 틀린다.</p>
+
+                    <pre><code># 1) 커널 링 버퍼 - 가장 빠르지만 오래 남지 않는다
+dmesg -T | grep -i -E 'out of memory|oom-killer|killed process'
+
+# 2) 저널 - 커널 메시지만, 시각 범위를 좁혀서
+journalctl -k --since '2 hours ago' | grep -i -E 'oom|killed process'
+
+# 3) 재부팅을 사이에 두었다면 부팅 단위로 되짚는다
+journalctl --list-boots
+journalctl -k -b -1 | grep -i 'killed process'
+
+# 4) 링 버퍼가 이미 밀렸을 때 - 경로는 배포판에 따라 다르다
+grep -i -E 'oom-killer|killed process' /var/log/messages
+grep -i -E 'oom-killer|killed process' /var/log/syslog</code></pre>
+
+                    <p><code>dmesg</code> 가 보는 링 버퍼는 고정 크기라서 새 메시지가 들어오면 오래된 것부터 밀려난다. 스토리지나 네트워크 메시지가 초당 여러 줄씩 찍히는 노드라면 몇 시간 전 OOM 기록은 이미 없다. <strong>「dmesg 에 없으니 OOM 이 아니다」는 결론은 링 버퍼가 밀리지 않았음을 확인한 뒤에만 성립한다.</strong> 저널도 저장 방식이 휘발성이면 재부팅과 함께 사라진다. 로그가 어디까지 남아 있는지는 그 자체가 별도의 주제이고, 로테이션 설정이 만드는 함정은 <a href="log_rotation_pitfalls.html">로그 로테이션이 조용히 어긋나는 자리</a>에서 따로 다뤘다.</p>
+
+                    <p>컨테이너 쪽 창구는 런타임과 오케스트레이터가 들고 있다. 커널 로그에 접근할 권한이 없는 경우가 많아 이쪽이 먼저 손에 닿는다.</p>
+
+                    <pre><code># 쿠버네티스 - 지난번 종료의 사유와 코드
+kubectl describe pod &lt;pod&gt; | sed -n '/Last State/,/Restart Count/p'
+kubectl get pod &lt;pod&gt; -o jsonpath='{range .status.containerStatuses[*]}{.name}{"\t"}{.lastState.terminated.reason}{"\t"}{.lastState.terminated.exitCode}{"\n"}{end}'
+
+# 도커 - OOMKilled 플래그와 종료 코드를 한 줄로
+docker inspect --format '{{.Name}} oom={{.State.OOMKilled}} exit={{.State.ExitCode}}' &lt;container&gt;
+
+# 노드에 들어갈 수 있다면, 커널 쪽과 시각을 맞춘다
+journalctl -k --since '2026-09-02 09:00' --until '2026-09-02 10:00'</code></pre>
+
+                    <p>여기서 첫 갈림길이 나온다. 컨테이너 상태는 <code>OOMKilled</code> 인데 <strong>노드의 커널 로그에 시스템 OOM 기록이 없다면 노드는 멀쩡했던 것</strong>이고, 사건은 cgroup 한도 쪽이다. 반대로 같은 시각에 여러 파드가 함께 죽었고 커널 로그에 노드 전체 메모리 덤프가 남아 있다면 노드 쪽이다. <strong>이 갈림길을 지나기 전에 한도를 올리거나 노드를 증설하는 것은 동전 던지기다.</strong></p>
+
+                    <h2 id="sec-4">커널이 찍는 표를 읽는 법</h2>
+
+                    <p>커널은 OOM 킬링을 수행할 때 태스크 목록을 표로 덤프하며 이 동작은 sysctl 로 켜고 끈다. 커널 sysctl 문서는 <code>oom_dump_tasks</code> 가 커널 스레드를 제외한 시스템 전역 태스크 덤프를 만들어 pid, uid, tgid, vm size, rss, pgtables_bytes, swapents, oom_score_adj 점수, name 같은 정보를 포함시킨다고 적는다. 커널 소스의 헤더 출력 함수에서도 이 덤프가 sysctl 값에 걸려 있는 것이 그대로 보인다.</p>
+
+                    <p>로그에 찍히는 문자열은 세 덩어리다. 아래는 커널 소스의 포맷 문자열을 그대로 옮긴 것이며 <code>%s</code> 나 <code>%d</code> 자리에 실제 값이 채워져 출력된다.</p>
+
+                    <pre><code># (1) 누가 OOM 킬러를 불렀는가 - dump_header()
+%s invoked oom-killer: gfp_mask=%#x(%pGg), order=%d, oom_score_adj=%d
+
+# (2) 후보 목록의 열 이름 - dump_tasks()
+[  pid  ]   uid  tgid total_vm      rss rss_anon rss_file rss_shmem pgtables_bytes swapents oom_score_adj name
+
+# (3) 결론 - __oom_kill_process()
+%s: Killed process %d (%s) total-vm:%lukB, anon-rss:%lukB, file-rss:%lukB, shmem-rss:%lukB, UID:%u pgtables:%lukB oom_score_adj:%d</code></pre>
+
+                    <p>대부분의 사람이 (3) 만 읽고 끝낸다. 그런데 (3) 은 <strong>결론</strong>이고, 원인 후보 목록은 (2) 아래 이어지는 표에 있다. 표를 안 보면 「왜 저 프로세스였는가」에 답할 수 없고, 답하지 못하면 다음번에도 같은 일이 일어난다.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>열</th><th>단위</th><th>무엇인가</th><th>범인을 고를 때의 쓸모</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>total_vm</td><td>페이지</td><td>가상 주소 공간 크기</td><td>낮다. 예약만 하고 쓰지 않은 영역이 포함된다</td></tr>
+                            <tr><td>rss</td><td>페이지</td><td>물리 메모리에 올라와 있는 총량</td><td>여기서 시작한다. 큰 순으로 정렬하면 후보가 좁혀진다</td></tr>
+                            <tr><td>rss_anon</td><td>페이지</td><td>파일 배경이 없는 부분. 힙과 스택</td><td>누수 의심의 1순위. 회수할 방법이 스왑밖에 없다</td></tr>
+                            <tr><td>rss_file</td><td>페이지</td><td>매핑된 파일 페이지</td><td>대개 회수 가능. 이 열만 큰 프로세스는 범인이 아닐 확률이 높다</td></tr>
+                            <tr><td>rss_shmem</td><td>페이지</td><td>tmpfs 와 공유 메모리</td><td><code>/dev/shm</code> 사용량. 파일처럼 보이지만 회수되지 않는다</td></tr>
+                            <tr><td>pgtables_bytes</td><td>바이트</td><td>페이지 테이블 자체가 쓰는 메모리</td><td>스레드가 많거나 매핑이 잘게 쪼개져 있을 때 커진다</td></tr>
+                            <tr><td>swapents</td><td>페이지</td><td>스왑으로 나가 있는 페이지 수</td><td>스왑이 있으면 rss 가 실제보다 작아 보인다. 같이 봐야 한다</td></tr>
+                            <tr><td>oom_score_adj</td><td>없음</td><td>선택에 걸리는 가중치</td><td>rss 1 등이 아닌 프로세스가 죽었다면 답이 이 열에 있다</td></tr>
+                            <tr><td>name</td><td>없음</td><td>실행 파일 이름</td><td>길면 잘린다. 같은 이름이 여럿이면 pid 로 대조한다</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>읽을 때 실수하기 쉬운 대목이 둘이다. 하나는 <strong>단위가 페이지</strong>라는 것이다. 이름에 <code>_bytes</code> 가 붙은 <code>pgtables_bytes</code> 만 바이트이고 나머지 메모리 열은 페이지 수다. 페이지 크기는 아키텍처와 설정에 따라 다르므로 그 시스템 값을 확인하고 곱해야 한다. 다른 하나는 <strong>열 구성이 커널 버전에 따라 다르다</strong>는 것이다. 위 sysctl 문서의 목록과 현재 소스의 헤더 문자열이 이미 어긋나 있다(소스 쪽에 <code>rss_anon</code>, <code>rss_file</code>, <code>rss_shmem</code> 이 더 있다). <strong>자기 로그의 헤더 줄을 먼저 읽고 열 위치를 맞춰야 한다.</strong></p>
+
+                    <pre><code># 저장해 둔 로그에서 표 부분만 추린다
+# 열 번호는 커널 버전마다 다르므로 헤더 줄을 반드시 같이 출력한다
+awk '/\[ *pid *\]/{print; f=1; next} f &amp;&amp; /^\[/{print} f &amp;&amp; !/^\[/{f=0}' oom.log | head -40
+
+# rss 열이 몇 번째인지 헤더에서 세어 본 뒤에 정렬한다 (아래는 4번째인 경우)
+awk '/^\[/{print $4, $NF, $0}' oom.log | sort -nr | head -20</code></pre>
+
+                    <h2 id="sec-5">왜 하필 그 프로세스가 죽었나</h2>
+
+                    <p>커널은 후보마다 badness 점수를 매기고 가장 높은 것을 고른다. 현재 소스에서 그 계산은 <strong>RSS 와 스왑 엔트리 수, 그리고 페이지 테이블 크기를 페이지 단위로 환산한 값을 더하는 것</strong>에서 출발한다. 「이 프로세스를 지금 끝내면 몇 페이지가 돌아오는가」에 대한 추정치다. 그다음 <code>oom_score_adj</code> 가 더해지는데, 그냥 더해지는 것이 아니라 <strong>전체 페이지 수를 1000 으로 나눈 값을 곱한 뒤에 더해진다.</strong></p>
+
+                    <p>이 곱셈이 실무적으로 중요하다. <code>oom_score_adj</code> 1 점이 전체 메모리의 0.1 퍼센트에 해당하는 페이지 수로 환산되므로, 이 값을 100 으로 올려 둔 프로세스는 <strong>전체 메모리의 10 퍼센트를 더 쓰고 있는 것처럼 취급된다.</strong> 128GiB 노드라면 13GiB 를 더 쓰는 셈이다. 「가장 많이 쓰는 프로세스가 죽는다」가 항상 맞지는 않은 산수적 이유가 여기 있다.</p>
+
+                    <p>커널 문서 기준으로 이 값의 범위는 -1000 부터 +1000 이다. 문서는 가장 낮은 -1000 에 대해 <strong>그 태스크의 OOM 킬링을 사실상 끄는 값</strong>이라고 적는다. 항상 badness 점수 0 을 보고하게 되기 때문이라는 설명이다. <code>/proc/&lt;pid&gt;/oom_score</code> 로 노출되는 값에는 이 가중치가 이미 포함돼 실질 범위가 0 부터 2000 이라는 점도 문서에 있다.</p>
+
+                    <pre><code># 특정 프로세스의 현재 점수와 가중치
+cat /proc/&lt;pid&gt;/oom_score
+cat /proc/&lt;pid&gt;/oom_score_adj
+
+# 가중치가 0 이 아닌 프로세스만 훑어 본다 (누가 손을 대 두었는지 확인)
+for p in /proc/[0-9]*; do
+  a=$(cat "$p/oom_score_adj" 2>/dev/null) || continue
+  [ "$a" = "0" ] &amp;&amp; continue
+  printf '%s\t%s\t%s\n' "${p#/proc/}" "$a" "$(tr -d '\0' &lt; "$p/comm")"
+done</code></pre>
+
+                    <ul>
+                        <li>커널은 <strong>스레드 하나가 아니라 스레드 그룹</strong>을 단위로 본다. 표에 <code>tgid</code> 열이 있는 이유다</li>
+                        <li><strong>모니터링 에이전트와 사이드카는 대개 점수가 낮다.</strong> 메모리를 적게 쓰기 때문이다. 그래서 죽는 것은 본체이고, 죽은 뒤에도 에이전트는 살아서 「프로세스 없음」을 보고한다</li>
+                        <li>반대로 <strong>사이드카에 가중치를 올려 둔 채 잊어버린 경우</strong>가 있다. 훨씬 적게 쓰는데 먼저 죽는다면 이 열을 의심한다</li>
+                        <li>오케스트레이터가 워크로드 등급에 따라 이 값을 설정하기도 한다. <strong>손댄 기억이 없어도 0 이 아닐 수 있다</strong></li>
+                    </ul>
+
+                    <div class="callout">
+                        <strong>위험 표기.</strong> <code>oom_score_adj</code> 를 -1000 으로 내리는 것은 그 프로세스를 후보에서 빼는 조치이지 메모리를 늘려 주는 조치가 아니다. 부족은 그대로 남고 <strong>대신 다른 무언가가 죽는다.</strong> 데이터베이스를 면제해 두면 그 옆의 감시 에이전트가 죽고, 그러면 장애를 아무도 알려 주지 않는다. 면제는 대응이 아니라 <strong>죽는 순서를 바꾸는 일</strong>이므로, 무엇이 대신 죽어도 되는지를 먼저 정한 다음에 손대는 값이다.
+                    </div>
+
+                    <h2 id="sec-6">시스템 OOM 과 cgroup OOM 은 다른 사건이다</h2>
+
+                    <p>커널 소스에는 이 둘이 갈리는 지점이 한 줄로 들어 있다. OOM 처리 함수를 부를 때 메시지 문자열을 삼항 연산자로 고르는데, 메모리 cgroup 의 OOM 이 아니면 <code>"Out of memory"</code>, 맞으면 <code>"Memory cgroup out of memory"</code> 를 넘긴다. 이 문자열이 앞 절 (3) 번 포맷의 맨 앞 <code>%s</code> 자리에 들어간다. <strong>로그의 첫 단어가 사건의 종류를 알려 준다.</strong></p>
+
+                    <table>
+                        <thead>
+                            <tr><th>구분</th><th>시스템(노드) OOM</th><th>cgroup OOM</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>방아쇠</td><td>노드 전체에서 회수가 실패했다</td><td>그 cgroup 이 자기 한도에 닿았다</td></tr>
+                            <tr><td>로그 머리말</td><td><code>Out of memory: Killed process ...</code></td><td><code>Memory cgroup out of memory: Killed process ...</code></td></tr>
+                            <tr><td>후보 범위</td><td>노드의 모든 프로세스</td><td>그 cgroup 과 그 하위</td></tr>
+                            <tr><td>노드의 여유</td><td>없다. 그래서 이 사건이 났다</td><td><strong>남아돌 수 있다.</strong> 대시보드는 평온해 보인다</td></tr>
+                            <tr><td>같이 죽는 것</td><td>무관한 워크로드까지 함께 흔들린다</td><td>그 컨테이너만 죽는다</td></tr>
+                            <tr><td>흔한 오진</td><td>애플리케이션 누수로 몰아간다</td><td>노드를 증설한다</td></tr>
+                            <tr><td>먼저 볼 곳</td><td><code>/proc/meminfo</code>, 커널 로그의 메모리 덤프</td><td><code>memory.events</code>, <code>memory.max</code>, <code>memory.current</code></td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>커널 cgroup v2 문서는 <code>memory.max</code> 를 <strong>메모리 사용량의 하드 한도</strong>로 정의하면서, cgroup 의 사용량이 이 한도에 도달하고 줄일 수 없으면 그 cgroup 안에서 OOM 킬러가 호출된다고 적는다. <code>memory.high</code> 는 다르다. 사용량이 high 경계를 넘으면 그 cgroup 의 프로세스들이 스로틀링되고 강한 회수 압박을 받지만 <strong>high 한도를 넘는 것은 결코 OOM 킬러를 호출하지 않는다</strong>고 같은 문서가 적는다. high 는 브레이크이고 max 는 벽이다.</p>
+
+                    <pre><code># 컨테이너 안에서 - cgroup v2
+cat /sys/fs/cgroup/memory.max        # 벽. max 면 한도 없음
+cat /sys/fs/cgroup/memory.high       # 브레이크
+cat /sys/fs/cgroup/memory.current    # 지금 얼마나 쓰고 있나
+cat /sys/fs/cgroup/memory.events     # 여기서 low/high/max/oom/oom_kill 을 본다
+cat /sys/fs/cgroup/memory.stat | head -20
+
+# 노드에서 특정 cgroup 경로를 지정할 때
+cat /sys/fs/cgroup/kubepods.slice/.../memory.events</code></pre>
+
+                    <p><code>memory.events</code> 의 두 값은 뜻이 다르고 이 차이가 예보 역할을 한다. 문서는 <code>oom</code> 을 <strong>cgroup 의 사용량이 한도에 도달해 할당이 실패하려던 횟수</strong>로, <code>oom_kill</code> 을 <strong>이 cgroup 에 속한 프로세스가 어떤 종류든 OOM 킬러에 의해 죽은 횟수</strong>로 정의한다. <code>oom</code> 은 오르는데 <code>oom_kill</code> 이 0 이면 아직 아무도 죽지 않았다는 뜻이고, 그것은 <strong>다음 배포나 다음 피크에 죽는다는 예고</strong>다. 이 값을 알림에 걸면 사후가 아니라 사전에 손댈 수 있다.</p>
+
+                    <p>같은 문서에 <code>memory.oom.group</code> 도 있다. 이 cgroup 을 OOM 킬러가 <strong>나눌 수 없는 하나의 워크로드</strong>로 취급할지를 정하는 값으로, 설정하면 그 cgroup 과 하위의 모든 태스크가 함께 죽거나 아무도 죽지 않는다. 프로세스 하나만 죽어 나머지가 반쪽으로 계속 도는 상황을 막는 스위치다.</p>
+
+                    <p>런타임이 메모리 한도를 어떻게 인식하는지는 또 다른 층위다. JVM 처럼 힙 크기를 컨테이너 한도에서 유추하는 런타임에는 고유한 함정이 있고, 그 얘기는 <a href="jvm_container_resource_limits.html">컨테이너 안의 JVM 이 한도를 잘못 읽을 때</a>에서 따로 다뤘다. 여기서는 커널과 cgroup 쪽 일반론만 본다.</p>
+
+                    <h2 id="sec-7">cgroup v1 과 v2 에서 달라지는 것</h2>
+
+                    <p>같은 「메모리 한도 512Mi」가 두 버전에서 다른 것을 뜻할 수 있다. 파일 이름부터 다르고 스왑을 세는 방식이 다르다.</p>
+
+                    <pre><code># 어느 버전으로 돌고 있나 - v2 단독이면 cgroup2fs 로 나온다
+stat -fc %T /sys/fs/cgroup
+mount | grep -E 'cgroup|cgroup2'
+
+# v1 계열에서 보는 파일들
+cat /sys/fs/cgroup/memory/memory.limit_in_bytes
+cat /sys/fs/cgroup/memory/memory.usage_in_bytes
+cat /sys/fs/cgroup/memory/memory.failcnt
+cat /sys/fs/cgroup/memory/memory.memsw.limit_in_bytes
+cat /sys/fs/cgroup/memory/memory.oom_control
+grep -E '^(cache|rss|mapped_file) ' /sys/fs/cgroup/memory/memory.stat</code></pre>
+
+                    <ul>
+                        <li><strong>스왑을 세는 방식.</strong> v1 은 <code>memory.memsw.limit_in_bytes</code> 로 메모리와 스왑을 <strong>합쳐서</strong> 건다. v2 는 <code>memory.swap.max</code> 로 따로 건다. 같은 숫자를 넣어도 의미가 달라지는 대표적인 자리다</li>
+                        <li><strong>사용량 값의 정확도.</strong> v1 문서는 <code>memory.usage_in_bytes</code> 가 정확한 값을 보여 주지 않는다고 스스로 밝히면서, 더 정밀하게 보려면 <code>memory.stat</code> 의 RSS 와 CACHE(그리고 SWAP)를 쓰라고 안내한다</li>
+                        <li><strong>실패 횟수 카운터.</strong> v1 의 <code>memory.failcnt</code> 는 한도에 부딪힌 횟수를 센다. v2 에서 이 자리를 대신하는 것이 <code>memory.events</code> 다</li>
+                        <li><strong>한도에 닿았을 때의 절차는 같은 뼈대다.</strong> v1 문서는 cgroup 이 한도를 넘으면 먼저 그 cgroup 에서 메모리를 회수하려 시도하고, 성공하지 못하면 OOM 루틴이 호출돼 가장 덩치 큰 태스크를 골라 죽인다고 적는다</li>
+                        <li><strong>OOM 킬링을 끄는 스위치.</strong> v1 의 <code>memory.oom_control</code> 에는 <code>oom_kill_disable</code> 과 <code>under_oom</code> 이 있다. 문서는 <code>under_oom</code> 이 1 일 때 그 cgroup 이 OOM 상태이며 <strong>태스크가 멈춰 있을 수 있다</strong>고 적는다</li>
+                    </ul>
+
+                    <div class="callout">
+                        <strong>위험 표기.</strong> v1 의 <code>oom_kill_disable</code> 을 켜면 죽지 않는 대신 <strong>멈춘다.</strong> 프로세스는 목록에 살아 있고 헬스체크 종류에 따라 통과할 수도 있는데 아무 요청도 처리하지 못한다. 죽어서 재시작되는 편이 나은 경우가 많으므로, <strong>이 값은 그 상태를 감지할 별도 수단이 있을 때만</strong> 검토한다.
+                    </div>
+
+                    <h2 id="sec-8">오버커밋 - malloc 이 성공해도 죽는 구조</h2>
+
+                    <p>리눅스는 기본적으로 실제로 가진 것보다 많은 메모리를 약속한다. 그렇게 하는 편이 대부분의 경우 이득이기 때문이다. <code>fork</code> 직후 <code>exec</code> 를 부르는 프로세스는 복사받은 주소 공간을 거의 쓰지 않고, 큰 배열을 미리 잡아 두고 앞부분만 쓰는 코드도 흔하다. <strong>물리 페이지는 그 주소에 처음 쓸 때 붙는다.</strong></p>
+
+                    <p>그래서 실패가 늦게 온다. 할당 함수는 주소 공간을 얻는 데 성공하고, 죽는 것은 그 주소에 처음 쓰는 순간이다. 코드에서 보면 <strong>성공한 할당 다음 줄에서 죽는다.</strong> 할당 실패 처리를 아무리 촘촘히 짜 두어도 그 경로로 오지 않는 이유가 여기 있다.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>vm.overcommit_memory</th><th>커널 문서의 설명</th><th>실제로 일어나는 일</th><th>부작용</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>0 (기본)</td><td>커널이 사용자 공간의 요청 크기를 전체 메모리와 스왑의 합과 비교해 명백한 과요청을 거절한다</td><td>웬만한 요청은 통과한다</td><td>실패가 할당 시점이 아니라 사용 시점에 OOM 으로 나타난다</td></tr>
+                            <tr><td>1</td><td>실제로 바닥날 때까지 커널이 메모리가 항상 충분한 척한다</td><td>거의 모든 요청이 성공한다</td><td>할당 실패라는 신호가 사라지고 모든 문제가 OOM 으로 수렴한다</td></tr>
+                            <tr><td>2</td><td>어떤 오버커밋도 막으려 시도하는 정책을 쓴다</td><td><code>CommitLimit</code> 을 넘는 커밋 자체가 거절된다</td><td>지금까지 성공하던 할당이 실패하기 시작한다</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>오버커밋 회계 문서는 2 번 모드의 한도를 <strong>스왑에 물리 RAM 의 설정 가능한 비율(기본 50 퍼센트)을 더한 값</strong>으로 설명한다. 이 비율은 <code>vm.overcommit_ratio</code>, 절대값은 <code>vm.overcommit_kbytes</code> 로 정하며 둘 다 2 번 모드에서만 효력이 있다. 현재의 한도와 커밋량은 <code>/proc/meminfo</code> 의 <code>CommitLimit</code> 과 <code>Committed_AS</code> 로 볼 수 있다고 적혀 있다.</p>
+
+                    <pre><code>sysctl vm.overcommit_memory vm.overcommit_ratio vm.overcommit_kbytes
+
+# 지금 얼마나 약속해 두었나 - Committed_AS 가 CommitLimit 에 얼마나 붙어 있는지 본다
+grep -E '^(MemTotal|SwapTotal|CommitLimit|Committed_AS):' /proc/meminfo</code></pre>
+
+                    <p><code>Committed_AS</code> 는 문서상 <strong>시스템에 현재 할당된 메모리의 양</strong>이며 프로세스들이 할당해 둔 모든 메모리의 합으로, 아직 실제로 쓰지 않았더라도 포함된다는 단서가 붙어 있다. 그래서 이 값이 <code>MemTotal</code> 을 훌쩍 넘는 것은 <strong>정상이며 오버커밋이 작동하고 있다는 증거</strong>다. 문제로 볼 값이 아니다.</p>
+
+                    <div class="callout">
+                        <strong>위험 표기.</strong> <code>vm.overcommit_memory</code> 를 2 로 바꾸면 OOM 대신 할당 실패가 시작된다. 크게 예약해 두고 조금만 쓰는 프로세스는 <strong>기동조차 못 할 수 있다.</strong> 운영 중인 노드에서 <code>sysctl</code> 로 즉시 바꾸는 것은 전체 서비스를 동시에 흔드는 조치이므로, 먼저 <code>Committed_AS</code> 와 <code>CommitLimit</code> 의 평소 추이를 며칠 재고 스테이징에서 기동 여부를 확인한 다음에 한다.
+                    </div>
+
+                    <h2 id="sec-9">스왑이 바꾸는 것</h2>
+
+                    <p>스왑이 있으면 커널에 회수할 곳이 하나 더 생긴다. 익명 페이지를 저장 장치로 내보내고 그 자리를 다시 쓸 수 있으므로 OOM 이 늦게 온다. 대신 그 구간이 느려진다. 이 「느려짐」이 <strong>죽는 것보다 나은가</strong>는 서비스 성격에 달렸다.</p>
+
+                    <p>커널 PSI 문서는 이 상태를 두 줄로 나눠 보여 준다. <code>some</code> 은 <strong>일부 태스크가 해당 자원을 기다리며 멈춰 있던 시간의 비율</strong>이고, <code>full</code> 은 <strong>유휴가 아닌 모든 태스크가 동시에 멈춰 있던 시간의 비율</strong>이다. 문서는 <code>full</code> 상태를 낭비된 CPU 사이클로 설명하며 스래싱을 가리킨다고 적는다. <code>full</code> 이 오르고 있다면 그 노드는 아직 죽지 않았을 뿐 이미 일하고 있지 않다.</p>
+
+                    <pre><code>swapon --show
+free -h
+grep -E '^(SwapTotal|SwapFree|SwapCached):' /proc/meminfo
+
+# 지금 멈춰 있는 비율 - some 과 full 을 나눠서 본다
+cat /proc/pressure/memory
+cat /sys/fs/cgroup/memory.pressure
+
+# 어떤 프로세스가 스왑에 나가 있나
+grep -H VmSwap /proc/[0-9]*/status | sort -t: -k3 -n -r | head -10</code></pre>
+
+                    <p>컨테이너 환경에서 스왑을 끄는 관행에는 이런 배경이 있다. 응답 지연이 죽는 것보다 나쁜 서비스가 있기 때문이다. 30 초 걸리는 응답은 이미 실패인데 프로세스는 살아 있어 헬스체크를 통과하고, 그러면 트래픽이 계속 들어와 상태가 더 나빠진다. 이 경우 <strong>빨리 죽고 빨리 재시작되는 편</strong>이 전체 가용성에 낫다.</p>
+
+                    <ul>
+                        <li>쿠버네티스 문서는 기본적으로 kubelet 이 <strong>스왑이 켜진 리눅스 노드에서 시작하지 않는다</strong>고 적는다. 시작하게 하려면 <code>failSwapOn: false</code> 를 명시해야 한다</li>
+                        <li>스왑 동작은 <code>memorySwap.swapBehavior</code> 로 정한다. 기본값 <code>NoSwap</code> 에서는 그 노드의 파드로 도는 워크로드가 스왑을 쓰지 않고 쓸 수도 없으며, <code>LimitedSwap</code> 에서는 쓸 수 있다</li>
+                        <li>같은 문서에 눈여겨볼 단서가 있다. <code>NoSwap</code> 으로 두고 스왑을 허용해도 <strong>쿠버네티스가 관리하지 않는 프로세스, 즉 systemd 서비스들과 kubelet 자신은 스왑을 쓸 수 있다</strong>는 것이다. 노드의 스왑 사용량이 0 이 아니라고 해서 파드가 쓰는 것은 아니다</li>
+                        <li>kubelet 은 컨테이너 런타임 API 로 설정을 지시하며, cgroup v2 의 예로 문서가 드는 것이 <code>memory.swap.max</code> 다. 앞 절의 파일과 그대로 이어진다</li>
+                        <li>스왑을 켜기로 했다면 <strong>지연이 어디까지 허용되는지를 먼저 정한다.</strong> 정하지 않으면 「죽지는 않는데 계속 느린」 상태가 상시화되고, 그 상태는 알림에 잘 안 걸린다</li>
+                    </ul>
+
+                    <div class="callout">
+                        <strong>위험 표기.</strong> 운영 중인 노드에서 <code>swapoff -a</code> 는 스왑에 나가 있던 페이지를 <strong>전부 물리 메모리로 되읽는</strong> 동작이다. 그 순간 물리 여유가 스왑 사용량보다 작으면 그 자리에서 OOM 을 부른다. 끄기 전에 <code>SwapTotal</code> 에서 <code>SwapFree</code> 를 뺀 값이 <code>MemAvailable</code> 안에 들어오는지 확인하고 트래픽이 적은 시간대에 한 장씩 끈다.
+                    </div>
+
+                    <h2 id="sec-10">RSS 가 전부가 아니다</h2>
+
+                    <p>메모리를 볼 때 가장 자주 잘못 읽는 값이 <code>free</code> 의 free 열이다. <code>free</code> 매뉴얼은 free 를 <strong>쓰이지 않은 메모리</strong>로만 정의하고 used 를 <strong>total 에서 available 을 뺀 값</strong>으로 계산한다고 적는다. 커널 쪽에서 그 available 에 해당하는 것이 <code>/proc/meminfo</code> 의 <code>MemAvailable</code> 이고, 커널 문서는 이 값을 <strong>스왑 없이 새 애플리케이션을 시작하기 위해 얼마나 많은 메모리가 사용 가능한지에 대한 추정치</strong>로 정의하면서 <code>MemFree</code> 와 <code>SReclaimable</code>, 파일 LRU 목록의 크기, 각 존의 low watermark 로부터 계산된다고 적는다. <strong>봐야 할 값은 free 가 아니라 available 이다.</strong></p>
+
+                    <pre><code>free -h
+grep -E '^(MemTotal|MemFree|MemAvailable|Buffers|Cached|Shmem|Slab|SReclaimable|SUnreclaim):' /proc/meminfo
+
+# 프로세스 하나의 내역 - VmRSS 는 아래 셋의 합이다
+grep -E '^(VmRSS|RssAnon|RssFile|RssShmem|VmSwap):' /proc/&lt;pid&gt;/status
+
+# 파일처럼 보이지만 메모리인 자리
+df -h /dev/shm</code></pre>
+
+                    <ul>
+                        <li><strong>페이지 캐시는 잠긴 메모리가 아니다.</strong> 필요하면 회수된다. 캐시가 커서 free 가 작아 보이는 것은 정상이고, 그 상태를 메모리 부족으로 신고하면 엉뚱한 곳을 고치게 된다</li>
+                        <li><strong>공유 메모리와 tmpfs 는 다르다.</strong> <code>/dev/shm</code> 에 쌓인 것은 파일처럼 보이지만 메모리이고 캐시처럼 회수되지 않는다. 커널 문서는 <code>Shmem</code> 을 공유 메모리와 tmpfs 가 쓰는 총량으로 정의한다</li>
+                        <li><strong>커널 슬랩도 메모리를 쓴다.</strong> <code>SReclaimable</code> 은 회수될 수 있는 부분, <code>SUnreclaim</code> 은 메모리 압박에서도 회수되지 않는 부분이다. 후자가 크게 늘어 있으면 사용자 공간을 아무리 뒤져도 답이 안 나온다</li>
+                        <li><strong>RSS 는 합산하면 안 된다.</strong> 커널 문서 기준 <code>VmRSS</code> 는 <code>RssAnon</code>, <code>RssFile</code>, <code>RssShmem</code> 의 합인데, 공유 라이브러리처럼 여러 프로세스가 같이 쓰는 페이지가 프로세스마다 세어진다. 프로세스별 RSS 를 더해 노드 사용량을 추정하면 실제보다 커진다</li>
+                        <li><strong>파일을 쥐고 있는 프로세스도 메모리로 잡힌다.</strong> 지워졌는데 열려 있는 파일이나 큰 매핑을 붙들고 있는 프로세스를 찾는 방법은 <a href="find_process_holding_file.html">어떤 프로세스가 이 파일을 쥐고 있는가</a>에 정리해 두었다</li>
+                    </ul>
+
+                    <h2 id="sec-11">OOM 은 증상이지 원인이 아니다</h2>
+
+                    <p>OOM 킬링은 메모리가 부족했다는 사실을 알려 줄 뿐 왜 부족했는지는 알려 주지 않는다. 그리고 왜 부족했는지는 죽은 순간의 스냅샷이 아니라 <strong>그 앞 구간의 모양</strong>에 들어 있다. 죽은 시점의 값은 이미 다 커진 뒤라 원인과 결과가 구분되지 않는다. 증상은 하나인데 원인은 여럿이고 순서를 정해 갈라내야 한다는 점에서, <a href="no_space_left_but_disk_free.html">디스크는 안 찼는데 No space left on device</a> 와 같은 종류의 문제다.</p>
+
+                    <ul>
+                        <li><strong>누수</strong> — 시간에 비례해 오른다. 재시작한 뒤에도 <strong>같은 기울기</strong>로 다시 오른다. 트래픽이 없는 새벽에도 오르면 거의 확정이다</li>
+                        <li><strong>요청 폭증</strong> — 계단으로 오르고 트래픽 그래프와 시각이 겹친다. 피크가 지나면 내려온다. 내려오지 않으면 폭증과 누수가 겹친 것이다</li>
+                        <li><strong>한도 설정 실수</strong> — 배포 직후부터 시작한다. 이전 배포와 매니페스트를 나란히 놓으면 몇 분 안에 끝나므로 순서상 앞에 둔다</li>
+                        <li><strong>상한 없는 캐시</strong> — 히트율은 좋아지고 메모리는 끝없이 오른다. 저부하에서는 안 보이다가 부하가 늘 때 한 번에 터진다. 최대 항목 수나 최대 바이트가 걸려 있는지부터 본다</li>
+                        <li><strong>결과 집합이 커짐</strong> — 페이지네이션 없는 조회, 연관 데이터를 건마다 다시 읽어 부푼 목록. <strong>코드는 안 바뀌었는데 어느 날 터지는</strong> 부류가 대개 이것이고, 기울기가 완만해 놓치기 쉽다</li>
+                        <li><strong>동시성 수치</strong> — 요청당 버퍼 크기 곱하기 동시 요청 수다. 워커 수나 커넥션 풀을 올린 다음 날 터진다. 배포 이력이 아니라 <strong>설정 변경 이력</strong>에서 찾아야 한다</li>
+                        <li><strong>이웃</strong> — 시스템 OOM 인데 우리 프로세스가 골라진 경우. 원인은 같은 노드의 다른 워크로드이고 우리 쪽은 덩치가 컸을 뿐이라, 우리 코드를 아무리 봐도 아무것도 안 나온다</li>
+                        <li><strong>노드의 다른 소비자</strong> — 로그 수집 데몬, 백업 에이전트, 커널 슬랩 같은 컨테이너 아닌 것들. 파드 사용량 합계와 노드 사용량이 크게 벌어져 있으면 이쪽이다</li>
+                    </ul>
+
+                    <p>갈라내는 데 가장 쓸모 있는 한 가지를 고르라면 <strong>기울기의 모양</strong>이다. 직선인지 계단인지 톱니인지만 봐도 후보의 절반이 떨어져 나간다. 그래서 사후 조사에서 제일 먼저 확보할 것은 로그가 아니라 <strong>죽기 전 몇 시간의 메모리 시계열</strong>이다. 이것이 없으면 조사는 추측이 된다.</p>
+
+                    <h2 id="sec-12">막는 법 - 한도와 요청, 그리고 재시작 루프</h2>
+
+                    <p>한도를 거는 것은 필요하지만 그것만으로는 부족하다. 스케줄러는 요청값을 보고 배치를 정하는데, 요청값이 없거나 실제보다 훨씬 작으면 한 노드에 과밀 배치가 일어난다. 그러면 컨테이너별 한도는 지켜지는데 <strong>노드 전체가 먼저 무너진다.</strong> 쿠버네티스 문서는 노드가 자원을 소진하면 BestEffort 파드를 먼저, 그다음 Burstable, 마지막으로 Guaranteed 를 축출한다고 적는다. 요청과 한도를 어떻게 적었는지가 <strong>축출 순서를 정한다.</strong></p>
+
+                    <ul>
+                        <li><strong>한도와 요청을 같이 건다.</strong> 한도만 있으면 스케줄러가 실제 소비를 모르고, 요청만 있으면 폭주를 막지 못한다</li>
+                        <li><strong>요청값은 평시 사용량, 한도는 피크에 여유를 더한 값</strong>에서 출발한다. 둘을 같게 두면 등급은 올라가지만 노드 활용률이 떨어진다</li>
+                        <li><strong>한도 상향은 시간을 사는 조치다.</strong> 누수라면 주기만 길어진다. 사기로 했다면 <strong>언제까지 사는지를 티켓에 적는다.</strong> 적지 않으면 그 한도는 영구가 된다</li>
+                        <li><strong>readiness 가 없으면 재시작 직후가 위험하다.</strong> 웜업 중인 인스턴스로 트래픽이 들어가고 그 부하가 다시 메모리를 밀어 올린다</li>
+                        <li><strong>liveness 가 지나치게 공격적이면 OOM 이 아닌 죽음이 섞인다.</strong> 잠깐 멈춘 것을 죽었다고 보고 재시작시키는 경우인데 이쪽은 SIGTERM 이라 143 이다. <strong>137 과 143 이 섞여 있으면 두 사건을 하나로 보고 있는 것이다</strong></li>
+                        <li><strong>종료 유예를 넘기면 143 이 아니라 137 이 된다.</strong> 같은 137 이라도 커널 로그에 그 시각의 OOM 기록이 없으면 이쪽이다</li>
+                        <li><strong>리플리카를 늘리는 대응은 원인에 따라 갈린다.</strong> 요청이 분산되는 종류면 효과가 있지만, 인스턴스마다 같은 캐시를 하나씩 더 만드는 구조면 노드 총량은 오히려 늘어난다</li>
+                        <li><strong>다중 프로세스 컨테이너는 <code>memory.oom.group</code> 을 검토한다.</strong> 하나만 죽고 나머지가 남으면 컨테이너는 살아 있는데 기능은 반쪽이 되고, 이 상태는 재시작으로도 정리되지 않는다</li>
+                    </ul>
+
+                    <p>재시작 루프로 번지는 순서는 대개 이렇다. 죽는다. 재시작한다. 웜업 중에 밀린 요청을 한꺼번에 받는다. 다시 죽는다. 오케스트레이터가 재시작 간격을 점점 벌리므로 처음 몇 분은 연달아 죽고 그 뒤에는 간헐적으로 죽는다. <strong>이 후반부를 「간헐적 장애」라고 부르는 순간 원인에서 멀어진다.</strong> 재시작 간격이 지수적으로 벌어지는 모양인지부터 확인하면 같은 사건인지가 바로 갈린다.</p>
+
+                    <div class="callout">
+                        <strong>위험 표기.</strong> 메모리 한도를 아예 없애는 것은 문제를 없애는 것이 아니라 <strong>cgroup OOM 을 시스템 OOM 으로 승격시키는 것</strong>이다. 한도가 있으면 죽는 대상이 그 컨테이너로 한정되지만, 한도를 없애면 커널이 노드 전체에서 후보를 고른다. 그때 골라지는 것은 우리가 정할 수 없고, 무관한 워크로드가 함께 흔들린다.
+                    </div>
+
+                    <h2 id="sec-13">점검 순서</h2>
+
+                    <p>순서를 정해 두는 이유는 단계마다 다음 단계가 좁혀지기 때문이다. 앞의 것을 건너뛰면 뒤의 것을 봐도 해석이 되지 않는다.</p>
+
+                    <ol>
+                        <li><strong>정말 죽은 것인지 확인한다.</strong> 종료 코드가 137 인가 143 인가 0 부터 125 사이인가. 컨테이너면 지난 종료의 사유와 코드를 같이 본다. 143 이나 정상 종료가 나오면 OOM 조사는 접는다</li>
+                        <li><strong>커널이 죽였는지 확인한다.</strong> 같은 시각에 커널 로그에 OOM 기록이 있는가. 없다면 링 버퍼가 밀린 것인지 먼저 확인하고, 밀리지 않았다면 커널이 아니라 오케스트레이터나 감시자나 사람이다</li>
+                        <li><strong>시스템인지 cgroup 인지 가른다.</strong> 로그 머리말이 <code>Out of memory</code> 인가 <code>Memory cgroup out of memory</code> 인가. 컨테이너 쪽에서는 <code>memory.events</code> 의 <code>oom_kill</code> 이 늘었는지 본다. 여기서 대응 방향이 완전히 갈린다</li>
+                        <li><strong>누가 늘었는지 본다.</strong> 커널이 남긴 표를 rss 로 정렬한다. 죽은 프로세스가 1 등이 아니라면 <code>oom_score_adj</code> 열을, 1 등이 맞다면 <code>rss_anon</code> 과 <code>rss_shmem</code> 의 비중을 본다</li>
+                        <li><strong>언제부터 늘었는지 본다.</strong> 죽기 전 몇 시간의 시계열을 확보한다. 직선인지 계단인지 톱니인지가 여기서 결정된다</li>
+                        <li><strong>왜 늘었는지 대조한다.</strong> 배포 시각, 설정 변경 이력, 트래픽 그래프, 데이터 증가량을 시계열 위에 겹친다. 겹치는 것이 하나면 거의 답이고, 없으면 한 층 아래(캐시 상한, 결과 집합 크기, 동시성)를 본다</li>
+                        <li><strong>무엇을 바꿀지 정한다.</strong> 한도 상향은 마지막 선택지다. 그 앞에 캐시 상한, 페이지 크기, 워커 수, 커넥션 풀이 있다. 올리기로 했다면 <strong>얼마나 오래 그 상태로 둘지를 같이 적는다</strong></li>
+                    </ol>
+
+                    <h2 id="sec-14">정리</h2>
+
+                    <p>애플리케이션 로그가 비어 있는 것은 정보가 없다는 뜻이 아니라 <strong>기록의 주체가 바뀌었다는 뜻</strong>이다. SIGKILL 은 잡히지 않으므로 애플리케이션은 아무것도 쓸 수 없고, 그 사건은 커널 쪽에 남는다. 조사의 시작점이 애플리케이션 로그를 더 파는 것이 아니라 종료 코드를 확인하고 커널 로그로 넘어가는 것인 이유다.</p>
+
+                    <p>넘어간 다음의 갈림길은 하나다. <strong>노드가 부족했는가, 한도에 닿았는가.</strong> 로그의 첫 단어가 이것을 알려 주고, 여기서 대응이 완전히 달라진다. 노드 문제에 한도를 만지거나 한도 문제에 노드를 증설하는 것은 둘 다 아무것도 바꾸지 못한다. 그리고 어느 쪽이든 <strong>OOM 자체는 원인이 아니다.</strong> 원인은 죽기 전 몇 시간의 기울기 안에 있고, 그 기울기는 사건이 끝난 뒤에는 확보할 수 없다. 그래서 남길 것은 명령 목록이 아니라 순서다. 죽은 게 맞는지, 커널이 죽였는지, 시스템인지 cgroup 인지, 누가 늘었는지, 언제부터, 왜. <strong>이 여섯을 순서대로 통과하면 마지막 질문에는 대개 답이 하나만 남는다.</strong></p>
+
+                    <h2 id="sec-15">확인하지 못한 것</h2>
+
+                    <ul>
+                        <li>이 글을 쓴 환경은 Windows 10 에 Git Bash(MSYS2, GNU bash 5.2.37(1)-release)이며 <strong>리눅스 커널이 없다.</strong> <code>dmesg</code>, <code>journalctl</code>, <code>/proc/meminfo</code>, <code>/sys/fs/cgroup</code> 의 <strong>실제 출력을 재현해 붙이지 않았다.</strong> 본문의 명령들은 공식 문서와 커널 소스에 근거해 적은 것이다</li>
+                        <li>실행해 확인한 것은 정확히 셋이다. <code>bash -c 'kill -9 $$'</code> 의 종료 상태가 137, <code>kill -15</code> 가 143, 셸 버전이 GNU bash 5.2.37(1)-release. 이 셋만 본문의 출력 블록에 실제 결과로 실려 있다</li>
+                        <li>커널 문서(<code>docs.kernel.org</code>)는 직접 열었으나 <strong>커널 소스 원문은 <code>git.kernel.org</code> 이 403 을 반환해 열지 못했다.</strong> 포맷 문자열과 badness 계산은 공식 미러인 <code>raw.githubusercontent.com/torvalds/linux</code> 의 master 브랜치에서 확인했다. 특정 배포판 커널의 코드가 아니다</li>
+                        <li><code>dump_tasks</code> 의 <strong>열 구성은 커널 버전에 따라 다르다.</strong> sysctl 문서의 목록과 master 소스의 헤더 문자열이 이미 어긋나 있다. 자기 커널의 헤더 줄을 직접 확인해야 한다</li>
+                        <li>badness 계산의 함수 이름은 버전에 따라 바뀌어 왔다. 그래서 이름은 옮기지 않고 <strong>구성과 <code>oom_score_adj</code> 환산 방식</strong>만 적었다. 세부 구현은 커널 버전마다 확인이 필요하다</li>
+                        <li>로그 파일 경로는 배포판과 로그 데몬 설정에 따라 다르다. <code>/var/log/messages</code> 와 <code>/var/log/syslog</code> 중 어느 쪽이 쓰이는지는 <strong>확인하지 못했다</strong></li>
+                        <li>컨테이너 런타임이 <strong>종료 코드 137 을 붙이는 정확한 규칙</strong>은 공식 문서에서 확인하지 못했다. 128 더하기 신호 번호는 셸의 규칙으로 확인한 것이고, 런타임이 같은 규칙을 따른다는 문서 근거는 찾지 못했다. Bash 매뉴얼의 해당 조항도 gnu.org 이 요청 제한으로 응답하지 않아 원문을 열지 못했다</li>
+                        <li>쿠버네티스 QoS 문서는 축출 순서만 설명하고 <strong><code>oom_score_adj</code> 를 등급별로 어떻게 설정하는지는 언급하지 않는다.</strong> 본문에서 「오케스트레이터가 설정하기도 한다」 이상으로 쓰지 않은 이유다. <code>systemd-oomd</code> 처럼 사용자 공간에서 도는 OOM 관리자도 다루지 않았다</li>
+                    </ul>
+
+                    <h2 id="sec-16">참고 자료</h2>
+
+                    <ul>
+                        <li><a href="https://docs.kernel.org/admin-guide/mm/concepts.html" target="_blank" rel="noopener">Concepts overview (Linux kernel documentation)</a> — 커널이 OOM 킬러를 호출해 희생시킬 태스크를 고른다는 설명, 페이지 캐시와 회수의 정의</li>
+                        <li><a href="https://docs.kernel.org/admin-guide/sysctl/vm.html" target="_blank" rel="noopener">Documentation for /proc/sys/vm/ (Linux kernel documentation)</a> — <code>overcommit_memory</code> 세 값, <code>overcommit_ratio</code>·<code>overcommit_kbytes</code>, <code>oom_dump_tasks</code> 가 덤프에 포함시키는 항목 목록</li>
+                        <li><a href="https://docs.kernel.org/mm/overcommit-accounting.html" target="_blank" rel="noopener">Overcommit Accounting (Linux kernel documentation)</a> — 2 번 모드의 한도가 스왑에 물리 RAM 의 설정 가능한 비율(기본 50 퍼센트)을 더한 값이라는 정의</li>
+                        <li><a href="https://docs.kernel.org/admin-guide/cgroup-v2.html" target="_blank" rel="noopener">Control Group v2 (Linux kernel documentation)</a> — <code>memory.max</code>·<code>memory.high</code> 의 정의, <code>memory.events</code> 의 <code>oom</code>·<code>oom_kill</code>, <code>memory.oom.group</code></li>
+                        <li><a href="https://docs.kernel.org/admin-guide/cgroup-v1/memory.html" target="_blank" rel="noopener">Memory Resource Controller (cgroup v1)</a> — <code>memory.limit_in_bytes</code>·<code>memory.memsw.limit_in_bytes</code>·<code>memory.failcnt</code>·<code>memory.oom_control</code> 과 한도 초과 시 절차</li>
+                        <li><a href="https://docs.kernel.org/filesystems/proc.html" target="_blank" rel="noopener">The /proc Filesystem (Linux kernel documentation)</a> — <code>oom_score_adj</code> 범위와 -1000 의 의미, <code>MemAvailable</code>·<code>CommitLimit</code>·<code>Committed_AS</code>·<code>VmRSS</code> 정의</li>
+                        <li><a href="https://docs.kernel.org/accounting/psi.html" target="_blank" rel="noopener">PSI - Pressure Stall Information</a> — <code>some</code> 과 <code>full</code> 의 정의, <code>full</code> 이 스래싱을 가리킨다는 설명</li>
+                        <li><a href="https://raw.githubusercontent.com/torvalds/linux/master/mm/oom_kill.c" target="_blank" rel="noopener">linux/mm/oom_kill.c (torvalds/linux, master)</a> — 열 이름 문자열, 종료 메시지 포맷, <code>dump_header()</code>, 두 OOM 의 메시지를 가르는 삼항 연산자, badness 계산</li>
+                        <li><a href="https://man7.org/linux/man-pages/man1/free.1.html" target="_blank" rel="noopener">free(1) - Linux manual page</a> — used 가 total 에서 available 을 뺀 값이라는 정의와 available 열의 설명</li>
+                        <li><a href="https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/" target="_blank" rel="noopener">Resource Management for Pods and Containers (Kubernetes)</a> — 메모리 한도가 반응적으로 강제된다는 서술</li>
+                        <li><a href="https://kubernetes.io/docs/concepts/cluster-administration/swap-memory-management/" target="_blank" rel="noopener">Swap Memory Management (Kubernetes)</a> — kubelet 의 기본 동작, <code>NoSwap</code>·<code>LimitedSwap</code>, 관리 밖 프로세스는 스왑을 쓸 수 있다는 단서</li>
+                        <li><a href="https://kubernetes.io/docs/concepts/workloads/pods/pod-qos/" target="_blank" rel="noopener">Pod Quality of Service Classes (Kubernetes)</a> — BestEffort, Burstable, Guaranteed 순으로 축출된다는 서술</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>이 글 공유하기</h3>
+                    <div class="social-share">
+                        <button id="kakao-share" class="share-btn kakao-btn"><img src="https://developers.kakao.com/assets/img/about/logos/kakaolink/kakaolink_btn_small.png" alt="카카오톡" loading="lazy" decoding="async" width="34" height="35">카카오톡</button>
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(트위터)</button>
+                        <button id="threads-share" class="share-btn threads-btn">쓰레드</button>
+                        <button id="link-copy" class="share-btn link-btn">링크 복사</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">목록으로 돌아가기</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">함께 쓰면 좋은 무료 도구</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/char_counter.html">글자수 세기</a></li>
+      <li><a href="../static/json_formatter.html">JSON 포맷터</a></li>
+      <li><a href="../static/regex_tester.html">정규식 테스트기</a></li>
+      <li><a href="../static/jwt_decoder.html">JWT 디코더·생성기 2026</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">전체 도구 보기 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">관련 글</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="jvm_container_resource_limits.html">JVM은 컨테이너 한도를 어떻게 보는가 - 쿠버네티스 Request와 Limit이 힙·GC·지연을 정하는 자리 2026</a></li>
+      <li><a href="find_process_holding_file.html">파일을 붙잡고 있는 프로세스 찾기 - 지웠는데 공간이 안 돌 때</a></li>
+      <li><a href="ai_generated_code_disclosure_license.html">AI가 만든 코드라고 라이선스에 적으면 - 이용허락과 출처 고지가 갈리는 자리</a></li>
+      <li><a href="always_available_terminal.html">터미널이 항상 떠 있으면 무엇이 달라지는가 - 여는 데 드는 몇 초가 바꾸는 것</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const kakaoShareBtn = document.getElementById('kakao-share');
+        if (kakaoShareBtn) {
+            kakaoShareBtn.addEventListener('click', function() {
+                if (!window.Kakao) return;
+                if (!window.Kakao.isInitialized()) window.Kakao.init('e06d0ee93e450a11bc6451d46e09cd88');
+                if (window.Kakao.Share) {
+                    window.Kakao.Share.sendDefault({
+                        objectType: 'feed',
+                        content: { title: document.title, description: document.querySelector('meta[name="description"]')?.content || '', imageUrl: 'https://braindetox.kr/site_logo.png', link: { mobileWebUrl: location.href, webUrl: location.href } },
+                        buttons: [{ title: '웹으로 보기', link: { mobileWebUrl: location.href, webUrl: location.href } }]
+                    });
+                }
+            });
+        }
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('링크가 복사되었습니다. 쓰레드 앱에 붙여넣기하여 공유하세요!');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('링크가 복사되었습니다!'); });
+    });
+    </script>
+</body>
+</html>

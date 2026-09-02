@@ -1,0 +1,873 @@
+<!DOCTYPE html>
+<!--
+ * 技術ブログ記事テンプレート
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ja">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ファイルを掴んでいるプロセスを見つける - 消したのに容量が戻らないとき</title>
+    <meta name="description" content="rm が消すのは名前だけである。リンク数と開いた参照という二つのカウンタを切り分け、lsof +L1 と fuser と /proc 走査で掴んでいる側を特定する手順、そして Windows 側のロック確認までを実行出力とともに整理する。">
+    <meta name="keywords" content="lsof, fuser, proc fd, 削除済みファイル, deleted, リンク数, unlink, ファイルロック, Restart Manager, openfiles, df du 差分, ログローテーション, NFS sillyrename, 開発, インフラ, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/ja/posts/find_process_holding_file.html">
+
+    <meta property="og:title" content="ファイルを掴んでいるプロセスを見つける - 消したのに容量が戻らないとき">
+    <meta property="og:description" content="消したファイルが容量を握ったままのとき、誰が掴んでいるかを特定する手順。Linux と Windows の両方を実行出力で切り分ける。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/ja/posts/find_process_holding_file.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ja_JP">
+    <meta property="article:published_time" content="2026-09-02">
+    <meta property="article:section" content="開発・インフラ">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="ファイルを掴んでいるプロセスを見つける">
+    <meta name="twitter:description" content="rm は名前を消す命令である。データを消すのは最後の参照が閉じた瞬間のカーネルだ。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "ファイルを掴んでいるプロセスを見つける - 消したのに容量が戻らないとき",
+      "alternativeHeadline": "リンク数と開いた参照という二つのカウンタ、そして Linux と Windows で犯人を特定する順序",
+      "datePublished": "2026-09-02",
+      "dateModified": "2026-09-02",
+      "inLanguage": "ja-JP",
+      "articleSection": "開発・インフラ",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "lsof, fuser, proc fd, 削除済みファイル, リンク数, unlink, ファイルロック, Restart Manager, openfiles, df du 差分",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/ja/posts/find_process_holding_file.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "ファイルを消したのになぜディスク容量が戻らないのか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "rm が呼ぶのは unlink であり、unlink はデータではなくディレクトリにある名前を一つ外す操作だからである。POSIX 規格はこう定めている。リンクは unlink が返る前に取り除かれるが、ファイル内容の削除はそのファイルへのすべての参照が閉じられるまで先送りされる、と。つまりファイルにはカウンタが二つある。一つは名前の数であるリンク数、もう一つは開いているファイル記述子の数である。rm は前者だけを 0 にする。後者が 0 になる瞬間に初めてブロックが返却される。だから対処はファイルをもう一度消すことではなく、掴んでいる側に手を放させることになる。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Linux で誰がそのファイルを掴んでいるかをどう探すか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "道は三つある。lsof +L1 はリンク数が 1 未満の開いたファイルだけを選ぶ。マニュアルは +L のあとに数値を与えるとリンク数がその値より小さいファイルだけを列挙すると記し、+L を指定すると NLINK 列が加わるとも記している。fuser -v は経路を一つ与えるとそれを使っているプロセスを ps に似た形で示し、ACCESS 列の f は開いたファイル、F は書き込みで開いたファイル、m は mmap されたファイルまたは共有ライブラリを意味する。道具が一切ないサーバなら /proc を直接走査する。各プロセスの fd ディレクトリにあるシンボリックリンクの宛先の末尾に、カーネルが deleted という印を付けてくれるので、それだけを拾えばよい。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "プロセスを再起動せずに容量を取り戻せるか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "広く知られた方法は開いたファイル記述子を直接切り詰めることである。ただしこれは取り消せず、確認の手順もない。番号を一つ間違えると、そのプロセスが開いている別のファイルが丸ごと空になる。そして通じる相手が限られる。ログのように末尾に追記するだけのファイルは切っても実行中のプログラムが書き続けられるが、オフセットを計算して特定の位置を読み書きするデータファイルやデータベースファイルは、切った瞬間にプロセスの世界観とファイルの実体がずれてしまう。再起動できるなら再起動が常に安全な側である。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Windows はなぜ使用中のファイルを消させないのか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Windows が無条件に阻むのではなく、ファイルを開く側が開く時点で共有モードを決め、カーネルがそれを強制するからである。CreateFile の文書は、共有モードが 0 ならそのファイルは共有できずハンドルが閉じられるまで再び開けないと記す。逆に開く側が FILE_SHARE_DELETE を併せて与えれば削除は通る。実際に確かめると同じファイルが共有モードによって正反対に分かれる。共有なしで開いたファイルは削除も名前変更も読み取りもすべて失敗し、共有モードに削除を含めて開いたファイルはプロセスが生きたままでも名前が即座に消える。Unix の flock はこれと性質が異なり、マニュアルどおりプロセスはそのロックを無視して入出力を行う自由がある。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "NFS で消したファイルが .nfs で始まる名前で残る理由は",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "NFS クライアントが行う sillyrename という真似のためである。名前が消えても開いた参照が残っていれば読み続けられなければならないが、プロトコルがそれを直接支えないので、クライアントのカーネルが消す代わりに .nfsXXXX という形の名前へ移しておく。Linux NFS wiki の説明によれば、クライアントは該当の vnode が非活性になったときにその新しい名前を消し、その間にクライアントが落ちるとサーバにごみファイルが残る。したがってこのファイルは消そうと苦心する対象ではなく、まだ誰かが開いているという標識である。掴んでいるプロセスを先に見つけて片づければ名前は自然に消える。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/find_process_holding_file.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/find_process_holding_file.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/find_process_holding_file.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/find_process_holding_file.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/find_process_holding_file.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "ホーム",
+      "item": "https://braindetox.kr/ja/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "開発・インフラ",
+      "item": "https://braindetox.kr/ja/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "ファイルを掴んでいるプロセスを見つける - 消したのに容量が戻らないとき",
+      "item": "https://braindetox.kr/ja/posts/find_process_holding_file.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="ファイルを掴んでいるプロセスを見つける - 消したのに容量が戻らないとき">
+                <meta itemprop="datePublished" content="2026-09-02">
+                <meta itemprop="dateModified" content="2026-09-02">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="lsof, fuser, proc fd, 削除済みファイル, リンク数, unlink, ファイルロック, Restart Manager, openfiles, df du 差分">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/ja/posts/find_process_holding_file.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">ファイルを掴んでいるプロセスを見つける - 消したのに容量が戻らないとき</h1>
+                    <h2 class="post-subtitle">rm が消すのは名前だけ。まだ掴んでいる側を Linux と Windows の両方で突き止める順序</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-02">2026-09-02</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">開発・インフラ</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>一番よくある流れはこうだ。ディスクが埋まったという警報が来る。大きなログを一つ見つけて <code>rm</code> で消す。<code>ls</code> にはもう見えない。ところが <code>df</code> は一桁も減っていない。数分待っても同じである。そこで消すものをさらに探しに行く。</p>
+
+                    <p>この時点で方向がすでにずれている。問題は消すものが足りないことではなく、<strong>すでに消したものがまだ生きている</strong>ことだ。この記事が扱うのは一つだけ、<strong>誰が掴んでいるかを特定する手順</strong>である。なぜこの症状が起きるのかという四つの原因分類は <a href="no_space_left_but_disk_free.html">ディスクは空いているのに No space left on device</a> の側にあり、この記事はそのうちの一つを引き継ぐ。</p>
+
+                    <div class="callout">
+                        この記事に出てくる命令のうち <strong>プロセスの終了</strong>と<strong>ファイル記述子の切り詰め</strong>は取り消せない。該当する節に危険の表示を別に付けてあるので、本番機ではその段落を先に読んでから手を付けるほうがよい。確認するだけの命令と状態を変える命令を混ぜないこと、それがこの作業のほとんどすべてである。
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>この記事で扱うこと</h3>
+                        <ol>
+                            <li><a href="#sec-1">カウンタは二つある - 名前の数と参照の数</a></li>
+                            <li><a href="#sec-2">この記事の実行環境と検証範囲</a></li>
+                            <li><a href="#sec-3">症状 - df と du が食い違う</a></li>
+                            <li><a href="#sec-4">名前は消え inode は残る</a></li>
+                            <li><a href="#sec-5">探し方 ① /proc を直接走査する</a></li>
+                            <li><a href="#sec-6">探し方 ② lsof - 命令と読み方</a></li>
+                            <li><a href="#sec-7">探し方 ③ fuser - 経路からプロセスへ</a></li>
+                            <li><a href="#sec-8">掴んでいる側が一つではないとき</a></li>
+                            <li><a href="#sec-9">Windows - 誰がロックしたかを突き止める</a></li>
+                            <li><a href="#sec-10">Windows - うまくいかない方法たち</a></li>
+                            <li><a href="#sec-11">再起動が答えだが再起動できないとき</a></li>
+                            <li><a href="#sec-12">ロックは別の話である</a></li>
+                            <li><a href="#sec-13">コンテナ - pid は視点によって違う</a></li>
+                            <li><a href="#sec-14">ネットワークファイルシステムの .nfs ファイル</a></li>
+                            <li><a href="#sec-15">そもそも起こさないようにする</a></li>
+                            <li><a href="#sec-16">急ぐときの順序</a></li>
+                            <li><a href="#sec-17">まとめ</a></li>
+                            <li><a href="#sec-18">確認できなかったこと</a></li>
+                            <li><a href="#sec-19">参考資料</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">カウンタは二つある - 名前の数と参照の数</h2>
+
+                    <p>この現象の全体が一つの文から出てくる。<strong><code>rm</code> はデータを消す命令ではない。</strong> <code>rm</code> が呼ぶシステムコールは <code>unlink</code> であり、これはディレクトリに書かれた<strong>名前を一つ外す</strong>操作である。データがあるのは名前ではなく inode で、inode は名前が消えたからといって一緒に消えたりしない。</p>
+
+                    <p>POSIX 規格はこの動作を誤読の余地なく釘付けにしている。リンクは <code>unlink</code> が返る前に取り除かれるが、<strong>ファイル内容の削除はそのファイルへのすべての参照が閉じられるまで先送りされる</strong>というものだ。つまり一つのファイルには性格の異なるカウンタが二つ付いていて、両方が 0 になって初めてブロックが戻る。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>カウンタ</th><th>数えるもの</th><th>0 にするもの</th><th>ここで見える</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>リンク数</td><td>この inode を指すディレクトリ項目の数</td><td><code>rm</code> · <code>unlink</code> · <code>mv</code> による上書き</td><td><code>stat -c %h</code> · <code>ls -l</code> の 2 番目の列</td></tr>
+                            <tr><td>開いた参照</td><td>この inode を開いている記述子とマッピングの数</td><td>プロセス終了 · <code>close()</code> · ログ再開シグナル</td><td><code>lsof</code> · <code>fuser</code> · <code>/proc/&lt;pid&gt;/fd</code></td></tr>
+                            <tr><td>ブロック返却の条件</td><td>両方が 0 になる時点</td><td>最後の参照が閉じた瞬間、カーネルが一度に</td><td><code>df</code> の空きが階段状に跳ねる</td></tr>
+                            <tr><td>観測道具の視野</td><td><code>du</code> は名前を歩き <code>df</code> はブロックを数える</td><td>名前がなければ <code>du</code> には見えない</td><td>二つの開きが握られた容量</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>この動作は欠陥ではなく安全装置である。あるプロセスが読んでいる最中に別のプロセスがそのファイルを消したからといって、読んでいる側が壊れては困る。問題はこの安全装置が<strong>運用中に静かに発動する</strong>ところにある。エラーも出ず、ログも残らず、ただ容量が戻らないだけだ。</p>
+
+                    <h2 id="sec-2">この記事の実行環境と検証範囲</h2>
+
+                    <p>主題は Linux サーバなのに、以下の出力を作った環境は <strong>Windows 10 上の Git Bash</strong> である。これを先に明かすのは、<strong>どの出力が実際に出たもので、どの命令が出力なしで書かれているか</strong>を読者が区別できなければならないからだ。</p>
+
+                    <pre><code>$ bash --version | head -1
+GNU bash, version 5.2.37(1)-release (x86_64-pc-msys)
+
+$ uname -a
+MINGW64_NT-10.0-19045 3.5.7-882031da.x86_64 2025-01-30 11:14 UTC x86_64 Msys
+
+$ git --version
+git version 2.48.1.windows.1
+
+$ stat --version | head -1
+stat (GNU coreutils) 8.32
+
+$ stat -f -c 'bsize=%s' /tmp/demo
+bsize=4096
+
+# PowerShell 側
+PS&gt; $PSVersionTable.PSVersion.ToString()
+5.1.19041.6456</code></pre>
+
+                    <p>coreutils は Linux と同じ GNU 8.32 なので <code>stat</code>·<code>df</code>·<code>du</code>·<code>truncate</code> のオプション動作は同一である。MSYS は <code>/proc</code> を独自に真似て提供しており、<strong>これが Linux カーネルの procfs ではない</strong>という点が後で一度だけ効いてくる。以下がこの記事で実際に走らせたものと走らせられなかったものの一覧である。</p>
+
+                    <ul>
+                        <li><strong>走らせたもの (Linux 側)</strong> — 削除後も開いたままのファイルの再現、<code>stat -c</code> による inode とリンク数の追跡、<code>stat -f</code> による空きブロック計測、<code>/proc/&lt;pid&gt;/fd</code> の参照と全走査、掴んでいる側が二つのときの挙動、ファイル記述子の切り詰めの試行、開いた直後に <code>unlink</code> する慣用句</li>
+                        <li><strong>走らせたもの (Windows 側)</strong> — 共有モードを変えたファイルロックの再現、ロックされたファイルへの <code>Remove-Item</code>·<code>Rename-Item</code>·<code>Get-Content</code>、Git Bash からの <code>rm</code>·<code>cat</code>、Restart Manager API による占有プロセスの特定、<code>openfiles</code>、<code>Get-Process</code> のモジュール一覧検索</li>
+                        <li><strong>走らせられなかったもの</strong> — <code>lsof</code>·<code>fuser</code>（この環境に入っていない）、コンテナとネームスペース関連のすべて、NFS マウント</li>
+                        <li><strong>作り話をしていないもの</strong> — 走らせられなかった命令の<strong>出力はこの記事に一行もない。</strong>命令の形と<strong>読み方</strong>だけを書き、その根拠は各道具のマニュアルである</li>
+                        <li><strong>手を入れたもの</strong> — 経路を <code>/tmp/demo</code> に縮めて書いた。<strong>数値は一つも変えていない。</strong>この機械は他の作業も同時に動く個人用 PC なので空きブロックの値に数百ブロック単位の雑音が混ざっており、その雑音もそのまま残した</li>
+                        <li>ブロックサイズは 4,096 バイトと報告される。以下の空きブロック数に 4,096 を掛ければバイトになる</li>
+                    </ul>
+
+                    <h2 id="sec-3">症状 - df と du が食い違う</h2>
+
+                    <p>診断の出発点は<strong>二つの道具が違う答えを返すこと</strong>である。<code>du</code> はディレクトリを歩いて名前の付いたファイルを数える。名前が消えたファイルは <code>du</code> の視野の外だ。<code>df</code> はファイルシステムのブロック会計を読むので、握られた容量を<strong>使用中</strong>と見る。だから二つが開き、<strong>開いた幅がそのまま握られた容量</strong>になる。</p>
+
+                    <p>200MiB のファイルを作り、<code>tail -f</code> で掴んだまま消してから <code>df -h</code> をそのまま出力した。</p>
+
+                    <pre><code>--- rm の前 ---
+du -sh . = 200M
+  Filesystem   Size  Used Avail Use% Mounted on
+  /tmp/demo    931G  601G  331G  65% /tmp
+
+--- rm の後 ---
+du -sh . = 0
+  Filesystem   Size  Used Avail Use% Mounted on
+  /tmp/demo    931G  601G  331G  65% /tmp
+
+--- 掴んでいたプロセスを終了した後 ---
+  Filesystem   Size  Used Avail Use% Mounted on
+  /tmp/demo    931G  600G  332G  65% /tmp</code></pre>
+
+                    <p>三つのブロックを並べて読めば順序がはっきりする。<code>rm</code> は <code>du</code> だけを 200M から 0 に変え、<code>df</code> は<strong>一桁も動かなかった</strong>。<code>df</code> が 601G/331G から 600G/332G に変わったのは <code>rm</code> ではなく<strong>プロセスを終了した後</strong>である。容量を返したのは <code>rm</code> ではなく <code>kill</code> だ。</p>
+
+                    <ul>
+                        <li>現場ではこの症状はたいてい<strong>グラフ</strong>で先に見える。整理作業を回したのにディスク使用量のグラフが階段状に落ちず平らなら、この原因の可能性が高い</li>
+                        <li><code>du -sh /</code> の合計と <code>df</code> の Used を比べるのが最も安い一次判別である。大きな差が出れば名前のないファイルがあるということだ</li>
+                        <li>ただし二つの値はもともと完全には一致しない。予約ブロック、ジャーナル、マウントに隠されたディレクトリのせいで数パーセントの差は正常だ。<strong>数十 GiB 単位で開くとき</strong>が信号である</li>
+                        <li>注意すべき落とし穴が一つある。<code>du</code> を root 以外の権限で回すと読めないディレクトリが静かに抜ける。そのとき生じた差はこの現象とは無関係だ</li>
+                    </ul>
+
+                    <h2 id="sec-4">名前は消え inode は残る</h2>
+
+                    <p>前節が症状なら、この節は原理を目で確かめる場所である。512MiB のファイルを作り、<code>tail -f</code> で掴み、消したあとに<strong>同じ inode をファイル記述子越しにもう一度覗いた。</strong></p>
+
+                    <pre><code>[1] 作成直後
+    name=app.log inode=4503599629412470 links=1 size=536870912 blocks=524288
+    free=86810586   du -sh . = 512M
+
+[2] tail -f (pid=1442) が開いたまま
+
+[3] rm の直後 - 名前は消えた
+    ls -A: []
+    du -sh . = 0    free=86811452
+
+[4] ところが fd 越しには inode が生きている
+    /proc/1442/fd/3  inode=4503599629412470 links=0 size=536870912 blocks=524288
+    readlink        /tmp/demo/app.log (deleted)
+
+[5] 掴んだ fd では今も読める
+    $ head -c 16 /proc/1442/fd/3 | od -An -tx1
+      00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+[6] kill の後 free=86939254</code></pre>
+
+                    <p>読む順序はこうだ。<strong>inode 番号が [1] と [4] で同じである。</strong>消したあとも同じ客体だ。変わったのは <code>links</code> 一つだけで、1 から 0 になった。一方 <code>size</code> と <code>blocks</code> は <strong>536870912 と 524288 のまま</strong>である。名前は消えたがデータは一バイトも返されていないということだ。</p>
+
+                    <p>空きブロックも同じことを言っている。<code>rm</code> の前後で 86810586 から 86811452 へ、<strong>866 ブロック</strong>しか動いていない。4,096 を掛ければ 3.4MiB 程度で、これは同じ機械で動く他の作業の雑音である。512MiB は 131,072 ブロックなのに、そのうち何も戻ってこなかった。そして <code>kill</code> のあと 86811452 から 86939254 へ、<strong>127,802 ブロックが一度に</strong>戻ってきた。</p>
+
+                    <ul>
+                        <li><code>links=0</code> なのに <code>size</code> が大きい。これが<strong>この状況の指紋</strong>である。他のどんな状態でもこの組み合わせは出ない</li>
+                        <li>カーネルが付ける <code>(deleted)</code> の札は<strong>経路文字列の一部ではなく表示</strong>である。その文字列をそのまま <code>cat</code> に渡せば、ないファイルだと言われる</li>
+                        <li>[5] が示すとおり<strong>掴んでいる側は何の支障もなく読み書きを続ける。</strong>だからアプリケーションはこの状況をエラーとして報告しない</li>
+                        <li>回復が一度に起きる点も覚えておく価値がある。少しずつ戻って止まるのではなく、最後の参照が閉じる<strong>その瞬間に全量</strong>である</li>
+                    </ul>
+
+                    <h2 id="sec-5">探し方 ① /proc を直接走査する</h2>
+
+                    <p>本番機に <code>lsof</code> がない場合は思ったより多い。最小構成のイメージ、コンテナの中、閉域網のサーバでは、道具を新たに入れること自体が手続きを要求する。ところが<strong>カーネルがすでに答えを露出している</strong>ので道具なしでもいける。各プロセスの <code>/proc/&lt;pid&gt;/fd</code> はそのプロセスが開いているファイルを指すシンボリックリンクの束であり、対象が消えている場合は宛先の末尾に <code>(deleted)</code> が付く。</p>
+
+                    <pre><code># 特定のプロセス一つだけを見るとき
+$ ls -l /proc/1442/fd | grep -i deleted
+lrwx------ 3 -&gt; /tmp/demo/app.log (deleted)
+
+# 全走査 - シェルだけで
+$ for p in /proc/[0-9]*; do
+    pid=${p##*/}
+    for fd in "$p"/fd/*; do
+      tgt=$(readlink "$fd" 2&gt;/dev/null) || continue
+      case "$tgt" in *"(deleted)") echo "pid=$pid fd=${fd##*/} -&gt; $tgt";; esac
+    done
+  done
+
+pid=318  fd=3  -&gt; /tmp/demo/app.log (deleted)
+pid=319  fd=3  -&gt; /tmp/demo/app.log (deleted)
+
+# 握られた大きさまで一緒に見たいなら
+$ stat -L -c '%i %h %s %n' /proc/318/fd/3
+16607023627971255 0 268435456 /proc/318/fd/3</code></pre>
+
+                    <p>この方式の値打ちは<strong>追加の導入が要らない</strong>ことだけではない。<code>stat -L</code> を付ければ握られた容量までその場で出るので、候補が複数出たとき<strong>どれから処理すれば容量が実際に戻るか</strong>を大きさ順に決められる。逆に限界も明らかだ。</p>
+
+                    <ul>
+                        <li>他のユーザのプロセスは<strong>権限がなければ見えない。</strong>上の巡回は静かにその行を飛ばすので、結果が空でも存在しないとは限らない。できるだけ <code>sudo</code> で回す</li>
+                        <li><code>fd</code> だけを見ると<strong>メモリマッピングを取りこぼす。</strong>ファイルを <code>mmap</code> したあと記述子を閉じてもマッピングは参照として残る。そちらは <code>/proc/&lt;pid&gt;/maps</code> にある</li>
+                        <li>巡回の途中でプロセスが消えると <code>readlink</code> が失敗する。上の慣用句が失敗を読み飛ばすのはそのためで、これゆえに<strong>同じ命令を二度回すと結果が違うことがある</strong></li>
+                        <li>プロセス数が数千なら、この巡回にも時間がかかる。急ぐならまず候補を絞る。ログを書くアプリケーションと<strong>そのログを読んで転送する収集器</strong>の両方が同じファイルを掴んでいる場合が最も多い</li>
+                    </ul>
+
+                    <h2 id="sec-6">探し方 ② lsof - 命令と読み方</h2>
+
+                    <p>標準の道具は <code>lsof</code> である。<strong>この環境には入っていないので走らせられなかった。</strong>だから以下に出力例はない。代わりにマニュアルが定める動作と、出力のどの列を見るべきかを書く。</p>
+
+                    <pre><code># 消えたのに開いているファイルだけ - この状況の正確な問い
+$ sudo lsof +L1
+
+# マウントで絞る（全体走査は遅い）
+$ sudo lsof -nP +L1 /var
+
+# 特定の経路を誰が開いているか
+$ sudo lsof /var/log/app.log
+
+# 特定のプロセスが何を開いているか
+$ sudo lsof -p 1234
+
+# ディレクトリ木の全体（再帰 - 非常に遅くなりうる）
+$ sudo lsof +D /var/log</code></pre>
+
+                    <p>核となるオプションは <code>+L1</code> である。マニュアルは <code>+L</code> のあとに数値を与えると<strong>リンク数がその値より小さいファイルだけを列挙する</strong>と記す。したがって <code>+L1</code> はリンク数が 0 のファイル、すなわち<strong>名前がすべて消えたのにまだ開いているファイル</strong>を正確に選ぶ。そして <code>+L</code> を与えると出力に <strong>NLINK 列が追加される</strong>。</p>
+
+                    <ul>
+                        <li>既定の列構成は COMMAND · PID · USER · FD · TYPE · DEVICE · SIZE/OFF · NODE · NAME である。ここで <strong>PID と SIZE/OFF と NAME</strong> の三つを見ればたいてい終わる</li>
+                        <li><code>+L</code> を与えると NLINK 列が割り込んで<strong>列の位置がずれる。</strong> <code>awk '{print $2}'</code> のような位置基準の処理はオプションを変えた瞬間に壊れる。自動化するならオプションごとに列位置を確認し直す</li>
+                        <li>FD 列には数値のほかに <code>cwd</code>·<code>txt</code>·<code>mem</code> といった値も来る。<code>mem</code> はメモリマッピングなので <code>/proc/&lt;pid&gt;/fd</code> の巡回では拾えなかった参照だ。<strong>lsof が <code>fd</code> 走査より優れる点がここ</strong>である</li>
+                        <li>数値のあとに付く <code>r</code>·<code>w</code>·<code>u</code> は読み・書き・双方向を意味する。ログファイルを<strong>書きで</strong>開いている側がたいてい処理対象になる</li>
+                        <li><code>-n</code> と <code>-P</code> は名前とポートの変換を切るオプションである。マニュアルも速度改善を理由に挙げる。<strong>ディスクが埋まった急場では習慣的に付けるほうがよい</strong></li>
+                        <li><code>+D</code> はディレクトリ木を再帰で走査する。楽だが対象が大きいと長くかかる。マウント単位で絞るほうを先に試す</li>
+                    </ul>
+
+                    <h2 id="sec-7">探し方 ③ fuser - 経路からプロセスへ</h2>
+
+                    <p><code>fuser</code> も<strong>この環境にないので走らせられなかった。</strong>性格が <code>lsof</code> とは異なる。<code>lsof</code> が一覧を吐く道具なら、<code>fuser</code> は<strong>経路を一つ問うてそれを使うプロセスを答える</strong>道具である。すでにファイルが特定できているときはこちらが速い。</p>
+
+                    <pre><code># このファイルを誰が使っているか（ps 形式で）
+$ sudo fuser -v /var/log/app.log
+
+# このファイルシステム全体を誰が使っているか - アンマウントできないとき
+$ sudo fuser -vm /var
+
+# 以下の二行はプロセスを殺す。確認せずに打たないこと
+$ sudo fuser -k  /var/log/app.log     # 即座に終了
+$ sudo fuser -ki /var/log/app.log     # 一つずつ確認しながら終了</code></pre>
+
+                    <p><code>-v</code> を与えるとマニュアルの表現どおり <strong>ps に似た形</strong>で PID·USER·COMMAND が出て、その間に <code>ACCESS</code> 列が付く。この列が <code>fuser</code> を読む要領のすべてだ。マニュアルが定義する文字は次のとおりである。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>文字</th><th>マニュアルの定義</th><th>この状況での意味</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>f</code></td><td>開いたファイル（既定表示では省略される）</td><td>読みで開いている。収集器や監視が多い</td></tr>
+                            <tr><td><code>F</code></td><td>書き込みで開いたファイル（既定表示では省略される）</td><td><strong>最有力の対象。</strong>今もこのファイルに書いている</td></tr>
+                            <tr><td><code>m</code></td><td>mmap されたファイルまたは共有ライブラリ</td><td>マッピングで掴んでいる。<code>fd</code> 走査では拾えない側</td></tr>
+                            <tr><td><code>c</code></td><td>カレントディレクトリ</td><td>そこで動いているだけ。アンマウントだけを阻む</td></tr>
+                            <tr><td><code>e</code></td><td>実行中の実行ファイル</td><td>バイナリ自体がそのファイルシステムにある</td></tr>
+                            <tr><td><code>r</code></td><td>ルートディレクトリ</td><td><code>chroot</code> されたプロセスで見える</td></tr>
+                        </tbody>
+                    </table>
+
+                    <div class="callout">
+                        <strong>危険</strong> — <code>fuser -k</code> はマニュアルどおり<strong>ファイルにアクセス中のプロセスを殺す。</strong>経路を広く与えればその下に書くプロセスが<strong>すべて</strong>対象になる。<code>-m</code> と <code>-k</code> を併せて与えれば、そのファイルシステムを使うすべてのプロセスが終了する。まず <code>-v</code> で一覧を見て、殺す対象がその一覧と正確に同じかを確かめてからのみ <code>-k</code> を付ける。確認したければ <code>-i</code> も与えるが、マニュアルは <strong><code>-k</code> なしで <code>-i</code> だけを与えると静かに無視される</strong>と記している。
+                    </div>
+
+                    <h2 id="sec-8">掴んでいる側が一つではないとき</h2>
+
+                    <p>実務で無駄骨が最も多く出る場所である。一つ見つけて再起動したのに容量がそのままなら、たいていは道具が間違ったのではなく<strong>参照が一つではなかった</strong>のだ。256MiB のファイルを二つのプロセスに掴ませ、片方ずつ終了させてみた。</p>
+
+                    <pre><code>[1] 256MiB 作成            free=86679271
+[2] rm 完了                free=86680587   ls -A=[]
+[3] 残った参照を全走査
+    pid=318  fd=3  -&gt; /tmp/demo/app.log (deleted)
+    pid=319  fd=3  -&gt; /tmp/demo/app.log (deleted)
+[4] 片方だけ終了 (pid 318)  free=86682346   &lt;-- まだだ
+[5] 残りも終了 (pid 319)    free=86748978   &lt;-- ここで戻る</code></pre>
+
+                    <p>[4] で動いたのは 1,759 ブロック、7MiB 程度の雑音である。256MiB は 65,536 ブロックなのに<strong>片方を殺しても何も戻らなかった。</strong>[5] で初めて 66,632 ブロックが一度に戻る。カーネルは参照を数えるのであってプロセスを数えるのではない。</p>
+
+                    <ul>
+                        <li>だから処理の順序は<strong>一覧を先に完成させてから手を付けること</strong>である。一つ見つけて殺してまた見る方式は、そのたびに一覧が変わって判断が揺れる</li>
+                        <li>同じプロセスが<strong>同じファイルを複数の記述子で</strong>開いている場合もある。このときはプロセス一つを処理すれば済むが、fd 切り詰めで対応するなら番号をすべて切らなければならない</li>
+                        <li>典型的な多重参照の組み合わせは決まっている。ログを書くアプリケーション、それを読む収集器、そして人が数日前に立てて忘れた <code>tail -f</code> のセッションだ</li>
+                        <li>親が開いたファイルを子が<strong>継承</strong>している場合も多い。親だけ再起動しても子がそのまま掴んでいる</li>
+                    </ul>
+
+                    <h2 id="sec-9">Windows - 誰がロックしたかを突き止める</h2>
+
+                    <p>Windows では症状そのものが違って現れる。消したファイルが容量を握るのではなく、<strong>そもそも消えない。</strong>使用中だというメッセージが出るのに、肝心のどのプログラムかは教えてくれないのが普通である。</p>
+
+                    <p>ここで実際に使えるのは <strong>Restart Manager API</strong> だ。マイクロソフトの文書はこの API の目的を、インストールや更新の途中で<strong>ファイルを使っているアプリケーションを終了して再起動し</strong>再起動回数を減らすことだと説明する。その過程に必要なのが、まさに我々の欲しい情報、すなわち<strong>このファイルを今誰が握っているか</strong>である。管理者権限なしで動き、別途の導入も要らない。</p>
+
+                    <pre><code>Add-Type -Namespace Rm -Name Api -MemberDefinition @'
+[StructLayout(LayoutKind.Sequential)]
+public struct RM_UNIQUE_PROCESS { public int dwProcessId;
+  public System.Runtime.InteropServices.ComTypes.FILETIME ProcessStartTime; }
+[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+public struct RM_PROCESS_INFO {
+  public RM_UNIQUE_PROCESS Process;
+  [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string strAppName;
+  [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)]  public string strServiceShortName;
+  public int ApplicationStatus; public uint TSSessionId;
+  [MarshalAs(UnmanagedType.Bool)] public bool bRestartable; }
+[DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+public static extern int RmStartSession(out uint h, int flags, string key);
+[DllImport("rstrtmgr.dll")] public static extern int RmEndSession(uint h);
+[DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+public static extern int RmRegisterResources(uint h, uint nFiles, string[] files,
+  uint nApps, RM_UNIQUE_PROCESS[] apps, uint nSvc, string[] svc);
+[DllImport("rstrtmgr.dll")]
+public static extern int RmGetList(uint h, out uint needed, ref uint count,
+  [In, Out] RM_PROCESS_INFO[] arr, ref uint reasons);
+'@
+
+$full = (Resolve-Path $Path).Path
+$h = 0
+[void][Rm.Api]::RmStartSession([ref]$h, 0, [guid]::NewGuid().ToString())
+[void][Rm.Api]::RmRegisterResources($h, 1, @($full), 0, $null, 0, $null)
+$needed = 0; $count = 0; $reason = 0
+$rc = [Rm.Api]::RmGetList($h, [ref]$needed, [ref]$count, $null, [ref]$reason)
+if ($rc -eq 234) {                       # ERROR_MORE_DATA - 実際の個数を教えてくれた
+    $arr = New-Object 'Rm.Api+RM_PROCESS_INFO[]' $needed
+    $count = $needed
+    if ([Rm.Api]::RmGetList($h,[ref]$needed,[ref]$count,$arr,[ref]$reason) -eq 0) {
+        for ($i = 0; $i -lt $count; $i++) {
+            $pi = $arr[$i]
+            "  PID {0,-7} {1,-22} restartable={2}" -f `
+              $pi.Process.dwProcessId, $pi.strAppName, $pi.bRestartable
+        }
+    }
+}
+[void][Rm.Api]::RmEndSession($h)</code></pre>
+
+                    <p>この環境で実際に走らせた結果である。同じファイルを二度問い、二度目は別のプロセスが共有なしで開いた状態だった。</p>
+
+                    <pre><code>=== A. 誰も掴んでいないとき ===
+holders of: C:\tmp\demo\locked.txt
+  (none - no process holds this file)
+
+=== B. 別のプロセスが掴んでいるとき ===
+holders of: C:\tmp\demo\locked.txt
+  PID 25328   Windows PowerShell     restartable=True</code></pre>
+
+                    <ul>
+                        <li>PID と一緒に <code>restartable</code> が出る点が実用的だ。真なら<strong>そのプログラムは終了後の再起動に耐えるよう登録されている</strong>という意味なので、処置の判断がしやすくなる</li>
+                        <li>最初の <code>RmGetList</code> 呼び出しが <code>234</code>（ERROR_MORE_DATA）を返すのは失敗ではなく<strong>必要な配列の大きさを教える正常な流れ</strong>である。この値をエラーとして扱うと結果がいつも空に見える</li>
+                        <li>エクスプローラの<strong>ファイルが使用中</strong>のダイアログがプログラム名を見せることがあるが、その裏にあるのがこの API だ。同じ情報をスクリプトで取り出しているだけである</li>
+                        <li>GUI で同じことをするなら<strong>リソースモニター</strong>（<code>resmon</code>）の CPU タブにある<strong>関連付けられたハンドル</strong>の検索欄にファイル名を入れればよい。この記事は GUI を撮っていないので画面の説明はここまでにする</li>
+                    </ul>
+
+                    <h2 id="sec-10">Windows - うまくいかない方法たち</h2>
+
+                    <p>検索するとよく出てくるが実際にはうまくいかない方法が二つある。どちらも走らせてみたが、<strong>なぜ駄目なのか</strong>のほうがむしろ役に立つ。</p>
+
+                    <pre><code>PS&gt; openfiles /Local
+エラー: ログオンしたユーザーは管理者権限を持っていません。
+
+PS&gt; openfiles /Query /FO TABLE
+情報: ローカルで開いているファイルを見るには、システムのグローバルフラグ
+      'maintain objects list' を有効にする必要があります。
+ローカル共有ポイント経由でリモートから開かれたファイル:
+エラー: アクセスが拒否されました。
+
+PS&gt; # Modules で探す - DLL は出てくる
+PS&gt; Get-Process | Where-Object { $_.Modules.FileName -contains
+      'C:\WINDOWS\System32\kernel32.dll' } | Select-Object -First 3 Id,ProcessName
+   Id ProcessName
+   -- -----------
+19744 AMDInstallManager
+11128 AMDRSSrcExt
+21760 ApplicationFrameHost
+
+PS&gt; # 同じ方式でデータファイルを探すと
+PS&gt; Get-Process | Where-Object { $_.Modules.FileName -contains $target }
+(結果 0 件)</code></pre>
+
+                    <p><code>openfiles</code> は二重に塞がれる。ローカルの一覧を見るには <strong>maintain objects list</strong> というシステム全域のフラグを立てる必要があるが、それを立てる <code>openfiles /Local ON</code> 自体が管理者権限を要求し、適用には再起動が要る。つまり<strong>すでに問題が起きたあとに立てて使える道具ではない。</strong>フラグが下りた状態で <code>/Query</code> が答えるのは共有経由でリモートから開かれたファイルだけである。</p>
+
+                    <p><code>Get-Process</code> の <code>Modules</code> は筋が違う。まったく駄目なのではなく<strong>対象が違う。</strong>この一覧に入るのはプロセスに読み込まれた実行イメージ、すなわち EXE と DLL である。上の出力で <code>kernel32.dll</code> はきちんと見つけている。しかしログファイルやデータファイルはモジュールではないので<strong>永遠に 0 件</strong>だ。</p>
+
+                    <ul>
+                        <li>まとめるとこうだ。<strong>DLL がロックされて更新が止まった状況</strong>なら <code>Modules</code> 検索で足り、それ以外のファイルなら前節の Restart Manager のほうへ行く</li>
+                        <li>Sysinternals の <code>handle</code> 系の道具が広く使われているが、<strong>この環境には入っていないので走らせられなかった。</strong>だからこの記事にはその出力がない</li>
+                        <li>実際の場面でロックの犯人が<strong>アンチウイルス・バックアップ・インデックスサービス</strong>であることはかなり多い。これらはファイルを短く開いて閉じるので、<strong>同じ照会を数秒間隔で二度</strong>やってみれば性格が分かれる</li>
+                    </ul>
+
+                    <h2 id="sec-11">再起動が答えだが再起動できないとき</h2>
+
+                    <p>掴んでいる側が見つかれば処置は単純である。<strong>再起動が最も確実だ。</strong>ログファイルなら再起動の代わりにログ再開シグナルで足りる場合も多い。ところが稼働中のサービスでどちらも今はできないなら、広く知られた迂回が一つある。開いたファイル記述子を<strong>直接切り取ること</strong>だ。</p>
+
+                    <div class="callout">
+                        <strong>危険</strong> — 以下の方法は<strong>取り消せず確認の手順もない。</strong>ファイル記述子の番号を一つ間違えると、そのプロセスが開いている<strong>別のファイルが丸ごと空になる。</strong>実行の前に <code>readlink /proc/&lt;pid&gt;/fd/&lt;n&gt;</code> で宛先を目で確かめ、それが <code>(deleted)</code> の表示が付いたログファイルで間違いないと見てからのみ手を付ける。再起動できるなら再起動が常に安全な側である。
+                    </div>
+
+                    <pre><code># 1) 必ず先に - 何を切ろうとしているかを目で確認
+$ readlink /proc/957/fd/3
+/tmp/demo/big.log (deleted)
+
+# 2) そのあとにだけ - 記述子の切り詰め（取り消せない）
+$ : &gt; /proc/957/fd/3
+
+# この環境で出た結果
+[A] rm の後             free=86771292
+    fd: inode=16607023627971255 links=0 size=268435456 blocks=262144
+[B] : &gt; /proc/957/fd/3
+    tail: big.log: file truncated
+    切り詰めの後: size=0  blocks=262144
+    free=86770524                     &lt;-- 戻らなかった
+[C] truncate -s 0 /proc/957/fd/3
+    size=0  blocks=262144
+    free=86769107                     &lt;-- 依然として
+[D] kill の後           free=86833972</code></pre>
+
+                    <p>結果は正直に読まねばならない。<strong>切り詰め自体は通った。</strong> <code>size</code> が 268435456 から 0 になり、掴んでいた <code>tail</code> が <code>file truncated</code> と反応したのがその証拠である。ところが<strong>空きブロックは戻らず</strong> <code>blocks</code> も 262144 のままだった。実際の返却は <code>kill</code> のあとの [D] で起きている。</p>
+
+                    <p>ここで結論を急いではいけない。この環境の <code>/proc</code> は Linux カーネルの procfs ではなく MSYS が真似たもので、その下は NTFS である。<strong>Linux で同じ結果になる根拠にはならない。</strong>ただしこの失敗から持ち帰る教訓は環境と無関係に有効だ。<strong>切り詰めが通ったかどうかは <code>size</code> ではなく <code>df</code> で確認しなければならない。</strong>大きさの表示が 0 になったことと容量が戻ったことは別の事実である。</p>
+
+                    <p>そしてこの方法には対象の制限がある。<strong>ログには通じ、データファイルには通じない。</strong>理由はファイルの扱い方が違うからだ。</p>
+
+                    <ul>
+                        <li><strong>ログファイル</strong> — たいてい追記モードで開かれ末尾にだけ足す。前の部分が消えても次の書き込みは新しい末尾から続く。切ってもアプリケーションの世界観が壊れない</li>
+                        <li><strong>データファイル・DB ファイル</strong> — オフセットを計算して特定の位置を読み書きする。切った瞬間に<strong>プロセスが覚えている構造とファイルの実体がずれる。</strong>次の読み取りが 0 で埋まった領域を正常なデータと解釈すれば、損傷は静かに広がる</li>
+                        <li><strong>追記モードでないログ</strong> — オフセットを保ったまま書く実装なら、切ってもファイルの大きさが元のオフセットまで再び伸びる。前の部分が 0 で埋まった<strong>スパースファイル</strong>になり、見かけの大きさだけ大きく実使用量は小さい状態になる</li>
+                        <li><strong>複数の記述子で開かれたファイル</strong> — 一つだけ切っても他の記述子がそのまま掴んでいる。前節で見たとおりだ</li>
+                    </ul>
+
+                    <h2 id="sec-12">ロックは別の話である</h2>
+
+                    <p>ここまでが<strong>消えたのに開いているファイル</strong>の話だった。<strong>ファイルロック</strong>は名前が似ていて症状も重なって見えるが別の機序である。そしてこの地点で Linux と Windows が正確に分かれる。</p>
+
+                    <p>Unix の <code>flock</code> は<strong>勧告的</strong>だ。マニュアルはこう記す。適切な権限があれば、<strong>プロセスは他のプロセスの <code>flock</code> の使用を無視して入出力を行う自由がある</strong>と。つまりロックは参加すると決めたプログラム同士の約束であって、カーネルが強制する壁ではない。だから Linux では<strong>他方がロックしたという理由で <code>rm</code> が失敗することはない。</strong></p>
+
+                    <p>Windows は違う。ただしよくある誤解とも違う。Windows が無条件に阻むのではなく、<strong>ファイルを開く側が開く時点で共有モードを決め、カーネルがそれを強制する。</strong> <code>CreateFile</code> の文書は共有モードが 0 なら<strong>そのファイルは共有できずハンドルが閉じられるまで再び開けない</strong>と記し、衝突する要求は <code>ERROR_SHARING_VIOLATION</code> で失敗すると記す。実際に確かめると同じファイルが共有モードによって正反対に分かれる。</p>
+
+                    <pre><code>=== 共有モード None で開いたファイル ===
+PS&gt; Remove-Item $target
+ERR: IOException
+MSG: The process cannot access the file ... because it is being used by another process.
+PS&gt; Rename-Item $target renamed.txt      -&gt; 同じエラー
+PS&gt; Get-Content $target                  -&gt; 同じエラー
+
+$ stat -c 'inode=%i links=%h size=%s' locked.txt
+inode=6192449489676514 links=1 size=19       # メタデータは読める
+$ cat locked.txt
+cat: locked.txt: Device or resource busy
+$ rm locked.txt
+rm: cannot remove 'locked.txt': Device or resource busy
+$ ls -l
+-rw-r--r-- 1 ... 19 Sep  2 09:12 locked.txt  # そのまま残っている
+
+=== 同じファイルを共有モード ReadWrite, Delete で開いた場合 ===
+$ cat shared.txt
+share-delete payload
+$ rm -v shared.txt
+removed 'shared.txt'                          # 成功。プロセスはまだ生きている
+$ ls -A
+(空)</code></pre>
+
+                    <p>二つのブロックの違いはファイルでも消す命令でもない。<strong>開く側が何を許したか</strong>の一つだけである。共有なしで開いたファイルは削除も名前変更も読み取りもすべて塞がれ、共有一覧に削除を含めて開いたファイルは<strong>掴んでいるプロセスが生きているのに名前が即座に消えた。</strong>後者は Unix と事実上同じ形である。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>区分</th><th>Linux / Unix</th><th>Windows</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>ロックの性格</td><td>勧告的。参加するプログラム同士の約束</td><td>開く時点で決めた共有モードをカーネルが強制</td></tr>
+                            <tr><td>使用中のファイルの削除</td><td>常に成功。名前だけが消える</td><td>開く側が削除を許したときだけ成功</td></tr>
+                            <tr><td>失敗したときに見えるもの</td><td>失敗しない</td><td>使用中というメッセージ · <code>Device or resource busy</code></td></tr>
+                            <tr><td>それで生じる問題</td><td>容量が静かに戻らない</td><td>配備や更新が騒がしく止まる</td></tr>
+                            <tr><td>探す道具</td><td><code>lsof</code> · <code>fuser</code> · <code>/proc</code></td><td>Restart Manager · リソースモニター</td></tr>
+                            <tr><td>よくある誤解</td><td><code>rm</code> がデータを消す</td><td>Windows は使用中なら絶対に消せない</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>実務的に残るのはこれだ。Windows で配備がファイルロックで止まるなら、<strong>直す場所は消す側ではなく開く側</strong>である。ログを開くコードが削除の共有を許せばローテーションは詰まらない。</p>
+
+                    <h2 id="sec-13">コンテナ - pid は視点によって違う</h2>
+
+                    <p>コンテナでこの作業が難しくなる理由は道具がないからではなく、<strong>pid と経路が視点ごとに違うから</strong>である。ホストで <code>lsof</code> を回して得た pid をコンテナの中で <code>kill</code> に渡せば見当違いのプロセスを殺す。逆も同じだ。</p>
+
+                    <p>コンテナ自体はこの環境で走らせられなかった。ただし<strong>同じ性質のずれ</strong>はここでもそのまま出る。MSYS は自分だけの pid を使い、Windows カーネルは別の pid を使う。</p>
+
+                    <pre><code>$ tail -f hold.log &gt; /dev/null &amp;
+$ echo $!
+1410
+
+$ ls -l /proc/1410/fd | grep -i deleted
+lrwxrwxrwx 3 -&gt; /tmp/demo/hold.log (deleted)
+
+$ ps -W | head -1
+      PID    PPID    PGID     WINPID  TTY   UID    STIME COMMAND
+$ ps -W | grep 1410
+     1410    1405    1403        580  ?  197609 09:18:32 /usr/bin/tail</code></pre>
+
+                    <p>シェルが知る pid は <strong>1410</strong> なのにカーネルが知る pid は <strong>580</strong> である。同じプロセスで、どちらも間違っていない。<strong>翻訳表なしに片方の数値をもう片方へ渡してはいけない</strong>というのが要点であり、コンテナの pid ネームスペースで起きることも性質は同じだ。以下はその状況で確認すべき場所である。</p>
+
+                    <ul>
+                        <li>ホストで見た pid をコンテナ内の pid へ移すには<strong>翻訳が要る。</strong>Linux では <code>/proc/&lt;host-pid&gt;/status</code> の <code>NSpid</code> 行に二つの値が並んで書かれる</li>
+                        <li>経路もずれる。コンテナ内の <code>/var/log/app.log</code> はホストから見ればオーバーレイ上位層のどこかの長い経路である。<strong>ホストで取った <code>lsof</code> の結果の経路をコンテナの経路と取り違えないこと</strong></li>
+                        <li>コンテナ内に <code>lsof</code> も <code>/proc</code> へのアクセス権もない場合が多い。そのときはホストから見るほうが速い。ホストの <code>/proc/&lt;pid&gt;/root/</code> の下にそのコンテナのファイルシステムがそのまま見える</li>
+                        <li>最もよくある誤りは<strong>コンテナを再起動すれば解決すると見てログのボリュームはそのまま置くこと</strong>である。掴んでいるプロセスがコンテナの外のログ収集器なら、コンテナを何度再起動しても容量は戻らない</li>
+                        <li>オーケストレータが付いていれば人が殺したプロセスを再び立ち上げる。<strong>新しく立ったプロセスが同じファイルをまた掴むか</strong>まで確認して初めて処置が終わる</li>
+                    </ul>
+
+                    <h2 id="sec-14">ネットワークファイルシステムの .nfs ファイル</h2>
+
+                    <p>NFS では同じ状況が<strong>目に見える形</strong>で現れる。消したファイルが消えずに <code>.nfs</code> で始まる名前で残っているのを見たことがあるはずだ。これは故障ではなく<strong>NFS クライアントが POSIX の動作を真似ようとしてやっていること</strong>で、普通は sillyrename と呼ぶ。</p>
+
+                    <p>事情はこうだ。ローカルのファイルシステムでは名前が消えても開いた参照があれば読み続けられる。NFS プロトコルはこれを直接支えない。そこでクライアントのカーネルが<strong>消す代わりに <code>.nfsXXXX</code> という形の名前へ移しておく。</strong> Linux NFS wiki の説明のとおり、クライアントは該当の vnode が非活性になったときにその新しい名前を消す。NFS マウントはこの環境にないので<strong>直接は再現できなかった。</strong></p>
+
+                    <ul>
+                        <li>したがって <code>.nfs</code> ファイルは<strong>消すべきごみではなく標識</strong>である。まだ誰かが開いているという意味なので、掴んでいるプロセスを見つけて片づければ名前は自然に消える</li>
+                        <li>消そうとしてもうまくいかない。参照が生きている間はクライアントがその名前を守る</li>
+                        <li>同じ wiki が記す例外がある。<strong>rename と remove の間にクライアントが落ちるとサーバにごみファイルが残る。</strong>この場合にだけ本当に消すべき対象になり、判断の基準はクライアントを再起動しても残っているかどうかだ</li>
+                        <li>この真似は<strong>クライアントが一つのときだけ</strong>成り立つ。他のクライアントがそのファイルを開いているかを知る術がないので、複数のクライアントが同じファイルを共有する配置では開いているファイルが消される状況もありうる</li>
+                        <li><code>rmdir</code> が<strong>空に見えるディレクトリで失敗する</strong>のも同じ理由である。<code>ls -a</code> で見れば <code>.nfs</code> ファイルが中にある</li>
+                    </ul>
+
+                    <h2 id="sec-15">そもそも起こさないようにする</h2>
+
+                    <p>この状況を作る原因は事実上一つに収束する。<strong>ログローテーションの設定が静かにずれていること</strong>だ。ファイルを移すか消したあとプロセスに開き直せという合図を送らなければ、プロセスは名前のない古いファイルに書き続ける。ローテーションがどうやってこの状況を作るのかは <a href="log_rotation_pitfalls.html">ログローテーションが静かに失敗する場所</a> の側で別に扱う。</p>
+
+                    <p>設計の側でできることもある。一時ファイルが必要なときは<strong>開いた直後に名前を消す</strong>慣用句がある。名前がないので他のプロセスが触れられず、プロセスがどんな形で終わってもカーネルが勝手に容量を返す。後片づけのコードを書く必要がなくなる。</p>
+
+                    <pre><code># 開いた直後に unlink - 無名の一時ファイル
+$ exec 9&gt; tmpdata
+$ rm tmpdata                      # 名前はここで消える
+$ echo "hello anonymous" &gt;&amp;9      # それでも書き込みは続く
+$ ls -A
+(空)
+$ stat -L -c 'inode=%i links=%h size=%s' /proc/self/fd/9
+inode=16325548651260599 links=0 size=16
+$ exec 9&gt;&amp;-                       # 閉じた瞬間に容量返却。後片づけ不要
+
+# 監視に入れる値 - df と du の差
+$ used_df=$(df -k --output=used /var | tail -1)
+$ used_du=$(du -sk /var 2&gt;/dev/null | cut -f1)
+$ echo "gap_kb=$(( used_df - used_du ))"</code></pre>
+
+                    <ul>
+                        <li>監視に <strong><code>df</code> と <code>du</code> の差</strong>を指標として入れておけば、この状況が事故になる前に見える。絶対値ではなく<strong>推移</strong>を見る。普段の幅から外れて開き続けるなら握られたファイルが溜まっている最中だ</li>
+                        <li><code>du</code> は大きなファイルシステムで負担が重いので周期を長く取る。CephFS のように全走査が高くつくファイルシステムではこの方式自体を避け、ファイルシステムが提供する再帰統計を使う</li>
+                        <li>ログを書く側と読む側の<strong>両方</strong>に再開シグナルが届くか確認する。アプリケーションだけがシグナルを受け取り収集器が受け取れなければ半分しか手を放さない</li>
+                        <li>ローテーションを名前の変更ではなく<strong>中身を空にする</strong>方式にすればこの問題は原理的に起きない。代わりにローテーションの瞬間に記録される行が失われうるという代償がある</li>
+                        <li>人が残す <code>tail -f</code> のセッションも原因になる。調査目的で立てたセッションは<strong>終わったら閉じる</strong>という習慣一つでなくせる類だ</li>
+                    </ul>
+
+                    <h2 id="sec-16">急ぐときの順序</h2>
+
+                    <p>ディスクが埋まった状態では判断する時間がない。だから順序をあらかじめ決めておくほうがよい。以下は確認が安いものから危険なものへの順である。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>順序</th><th>すること</th><th>見る値</th><th>ここでしてはいけないこと</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>1</td><td>失敗した経路を <code>df</code> に直接与える</td><td>その経路は本当にそのファイルシステムか</td><td>ルートの行だけ見て判断すること</td></tr>
+                            <tr><td>2</td><td><code>du -sh</code> の合計と <code>df</code> の Used を比較</td><td>差が数十 GiB か</td><td>差を即座に原因と断定すること</td></tr>
+                            <tr><td>3</td><td><code>lsof +L1</code> または <code>/proc</code> 走査</td><td>pid · 握られた大きさ · 経路</td><td>一覧を最後まで作らずに手を付けること</td></tr>
+                            <tr><td>4</td><td>同じファイルの参照を<strong>すべて</strong>集める</td><td>親·子·収集器·人のセッション</td><td>一つ殺して数え直すこと</td></tr>
+                            <tr><td>5</td><td>再起動またはログ再開シグナル</td><td><code>df</code> の空きが階段状に跳ねるか</td><td><code>kill -9</code> を先に使うこと</td></tr>
+                            <tr><td>6</td><td>それでも駄目なら fd の切り詰め</td><td><code>readlink</code> で対象を確認してからのみ</td><td>データファイル·DB ファイルに適用</td></tr>
+                        </tbody>
+                    </table>
+
+                    <div class="callout">
+                        <strong>危険</strong> — <code>kill -9</code>（<code>SIGKILL</code>）はプロセスに片づける機会を与えない。バッファに残ったログが消える程度で済むこともあるが、書き込み途中だったファイルが中間状態で残ることもある。<strong>まず既定の終了シグナルを送り、数秒待っても生きているときにだけ</strong>強制終了を使う。いずれにせよデータベースや状態を持つプロセスには最後の手段である。
+                    </div>
+
+                    <ul>
+                        <li>3 番で候補が <strong>0 件</strong>なら権限をまず疑う。他のユーザのプロセスは静かに抜ける</li>
+                        <li>5 番をやっても <code>df</code> が動かなければ 4 番へ戻る。道具が間違ったのではなく<strong>参照が残っている</strong>のだ</li>
+                        <li>急場で<strong>消すものをさらに探す方向</strong>へ行くとたいてい時間を失う。<code>du</code> と <code>df</code> が食い違っているなら消すことでは解決しない</li>
+                        <li>処置が終わったら<strong>同じファイルがまた掴まれるか</strong>をもう一度見る。ローテーションの設定がそのままなら数日後に同じ場所へ戻ってくる</li>
+                        <li>メモリ側が原因のときは症状が似て見えても別の問題だ。その筋は <a href="oom_killer_diagnosis.html">OOM Killer が何を選んだかを読む方法</a> の側にある</li>
+                    </ul>
+
+                    <h2 id="sec-17">まとめ</h2>
+
+                    <p><code>rm</code> は名前を消す命令である。データを消すのは<strong>最後の参照が閉じる瞬間のカーネル</strong>だ。だからこの状況の解決はファイルをまた消すことではなく<strong>掴んでいる側に手を放させること</strong>であり、そのためにはまず誰が掴んでいるかを特定しなければならない。</p>
+
+                    <p>特定する道は三つだ。<code>lsof +L1</code> はリンク数が 0 の開いたファイルだけを正確に選ぶ。<code>fuser -v</code> は経路を一つ問うてプロセスを答え、ACCESS 列が性格を教えてくれる。どちらもなければ <code>/proc/&lt;pid&gt;/fd</code> をシェルで走査すればよく、<code>(deleted)</code> の札が答えの代わりになる。Windows では症状が逆に現れ、Restart Manager がその答えを出す。</p>
+
+                    <p>そして忘れやすいことが二つある。参照は<strong>一つとは限らない</strong>ということ、そしてファイル記述子の切り詰めは<strong>ログには通じデータファイルには通じない</strong>ということだ。この二つを取りこぼすと、処置をしたのに <code>df</code> が動かないか、動いたのに別のものが壊れる。</p>
+
+                    <h2 id="sec-18">確認できなかったこと</h2>
+
+                    <ul>
+                        <li><code>lsof</code> と <code>fuser</code> は<strong>この環境に入っておらず一度も実行できなかった。</strong>該当する節の命令と列の説明は各道具のマニュアルに基づくもので、<strong>実行出力はこの記事にない。</strong>バージョンやディストリビューションによって列構成が変わりうるので、自動化の前に各自の機械で一度確認するほうがよい</li>
+                        <li>ファイル記述子の切り詰めはこの環境で <strong><code>size</code> だけが 0 になり空きブロックは戻らなかった。</strong>MSYS の <code>/proc</code> が Linux カーネルの procfs ではなくその下が NTFS なので、<strong>Linux の ext4·XFS で同じ結果になるかは確認できなかった。</strong>この記事はその環境の結果を断定しない</li>
+                        <li>コンテナと pid ネームスペースは<strong>直接再現できなかった。</strong>本文に載せた pid のずれは MSYS と Windows カーネルの間のもので、<strong>性質が同じだという類比</strong>として書いたのであってコンテナから取った出力ではない。<code>/proc/&lt;pid&gt;/status</code> の <code>NSpid</code> 行もこの環境では確認できなかった</li>
+                        <li>NFS マウントがないので <code>.nfsXXXX</code> ファイルを<strong>自分で作ってみることはできなかった。</strong>該当する節は Linux NFS wiki の説明に基づくものである</li>
+                        <li>Sysinternals の <code>handle</code> 系の道具は<strong>入っていないので走らせられず</strong>、だからこの記事はその道具の出力を引用していない。リソースモニターも GUI なので画面の撮影なしに操作の位置だけを書いた</li>
+                        <li><code>openfiles /Local ON</code> を実際に立てて<strong>フラグが有効な状態の動作は確認できなかった。</strong>管理者権限と再起動が要るからである。本文の二つのエラーメッセージは<strong>下りた状態で出た実際の出力</strong>だ</li>
+                        <li>空きブロックの値に混ざった雑音は<strong>取り除いていない。</strong>この機械で他の作業が同時に動くためで、数百から数千ブロック単位の揺れはそのせいである。再現しても同じ数値にはならない</li>
+                    </ul>
+
+                    <h2 id="sec-19">参考資料</h2>
+
+                    <ul>
+                        <li><a href="https://pubs.opengroup.org/onlinepubs/9699919799/functions/unlink.html" target="_blank" rel="noopener">unlink - POSIX.1-2017 (The Open Group Base Specifications Issue 7)</a> — リンクは unlink が返る前に取り除かれるが、ファイル内容の削除はすべての参照が閉じられるまで先送りされるという規定</li>
+                        <li><a href="https://linux.die.net/man/8/lsof" target="_blank" rel="noopener">lsof(8) マニュアル</a> — <code>+L</code> のあとの数値よりリンク数が小さいファイルだけを列挙するという説明、<code>+L</code> 指定時に NLINK 列が付くという説明、<code>-n</code>·<code>-P</code>·<code>+D</code>·<code>-p</code> の動作</li>
+                        <li><a href="https://man7.org/linux/man-pages/man1/fuser.1.html" target="_blank" rel="noopener">fuser(1) - Linux manual page</a> — <code>-v</code> の ps に似た出力、ACCESS 文字 <code>c</code>·<code>e</code>·<code>f</code>·<code>F</code>·<code>r</code>·<code>m</code> の定義、<code>-m</code>·<code>-k</code>·<code>-i</code> の動作</li>
+                        <li><a href="https://man7.org/linux/man-pages/man2/flock.2.html" target="_blank" rel="noopener">flock(2) - Linux manual page</a> — 勧告的ロックであるという規定、プロセスがロックを無視して入出力する自由があるという一文、ロックが開いたファイル記述に結び付くという説明</li>
+                        <li><a href="https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew" target="_blank" rel="noopener">CreateFileW function (fileapi.h) - Win32 apps</a> — <code>dwShareMode</code> が 0 なら共有できずハンドルが閉じられるまで再び開けないという説明、衝突時の <code>ERROR_SHARING_VIOLATION</code>、<code>FILE_SHARE_DELETE</code> の意味</li>
+                        <li><a href="https://learn.microsoft.com/en-us/windows/win32/rstmgr/about-restart-manager" target="_blank" rel="noopener">About Restart Manager - Win32 apps</a> — 更新対象のファイルを使っているアプリケーションとサービスを終了・再起動して再起動回数を減らすという目的、終了の順序</li>
+                        <li><a href="https://wiki.linux-nfs.org/wiki/index.php/Server-side_silly_rename" target="_blank" rel="noopener">Server-side silly rename - Linux NFS</a> — 開いているファイルを消すとき名前を変えておくクライアントの動作、vnode が非活性になったときに消すという説明、その間にクライアントが落ちるとサーバにごみファイルが残るという言及</li>
+                        <li><a href="no_space_left_but_disk_free.html">ディスクは空いているのに No space left on device - inode と開いたままのファイル</a> — この症状の四つの原因分類と診断の順序。この記事はそのうち二番目の原因を引き継ぐ</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>この記事をシェア</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">スレッズ</button>
+                        <button id="link-copy" class="share-btn link-btn">リンクをコピー</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">一覧に戻る</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">一緒に使うと便利な無料ツール</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/code_image.html">コード画像ジェネレーター</a></li>
+      <li><a href="../static/char_counter.html">文字数カウント</a></li>
+      <li><a href="../static/json_formatter.html">JSON フォーマッター</a></li>
+      <li><a href="../static/regex_tester.html">正規表現テスター</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">すべてのツールを見る &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">関連記事</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="no_space_left_but_disk_free.html">ディスクは空いているのに No space left on device - inode と開いたままのファイル</a></li>
+      <li><a href="oom_killer_diagnosis.html">プロセスが黙って死んだ - OOM キラーの読み方</a></li>
+      <li><a href="git_credential_leak_prevention.html">リモートURLにトークンが埋まっている - git の資格情報が漏れる場所</a></li>
+      <li><a href="git_gitignore_already_tracked.html">.gitignore に入れたのにコミットされ続ける - すでに追跡中のファイル</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('リンクをコピーしました。スレッズアプリに貼り付けて共有してください。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('リンクをコピーしました!'); });
+    });
+    </script>
+</body>
+</html>
