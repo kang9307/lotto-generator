@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ja">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OCRはなぜ遅いのか - 画像は一度に見るのに出力は一行ずつ出てくる</title>
+    <meta name="description" content="いまのOCRが遅い理由は画像を読めないからではなく、出力トークンを一つずつ出すからだ。その逐次性を拡散デコーディングがどう崩すのか、公表された高速化倍率をどの測定条件と一緒に読むべきか、そして日本語や中国語で何が変わるのかを整理する。">
+    <meta name="keywords" content="OCR, 拡散デコーディング, 自己回帰, 投機的デコーディング, block diffusion, CER, WER, OmniDocBench, 文書パース, 読み順, 日中韓OCR, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/ja/posts/diffusion_ocr_decoding.html">
+
+    <meta property="og:title" content="OCRはなぜ遅いのか - 画像は一度に見るのに出力は一行ずつ出てくる">
+    <meta property="og:description" content="遅さの正体は認識ではなくデコーディングだ。逐次生成が生む非対称と、それを崩す方式を測定条件つきで見る。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/ja/posts/diffusion_ocr_decoding.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ja_JP">
+    <meta property="article:published_time" content="2026-09-04">
+    <meta property="article:section" content="IT・技術">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="OCRはなぜ遅いのか">
+    <meta name="twitter:description" content="画像は一度に見るのに、出力は一行ずつ出てくる。その非対称が遅さの正体だ。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "OCRはなぜ遅いのか - 画像は一度に見るのに出力は一行ずつ出てくる",
+      "alternativeHeadline": "デコーディング構造が生む非対称、それを崩す方式、そして高速化倍率を読む条件",
+      "datePublished": "2026-09-04",
+      "dateModified": "2026-09-04",
+      "inLanguage": "ja-JP",
+      "articleSection": "IT・技術",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "OCR, 拡散デコーディング, 自己回帰, 投機的デコーディング, block diffusion, CER, WER, OmniDocBench, 文書パース, 読み順",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/ja/posts/diffusion_ocr_decoding.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "いまのOCRが遅い本当の理由は何か。",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "画像を見る段階ではなく、結果を書き出す段階だ。画像エンコーダは画面全体を一回の演算でまとめて処理するが、言語モデル方式のデコーダは出力トークンを先頭から一つずつ作る。前のトークンが確定しないと次のトークンを計算できないため、出力の長さだけ逐次実行が積み上がる。一枚の文書から出るトークン数は内容によって大きく異なり、表のある領域は自由テキストの領域よりはるかに出力が長い。同じ解像度のページでも表の多い文書が遅いのはそのためだ。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "拡散デコーディングは自己回帰生成と何が違うのか。",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "自己回帰は空欄を左から一つずつ確定していく。拡散系のデコーディングは複数の空欄をまとめて隠した状態から始め、一回の演算でそれらを同時に埋め、必要なら再び整える。実務で使われる形は文全体ではなく一定サイズのブロック単位でこれを行う方式だ。Marianne Arriolaらが2025年に発表したBlock Diffusion論文が、この折衷の理論的土台として広く引用されている。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "高速化倍率を見るとき何を一緒に確認すべきか。",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "少なくとも四つある。どのハードウェアを何枚使ったか、バッチサイズはいくつか、入力はページ全体か切り出した領域か、そしてその倍率がトークン生成区間だけを測った値か要求全体の時間を測った値かだ。同じシステムでもこの条件が変われば倍率は何倍も開く。実際この事例では、トークン生成区間だけ見ると3.85倍、固定コストまで含めた要求全体では1.85倍、レイアウト処理まで含めたページ処理量では1.34倍と、三つの値がすべて異なる。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "CERとWERだけ見るとなぜ足りないのか。",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "どちらも正解文字列と出力文字列の編集距離なので、文字列として並べ直した後の差しか数えない。表の行と列がずれたか、二段組の紙面で読む順序が入れ替わったか、脚注が本文の途中に割り込んだかは、この数値にほとんど表れない。文書パースのベンチマークが表には木構造の編集距離に基づく指標を、読み順には別の編集距離を個別に置いているのはそのためだ。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "精度99パーセントなら実務で十分か。",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "用途による。一枚に文字が3,000字あれば、99パーセントは30字が誤るという意味だ。さらに厄介なのは、その30字がどこか分からないことだ。検索索引用なら誤字がいくつか混じっても埋もれるが、金額や口座番号や人名がかかる文書なら一文字で全体が無効になる。だから点検は全数ではなくリスクの集まる項目に配置し、合計の突き合わせや書式検査のように人の目でなくても弾ける規則を先に入れるほうがよい。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/diffusion_ocr_decoding.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/diffusion_ocr_decoding.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/diffusion_ocr_decoding.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/diffusion_ocr_decoding.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/diffusion_ocr_decoding.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "ホーム",
+      "item": "https://braindetox.kr/ja/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "IT・技術",
+      "item": "https://braindetox.kr/ja/category/tech.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "OCRはなぜ遅いのか - 画像は一度に見るのに出力は一行ずつ出てくる",
+      "item": "https://braindetox.kr/ja/posts/diffusion_ocr_decoding.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="OCRはなぜ遅いのか - 画像は一度に見るのに出力は一行ずつ出てくる">
+                <meta itemprop="datePublished" content="2026-09-04">
+                <meta itemprop="dateModified" content="2026-09-04">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="OCR, 拡散デコーディング, 自己回帰, 投機的デコーディング, block diffusion, CER, WER, OmniDocBench, 文書パース, 読み順">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/ja/posts/diffusion_ocr_decoding.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">OCRはなぜ遅いのか - 画像は一度に見るのに出力は一行ずつ出てくる</h1>
+                    <h2 class="post-subtitle">デコーディング構造が生む非対称、それを崩す方式、そして公表された高速化倍率を読む条件</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-04">2026-09-04</span>
+                        <a class="post-category-link" href="../category/tech.html"><span class="post-category" itemprop="articleSection">IT・技術</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>文書を一枚テキストに変えるのに数秒かかると聞けば、たいていはモデルが文字を見分けるのに時間がかかっていると考える。ところが、いまの方式ではそちらではない。<strong>文字を見分ける作業はほぼ一瞬で終わり、その結果を書き下ろす作業が時間を食い尽くす。</strong></p>
+
+                    <p>この記事はその構造を見る。どの製品がよいという話ではなく、いまOCRが遅い場所が正確にどこで、なぜそこなのか、そしてその場所に手を入れる試みが何を得て何を差し出すのかという話だ。公表される高速化倍率をそのまま信じずに読む方法も一緒に整理する。</p>
+
+                    <div class="callout">
+                        この記事に出てくる性能数値はすべて公開された測定結果であり、測定条件を併記している。条件が変われば同じ手法でも倍率は大きく変わるので、自分のワークロードで直接測るまでは参考値として扱うほうが安全だ。
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>この記事で扱うこと</h3>
+                        <ol>
+                            <li><a href="#sec-1">きっかけ - 倍率だけ持ち出しても何も分からない</a></li>
+                            <li><a href="#sec-2">古典OCRと生成型OCRはそもそも別の仕事をしている</a></li>
+                            <li><a href="#sec-3">ボトルネックの位置 - 入力は並列、出力は逐次</a></li>
+                            <li><a href="#sec-4">拡散デコーディングが実際に変えるもの</a></li>
+                            <li><a href="#sec-5">なぜOCRと相性がよいのか</a></li>
+                            <li><a href="#sec-6">何をどの条件で測ったのか</a></li>
+                            <li><a href="#sec-7">バッチを大きくすると利得は消える</a></li>
+                            <li><a href="#sec-8">投機的デコーディングとの共通点と相違点</a></li>
+                            <li><a href="#sec-9">CERとWERが実際に数えているもの</a></li>
+                            <li><a href="#sec-10">その指標が取りこぼすもの - 表、読み順、段組</a></li>
+                            <li><a href="#sec-11">韓国語・中国語・日本語で変わること</a></li>
+                            <li><a href="#sec-12">遅さが実際に問題になる場所</a></li>
+                            <li><a href="#sec-13">精度99パーセントでも足りない場合</a></li>
+                            <li><a href="#sec-14">古典で足りる場合と生成型が要る場合</a></li>
+                            <li><a href="#sec-15">確認できなかったこと</a></li>
+                            <li><a href="#sec-16">参考資料</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">きっかけ - 倍率だけ持ち出しても何も分からない</h2>
+
+                    <p>2026年9月初め、韓国の開発者コミュニティにOCRのデコーディングを拡散で高速化したという記事が上がった。紹介文は<strong>品質を落とさずデコーディング3.85倍</strong>だった。この種の文はそのまま持ち出されやすく、持ち出された後には情報がほとんど残らない。3.85倍が何に対する何なのか、どのハードウェアでバッチいくつで測った値なのか、その倍率が要求全体の時間にもそのまま乗るのかが抜け落ちているからだ。</p>
+
+                    <p>実際、原文は同じシステムで<strong>三つの異なる倍率</strong>を並べて書いている。トークン生成区間だけ見れば3.85倍、画像エンコーディングとプリフィルまで含めた要求全体では1.85倍、レイアウトと領域処理まで付けたページ処理量では1.34倍だ。三つとも正直な数字であり、三つとも別の問いへの答えだ。どの数字を引くかは<strong>自分が何を減らそうとしているか</strong>が決める。</p>
+
+                    <p>だからこの記事の関心は倍率そのものではなく、その倍率が出てくる構造にある。構造が分かれば自分の文書で倍率がいくつになるか見当がつくし、そもそも効かない場所も先に見えてくる。</p>
+
+                    <h2 id="sec-2">古典OCRと生成型OCRはそもそも別の仕事をしている</h2>
+
+                    <p>古い方式は二段階だ。まず画像から文字がありそうな領域を探し出し、その領域を切り出したうえで、各断片を文字列に変える。検出と認識が分かれていて、各断片の認識は互いに独立なので<strong>複数の断片を同時に処理できる</strong>。成果物は文字列と座標の一覧だ。その一覧をどの順で読むべきか、どこからどこまでが一つの表なのかは、後処理の規則が別に判断する。</p>
+
+                    <p>最近の方式はこの構造を畳んだ。画像を丸ごとエンコーダに入れ、デコーダが結果を<strong>マークダウンやHTMLのような文字列として生成する</strong>。表の行と列、数式、見出しの階層、読む順序が出力形式そのものに入る。後処理の規則で組み立てていたものを、モデルが一度に書くわけだ。うまく合う場所ではこちらのほうがはるかに整う。とくに結合セルのある表や二段組の紙面のように、<strong>座標だけでは復元できない構造</strong>で差が大きい。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>項目</th><th>検出＋認識の方式</th><th>画像からテキストを生成する方式</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>出力</td><td>文字列と座標の一覧</td><td>構造の入った文書文字列</td></tr>
+                            <tr><td>並列性</td><td>領域単位に分けて同時処理できる</td><td>出力トークンが先頭から逐次</td></tr>
+                            <tr><td>表・数式</td><td>後処理の規則が組み立てる。結合セルに弱い</td><td>出力形式のなかに構造が入る</td></tr>
+                            <tr><td>読み順</td><td>座標に基づく整列規則に依存する</td><td>モデルが生成順として決める</td></tr>
+                            <tr><td>誤ったとき</td><td>どの領域が誤ったか座標で指せる</td><td>原本と突き合わせて誤りを探す必要がある</td></tr>
+                            <tr><td>遅延の主因</td><td>領域数と画像サイズ</td><td>出力トークン数</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>最後の行がこの記事の出発点だ。方式を変えたことで<strong>遅さの原因が画像側からテキスト側へ移った</strong>。ページ単位の限界をアーキテクチャで押し切った事例は<a href="baidu_unlimited_ocr_2026.html">長文文書を単一パスでパースするモデル</a>の記事で別に整理したので、ここではデコーディング側だけを見る。</p>
+
+                    <h2 id="sec-3">ボトルネックの位置 - 入力は並列、出力は逐次</h2>
+
+                    <p>画像エンコーダは画面全体を一回の演算のまとまりとして処理する。左上のピクセルを見なければ右下のピクセルを見られないわけではないので、単に全部まとめて見る。一方、言語モデル方式のデコーダは<strong>前のトークンが確定しないと次のトークンを計算できない</strong>。だから出力が1,000トークンなら演算を1,000回逐次で回す。</p>
+
+                    <p>この非対称が実際にどれほど大きいかは出力の長さを測ると見えてくる。先に触れた原文は、英語文書ベンチマークの切り出し領域を対象に<strong>表の領域は断片あたり平均888トークン、自由テキストの領域は断片あたり平均74トークン</strong>だったと書いている。同じ大きさの画像でも表が入っていれば逐次実行の回数が十倍以上開くということだ。表の多い財務文書がとりわけ遅いのはここに理由がある。</p>
+
+                    <pre><code>自己回帰    : [forward] -&gt; t1
+              [forward] -&gt; t2
+              [forward] -&gt; t3   ... 出力の長さだけ繰り返す
+
+ブロック拡散: [forward] -&gt; t1..t32 をまとめて下書き
+              [forward] -&gt; 検証して合う先頭部分だけ確定
+              (1ラウンド = forward 2回)</code></pre>
+
+                    <p>そしてこの逐次区間でハードウェアはおおむね遊んでいる。一度にトークンを一つだけ作ると演算量が小さいので、計算ユニットではなく<strong>重みを読み出すメモリ帯域</strong>が速度を決める。同じ演算コストでトークンを複数作れるなら、その分はそのまま得だ。この部分のハードウェア側の事情は<a href="inference_hardware_tradeoffs.html">推論ハードウェア選定で分かれる軸</a>を整理した記事に詳しく書いてある。</p>
+
+                    <h2 id="sec-4">拡散デコーディングが実際に変えるもの</h2>
+
+                    <p>拡散系のテキスト生成は、空欄を左から埋める代わりに<strong>複数の空欄を隠した状態から始めて一度に埋め、整える</strong>。画像生成でノイズを繰り返し取り除くのと同じ発想を離散トークンに移したものだ。原理そのものは<a href="diffusiongemma_text_generation_2026.html">拡散ベースのテキスト生成</a>の記事で解いてあるので繰り返さない。</p>
+
+                    <p>ここで重要なのは実務型が<strong>ブロック単位</strong>だという点だ。文書全体を一つの塊として扱うと長さを先に決めねばならず、キャッシュの再利用も難しい。そこで32トークンのような固定ブロックだけを拡散で埋め、ブロックの間は従来どおり左から右へ進む。自己回帰と拡散のあいだをつなぐこの折衷は、Marianne Arriolaらが2025年に発表した<em>Block Diffusion</em>論文で広く知られるようになった。</p>
+
+                    <p>今回の事例が採った方式はここから一歩進む。<strong>同じモデルが下書きも作り検証も行う。</strong>1ラウンドで演算を二回回すのだが、一回目はブロック内のトークンをまとめて引く下書きで、二回目はその下書きを従来の逐次方式で確かめる検証だ。先頭から一致する部分までを確定し、最初に食い違った位置は検証側の答えをおまけのように得る。原文の実測では<strong>1ラウンドあたり平均およそ19トークン</strong>が確定し、演算一回あたりに換算すると9.6トークンになる。</p>
+
+                    <h2 id="sec-5">なぜOCRと相性がよいのか</h2>
+
+                    <p>複数の空欄を同時に埋める方式が常にうまくいくわけではない。自由な文章では前の語が後ろの語を大きく左右する。同じ位置に入る候補が複数あり、そのどれを選んだかで次の位置の答えが変わる。同時に埋めれば互いに噛み合わないことが増える。</p>
+
+                    <p>OCRは事情が違う。<strong>正解がすでに画面にある。</strong>モデルが作り出す余地はほとんどなく、各位置の答えは前後の文脈よりもその位置に対応するピクセルにはるかに強く結びついている。だから複数の位置をまとめて埋めても互いに矛盾する確率は低い。この仮説は実測の順序にも裏づけられる。ブロックあたりの確定トークン数が<strong>表25.4、数式20.7、自由テキスト16.9</strong>の順に出た。表は区切り記号や整列記号が規則的で予測しやすく、自由テキストは相対的にそうではない。</p>
+
+                    <ul>
+                        <li>出力の不確実性が低いほど一度に確定するトークンが増える。<strong>速度の利得は予測しやすさから出てくる</strong></li>
+                        <li>だから印刷品質の悪いスキャンや手書きは、同じ手法でも利得が減る余地がある。不確実性が上がるからだ</li>
+                        <li>逆に書式の固まった帳票は利得が大きい側だ。繰り返される構造が予測を容易にする</li>
+                        <li>注意すべきは<strong>この順序が利得の大きさであって精度の大きさではない</strong>という点だ。表が速く出るからといって表が正確なわけではない</li>
+                    </ul>
+
+                    <h2 id="sec-6">何をどの条件で測ったのか</h2>
+
+                    <p>ここからがこの記事の中身だ。下の表は原文に書かれた測定条件と結果をそのまま移したものだ。条件の欄を消すと結果の欄は意味を失う。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>区分</th><th>値</th><th>測定条件</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>ハードウェア</td><td>H100を1枚</td><td>単件サービング。バッチ1</td></tr>
+                            <tr><td>モデル</td><td>0.9Bの文書パースモデル</td><td>既存の自己回帰モデルをブロック拡散の経路と併用するよう変換。ブロックサイズ32</td></tr>
+                            <tr><td>入力</td><td>英語ベンチマークの正解領域8,922件を全数</td><td>出力の長さ制限なし</td></tr>
+                            <tr><td>トークン生成区間</td><td>739 → 2,846 トークン/秒（3.85倍）</td><td>画像エンコーディングやプリフィルなどの固定コストを除外</td></tr>
+                            <tr><td>要求全体</td><td>442 → 816 トークン/秒（1.85倍）</td><td>固定コストを含む</td></tr>
+                            <tr><td>ページ処理量</td><td>0.571 → 0.781 ページ/秒（1.34倍）</td><td>レイアウトと領域処理の段階まで含む</td></tr>
+                            <tr><td>品質</td><td>総合 95.48 → 95.16（-0.32）</td><td>1,651ページの文書パースベンチマークv1.6、公式プロトコル</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>この表で注目すべきは<strong>3.85倍と1.34倍が同じシステムの数字だ</strong>という点だ。前者はトークンを引く区間だけを切り出したもので、後者は利用者が実際に待つ時間に近い。どちらも誇張ではないが、宣伝文句に入るのはいつも前者だ。</p>
+
+                    <p>内容の種類でも分かれる。原文は<strong>表3.50倍、数式1.93倍、自由テキスト1.65倍</strong>と書き、その差の原因として表は出力が長く固定コストがよく薄まる点を挙げた。つまりこれらの倍率は固定コストを含む側の基準だ。短いテキスト断片ばかりを大量に処理するワークロードなら<strong>固定コストが支配して高速化の体感が最も小さい</strong>。</p>
+
+                    <p>品質の側にもう一つ見るべきものがある。総合点が0.32点下がったが、原文は検証を通った出力が元の自己回帰デコーディングと<strong>バイト単位で同一である</strong>ことを確認したと書いている。であればその0.32点はデコーディングではなく、モデルを拡散の経路と併用するよう変換する過程で生じた損失だ。この区別は重要だ。<strong>速度のために精度を削ったのと、変換コストとして精度が削れたのは別の話である。</strong></p>
+
+                    <h2 id="sec-7">バッチを大きくすると利得は消える</h2>
+
+                    <p>ここが実務で最もよく見落とされる場所だ。原文はバッチを大きくするとself-speculative方式の利点が<strong>バッチ1の1.85倍から、両方式それぞれの最大処理量どうしを比べると1.08倍まで縮む</strong>と書いている。</p>
+
+                    <p>理由は単純だ。逐次生成が遅い根本の原因は演算量ではなく、ハードウェアを埋め切れないことにある。ところが要求を複数まとめて一度に回せば、自己回帰方式でもハードウェアが埋まる。埋まってしまえばもう埋める余地がないので、並列デコーディングの利点は消える。まとめるとこうなる。</p>
+
+                    <ul>
+                        <li>この手法は<strong>遅延を減らす手法であって処理量を増やす手法ではない</strong></li>
+                        <li>夜間バッチで数万枚を先に処理しておくチームには利得がほとんどない。そちらはすでにバッチでハードウェアを埋めている</li>
+                        <li>逆に<strong>一人が一枚を上げて結果を待つ</strong>対話型サービスではそのまま体感される</li>
+                        <li>だから導入検討の最初の問いは性能ではなく<strong>うちのトラフィックは同時に何件か</strong>だ。この値が大きければ倍率をそのまま期待してはならない</li>
+                        <li>単件の遅延と全体の処理量のどちらが目標かを先に固めるべきだ。二つは同じ方向ではない</li>
+                    </ul>
+
+                    <h2 id="sec-8">投機的デコーディングとの共通点と相違点</h2>
+
+                    <p>逐次性を崩そうとする試みは今回が初めてではない。最も広く使われているのが投機的デコーディングだ。Yaniv Leviathan、Matan Kalman、Yossi Matiasが2022年に発表した論文がその出発点で、小さく速いモデルが複数のトークンを先に引き、大きいモデルが一回の演算でそれを確かめる方式だ。この論文はT5-XXLで<strong>出力を変えないまま2〜3倍</strong>を報告している。</p>
+
+                    <p>核心は検証だ。下書きが誤っていれば捨てて大きいモデルの答えを使うので、下書きモデルが悪くても結果の品質は落ちない。落ちるのは速度だけだ。今回のOCR事例も同じ骨組みを使いつつ、下書きを<strong>別の小さいモデルではなく同じモデルの拡散経路</strong>が作る点が違う。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>比較項目</th><th>投機的デコーディング</th><th>拡散の下書き＋自己回帰の検証</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>下書きを作る主体</td><td>別の小さいモデル</td><td>同じモデルの別経路</td></tr>
+                            <tr><td>追加で管理するもの</td><td>下書きモデルの学習・配布・バージョン整合</td><td>変換されたチェックポイント一つ</td></tr>
+                            <tr><td>メモリ</td><td>モデルを二つ載せる</td><td>事実上一つ</td></tr>
+                            <tr><td>下書きの品質が悪いとき</td><td>受理率が落ちて遅くなる</td><td>同じ。精度は保たれる</td></tr>
+                            <tr><td>精度の保証</td><td>検証の規則が分布を保存する</td><td>同一の検証の骨組みを使う</td></tr>
+                            <tr><td>共通の限界</td><td colspan="2">バッチが大きくなると利得が減り、検証の演算が追加でかかる</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>どちらも同じ考え方だ。<strong>安く複数を刷ってみて、高いが確実な方法で一度に確かめる。</strong>確かめる費用が生成する費用よりはるかに安いから成立する取引だ。</p>
+
+                    <h2 id="sec-9">CERとWERが実際に数えているもの</h2>
+
+                    <p>速度の話をしていると精度の話が付いてくるが、そこで使われる数字も条件を見るべきなのは同じだ。最もよく使われるのが文字誤り率と単語誤り率だ。</p>
+
+                    <p>文字誤り率は正解の文字列にするために必要な編集回数を正解の長さで割った値だ。広く使われる定義は<code>CER = (S + D + I) / N</code>で、Sは誤って置き換わった文字、Dは抜けた文字、Iはなかった文字が割り込んだ数、Nは正解の文字数だ。単語誤り率は同じ計算を単語単位で行う。</p>
+
+                    <ul>
+                        <li>どちらの指標も<strong>編集距離</strong>だ。結果を一行に伸ばした後の差だけを数える</li>
+                        <li>なかった内容が多く割り込むと<strong>値が1を超えうる</strong>。標準的なライブラリの文書もこの点を明示している。100パーセントを上限と読んではならない</li>
+                        <li>だから正規化した変形を使うところもある。<strong>異なる報告書の数値をそのまま比べてはならない理由</strong>がこれだ</li>
+                        <li>どんな種類の誤りかは教えてくれない。助詞が一つ違うのと金額の桁が違うのが同じ1として計算される</li>
+                        <li>前処理によっても値は揺れる。空白の正規化、大文字小文字の統一、句読点の除去をするかしないかで結果が変わる</li>
+                    </ul>
+
+                    <h2 id="sec-10">その指標が取りこぼすもの - 表、読み順、段組</h2>
+
+                    <p>編集距離は文字列を比べるので、<strong>文字列にした瞬間に消えるもの</strong>は見られない。表の行と列がずれたか、二段組の紙面で右の段を先に読んだか、脚注が本文の段落の間に割り込んだかがそれだ。この種の誤りは文字そのものは全部合っているので文字誤り率は低く出る。ところがその結果を検索索引や質問応答に入れると<strong>内容が丸ごと混ざる</strong>。</p>
+
+                    <p>文書パースのベンチマークが指標を複数に割っている理由はここにある。広く使われる公開ベンチマークを一つ例に取ると、本文テキストには正規化編集距離を、表には木構造の編集距離に基づく類似度を、数式には別の文字検出マッチング指標を、そして<strong>読み順にはまた別の編集距離</strong>をそれぞれ付ける。1,651ページに十種類の文書と五種類のレイアウトが混ざっており、そのなかに二段組の紙面が別項目として入っている。</p>
+
+                    <p>ところが総合点の計算式を見ると<strong>本文の編集距離、表の類似度、数式の指標という三つの平均</strong>だ。読み順はそのなかに入らない。前節で見た0.32点の低下が読み順にどう影響したかは、総合点だけを見ても分からないということだ。これはそのベンチマークの欠陥ではなく、<strong>あらゆる要約指標が持つ性質</strong>だ。</p>
+
+                    <ul>
+                        <li>ベンチマークの数字を見るときは<strong>その数字が何の平均なのか</strong>を先に見る。総合点はたいてい複数の項目を合わせたものだ</li>
+                        <li>合わされていない項目があるなら、その項目はその数字で管理されていないという意味だ</li>
+                        <li>自分の文書に表が多ければ表の指標を、二段組の論文が多ければ読み順の指標を別に見る</li>
+                        <li>最も確かなのは<strong>自分の文書30枚で直接測ってみること</strong>だ。公開ベンチマークの文書分布がうちのものと同じである理由はない</li>
+                    </ul>
+
+                    <h2 id="sec-11">韓国語・中国語・日本語で変わること</h2>
+
+                    <p>先の測定はすべて英語の文書を対象にした値だ。この倍率を韓国語や中国語の文書にそのまま移してはならない理由がいくつかあり、その理由は性能の問題ではなく<strong>文字体系の問題</strong>だ。</p>
+
+                    <p>一つ目は字数だ。ユニコードのCJK統合漢字ブロックはU+4E00からU+9FFFまでで<strong>20,992字あり、空きなく全部が割り当てられて</strong>いる。これも最もよく使う字だけを集めた基本ブロックで、拡張ブロックが別にいくつもある。ハングルは組み合わせの規則があるので計算で出る。初声19かける中声21かける終声28で<strong>11,172字</strong>が完成形として割り当てられている。アルファベット26字を扱うのとは問題の大きさが違う。</p>
+
+                    <p>二つ目はトークン数だ。生成型の方式は文字ではなくトークンを作る。サブワードのトークナイザでは漢字やハングルの一文字が<strong>複数のトークンに割れることがよくある</strong>。すると同じ分量のページでも出力トークン数が言語ごとに変わる。毎秒トークン数で公表された倍率を言語のあいだで移せない、最も実務的な理由がこれだ。比べるなら<strong>毎秒ページ数</strong>のように言語に振り回されにくい単位で見る必要がある。</p>
+
+                    <p>三つ目は単語誤り率がうまく定義されない点だ。中国語と日本語は単語のあいだを空けず、韓国語は空けはするが規範と実際の表記がしばしば食い違う。単語を何で数えるかが形態素解析器の設定に左右されるなら、<strong>その数字はOCRの性能ではなく解析器の設定の関数</strong>になる。だからこの言語圏では文字誤り率のほうがまだ揺れが小さい。</p>
+
+                    <p>四つ目は縦書きだ。ユニコードは縦組みのために文字ごとの既定方向を規定した別の文書を持っており、漢字と仮名とハングルは縦に置いてもそのまま立つが、ラテン文字は寝るというのがその骨組みだ。縦書きの紙面では<strong>読み順と改行の規則そのものが違うので</strong>、横書きの文書で学習したモデルの指標をそのまま期待するのは難しい。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>論点</th><th>英語の文書</th><th>韓国語・中国語・日本語の文書</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>出力クラス数</td><td>アルファベットと句読点が中心</td><td>基本の漢字ブロックだけで20,992字、ハングル完成形11,172字</td></tr>
+                            <tr><td>一文字あたりのトークン</td><td>おおむね一トークンに複数の文字</td><td>一文字が複数トークンになることがよくある</td></tr>
+                            <tr><td>毎秒トークンの比較</td><td>基準を取りやすい</td><td>言語間の比較が成り立たない</td></tr>
+                            <tr><td>単語誤り率</td><td>空白で単語が分かれる</td><td>単語の境界がツールの設定に左右される</td></tr>
+                            <tr><td>組版の方向</td><td>横書き</td><td>縦書きの紙面が存在する</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2 id="sec-12">遅さが実際に問題になる場所</h2>
+
+                    <p>速度を改善するという言い方は、常に<strong>誰のどの待ち時間を減らすのか</strong>に置き換えて見るべきだ。場所ごとに許される遅延が違い、だから必要な手当ても違う。</p>
+
+                    <ul>
+                        <li><strong>大量バッチ処理</strong> — 夜のあいだに数万枚を処理しておく仕事だ。一枚の遅延は誰も見ない。ここで重要なのは一時間あたり何枚かで、バッチを大きくすれば前節で見たとおり並列デコーディングの利得はほぼ消える</li>
+                        <li><strong>アップロード後の即時確認</strong> — 利用者がファイルを上げて画面の前で待つ。数秒単位の遅延がそのまま体感され、この場所に並列デコーディングが最もよく合う</li>
+                        <li><strong>カメラを通した実時間翻訳</strong> — 画面に重ねて見せねばならないので数百ミリ秒で終える必要がある。ここまで来るとデコーディング方式より<strong>モデルの大きさと配置場所</strong>が先に決まる</li>
+                        <li><strong>対話型の文書質問</strong> — 文書を先に処理しておけるなら遅延は索引の時点に移る。利用者の側からはOCRの速度がそもそも見えない</li>
+                        <li><strong>再処理</strong> — モデルを変えて全体を回し直す仕事が周期的に生じる。このときはバッチ処理と同じ性格になる</li>
+                    </ul>
+
+                    <p>下の二行がよく忘れられる。<strong>先に処理しておけるなら速度の問題の相当部分は問題そのものが消える。</strong>実時間が本当に必要な場所なのかを先に確かめるほうがよく、現場の機器に載せる必要があるなら<a href="edge_vision_ai_deployment.html">配置場所があらかじめ決めてしまうもの</a>を先に見るほうがよい。先に処理して検索できる単位に割るこのやり方は、<a href="video_understanding_pipeline.html">時間軸のある媒体</a>でより極端な形になって現れる。</p>
+
+                    <h2 id="sec-13">精度99パーセントでも足りない場合</h2>
+
+                    <p>文字精度99パーセントはよい数字に聞こえる。ところが一枚に文字が3,000字あれば<strong>30字が誤る</strong>という意味だ。一ページに誤字が三十個ある文書をそのまま次の工程へ渡せるかは用途が決める。</p>
+
+                    <p>さらに厄介なのは個数ではなく位置だ。<strong>どの30字が誤ったのか分からない。</strong>文中の助詞が一つ違う程度ならたいてい何も起きないが、金額の桁や口座番号の一桁や人名の一文字なら、その文書全体が無効になる。誤りの費用が均一だという前提がここで崩れる。</p>
+
+                    <ul>
+                        <li>人の点検を全数で入れると自動化の理由が消える。<strong>点検はリスクの集まる項目にだけ配置する</strong></li>
+                        <li>人より先に<strong>規則が捕まえられるもの</strong>を弾く。合計と項目の突き合わせ、日付の書式、桁数、チェックサムのある番号がここに入る</li>
+                        <li>同じページを<strong>別の方式でもう一度読んで互いに突き合わせる</strong>方法もある。二つの結果が分かれる場所がすなわち疑い区間だ</li>
+                        <li>モデルが出す確信度の点数は参考にはなるが<strong>生成型では根拠にしにくい</strong>。自信を持って誤った出力が出ることがある</li>
+                        <li>原本の画像と出力の対応位置を残しておけば点検の費用が大きく減る。この対応を捨てるパイプラインが意外に多い</li>
+                        <li>どうせ誤ることを前提に<strong>訂正の経路を設計に入れる</strong>。後から付けるとたいてい付かない</li>
+                    </ul>
+
+                    <h2 id="sec-14">古典で足りる場合と生成型が要る場合</h2>
+
+                    <p>構造を見たので選択の基準は短くまとまる。新しい方式が常によいわけではなく、とくに<strong>遅さの原因が移ったという事実そのものが選択の根拠</strong>になる。</p>
+
+                    <ul>
+                        <li>領収書の番号、車のナンバープレート、身分証の項目のように<strong>短くて位置の決まった値</strong>を抜く仕事なら、検出＋認識の方式のほうが速く安く予測しやすい</li>
+                        <li>出力が短ければ生成型の利点はほとんどなく、先に見たとおり<strong>固定コストが支配する</strong>ので高速化手法の効果も小さい</li>
+                        <li>結合セルのある表、二段組の紙面、数式の混じった文書なら生成型のほうがよい。座標の整列規則では復元できない構造だ</li>
+                        <li>結果を人が読まず<strong>そのまま次のプログラムが食べる</strong>なら、読み順と表の構造が重要になる。文字誤り率だけを見て選ぶと後で選び直すことになる</li>
+                        <li>二つの方式を混ぜるのもよくある。<strong>レイアウトは検出で押さえ、複雑な領域だけ生成型に渡す</strong>構成が費用対効果のよいことが多い</li>
+                        <li>どちらにせよ決める前に<strong>自分の文書の標本で測ってみる</strong>。公表された倍率と点数は他人の文書分布から出た値だ</li>
+                    </ul>
+
+                    <p>拡散デコーディングのような手法をどこに置くべきかもここから出てくる。それは生成型を選んだ人にだけ意味のある選択肢であり、そのなかでも<strong>単件の遅延が問題である人にだけ</strong>価値がある。その条件の外では倍率がいくら大きくても体感されない。</p>
+
+                    <h2 id="sec-15">確認できなかったこと</h2>
+
+                    <ul>
+                        <li>きっかけになった記事が引いた複数の関連論文は一覧を確認しただけで、<strong>各論文を直接開いていない</strong>。だから本文はそれらの論文の内容を根拠にしていない。直接確認したのはブロック拡散の論文、投機的デコーディングの論文、そして文書パースのベンチマークの三つだ</li>
+                        <li>総合点0.32点の低下が<strong>本文の編集距離から来たのか表の類似度から来たのか</strong>は、内訳がないので確認できなかった。読み順の指標の変化も同じだ</li>
+                        <li>同じ手法を<strong>韓国語・中国語・日本語の文書</strong>に適用したときの倍率は確認できなかった。公開されている測定は英語の文書を対象にしたものだ</li>
+                        <li>縦書きの紙面や手書きで確定トークン数がどう変わるかも確認できなかった。予測しやすさが下がれば利得が減るだろうというのは<strong>構造から出た推論であって測定値ではない</strong></li>
+                        <li>業界で通用する文字誤り率の許容値のような基準は見つけられなかった。文書の種類と用途によって変わる値で、公表された単一の基準はないようだ</li>
+                    </ul>
+
+                    <h2 id="sec-16">参考資料</h2>
+
+                    <ul>
+                        <li><a href="https://news.hada.io/topic?id=33187" target="_blank" rel="noopener">GeekNews トピック 33187</a> — この記事のきっかけになった紹介。原文のアドレスと要約がある場所</li>
+                        <li><a href="https://blog.trillionlabs.co/posts/diffusion-ocr/" target="_blank" rel="noopener">Diffusionで OCR デコーディングを加速する（Trillion Labs ブログ・韓国語）</a> — 本文に引いた測定値の出典。H100を1枚での単件サービング、英語ベンチマークの正解領域8,922件、出力キャップなしという条件と、トークン生成区間3.85倍・要求全体1.85倍・ページ処理量1.34倍、総合95.48から95.16、バッチ拡大時に1.08倍まで縮小が、すべてこの記事に書かれている</li>
+                        <li><a href="https://arxiv.org/abs/2503.09573" target="_blank" rel="noopener">Marianne Arriola ほか、Block Diffusion: Interpolating Between Autoregressive and Diffusion Language Models（arXiv:2503.09573、2025）</a> — 自己回帰と拡散のあいだをブロック単位でつなぐ方式。ICLR 2025 発表</li>
+                        <li><a href="https://arxiv.org/abs/2211.17192" target="_blank" rel="noopener">Yaniv Leviathan、Matan Kalman、Yossi Matias、Fast Inference from Transformers via Speculative Decoding（arXiv:2211.17192、2022）</a> — 下書きと検証で逐次性を崩す原型。T5-XXLで出力を変えずに2〜3倍</li>
+                        <li><a href="https://github.com/opendatalab/OmniDocBench" target="_blank" rel="noopener">OmniDocBench（CVPR 2025）</a> — 1,651ページ、文書10種、レイアウト5種。本文に正規化編集距離、表にTEDS、数式にCDM、読み順に編集距離をそれぞれ置き、総合点は先の三項目の平均として計算する</li>
+                        <li><a href="https://raw.githubusercontent.com/huggingface/evaluate/main/metrics/cer/README.md" target="_blank" rel="noopener">Character Error Rate 指標の文書（Hugging Face evaluate）</a> — CER = (S + D + I) / N の定義と、挿入が多ければ値が1を超えうるという明示</li>
+                        <li><a href="https://en.wikipedia.org/wiki/CJK_Unified_Ideographs_(Unicode_block)" target="_blank" rel="noopener">CJK Unified Ideographs (Unicode block)</a> — U+4E00からU+9FFFまで20,992字、空きなく全部が割り当て済み</li>
+                        <li><a href="https://en.wikipedia.org/wiki/Hangul_Syllables" target="_blank" rel="noopener">Hangul Syllables</a> — 初声19 × 中声21 × 終声28 = 11,172字の完成形が割り当て</li>
+                        <li><a href="https://www.unicode.org/reports/tr50/" target="_blank" rel="noopener">UAX #50: Unicode Vertical Text Layout</a> — 縦組みで文字ごとの既定方向を定めた規格。漢字・仮名・ハングルは立ち、ラテン文字は寝る</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>この記事をシェア</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">リンクをコピー</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">一覧に戻る</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">一緒に使うと便利な無料ツール</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/base64_encoder.html">Base64 エンコーダー/デコーダー</a></li>
+      <li><a href="../static/json_formatter.html">JSON フォーマッター</a></li>
+      <li><a href="../static/unit_converter.html">単位変換器</a></li>
+      <li><a href="../static/css_gradient_generator.html">CSS グラデーション ジェネレーター</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">すべてのツールを見る &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">関連記事</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="claude_fable_51_prompting_shift.html">そのまま動くことと、そのままでいいことは違う - Claude Fable 5から5.1へプロンプトを移すとき</a></li>
+      <li><a href="security_learning_barrier.html">情報セキュリティはなぜ学びにくいのか - 知識ではなく構造の問題である場所</a></li>
+      <li><a href="utility_consolidation_cost.html">十個を一つにまとめると権限も一つにまとまる - 統合ユーティリティの実際の取引</a></li>
+      <li><a href="biometric_payment_selfbuilt.html">指紋で決済するという設計が背負うもの - 機微情報、しきい値、そして取り消せなさ</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('リンクがコピーされました。Threadsアプリに貼り付けてシェアしてください！');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('リンクがコピーされました！'); });
+    });
+    </script>
+</body>
+</html>
