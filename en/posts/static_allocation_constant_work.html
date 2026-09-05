@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<!--
+ * Tech blog post template
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="en">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Making the Worst Case Constant Is a Different Goal from Making the Average Fast - Static Allocation and Constant Work</title>
+    <meta name="description" content="Lowering the average and flattening the worst case are different goals, and they cut into each other. What removing runtime allocation buys and sells.">
+    <meta name="keywords" content="static allocation, constant work, tail latency, P100, ring buffer, arena allocator, object pool, deadline, page fault, GC tuning, TigerBeetle, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/en/posts/static_allocation_constant_work.html">
+
+    <meta property="og:title" content="Making the Worst Case Constant Is a Different Goal from Making the Average Fast">
+    <meta property="og:description" content="How to tell which work has a deadline, what static allocation buys and sells, and the metric that actually shows you the result.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/en/posts/static_allocation_constant_work.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="en_US">
+    <meta property="article:published_time" content="2026-09-05">
+    <meta property="article:section" content="Dev &amp; Infra">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Static Allocation and Constant Work">
+    <meta name="twitter:description" content="A fast average and a constant worst case are different goals. They usually cut into each other.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "Making the Worst Case Constant Is a Different Goal from Making the Average Fast - Static Allocation and Constant Work",
+      "alternativeHeadline": "How to tell which work has a deadline, what each technique buys and sells, and the metric that shows it",
+      "datePublished": "2026-09-05",
+      "dateModified": "2026-09-05",
+      "inLanguage": "en-US",
+      "articleSection": "Dev & Infra",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "static allocation, constant work, tail latency, P100, ring buffer, arena allocator, object pool, deadline, page fault, GC tuning",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/en/posts/static_allocation_constant_work.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "What does static allocation actually do?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "It reserves the maximum amount of memory the program will ever use once, at startup, and never allocates again while running. Requests beyond that ceiling are rejected instead of served by grabbing more memory. The TigerBeetle style guide states the rule as 「All memory must be statically allocated at startup. No memory may be dynamically allocated (or freed and reallocated) after initialization.」 The two reasons it gives are predictable performance and the avoidance of use-after-free bugs."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "What does the constant work principle mean?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Instead of iterating only the live items, you always iterate the whole fixed-size array, and empty slots hold a neutral value that does not change the result. The article that prompted this piece gives two reasons. First, unconditionally walking the whole array is far easier for the compiler to vectorize and for the CPU cache to prefetch. Second, P100 latency stays flat regardless of the load. A side effect is that insufficient performance shows up when you roll the system out rather than during peak season."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How is P100 different from P99?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "P99 is the maximum after discarding the slowest one percent. P100 discards nothing and is the true maximum. The original article says P100 stays flat, not P99, and that distinction decides things when the work has a deadline. In an audio callback that fires a hundred times a second, a P99 target permits roughly one missed deadline every second, and that one miss is audible. Where deadlines exist, the numbers to watch are the maximum and the count of overruns, not the average and not P99."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "What should happen when the ceiling is exceeded?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "There are only five options: reject immediately, wait in a queue that itself has a bound, drop the oldest, drop the newest, or degrade by lowering precision or dropping features. None of them is 「handle everything somehow」. Dynamic allocation imitates that somehow until it meets the kernel OOM killer, and then you lose not one request but everything in flight. So the real decision is not whether to reject but what to discard and when, written down where reviewers can see it."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Do these rules carry over to servers and web backends?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Only partly. The two that transfer cleanly are 「put a limit on everything」 and 「reject the surplus」. Connection pool sizes, queue depths, timeouts, and concurrency caps are already the same idea under different names. The one that transfers worst is iterating everything, because that pays off only when the data structure fits in cache, and server data structures usually do not. On a garbage-collected runtime the rule arrives in a different form: lower the allocation rate rather than remove allocation."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/static_allocation_constant_work.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/static_allocation_constant_work.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/static_allocation_constant_work.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/static_allocation_constant_work.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/static_allocation_constant_work.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "Home",
+      "item": "https://braindetox.kr/en/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "Dev & Infra",
+      "item": "https://braindetox.kr/en/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "Making the Worst Case Constant Is a Different Goal from Making the Average Fast - Static Allocation and Constant Work",
+      "item": "https://braindetox.kr/en/posts/static_allocation_constant_work.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="Making the Worst Case Constant Is a Different Goal from Making the Average Fast - Static Allocation and Constant Work">
+                <meta itemprop="datePublished" content="2026-09-05">
+                <meta itemprop="dateModified" content="2026-09-05">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="static allocation, constant work, tail latency, P100, ring buffer, arena allocator, object pool, deadline, page fault, GC tuning">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/en/posts/static_allocation_constant_work.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">Making the Worst Case Constant Is a Different Goal from Making the Average Fast - Static Allocation and Constant Work</h1>
+                    <h2 class="post-subtitle">How to tell which work has a deadline, what each technique buys and sells, and the metric that actually shows you the result</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-05">2026-09-05</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">Dev &amp; Infra</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>Saying that performance improved usually means something got faster. But in some places <strong>faster is not the goal at all.</strong> Taking the same amount of time every single time is the goal. If the average halves and one call in a hundred takes ten times longer, that is not an improvement in those places. It is a regression.</p>
+
+                    <p>This piece is about how those two goals differ and why they usually cut into each other. It is not a collection of memory allocation tips. It is about what the decision to remove runtime allocation actually <strong>buys and what it sells</strong>, and about which metric tells you whether the trade went the way you intended.</p>
+
+                    <div class="callout">
+                        Everything quoted here comes from a primary source, and section 1 separates what the article that prompted this piece actually says from what it does not. Where a line of argument is not in the original, the text says so at that point rather than letting it blur.
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>What this article covers</h3>
+                        <ol>
+                            <li><a href="#sec-1">The prompt - what the original says and what it does not</a></li>
+                            <li><a href="#sec-2">Work with a deadline and work without one</a></li>
+                            <li><a href="#sec-3">Why the average and the worst case cut into each other</a></li>
+                            <li><a href="#sec-4">What disappears when runtime allocation goes away</a></li>
+                            <li><a href="#sec-5">What constant work inverts</a></li>
+                            <li><a href="#sec-6">The trade per technique - gained, lost, and observed</a></li>
+                            <li><a href="#sec-7">Cost 1 - how do you pick the ceiling</a></li>
+                            <li><a href="#sec-8">Cost 2 - what happens when it overflows</a></li>
+                            <li><a href="#sec-9">Cost 3 - full work even when there is nothing to do</a></li>
+                            <li><a href="#sec-10">What changes on a garbage-collected runtime</a></li>
+                            <li><a href="#sec-11">What survives the move to servers and what does not</a></li>
+                            <li><a href="#sec-12">What to measure first</a></li>
+                            <li><a href="#sec-13">What I could not verify</a></li>
+                            <li><a href="#sec-14">References</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">The prompt - what the original says and what it does not</h2>
+
+                    <p>On 2 September 2026 matklad published <em>Static Allocation, Constant Work</em>. It is short, the example code is Zig, and it uses an order matching engine as its illustration. Notably, the author writes that <strong>he has only a vague understanding of what an order matching engine is</strong> and merely suspects these tricks might help there. So the piece is best read not as a prescription for a particular domain but as a description of two design habits.</p>
+
+                    <p>The first habit is static allocation. You take everything you will need once, at startup, and never take more. The example reserves it all in one call, with the ceiling supplied on the command line: <code>const orders: []Order = try gpa.alloc(Order, cli_args.orders_max);</code>. And <strong>if more than that many requests arrive at runtime, the surplus requests are rejected.</strong> The reasoning is blunt. In the article's own words, attempting to allocate just one more order could cause the kernel OOM killer to <strong>terminate the entire order matching engine, losing the other million orders</strong>, or, worse, to kill the supervisor process so that you cannot even restart.</p>
+
+                    <p>The second habit is constant work. Rather than tracking the live objects separately through an index list or a bit set, you <strong>always iterate a fixed-size array in full.</strong> Inactive slots hold a neutral, no-op value. In the article's example an order carries a tag with the values <code>bid</code>, <code>ask</code>, and <code>reserved</code>, and the last of those is the neutral state.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>What the original actually says</th><th>What is not in the original</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Reserve the ceiling at startup and reject the surplus at runtime</td><td>How that ceiling should be derived in the first place</td></tr>
+                            <tr><td>Iterating everything is far easier to vectorize and to prefetch</td><td>Any measurement or benchmark supporting that claim</td></tr>
+                            <tr><td>P100 latency stays flat regardless of the load</td><td>Any mention of P99, the median, or other percentiles</td></tr>
+                            <tr><td>An object pool is a tagged union whose tag is which generation of object currently lives in that slot</td><td>Arena allocators and ring buffers</td></tr>
+                            <tr><td>Type-segregated allocation mitigates type confusion, and inline enums break that defense</td><td>Audio callbacks, game frames, control loops, or any such application</td></tr>
+                            <tr><td>This is a trick worth having in your arsenal, not a universal solution to all of programming's problems</td><td>Power draw or battery cost</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>One detail deserves care. What the original says stays flat is <strong>P100, not P99.</strong> P99 is the maximum after throwing away the slowest one percent; P100 throws nothing away and is the real maximum. That distinction blurs easily as a claim gets summarized and passed along, and as the next section shows, <strong>in work with a deadline that discarded one percent is precisely the one percent that matters.</strong></p>
+
+                    <h2 id="sec-2">Work with a deadline and work without one</h2>
+
+                    <p>Why constancy becomes a goal only makes sense once you sort work into two kinds. The test is a single question. <strong>If the result is not ready by a fixed moment, does the result become worthless?</strong> If yes, the work has a deadline. If no, it does not.</p>
+
+                    <p>The classic examples on the deadline side are the audio callback, the game frame, and the control loop that moves a machine. The audio device asks for the next buffer at a fixed instant, and if the data is not there, silence goes out and the sound breaks. Producing that audio afterwards is useless because the moment has passed. <strong>The value of a late result is zero or negative.</strong> This axis is not in the original article, which never mentions deadlines, audio, or games.</p>
+
+                    <p>Operating system documentation, however, has recorded this property for a long time. The Linux manual page for <code>mlockall(2)</code> states that <strong>real-time applications require deterministic timing, and, like scheduling, paging is one major cause of unexpected program execution delays.</strong> The same page goes further: real-time processes using <code>mlockall()</code> to prevent delays on page faults <strong>should reserve enough locked stack pages before entering the time-critical section, so that no page fault can be caused by function calls.</strong> Between those two sentences sits the whole reason that grabbing memory up front is a question of predictability rather than of speed.</p>
+
+                    <pre><code>/* Lock current and future mappings before the real-time section */
+mlockall(MCL_CURRENT | MCL_FUTURE);</code></pre>
+
+                    <table>
+                        <thead>
+                            <tr><th>Question to ask</th><th>There is a deadline</th><th>There is no deadline</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Value of a late result</td><td>Zero, or actively harmful</td><td>Unchanged by lateness</td></tr>
+                            <tr><td>How delay accumulates</td><td>It pushes the next cycle and compounds</td><td>A queue absorbs it</td></tr>
+                            <tr><td>Retry</td><td>Impossible or pointless</td><td>Possible and routine</td></tr>
+                            <tr><td>Statistic to watch</td><td>The maximum and the overrun count</td><td>Average, median, throughput</td></tr>
+                            <tr><td>Definition of improvement</td><td>Overruns converging on zero</td><td>More work finished per unit time</td></tr>
+                            <tr><td>What failure looks like</td><td>Audio drops out, frames hitch</td><td>Things feel a bit slow</td></tr>
+                            <tr><td>What spare capacity is for</td><td>Held back purely to lower the worst case</td><td>Filled up to process more</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>That last row is where teams talk past each other most often. Given the same idle CPU, a system with a deadline <strong>leaves it empty as insurance against the worst case</strong>, while a system without one <strong>fills it to increase throughput.</strong> Two engineers can read the same dashboard and reach opposite conclusions for exactly this reason.</p>
+
+                    <h2 id="sec-3">Why the average and the worst case cut into each other</h2>
+
+                    <p>Most techniques that lower an average share one shape. <strong>They defer cost and pay it in a lump later.</strong> Caching does this. Lazy initialization does this. Growing an array by doubling does this. Generational garbage collection does this. Most calls become very cheap and one call occasionally becomes very expensive. The total falls. The maximum rises.</p>
+
+                    <p>A dashboard that shows only averages is <strong>structurally incapable</strong> of showing that trade. The gain lands on the graph and the cost lands off it. This is why style guides for deadline-bound systems tend to nail the point down explicitly. The TigerBeetle style guide says to <strong>put a limit on everything</strong> because in reality everything has a limit, and it gives as its example that <strong>all loops and all queues must have a fixed upper bound to prevent infinite loops or tail latency spikes.</strong> Unbounded loops and unbounded queues are placed side by side as causes of tail latency.</p>
+
+                    <p>The reverse direction holds too. <strong>Constant work deliberately makes the average worse.</strong> If ten items are live and you walk a hundred slots, ninety of those visits are thrown away. Total work rises and the average rises with it. In exchange, the ten-item case and the hundred-item case become the same case. The original's sentence about P100 is exactly this bargain. It <strong>does not lower the worst case; it makes the worst case permanent, and therefore flat.</strong></p>
+
+                    <p>One thing comes along for free, and the original lists it right alongside the performance argument. <strong>Insufficient performance is discovered when you roll the system out, not during a peak-season on-call at three in the morning.</strong> Because with no load the system does the same work it would do at full load. In that sense constant work is less a performance technique than an <strong>observability technique.</strong></p>
+
+                    <h2 id="sec-4">What disappears when runtime allocation goes away</h2>
+
+                    <p>It is worth counting, one by one, what the rule against allocating at runtime actually removes. Only then can you count how many of those items your own system ever had.</p>
+
+                    <ul>
+                        <li><strong>The variable cost of the allocation call itself</strong> — asking for the same number of bytes does not take the same amount of time twice. It is cheap if a free block of the right size is sitting there, more expensive if blocks must be split or coalesced, and far more expensive if fresh memory has to come from the kernel. With no runtime allocation, that entire distribution vanishes</li>
+                        <li><strong>Queueing behind the allocator</strong> — when several threads hit the same allocator at once, something somewhere has to order them. If nobody calls it, nobody queues for it</li>
+                        <li><strong>Page faults</strong> — freshly obtained memory involves the kernel the first time it is touched. This is the point behind the <code>mlockall(2)</code> text quoted above, which names paging as a major cause of unexpected delay. Reserving and touching everything at startup moves that cost into the startup window</li>
+                        <li><strong>Garbage collector involvement</strong> — no allocation means no pressure to trigger collection. On a garbage-collected language the relationship is not that simple, which is why section 10 treats it separately</li>
+                        <li><strong>Tail latency from fragmentation</strong> — the longer a process runs, the harder it becomes to obtain a large contiguous block. This cost is absent at first and appears days later, so a short test run almost never catches it</li>
+                        <li><strong>One family of use-after-free bugs</strong> — the TigerBeetle style guide gives use-after-free avoidance, alongside unpredictable performance, as its reason for static allocation. With no free and no reallocation, the very notion of a pointer to freed memory shrinks</li>
+                    </ul>
+
+                    <p>And one more thing disappears that is not on the list: <strong>the moment of failure.</strong> If you reserve the ceiling at startup, then on a machine that does not have it the process dies immediately. Dying right after deployment is almost always better than dying at three in the morning four days later. Half the reason the TigerBeetle style guide states that <strong>all memory must be statically allocated at startup and no memory may be dynamically allocated, or freed and reallocated, after initialization</strong> lives right here.</p>
+
+                    <h2 id="sec-5">What constant work inverts</h2>
+
+                    <p>The ordinary instinct is that doing only the work that needs doing is a virtue. You keep a list of live items and iterate that list. The original inverts the instinct. You walk the whole array and leave a neutral value in the empty slots that does not change the result.</p>
+
+                    <pre><code>// The form the original argues against - follow the active indices
+for (orders_active) |order_index| {
+    const order = orders[order_index];
+    process(order);
+}
+
+// The form the original prefers - walk every slot unconditionally
+for (orders) |order| {
+    process(order);
+}</code></pre>
+
+                    <p>The original gives two reasons. The first form reads an index and then uses that value to look up the array again, so each item costs two dependent accesses. The second walks memory front to back in order. In the article's phrasing, the second is <strong>much easier for the compiler to vectorize, and for the CPU cache to prefetch.</strong> And because it does the same work regardless of how many items are live, <strong>P100 latency stays flat regardless of the load.</strong></p>
+
+                    <p>Designing the neutral state is fussier than it looks, and correctness comes before speed here.</p>
+
+                    <ul>
+                        <li>The neutral value <strong>must not change the result.</strong> Zero for a sum, one for a product, the largest representable value for a running minimum</li>
+                        <li>If a neutral slot leaks into an aggregate, the program does not crash. It <strong>quietly produces a wrong number</strong>, and that class of bug outlives performance bugs by a wide margin</li>
+                        <li>Reusing a slot requires distinguishing generations. That is why the original describes an object pool as a <strong>tagged union whose tag is which generation of object currently lives in the slot.</strong> Drop the generation and an old reference points at a new object</li>
+                        <li>The bargain only works when handling a neutral slot costs <strong>roughly what handling a real one costs.</strong> If neutral is far cheaper, walking everything is pure waste; if it is more expensive, the idea makes no sense at all</li>
+                        <li>If the array does not fit in cache, walking it in full is a net loss. The prefetch benefit appears <strong>when the contiguous memory you walk is memory you actually use</strong></li>
+                        <li>The original does not discuss branch prediction. Branches do not disappear; the branch that handles the neutral state simply moves inside the loop</li>
+                    </ul>
+
+                    <p>The original applies the same reasoning to search loops with an early return. A form like <code>const item = for (items) |item| { if (predicate(item)) break item; } else null;</code> exits as soon as it finds a match, which is good for the average but makes the running time depend on the data. Scanning everything always takes the same time. <strong>That too is the average sold to buy constancy.</strong></p>
+
+                    <h2 id="sec-6">The trade per technique - gained, lost, and observed</h2>
+
+                    <p>The phrase static allocation covers several techniques with fairly different characters. Laying out what each one gives, what it takes, and above all <strong>what you look at to confirm it is working</strong> makes the choice much less muddled. Arenas and ring buffers do not appear in the original; they belong to the same family, so they sit here alongside the rest.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Technique</th><th>What you gain</th><th>What you lose</th><th>How you observe it</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><strong>Static allocation</strong><br>Reserve the ceiling at startup</td><td>There is no runtime allocation path at all. Memory use is a constant. Overflow shows up as a rejection rather than as the OOM killer</td><td>You hold the maximum at all times. Set the ceiling too low and you fail early; set it too high and you waste</td><td>Whether resident memory is flat from startup onward. Rejection count. Page fault count</td></tr>
+                            <tr><td><strong>Arena</strong><br>Bulk allocate per phase, discard at once</td><td>No individual frees, so the cost of releasing is near constant. Objects with the same lifetime are handled as one block</td><td>Nothing comes back until the phase ends. A long phase means a correspondingly large peak</td><td>Peak footprint per phase. Distribution of phase durations. Reuse count per phase</td></tr>
+                            <tr><td><strong>Object pool</strong><br>Reuse slots of one type</td><td>Slots of a single size are recycled. Segregating by type reduces type confusion</td><td>You must define behaviour on exhaustion. Omit the generation tag and use-after-free lives on silently</td><td>Peak pool occupancy. Acquisition failure count. How fast generations advance per slot</td></tr>
+                            <tr><td><strong>Fixed-size ring buffer</strong><br>A queue that wraps via head and tail</td><td>Producer and consumer are decoupled without a lock. With a power-of-two size the wrap uses a bitwise AND instead of a modulo</td><td>When full you either drop or block, and both are policy decisions. There must be exactly one producer and one consumer</td><td>Peak occupancy depth. Number of items dropped. Time the producer spent blocked</td></tr>
+                            <tr><td><strong>Constant work</strong><br>Iterate everything regardless of liveness</td><td>The maximum goes flat with respect to load. Insufficient performance surfaces at rollout</td><td>You do full work while idle. Average duration and power draw both rise</td><td>Idle CPU utilisation. The slope of the maximum as you raise load</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>The details on the ring buffer row are written down in the Linux kernel documentation. The head is <strong>the point at which the producer inserts items into the buffer</strong> and the tail is <strong>the point at which the consumer finds the next item.</strong> If the buffer is a power-of-two size, then <strong>a much quicker bitwise-AND instruction can be used instead</strong> of the slower wrap arithmetic. And <strong>the buffer is full when the head pointer is one less than the tail pointer</strong>, meaning one slot is permanently sacrificed to distinguish full from empty. To use it without locks, <strong>there needs to be just one producer and just one consumer</strong>, and instead of a single lock governing both ends the producer uses <code>smp_store_release()</code> while the consumer uses <code>smp_load_acquire()</code>.</p>
+
+                    <h2 id="sec-7">Cost 1 - how do you pick the ceiling</h2>
+
+                    <p>The first cost of static allocation is that <strong>you have to know the ceiling in advance.</strong> The original pushes this problem outside the code by taking the ceiling as a command-line argument. That is partly the right answer, since the ceiling depends on the deployment environment rather than on the code and should not be a compiled-in constant. But <strong>how to derive the value is not in the original.</strong></p>
+
+                    <ul>
+                        <li>Find the <strong>physical ceiling</strong> first: the machine's memory, the file descriptor limit, the network queue depth. A business ceiling larger than this means nothing</li>
+                        <li>Then find the <strong>business ceiling</strong>: measured concurrent connections, outstanding orders, open sessions. Look at the <strong>observed maximum</strong>, not the average</li>
+                        <li>If the observation window is short, the maximum is <strong>always an underestimate.</strong> The window must contain at least one peak season</li>
+                        <li>Keep the ceiling in configuration rather than in the source. The same binary should run on a large machine and a small one</li>
+                        <li><strong>Export the number of times the ceiling was reached.</strong> Without that counter you cannot tell whether the value is a limit or merely a big number</li>
+                        <li>Put an alert threshold at some fraction of the ceiling. Learning about it after the fact is learning about it too late</li>
+                        <li>Setting the ceiling high is not free either. Holding the maximum permanently means <strong>you cannot put anything else on the same machine</strong></li>
+                    </ul>
+
+                    <p>If you also lock the memory, one more constraint appears. The <code>mlockall(2)</code> page notes that since Linux 2.6.9 no limits are placed on how much a privileged process may lock, and that <strong>the <code>RLIMIT_MEMLOCK</code> soft resource limit instead defines a limit on how much memory an unprivileged process may lock.</strong> It also states that if <code>MCL_FUTURE</code> has been specified, <strong>a later system call such as <code>mmap</code>, <code>sbrk</code>, or <code>malloc</code> may fail if it would cause the number of locked bytes to exceed the permitted maximum.</strong> Ceiling design does not end inside the application; it interlocks with the resource limits of the environment.</p>
+
+                    <h2 id="sec-8">Cost 2 - what happens when it overflows</h2>
+
+                    <p>The second cost is heavier. <strong>Past the ceiling there is no graceful failure.</strong> More precisely: inside the ceiling everything is graceful, and outside it there are exactly five options, none of which is handling everything somehow.</p>
+
+                    <ul>
+                        <li><strong>Reject immediately</strong> — the original's choice. It only means anything if the caller has a retry policy; without one it is simply loss. Rejection does not remove the problem, it <strong>hands the problem to the caller</strong></li>
+                        <li><strong>Wait</strong> — put a queue in front and let callers wait. But that queue needs a bound too. An unbounded waiting queue reinstates exactly the unboundedness you just removed</li>
+                        <li><strong>Drop the oldest</strong> — the common ring buffer choice. It suits data where only the latest state matters, such as a sensor reading or a screen refresh</li>
+                        <li><strong>Drop the newest</strong> — suits data where ordering carries meaning. You protect what is already in flight and cut off the tail</li>
+                        <li><strong>Degrade</strong> — keep accepting at lower precision or with features switched off. This is the most common answer in deadline-bound systems, where an approximate answer on time beats an exact answer late</li>
+                    </ul>
+
+                    <p>Dynamic allocation picks none of those five and imitates the somehow instead. At the end of the imitation stands the OOM killer. As the original points out, what you lose at that moment is not the one request that overflowed but <strong>everything that was in flight</strong>, and in the worst case the restart path along with it. The essence of imposing a ceiling is <strong>not eliminating failure but choosing the shape of it.</strong></p>
+
+                    <p>So the question you actually have to answer is not whether to reject. It is <strong>what to discard and when</strong>, and writing that answer somewhere visible in the code is one of the real benefits of static allocation. In dynamically allocating code the decision is written nowhere, which is why nobody ever reviews it.</p>
+
+                    <h2 id="sec-9">Cost 3 - full work even when there is nothing to do</h2>
+
+                    <p>The third cost is already in the name. <strong>Constant work</strong> means the system does peak-load work when there is no load. That reads as pure gain only when keeping a deadline on dedicated hardware is the sole objective.</p>
+
+                    <ul>
+                        <li><strong>Battery-powered devices</strong> — idle stops being idle. The same loop runs with the screen off</li>
+                        <li><strong>Usage-billed environments</strong> — CPU time is money. You pay the peak rate continuously to buy a flat maximum</li>
+                        <li><strong>Shared machines</strong> — your idle cost becomes the neighbouring process's latency. Without isolation the neighbour pays your bill</li>
+                        <li><strong>Thermally constrained devices</strong> — sustained peak work invites clock throttling, and then the deadline you were protecting starts wobbling anyway</li>
+                        <li><strong>Dedicated hardware where the deadline is everything</strong> — here the cost is simply invisible. You had no other plans for that CPU</li>
+                    </ul>
+
+                    <p>The original says nothing about power or batteries. The list above is a cost that follows from the structure, and no published measurement of it was confirmed (see section 13). Measuring idle CPU utilisation in your own environment before and after is the reliable route.</p>
+
+                    <p>There is a softened variant. Instead of the whole array, walk a <strong>fixed number of slots per cycle</strong> and continue where you left off next cycle. The maximum is still a constant and the idle cost drops. In exchange, <strong>the worst-case delay before any one item is processed grows in proportion to the array size.</strong> Whether that variant is the answer depends on whether the deadline applies per item or per cycle.</p>
+
+                    <h2 id="sec-10">What changes on a garbage-collected runtime</h2>
+
+                    <p>The rule against runtime allocation assumes manual memory management. On a runtime with a garbage collector, reducing allocation does not make the collector go away. The direction still holds, and the official Go GC guide says why: <strong>GC CPU costs are largely determined by allocation rate and the cost per byte to scan memory.</strong></p>
+
+                    <p>The guide's list of latency sources makes the importance of allocation rate concrete. First, brief stop-the-world pauses when the GC transitions between the mark and sweep phases. Second, scheduling delays because the GC takes 25 percent of CPU resources when in the mark phase. Third, <strong>user goroutines assisting the GC in response to a high allocation rate.</strong> Fourth, pointer writes requiring additional work while the GC is in the mark phase. Fifth, running goroutines being suspended so their roots can be scanned. The third item is the crux: <strong>code that allocates heavily manufactures its own latency.</strong></p>
+
+                    <pre><code># The cheapest way to see the collector at work
+GODEBUG=gctrace=1 ./myserver</code></pre>
+
+                    <p>The same tension shows up on the ceiling side. The Go memory limit is a <strong>soft</strong> limit. In the guide's words, <strong>the Go runtime makes no guarantees that it will maintain this memory limit under all circumstances; it only promises some reasonable amount of effort.</strong> The reason for the looseness is stated outright: <strong>this relaxation is critical to avoiding thrashing behaviour, because it gives the GC a way out.</strong> The mechanism is a cap on the CPU time the GC may consume, currently around 50 percent over a <code>2 * GOMAXPROCS</code> CPU-second window.</p>
+
+                    <p>What happens without that escape hatch is documented in the same place. Turn GOGC off and keep lowering the limit, and <strong>the total time the application takes will start to grow in an unbounded manner as the GC is constantly executing to maintain an impossible memory limit.</strong> And one summarising sentence lands exactly on the argument of section 8: <strong>in many cases, an indefinite stall is worse than an out-of-memory condition, which tends to result in a much faster failure.</strong></p>
+
+                    <p>Put together: the original keeping its ceiling hard to avoid the OOM killer, and the Go runtime keeping its ceiling soft to avoid an indefinite stall, are <strong>two ends of the same problem.</strong> Whichever end you pick, you still have to answer what happens when the limit is hit. The knob itself is simple enough — per the guide, <strong>doubling GOGC will double heap memory overheads and roughly halve GC CPU cost</strong> — so the memory-versus-CPU trade is exposed on a single dial. <a href="dev_tool_memory_footprint.html">Actually measuring what your tools occupy</a> and <a href="postgres_startup_survival_2026.html">what goes wrong when a connection ceiling is set badly</a> are covered separately.</p>
+
+                    <h2 id="sec-11">What survives the move to servers and what does not</h2>
+
+                    <p>These principles grew up where deadlines are tight. Moving to servers and web backends, some of them are already in use under different names and others do not apply at all.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Principle</th><th>Where deadlines are tight</th><th>On servers and web backends</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Reserve the maximum at startup</td><td>Natural, since physical memory is fixed</td><td>Where instances scale up and down, one node's maximum is cost. Restated as a cap on concurrent work in flight, it holds fully</td></tr>
+                            <tr><td>Reject surplus requests</td><td>There is no alternative</td><td>Holds directly. It is already standard practice under the name load shedding</td></tr>
+                            <tr><td>Iterate everything</td><td>The data structure is small enough for cache</td><td>Barely holds. Anything like iterating all users does not fit in cache</td></tr>
+                            <tr><td>Target P100</td><td>Obvious, because a deadline exists</td><td>Per-request deadlines are rare, so P99 or P99.9 is usually the operative target</td></tr>
+                            <tr><td>Remove runtime allocation</td><td>The language permits it</td><td>The runtime does it for you. It arrives as lowering the allocation rate</td></tr>
+                            <tr><td>Put a limit on everything</td><td>Applies as written</td><td>Applies as written. Queue depth, connection pools, timeouts, and retry counts are all the same idea</td></tr>
+                            <tr><td>Fill slots with a neutral state</td><td>Cheap, because the array is small</td><td>Rarely used. Pre-created connections and worker pools play the equivalent role</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>The two lines that transfer best are <strong>put a limit on everything</strong> and <strong>reject the surplus.</strong> Neither depends on a language, and on the server side both are already in use under other names. Connection pool size, queue depth, timeouts, and concurrency caps are all instances of putting a limit on everything. The TigerBeetle style guide makes the same point when it says that wherever your program interacts with external entities you should <strong>not do things directly in reaction to external events</strong> but let the program run at its own pace, and it gives as the reason that <strong>this makes it easier to maintain bounds on work done per time period.</strong></p>
+
+                    <p>The line that transfers worst is iterating everything. That benefit appears <strong>only when the contiguous memory you walk is memory you actually use</strong>, and server data structures generally do not fit in cache. In between sits reserving the maximum at startup: pinning one process's memory can be a loss in an elastic environment, but restated as <strong>a cap on the number of items in flight</strong> it is a straight gain.</p>
+
+                    <p>There are also places that adopt the rule explicitly while being neither embedded nor a game. The ggml repository lists <strong>no third-party dependencies, zero memory allocations during runtime, and integer quantization support</strong> among its design goals. An inference library states zero runtime allocation as a goal not to boast about speed but to get closer to <strong>running the same way wherever it is deployed.</strong> What the hardware side decides for you before you get a say is covered in <a href="inference_hardware_tradeoffs.html">the forks in inference hardware</a>, and the problems of squeezing into a very small device in <a href="esp32_tiny_llm_on_mcu_2026.html">the case of running a model on an eight-dollar microcontroller</a>. The debate over how much memory safety to delegate to the language is laid out in <a href="memory_safety_absolutists_rust_filc_2026.html">the argument around memory safety absolutism</a>.</p>
+
+                    <h2 id="sec-12">What to measure first</h2>
+
+                    <p>That is the judgement framework. The order of actual work is short, and there is something to measure before you touch any code.</p>
+
+                    <h3>Step 1 - decide whether a deadline exists</h3>
+
+                    <p>Write down, in a sentence, <strong>where in this system a late result becomes worthless.</strong> If the sentence will not write, there is no deadline and most of the techniques here are unnecessary. If there is one, write the instant and the permitted number of overruns as numbers. The phrase it should be fast is not a deadline.</p>
+
+                    <h3>Step 2 - record the maximum</h3>
+
+                    <p>Put <strong>the maximum and the overrun count</strong> next to the average and the median. On a dashboard without those two columns, the trade described in section 3 is invisible. Record peak values for items in flight, queue depth, and pool occupancy at the same time. Those are precisely the numbers you will use to set the ceiling.</p>
+
+                    <h3>Step 3 - add a ceiling and count the hits</h3>
+
+                    <p>Add a ceiling to exactly one data structure, the largest, and <strong>export the number of times it is reached.</strong> Converting the code to static allocation comes after that. A hit count of zero means the ceiling is generous; a steadily rising one means the ceiling is tight or the upstream is letting too much through. That single number makes most of the decisions in sections 7 and 8 for you.</p>
+
+                    <h2 id="sec-13">What I could not verify</h2>
+
+                    <ul>
+                        <li>I could not confirm a <strong>single normative definition</strong> separating hard from soft real time in a primary source. The text therefore avoids those terms and sorts work by the functional test of whether a deadline exists</li>
+                        <li>I also could not confirm the definition of priority inversion or its mitigations in a primary source, so <strong>the term does not appear in the body at all.</strong> The effect of locking on deadlines is left outside this article's scope</li>
+                        <li>The vectorization and prefetch benefits the original claims come with <strong>no measurements attached.</strong> The original argues structurally without presenting evidence, so this piece quotes no multipliers either</li>
+                        <li>I could not verify <strong>concrete deadline figures</strong> for audio callbacks or game frames in a primary source, so none are given. Only the existence of the deadline is used</li>
+                        <li>For arena allocators I did not open any specific implementation's official documentation. The arena row in the table therefore states <strong>only properties that follow from the definition</strong> and carries no numbers</li>
+                        <li>I found <strong>no published measurements</strong> of how much latency allocator contention actually causes, or of how much fragmentation grows tail latency over time. The descriptions in the body follow from structure and are not measured results</li>
+                        <li>I also found no measurement of <strong>the effect of constant work on power consumption.</strong> The list in section 9 is a cost that follows from the structure</li>
+                        <li>I could not confirm the latency figures TigerBeetle actually achieves with these rules. What is quoted is only the normative text of the style guide</li>
+                    </ul>
+
+                    <h2 id="sec-14">References</h2>
+
+                    <ul>
+                        <li><a href="https://news.hada.io/topic?id=33198" target="_blank" rel="noopener">GeekNews topic 33198 - Static Allocation and Constant Work</a> — the post that prompted this article, and where the original link sits</li>
+                        <li><a href="https://matklad.github.io/2026/09/02/static-allocation-constant-work.html" target="_blank" rel="noopener">matklad, Static Allocation, Constant Work (2026-09-02)</a> — the original quoted throughout. The Zig examples, the ceiling taken as a command-line argument, the rejection of surplus requests, the OOM killer argument, the fixed-size array with a neutral state, the vectorization and prefetch claim, the sentence that P100 latency stays flat regardless of the load, and the closing caveat all come from here</li>
+                        <li><a href="https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md" target="_blank" rel="noopener">TigerBeetle, TIGER_STYLE.md</a> — source for the rule that all memory be statically allocated at startup with no dynamic allocation after initialization, for putting a limit on everything with all loops and queues bounded to prevent tail latency spikes, and for not reacting directly to external events but running at your own pace</li>
+                        <li><a href="https://www.kernel.org/doc/html/latest/core-api/circular-buffers.html" target="_blank" rel="noopener">Linux kernel documentation, Circular Buffers</a> — definitions of head and tail, the bitwise AND available at power-of-two sizes, the full condition where the head is one less than the tail, the requirement of exactly one producer and one consumer, and the ordering provided by <code>smp_store_release()</code> and <code>smp_load_acquire()</code></li>
+                        <li><a href="https://man7.org/linux/man-pages/man2/mlockall.2.html" target="_blank" rel="noopener">mlockall(2) - Linux manual page</a> — real-time applications requiring deterministic timing with paging as a major cause of unexpected delay, the advice to reserve locked stack pages before a time-critical section, the definitions of <code>MCL_CURRENT</code> and <code>MCL_FUTURE</code>, and the role of the <code>RLIMIT_MEMLOCK</code> soft limit</li>
+                        <li><a href="https://go.dev/doc/gc-guide" target="_blank" rel="noopener">A Guide to the Go Garbage Collector</a> — GOGC as the trade between GC CPU and memory, doubling GOGC roughly halving GC CPU cost, why the memory limit is soft and how that avoids thrashing, the roughly 50 percent GC CPU cap over a <code>2 * GOMAXPROCS</code> CPU-second window, the five listed sources of latency, the sentence that an indefinite stall is worse than an out-of-memory condition, and <code>GODEBUG=gctrace=1</code></li>
+                        <li><a href="https://github.com/ggml-org/ggml" target="_blank" rel="noopener">The ggml repository</a> — lists no third-party dependencies, zero memory allocations during runtime, and integer quantization support among its design goals. MIT licensed</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>Share this post</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X (Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">Copy link</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">Back to list</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Free tools you may find useful</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/code_image.html">Code Image Generator</a></li>
+      <li><a href="../static/char_counter.html">Character Counter</a></li>
+      <li><a href="../static/json_formatter.html">JSON Formatter</a></li>
+      <li><a href="../static/regex_tester.html">Regex Tester</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">See all tools &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+<!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Related Posts</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="pr_cap_queue_effect_2026.html">A Cap on Open Items Will Not Shorten Your Review Queue - Caps and Queue Dynamics 2026</a></li>
+      <li><a href="percentile_aggregation_error.html">We Averaged the p99 of Ten Servers - That Number Is Nothing 2026</a></li>
+      <li><a href="software_performance_expectations.html">How We Agreed That Software Can Be Slow - Why Faster Hardware Never Feels Faster 2026</a></li>
+      <li><a href="mongodb_to_postgres_sync.html">Copying Once and Staying in Sync Are Different Problems - What Moving a MongoDB Collection Into PostgreSQL Forces You to Decide</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('Link copied. Paste it into the Threads app to share.');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('Link copied.'); });
+    });
+    </script>
+</body>
+</html>

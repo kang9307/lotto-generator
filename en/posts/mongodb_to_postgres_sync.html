@@ -1,0 +1,671 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="en">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Copying Once and Staying in Sync Are Different Problems - What Moving a MongoDB Collection Into PostgreSQL Forces You to Decide</title>
+    <meta name="description" content="What a schemaless document forces you to decide inside a table, and what changes once copying becomes syncing: resume points, idempotent loads, deletions.">
+    <meta name="keywords" content="MongoDB, PostgreSQL, change streams, resume token, JSONB, idempotent load, upsert, ON CONFLICT, ObjectId, schema mapping, CDC, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/en/posts/mongodb_to_postgres_sync.html">
+
+    <meta property="og:title" content="Copying Once and Staying in Sync Are Different Problems - What Moving a MongoDB Collection Into PostgreSQL Forces You to Decide">
+    <meta property="og:description" content="Mapping is not a matter of taste. It is what the structure forces on you, and every choice buys something now by making something else expensive later.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/en/posts/mongodb_to_postgres_sync.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="en_US">
+    <meta property="article:published_time" content="2026-09-05">
+    <meta property="article:section" content="Dev &amp; Infra">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Copying Once and Staying in Sync Are Different Problems">
+    <meta name="twitter:description" content="What a document forces you to decide on the way into a table, and where sync parts ways with copying.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "Copying Once and Staying in Sync Are Different Problems - What Moving a MongoDB Collection Into PostgreSQL Forces You to Decide",
+      "alternativeHeadline": "What gets decided when a document enters a table, the constraints created by how you capture change, and when not to build this at all",
+      "datePublished": "2026-09-05",
+      "dateModified": "2026-09-05",
+      "inLanguage": "en-US",
+      "articleSection": "Dev & Infra",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "MongoDB, PostgreSQL, change streams, resume token, JSONB, idempotent load, ON CONFLICT, ObjectId, schema mapping, CDC",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/en/posts/mongodb_to_postgres_sync.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "What does MongoDB require before change streams can be used?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "The official MongoDB manual states that change streams are available for replica sets and sharded clusters. Those deployments must use the WiredTiger storage engine and replica set protocol version 1. They also work on deployments that use the encryption-at-rest feature. Availability is independent of majority read concern support, so change streams work whether that setting is enabled or disabled. Put the other way around, a standalone server has no such channel at all. That single fact is the first fork in the road for any sync design, because everything downstream depends on whether ordered change events exist as a primitive."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Where does the resume token live, and when does it stop working?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "The manual states that change event notifications include a resume token on the _id field. There are two kinds. An event token identifies a specific change event, and a highwatermark token represents a point in time without an associated change event, which the server generates periodically to indicate that cluster time has advanced. Resuming fails in two situations. First, the oplog must have enough history to locate the operation associated with the token. Second, after an invalidate event such as a collection drop or rename closes the stream, resumeAfter cannot be used and a new stream must be opened with startAfter instead."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How do you decide between flattening a nested document and storing it as JSONB?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "The deciding question is what you intend to attach to the value. Flattening into columns gives you NOT NULL and check constraints, foreign keys, per-column statistics and ordinary B-tree indexes. The price is that every new field upstream drags a DDL change behind it. Storing JSONB lets you absorb new fields without a schema change, and the PostgreSQL documentation says that in general most applications should prefer to store JSON data as jsonb unless there are quite specialized needs. The price is that there is nowhere to hang a column-level constraint and the planner statistics collapse into a single column. Fixed field list means flatten, varying field list means JSONB."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "What does at-least-once delivery demand from the PostgreSQL side?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "It demands that applying the same change twice produce the same result, which is to say an idempotent load. In PostgreSQL the tool for that is ON CONFLICT DO UPDATE, and there the conflict target is mandatory rather than optional. The documentation states that specifying a conflict target is optional for DO NOTHING but must be provided for DO UPDATE. The proposed values are reached through the special excluded table. One trap deserves attention. The documentation calls the statement deterministic, says the command will not be allowed to affect any single existing row more than once, and warns that a cardinality violation error is raised when that happens. Batched loads therefore need a per-key deduplication step first."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Why can polling never detect deletions?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Polling selects documents that currently exist according to some predicate. A deleted document no longer exists, so it matches no predicate at all. The fact of its disappearance simply does not appear in any query result. Polling-based sync is therefore structurally blind to deletion, and the target accumulates rows that the source no longer has. Closing that gap requires either changing the application so it writes a deletion marker instead of removing the document, or periodically reconciling the full key lists on both sides. A change stream delete event carries a documentKey containing the _id, which is exactly what makes the row identifiable on the target."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/mongodb_to_postgres_sync.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/mongodb_to_postgres_sync.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/mongodb_to_postgres_sync.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/mongodb_to_postgres_sync.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/mongodb_to_postgres_sync.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "Home",
+      "item": "https://braindetox.kr/en/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "Dev & Infra",
+      "item": "https://braindetox.kr/en/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "Copying Once and Staying in Sync Are Different Problems - What Moving a MongoDB Collection Into PostgreSQL Forces You to Decide",
+      "item": "https://braindetox.kr/en/posts/mongodb_to_postgres_sync.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="Copying Once and Staying in Sync Are Different Problems - What Moving a MongoDB Collection Into PostgreSQL Forces You to Decide">
+                <meta itemprop="datePublished" content="2026-09-05">
+                <meta itemprop="dateModified" content="2026-09-05">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="MongoDB, PostgreSQL, change streams, resume token, JSONB, idempotent load, ON CONFLICT, ObjectId, schema mapping, CDC">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/en/posts/mongodb_to_postgres_sync.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">Copying Once and Staying in Sync Are Different Problems - What Moving a MongoDB Collection Into PostgreSQL Forces You to Decide</h1>
+                    <h2 class="post-subtitle">What gets decided the moment a document enters a table, the constraints created by how you capture change, and when not to build this at all</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-05">2026-09-05</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">Dev &amp; Infra</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>Pulling a single MongoDB collection into PostgreSQL is usually treated as an afternoon of work. You read the documents and you put them into columns. What is difficult about that? And sometimes it really does end there. That happens when the job is <strong>to move the data once</strong>.</p>
+
+                    <p>The trouble starts with the next sentence. <strong>And then keep the two in sync.</strong> The moment that clause is attached, the nature of the work changes entirely. The first job is data type conversion. The second is a <strong>distributed system</strong>. It becomes an exercise in accepting that two databases hold different states at different instants, and then deciding how much of that gap you are willing to tolerate.</p>
+
+                    <p>What follows separates those two problems. First come the decisions that <strong>the structure forces on you rather than leaving to taste</strong> when a document goes into a table, and what each of those decisions makes hard later on. Then comes the reason <strong>synchronization is a far harder problem than copying</strong>, worked through in the order of resume points, duplicate delivery and deletion detection. The last part runs in the opposite direction: when keeping two databases aligned costs more than collapsing them into one.</p>
+
+                    <div class="callout">
+                        Every statement below about MongoDB change streams, resume tokens and BSON types, and about PostgreSQL <code>jsonb</code> and <code>ON CONFLICT</code>, comes from the official MongoDB manual and the PostgreSQL 17 documentation. Where behaviour depends on the version, the version is named alongside it. There are no performance numbers here, because there are none in the source article either.
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>What this article covers</h3>
+                        <ol>
+                            <li><a href="#sec-1">The trigger - the hard part was mapping, not syncing</a></li>
+                            <li><a href="#sec-2">Splitting the two problems - copying and alignment demand different things</a></li>
+                            <li><a href="#sec-3">Five decisions a schemaless document forces at the table boundary</a></li>
+                            <li><a href="#sec-4">What do you receive _id as</a></li>
+                            <li><a href="#sec-5">When the same field has a different type in different documents</a></li>
+                            <li><a href="#sec-6">Nested documents - between flattening and JSONB</a></li>
+                            <li><a href="#sec-7">Arrays - between a child table and a single column</a></li>
+                            <li><a href="#sec-8">An absent field and a null field are not the same thing</a></li>
+                            <li><a href="#sec-9">The mapping decision table - what you gain and what you give up</a></li>
+                            <li><a href="#sec-10">How do you capture change - polling versus change streams</a></li>
+                            <li><a href="#sec-11">The resume point - what the token demands</a></li>
+                            <li><a href="#sec-12">At least once - why an idempotent load becomes mandatory</a></li>
+                            <li><a href="#sec-13">Deletion - how do you learn that a document is gone</a></li>
+                            <li><a href="#sec-14">When not to build this at all</a></li>
+                            <li><a href="#sec-15">What could not be confirmed</a></li>
+                            <li><a href="#sec-16">References</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">The trigger - the hard part was mapping, not syncing</h2>
+
+                    <p>In early September 2026 a Korean developer community picked up an article titled <strong>Copy and Sync a MongoDB Collection to PostgreSQL</strong>. The original is a blog post from a team called VisuaLeaf, and it records the process of moving a single collection of clinical visit records into a PostgreSQL table and then keeping it aligned. One sentence from the author is the starting point for everything here. <strong>Mapping the MongoDB document structure onto a PostgreSQL table turned out to be trickier than the synchronization itself.</strong></p>
+
+                    <p>It is more honest to state the nature of that source up front. It is <strong>an article introducing the team's own product</strong>. The author used VisuaLeaf Mongo Sync, and gives as the reason a desire to lay out the workflow visually: source collection, target PostgreSQL table, field mapping and sync status. In an article recommending a tool, the most trustworthy part is rarely the success story. It is <strong>the record of where the author got stuck</strong>, and there are two such records here.</p>
+
+                    <p>The first was an error saying that the SQL target had no key columns and therefore could not be upserted idempotently. The author resolved it by receiving MongoDB's <code>_id</code> into a <code>TEXT</code> column named <code>mongo_id</code> and making that the primary key. The second was a field name mismatch, where the source had <code>labResults</code> while the target had <code>lab_results</code>, producing an error that the column did not exist on the relation. The fix was either mapping each field explicitly or using quoted camel case on the PostgreSQL side.</p>
+
+                    <p>The two errors look similar in size but they are entirely different in kind. The second is <strong>a configuration mistake</strong>. You fix it once and it is over. The first is not. It was not a mistake but <strong>something the structure demanded</strong>, and nearly every constraint that appears later in this article traces back to it. Half of what follows is an explanation of why that error was inevitable.</p>
+
+                    <p>It is worth being equally clear about what is <strong>not</strong> in the source. There are no numbers at all: no data volume, no document count, no throughput, no latency. Nor does it describe how the initial full copy and the subsequent change feed are stitched together, or how the gap at that seam is closed. So the results reported there cannot be widened into a claim that <strong>this approach is generally fast or generally safe</strong>. What the source demonstrated was one collection, one tool and one scenario.</p>
+
+                    <h2 id="sec-2">Splitting the two problems - copying and alignment demand different things</h2>
+
+                    <p>Moving data once and keeping it aligned are connected only by name. What they demand is different, and the largest difference lies in <strong>what you are able to do when something fails</strong>. The first can simply be run again from the beginning. Empty the target table, refill it, and the operation is idempotent by definition. The second cannot. You have to know how far you got, that point has to still be valid, and the same event arriving twice has to produce the same result.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>What to weigh</th><th>One-time copy</th><th>Standing synchronization</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Failure recovery</td><td>Rerun everything. No side effects</td><td>Needs a resume point, and that point can expire</td></tr>
+                            <tr><td>Duplicates</td><td>Cannot occur, since everything is read once</td><td>Inevitable around restarts. The load must be idempotent</td></tr>
+                            <tr><td>Ordering</td><td>Irrelevant. Only the final state has to match</td><td>Updates to one document go wrong if their order is inverted</td></tr>
+                            <tr><td>Deletion</td><td>Absent upstream means absent downstream. It matches for free</td><td>Needs a dedicated mechanism to learn what disappeared</td></tr>
+                            <tr><td>Schema change</td><td>Rebuild with the new mapping on the next run</td><td>Needs a separate procedure for changing a mapping in flight</td></tr>
+                            <tr><td>Load on the source</td><td>Concentrated at run time. Predictable</td><td>Continuous. An open cursor keeps consuming server resources</td></tr>
+                            <tr><td>The axis that grows cost</td><td>Data volume</td><td>Elapsed operating time and change rate</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>That last row matters most in practice. The cost of a one-time copy grows with the data and then stops. The cost of synchronization <strong>accumulates over time</strong>. Tokens expire, collections get dropped, fields appear upstream, and eventually there are three days during which the stream sat quietly stopped and nobody noticed. Everything discussed from here on lives on that axis.</p>
+
+                    <p>The assumption that writes happen on only one side deserves to be stated too. What is described here is a <strong>one-way</strong> arrangement in which MongoDB is the source of truth and PostgreSQL is a copy. An arrangement where both sides accept writes is a completely different problem, with conflict resolution and causality tracking layered on top, and that shape is treated separately in <a href="offline_first_database_sync.html">the price of holding the data</a>.</p>
+
+                    <h2 id="sec-3">Five decisions a schemaless document forces at the table boundary</h2>
+
+                    <p>There are decisions a document database lets you postpone. A relational table does not extend that courtesy. Creating a column requires a type, and choosing a type requires deciding what that field actually is. So the real substance of mapping work is not conversion. It is <strong>paying, all at once, for every decision that was deferred</strong>. There are five of them worth naming.</p>
+
+                    <ul>
+                        <li><strong>Identity</strong> - what type of column receives <code>_id</code>. If it does not become the primary key, everything downstream falls apart</li>
+                        <li><strong>Type inference</strong> - which type wins when the same field appears with different types across documents</li>
+                        <li><strong>Nesting</strong> - whether a document inside a document is spread into columns or kept as one blob</li>
+                        <li><strong>Arrays</strong> - whether to normalize into a child table, or keep an array column or JSONB</li>
+                        <li><strong>Absence</strong> - whether the difference between a missing field and a <code>null</code> field is preserved at all</li>
+                    </ul>
+
+                    <p>Each is examined in turn below. What they share is that no choice is <strong>free</strong>. Every one of them pairs something that gets easier now with something that gets harder later.</p>
+
+                    <h2 id="sec-4">What do you receive _id as</h2>
+
+                    <p>This is the first decision and the hardest one to reverse. MongoDB's default <code>_id</code> is an ObjectId, and according to the official documentation it consists of <strong>12 bytes</strong>. The first 4 bytes are a timestamp measured in seconds since the Unix epoch representing the ObjectId's creation, the next 5 are a random value generated once per client-side process, and the last 3 are an incrementing counter initialized to a random value. The documentation notes that for the timestamp and counter values <strong>the most significant bytes appear first</strong>, unlike other BSON values.</p>
+
+                    <p>There is one further statement that matters enormously in practice. The documentation explicitly says that while ObjectId values should increase over time, <strong>they are not necessarily monotonic</strong>. Two reasons are given. They contain only one second of temporal resolution, so values created within the same second have no guaranteed ordering, and they are generated by clients, which may have differing system clocks. In other words, a design that uses <code>_id</code> <strong>as a watermark for change detection is broken from the start</strong>. That thread is picked up again in the section on polling.</p>
+
+                    <p>On the receiving side there are effectively two options. Either unpack it into a 24-character hexadecimal string and take it as a <code>text</code> primary key, as the source article did, or keep the 12 bytes as <code>bytea</code>. The former is human-readable and easy to handle in any tool, but doubles the storage and grows the index accordingly. The latter preserves the original size but produces query results nobody can read, with thinner tool support. Most teams choose the former, and the reason is not performance. It is that <strong>people need to look at those values during operations, and they need to do it often</strong>.</p>
+
+                    <p>Whichever way you go, one condition is not negotiable. <strong>That column has to be the primary key.</strong> This is exactly where the source article hit its first error. Without a key there is no idempotent upsert, without an idempotent upsert you cannot absorb the duplicates that restarts produce, and without that, restarting is impossible in the first place. On top of which, the delete events discussed later carry no document body at all, so without a key derived from <code>_id</code> there is <strong>no way whatsoever to identify what should be removed</strong>.</p>
+
+                    <p>As a footnote, what a highly random primary key does to an index is its own subject. ObjectId fares better than a fully random key because time occupies the leading bytes, but the general form of that argument is set out in <a href="uuid_primary_key_sqlite_performance_2026.html">why you should not use UUIDs as primary keys</a>.</p>
+
+                    <h2 id="sec-5">When the same field has a different type in different documents</h2>
+
+                    <p>This is the most common problem in a document database and the one discovered latest. In the collection's first month <code>amount</code> was always an integer. Then at some point strings crept in, somewhere else it arrives as <code>NumberDecimal</code>, and in some documents the field is simply absent. MongoDB does not prevent any of this. Which means the loader becomes the first thing in the system that ever tells you about it.</p>
+
+                    <pre><code class="language-javascript">// Same collection, same field name. The type differs from document to document.
+db.visits.insertMany([
+  { visitId: "VIS-1", amount: 12000,                  visitDate: ISODate("2026-09-01T09:00:00Z") },
+  { visitId: "VIS-2", amount: "12,000",               visitDate: "2026-09-02" },
+  { visitId: "VIS-3", amount: NumberDecimal("12000"), visitDate: ISODate("2026-09-03T09:00:00Z") },
+  { visitId: "VIS-4",                                 visitDate: null },
+  { visitId: "VIS-5", amount: null,                   visitDate: ISODate("2026-09-05T09:00:00Z") }
+]);
+
+// VIS-4 has no amount field at all, while VIS-5 has one whose value is null.
+// Receive both into a single column and the distinction between them disappears.
+</code></pre>
+
+                    <p>There are three options and each surrenders something different. First, <strong>receive everything as the widest type</strong>. Put it all in <code>text</code> and the load will never stop. In exchange, ordering and range queries follow string rules, so <code>"9000"</code> sorts above <code>"12000"</code>. Second, <strong>receive a strict type and fail on anything that deviates</strong>. Data quality is protected, but the entire pipeline halts the moment one bad value lands upstream. Third, <strong>route well-formed values into typed columns and exceptions into a separate column or JSONB</strong>. There is more to build, but it avoids both a stalled pipeline and silent loss.</p>
+
+                    <p>There is an additional wrinkle from the BSON side. According to the official documentation, BSON <code>Date</code> is a 64-bit integer counting <strong>milliseconds</strong> since the Unix epoch, and it is signed, so dates before 1970 are representable. Receiving it into <code>timestamptz</code> is natural enough, but it is worth holding on to the fact that precision below the millisecond <strong>never existed in the source</strong>. A more precise target type does not conjure information that was never there.</p>
+
+                    <p>Numbers behave the same way. BSON distinguishes Double, 32-bit integer, 64-bit integer and Decimal128. The documentation records that Decimal128 carries 34 decimal digits of precision with an exponent range from -6143 to +6144. If a collection handling money uses Decimal128, the target column has to be <code>numeric</code>, and the moment it is received into <code>double precision</code> the entire reason for paying that precision cost is thrown away.</p>
+
+                    <h2 id="sec-6">Nested documents - between flattening and JSONB</h2>
+
+                    <p>The source article made a clear choice. Simple fields became ordinary columns, and nested objects and arrays were stored as JSONB. So <code>visitId</code>, <code>status</code> and <code>visitDate</code> became <code>text</code>, <code>text</code> and <code>timestamptz</code> columns, while <code>patient</code>, <code>doctor</code>, <code>symptoms</code>, <code>prescriptions</code>, <code>invoice</code> and <code>labResults</code> all became JSONB. That is a sensible default, but it is worth being explicit about what the choice buys and what it sells.</p>
+
+                    <h3>When flattening wins</h3>
+
+                    <p>Spread <code>patient.fullName</code> into a <code>patient_full_name</code> column and you can <strong>attach constraints to it</strong>. <code>NOT NULL</code>, check constraints, uniqueness and foreign keys all become possible. Planner statistics are gathered per column, so selectivity estimates get sharper, and an ordinary B-tree index is enough. If you know what the value is and you plan to join or filter on it, flattening is the answer.</p>
+
+                    <p>The price is that <strong>the schema has to chase the source</strong>. Adding a field to a nested document on the MongoDB side happens without a deployment, but on the target side each one drags an <code>ALTER TABLE</code> and a mapping change behind it. When the team that owns the source is not the team that owns the copy, that gap turns into operational debt immediately.</p>
+
+                    <h3>When JSONB wins</h3>
+
+                    <p>The PostgreSQL documentation spells out the difference between <code>json</code> and <code>jsonb</code>. The <code>json</code> type stores an exact copy of the input text which processing functions must reparse on each execution, while <code>jsonb</code> is stored in a <strong>decomposed binary format</strong> that is slightly slower to input because of the conversion overhead but significantly faster to process since no reparsing is needed. The recommendation is explicit: <strong>in general most applications should prefer to store JSON data as <code>jsonb</code></strong>, unless there are quite specialized needs such as legacy assumptions about the ordering of object keys.</p>
+
+                    <p>In exchange, <code>jsonb</code> <strong>throws things away</strong>. The documentation says it does not preserve white space, does not preserve the order of object keys, and does not keep duplicate object keys, retaining only the last value when duplicates are supplied. The <code>json</code> type preserves all three. If the field order of the original document or its byte-level form might matter later, that difference is decisive.</p>
+
+                    <p>The documentation also notes that <code>jsonb</code> supports indexing, which can be a significant advantage. But the choice of operator class has consequences downstream. The default GIN operator class supports the key-exists operators <code>?</code>, <code>?|</code> and <code>?&amp;</code>, the containment operator <code>@&gt;</code>, and the jsonpath match operators <code>@?</code> and <code>@@</code>. The non-default class <code>jsonb_path_ops</code> <strong>does not support the key-exists operators</strong> and covers only <code>@&gt;</code>, <code>@?</code> and <code>@@</code>. In return, the documentation says a <code>jsonb_path_ops</code> index is usually much smaller over the same data and offers better search specificity, particularly when queries contain keys that appear frequently.</p>
+
+                    <p>What that choice blocks reappears in the eighth section. The moment you need <strong>a query asking whether a key exists</strong>, having chosen the smaller index means that question can no longer be answered by an index.</p>
+
+                    <pre><code class="language-sql">CREATE TABLE mongo_visits_sync (
+    mongo_id     text PRIMARY KEY,        -- ObjectId received as a 24-character hex string
+    visit_id     text,
+    status       text,
+    visit_date   timestamptz,
+    -- Nested documents and arrays with a varying field set stay whole, as jsonb
+    patient      jsonb,
+    lab_results  jsonb,
+    -- Columns holding the state of the sync itself, absent from the source document
+    src_ts       timestamptz NOT NULL,
+    deleted_at   timestamptz
+);
+
+-- The key-exists operators require the default operator class
+CREATE INDEX ON mongo_visits_sync USING gin (patient);
+
+-- For containment and jsonpath queries only, this index is far smaller
+CREATE INDEX ON mongo_visits_sync USING gin (lab_results jsonb_path_ops);
+</code></pre>
+
+                    <p>It is worth noticing the two columns in that definition which do not exist upstream. <code>src_ts</code> and <code>deleted_at</code> are not document content. They are <strong>the state of the synchronization procedure itself</strong>. The fact that such columns become necessary is the most visible evidence that copying and syncing are different problems.</p>
+
+                    <h2 id="sec-7">Arrays - between a child table and a single column</h2>
+
+                    <p>Arrays offer one more option than nesting does, and the fork is correspondingly wider. The answer splits on whether you are looking at an array of scalars or an array of documents.</p>
+
+                    <p>For something like a list of tags, an <strong>array of strings</strong>, PostgreSQL's <code>text[]</code> is the natural fit. Array operators work and a GIN index is available. The catch is that when per-element metadata appears later, an array column has nowhere to put it. The moment somebody asks to record when each tag was attached, the structure has to be rebuilt.</p>
+
+                    <p>For an <strong>array of documents</strong> the question compresses into one: <strong>is the element itself something you will query</strong>. If you need aggregates per prescription item, if you need to find visits containing a particular drug, if you plan to join at the item level, then normalizing into a child table is the right answer. Every relational tool comes back with it.</p>
+
+                    <p>The price shows up on the sync side. A single event upstream saying <strong>one document changed</strong> has to be translated on the target into <strong>deletes and inserts across several child rows</strong>. Those statements have to complete atomically inside one transaction, and a failure part way through leaves the parent row and the child rows in disagreement. What used to be a single-row upsert becomes a procedure.</p>
+
+                    <p>If the elements are only ever read and written as a whole, a single JSONB column is better. The correspondence of <strong>one document to one row</strong> is preserved, so the load logic stays a simple upsert. In exchange, counting elements or sorting by them pays an expansion cost on every query. The deciding factor is not the shape of the data. It is <strong>the shape of the questions you will ask of it</strong>.</p>
+
+                    <h2 id="sec-8">An absent field and a null field are not the same thing</h2>
+
+                    <p>This is where information disappears most quietly. A field in a MongoDB document can be in one of three states. It can be <strong>absent entirely</strong>, present with a value of <strong><code>null</code></strong>, or present <strong>with a value</strong>. Those three mean different things. For a survey response they correspond to <strong>not asked</strong>, <strong>asked and declined</strong>, and <strong>answered</strong>.</p>
+
+                    <p>Flatten that into an ordinary column and the first two states become <strong>the same SQL NULL</strong>. There is no way back. In its table of JSON primitive types, the PostgreSQL documentation puts a note where the PostgreSQL type for JSON <code>null</code> would go, stating that <strong>SQL NULL is a different concept</strong>. That is a warning that two worlds are using the same word for different things.</p>
+
+                    <p>Preserving all three states means keeping the value inside JSONB. Then you can ask <strong>whether the key is present</strong> and separate absence from <code>null</code>. And here the index choice from the previous section comes back to bite. The key-exists operator <code>?</code> is supported <strong>only by the default GIN operator class</strong>, not by <code>jsonb_path_ops</code>. If <code>jsonb_path_ops</code> was chosen because the index is smaller, you have preserved three states and simultaneously lost the ability to ask about them through an index.</p>
+
+                    <p>Two more traps live in the same family. The PostgreSQL documentation states that <code>jsonb</code> <strong>will reject numbers that are outside the range of the PostgreSQL <code>numeric</code> data type</strong>, while <code>json</code> will not. And in the JSON primitive type table it records that for numbers <strong><code>NaN</code> and infinity values are disallowed</strong>, and for strings that <strong><code>\u0000</code> is disallowed, as are Unicode escapes representing characters not available in the database encoding</strong>.</p>
+
+                    <p>BSON's Double can hold <code>NaN</code> and infinity. If a calculation error has left one such value in a document somewhere in the collection, that document <strong>cannot enter a JSONB column</strong>. The same holds for a null character inside a string. Both of these are the kind of problem that sails quietly through the initial full copy and then detonates months later on a single change event. Unless the mapping stage decided in advance where such values go, the sync stops that day and waits to be discovered.</p>
+
+                    <h2 id="sec-9">The mapping decision table - what you gain and what you give up</h2>
+
+                    <p>The five decisions above collapse into one table. Each row is a document structure, an option for receiving it, and <strong>what that option surrenders</strong>. The last column is the reason the table exists.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Document structure</th><th>PostgreSQL mapping option</th><th>What you gain</th><th>What you give up</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>_id</code> (ObjectId)</td><td><code>text</code> primary key</td><td>Human-readable, good tool support</td><td>12 bytes become 24 characters. The index grows to match</td></tr>
+                            <tr><td><code>_id</code> (ObjectId)</td><td><code>bytea</code> primary key</td><td>Original size preserved</td><td>Unreadable query results, thin tool support</td></tr>
+                            <tr><td>Top-level scalar, consistent type</td><td>Ordinary column</td><td>Constraints, indexes, joins and statistics</td><td>The load halts the moment the type wavers</td></tr>
+                            <tr><td>Top-level scalar, mixed types</td><td><code>text</code> column</td><td>The load never halts</td><td>Sorting and range queries follow string rules</td></tr>
+                            <tr><td>BSON <code>Date</code></td><td><code>timestamptz</code></td><td>Time zone arithmetic and indexes</td><td>The source stops at milliseconds. Below that, nothing existed</td></tr>
+                            <tr><td>Decimal128</td><td><code>numeric</code></td><td>Value and digit count preserved</td><td>Exponent ranges differ, so boundary values need checking</td></tr>
+                            <tr><td>Double <code>NaN</code> or infinity</td><td>Impossible in jsonb</td><td>-</td><td>jsonb rejects it. A separate column or sentinel is required</td></tr>
+                            <tr><td>Nested document, fixed fields</td><td>Flatten into columns</td><td>NOT NULL, check, foreign key, per-column statistics</td><td>Every new field upstream drags a DDL change along</td></tr>
+                            <tr><td>Nested document, varying fields</td><td>One <code>jsonb</code> column</td><td>Absorbs new fields without a schema change</td><td>No column-level constraints. Statistics collapse into one</td></tr>
+                            <tr><td>Nested document, fidelity required</td><td><code>json</code> column</td><td>White space, key order and duplicate keys preserved</td><td>Reparsed on every query. No index support</td></tr>
+                            <tr><td>Array of scalars</td><td><code>text[]</code></td><td>Array operators and a GIN index</td><td>Nowhere to attach per-element metadata</td></tr>
+                            <tr><td>Array of documents, elements queried</td><td>Child table with a foreign key</td><td>Per-element querying, aggregation and joins</td><td>One document change becomes many row deletes and inserts</td></tr>
+                            <tr><td>Array of documents, used whole</td><td><code>jsonb</code></td><td>One document to one row. The upsert stays simple</td><td>Expansion cost on every count and sort over elements</td></tr>
+                            <tr><td>Absence versus <code>null</code></td><td>Flatten into a column</td><td>-</td><td>Both states become the same SQL NULL. The distinction dies</td></tr>
+                            <tr><td>Absence versus <code>null</code></td><td><code>jsonb</code> with default GIN</td><td>All three states survive</td><td>The smaller <code>jsonb_path_ops</code> index has to be given up</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>One rule runs through the whole table. <strong>A flexible choice now makes queries expensive later, and a strict choice now makes schema changes expensive later.</strong> Which is preferable is not settled by the nature of the data but by <strong>why the data was sent to PostgreSQL at all</strong>. Sent there to be aggregated and joined in SQL, the strict side is right. Sent there to be retained without loss, the flexible side is.</p>
+
+                    <h2 id="sec-10">How do you capture change - polling versus change streams</h2>
+
+                    <p>From here on the problems belong to synchronization alone. The first question is simple. <strong>How do you know what changed.</strong></p>
+
+                    <h3>What polling actually misses</h3>
+
+                    <p>The first idea anyone has is to run a query on a timer and pull back only the recent rows. It is easy to build and needs no special deployment topology. But there are three holes in it, and all three are quiet.</p>
+
+                    <p>First, <strong>there is no good column to use as a watermark</strong>. Using <code>_id</code> runs straight into the fact, established above, that ObjectId is not monotonic. Because temporal resolution is one second and client clocks differ, a document with an ObjectId <strong>smaller</strong> than the point already processed can be inserted afterwards. That document is skipped forever. Using an application field such as <code>updatedAt</code> produces the same outcome if even one write path forgets to set it.</p>
+
+                    <p>Second, <strong>deletion is invisible</strong>. Polling selects documents that currently exist according to a predicate. A document that is gone matches no predicate. So rows the source no longer has remain on the target, and they accumulate.</p>
+
+                    <p>Third, <strong>latency and load trade against each other</strong>. Shorten the interval and queries hammer the source continuously; lengthen it and the copy goes stale. And a document that changed several times within one interval shows <strong>only its final state</strong>. If anything downstream needs to reason about intermediate states, polling was never the right instrument.</p>
+
+                    <h3>What change streams require</h3>
+
+                    <p>MongoDB's change streams close those holes, at a price in prerequisites. The manual says change streams are <strong>available for replica sets and sharded clusters</strong>. Those deployments must use the <strong>WiredTiger storage engine</strong> and <strong>replica set protocol version 1</strong>. They also work on deployments using encryption at rest, and availability is explicitly stated to be independent of majority read concern support. On a standalone server, this channel does not exist.</p>
+
+                    <p>The manual also carries several operational caveats, each of them expensive to learn late. Change streams <strong>cannot use indexes</strong>, and MongoDB does not support creating indexes on the oplog collection, so the documentation advises <strong>avoiding a high number</strong> of specifically-targeted change streams because they can impact server performance. A design that attaches one stream per collection therefore eats into the server in proportion to the collection count.</p>
+
+                    <p>For replica sets with arbiter members, the documentation says change streams <strong>may remain idle</strong> if enough data-bearing members are unavailable that operations cannot be majority committed. During an incident the stream goes quiet rather than raising an error. On sharded clusters, shards that are <strong>cold</strong> for the collection negatively affect the change stream's response time, because <code>mongos</code> must still check with those shards to guarantee total ordering of changes. Conversely, when a sharded collection has high levels of activity, <code>mongos</code> may not be able to keep up with changes across all shards, and the documentation recommends notification filters such as a <code>$match</code> stage restricting the operations of interest.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>What to weigh</th><th>Polling</th><th>Change streams</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Deployment requirements</td><td>None. Works on a standalone server</td><td>Replica set or sharded cluster, WiredTiger, pv1</td></tr>
+                            <tr><td>Deletion detection</td><td>Structurally impossible</td><td>Arrives as a delete event</td></tr>
+                            <tr><td>Intermediate states</td><td>Collapsed within each interval</td><td>Delivered per operation</td></tr>
+                            <tr><td>Restart</td><td>A watermark value. Never expires</td><td>A resume token. Valid while oplog history remains</td></tr>
+                            <tr><td>Ordering</td><td>A non-monotonic watermark skips documents</td><td>The stream orders them. On shards <code>mongos</code> guarantees it</td></tr>
+                            <tr><td>Load on the source</td><td>Proportional to interval and query cost</td><td>A cursor stays open. Many of them affect the server</td></tr>
+                            <tr><td>Silent failure</td><td>Hard to tell a stalled watermark from a quiet period</td><td>Stays idle when majority commit is blocked</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2 id="sec-11">The resume point - what the token demands</h2>
+
+                    <p>Having chosen change streams, the next question is single. <strong>When the process dies and comes back, where does it start reading again.</strong></p>
+
+                    <p>According to the manual, change event notifications <strong>include a resume token on the <code>_id</code> field</strong>. There are two kinds. An <strong>event token</strong> identifies a specific change event, and a <strong>highwatermark token</strong> represents a point in time without an associated change event, generated periodically by the server to indicate that cluster time has advanced. The existence of the second kind matters more in practice than it first appears, because it means the stored resume point can keep moving forward even on a collection where changes are rare.</p>
+
+                    <p>There are three ways to resume, each for a different situation. <code>resumeAfter</code> continues after a specific event. <code>startAfter</code> <strong>starts a new stream</strong> after that point. <code>startAtOperationTime</code> opens the cursor at a particular point in time, and the documentation says that if the specified starting point is in the past, <strong>it must be in the time range of the oplog</strong>.</p>
+
+                    <p>The difference between the first two surfaces during an incident. The documentation states plainly that <strong>you cannot use <code>resumeAfter</code> to resume a change stream after an invalidate event closes it</strong>, and directs you to <code>startAfter</code> to begin a new stream instead. Collection drop and rename are named as examples of an invalidate event. A cursor also closes on explicit close, on connection loss or timeout, and on a sharded cluster a shard removal may close an open cursor, in which case the documentation warns the closed cursor <strong>may not be fully resumable</strong>.</p>
+
+                    <p>The expiry condition is equally explicit. The documentation states that <strong>the oplog must have enough history to locate the operation associated with the token</strong>. So the upper bound on how long a restart stays possible is the <strong>oplog window</strong>, and that is a database setting, not a setting of the sync tool. The production recommendations add that if significant downtime is expected, such as for an upgrade or a significant disaster, you should <strong>consider increasing the size of the oplog so that operations are retained for longer than the estimated downtime</strong>. If a sync process is going to be parked for days, that sentence is the only defence available on the day it matters.</p>
+
+                    <pre><code class="language-javascript">// Read the stored resume point. If there is none, open from now.
+const saved = await loadResumeToken();
+
+const options = { fullDocument: "updateLookup" };
+if (saved) options.resumeAfter = saved;   // this fails after an invalidate event
+
+const stream = db.collection("visits").watch([], options);
+
+for await (const event of stream) {
+  // The _id of every change event is the resume token
+  await applyToPostgres(event);           // apply first
+  await saveResumeToken(event._id);       // then record the point
+  // Invert this order and events are lost. Keep it and duplicates appear.
+  // Loss cannot be repaired, duplicates can be absorbed by idempotency.
+}
+</code></pre>
+
+                    <p>The last two comments are the conclusion of this section. Applying the change and saving the token are <strong>two writes to two different systems</strong>, and there is no way to wrap them in a single transaction. One has to happen first, and either choice produces an accident. Save the token first and you get <strong>loss</strong>; apply first and you get <strong>duplicates</strong>. Only one of those is recoverable.</p>
+
+                    <h2 id="sec-12">At least once - why an idempotent load becomes mandatory</h2>
+
+                    <p>That choice fixes the delivery guarantee. Having decided to apply first, the pipeline is <strong>at least once</strong>. The same change can arrive more than once, and that is not a defect but a designed property. Which in turn fixes what the load side has to cope with.</p>
+
+                    <ul>
+                        <li><strong>Applying the same event twice must produce the same result</strong> - meaning the operation has to be expressed as an overwrite rather than an accumulation</li>
+                        <li><strong>There has to be a key</strong> - without a way to identify what is being overwritten, idempotency does not exist. This is the first error the source article hit</li>
+                        <li><strong>A stale event arriving late must not overwrite newer state</strong> - wherever ordering guarantees can break, a version comparison is required</li>
+                    </ul>
+
+                    <p>The tool that expresses this in PostgreSQL is <code>ON CONFLICT</code>. The documentation's definition is compact. <strong><code>ON CONFLICT DO NOTHING</code> simply avoids inserting a row as its alternative action, and <code>ON CONFLICT DO UPDATE</code> updates the existing row that conflicts with the row proposed for insertion.</strong> The conflict target is given either by unique index inference or by naming a constraint explicitly with <code>ON CONSTRAINT</code>.</p>
+
+                    <p>One rule here is easy to miss. The documentation states that <strong>specifying a conflict target is optional for <code>DO NOTHING</code> but must be provided for <code>DO UPDATE</code></strong>. And the values to update with are reached through <strong>the special <code>excluded</code> table</strong>. In the documentation's own phrasing, the <code>SET</code> and <code>WHERE</code> clauses have access to the existing row using the table's name or an alias, and to the row proposed for insertion using <code>excluded</code>.</p>
+
+                    <p>The most expensive trap is at the end. The documentation calls an <code>INSERT</code> with <code>ON CONFLICT DO UPDATE</code> a <strong>deterministic statement</strong>, says the command <strong>will not be allowed to affect any single existing row more than once</strong>, and warns that <strong>a cardinality violation error will be raised when this situation arises</strong>. Why does that matter here? Because when change stream events are loaded in batches, <strong>several events for the same document routinely land in the same batch</strong>. Put them into one statement as they are and the whole batch fails. So a per-key reduction that keeps only the newest is required immediately before the load.</p>
+
+                    <pre><code class="language-sql">-- If the same mongo_id appears twice in one batch, a cardinality violation is raised.
+-- So immediately before loading, keep only the newest row per key.
+INSERT INTO mongo_visits_sync AS t (mongo_id, visit_id, status, visit_date, patient, src_ts)
+SELECT DISTINCT ON (mongo_id)
+       mongo_id, visit_id, status, visit_date, patient, src_ts
+FROM   staging_changes
+ORDER  BY mongo_id, src_ts DESC
+ON CONFLICT (mongo_id) DO UPDATE
+SET    visit_id   = EXCLUDED.visit_id,
+       status     = EXCLUDED.status,
+       visit_date = EXCLUDED.visit_date,
+       patient    = EXCLUDED.patient,
+       src_ts     = EXCLUDED.src_ts,
+       deleted_at = NULL
+WHERE  t.src_ts &lt; EXCLUDED.src_ts;   -- stops a stale event overwriting newer state
+</code></pre>
+
+                    <p>That final <code>WHERE</code> clause handles the third requirement. If the existing row is <strong>newer than the incoming one, the update is skipped</strong>. Without it, an old event replayed across a restart boundary erases whatever was applied in the meantime. As a related note, the documentation suggests considering <code>MERGE</code> when <code>INSERT</code>, <code>UPDATE</code> and <code>DELETE</code> need to be mixed within a single statement, describing it as the more SQL-standard-conforming alternative to <code>ON CONFLICT</code>.</p>
+
+                    <p>There is also the matter of change streams returning, by default, <strong>only the delta of fields during an update operation</strong>. Getting the whole document requires setting <code>fullDocument</code> to <code>updateLookup</code>, which the documentation describes as a <strong>separate read of the most current majority-committed version of the document from the collection</strong>. Caveats follow. If the document is deleted or the collection dropped between the update and the lookup, <code>fullDocument</code> <strong>may be missing</strong>, and if other majority-committed operations modified the document in between, the document returned <strong>may differ significantly from the document at the time of the update</strong>. In other words, <code>updateLookup</code> gives you <strong>the state now, not the state then</strong>.</p>
+
+                    <p>That property has a bright side. Because the lookup happens <strong>at replay time</strong>, even a stale replayed event self-corrects when the goal is convergence to a final state. Conversely, if the goal is to retain a faithful history of changes, <code>updateLookup</code> is the wrong instrument. Pre-images and post-images, available from 6.0, occupy that role, and the documentation notes that there is no pre-image for an inserted document and no post-image for a deleted one.</p>
+
+                    <p>There is a size limit too. The production recommendations state that change stream response documents <strong>must adhere to the 16MB BSON document limit</strong>, and that depending on document size in the collection, <strong>notifications may fail</strong> if the resulting notification document exceeds it. Update operations configured to return the full updated document, and inserts or replaces of documents at or just below the limit, are given as examples. From 6.0.9 the <code>$changeStreamSplitLargeEvent</code> aggregation stage can split events into smaller fragments. For a collection holding large documents, it is better to work that limit out during mapping. Learning it from a failure means learning it after the stream has already stopped.</p>
+
+                    <h2 id="sec-13">Deletion - how do you learn that a document is gone</h2>
+
+                    <p>This is the item most often left out of a sync, and the one whose omission takes longest to surface. Inserts and updates that go wrong produce strange values, so somebody notices. A missed deletion appears as <strong>a row still sitting exactly where it should be</strong>, and nobody feels anything is wrong.</p>
+
+                    <p>What a change stream delete event carries is set out precisely in the reference. The event contains <code>_id</code>, which is the resume token, <code>clusterTime</code>, the timestamp from the associated oplog entry, the namespace <code>ns</code>, the <code>operationType</code>, and <code>documentKey</code>. The documentation describes <code>documentKey</code> as <strong>a document that contains the <code>_id</code> value of the document created or modified by the CRUD operation</strong>, adding that for sharded collections this field <strong>also displays the full shard key</strong> and that <code>_id</code> is not repeated if it is already part of the shard key. From 6.0, <code>wallTime</code> carries the server date and time of the operation.</p>
+
+                    <p>The decisive sentence is this. <strong>The <code>fullDocument</code> document is omitted as the document no longer exists at the time the change stream cursor sends the delete event to the client.</strong> Which means a delete event tells you <strong>only the identifier of what disappeared</strong>.</p>
+
+                    <p>That single sentence retroactively justifies several earlier decisions. If the target table's primary key is not derived from <code>_id</code>, then receiving a delete event leaves you with <strong>no way to work out which row to remove</strong>. Matching on document content is not an option because the content does not arrive. The error the source article hit first, that the target had no key columns and could not be upserted idempotently, looked like an insert-side problem. It was blocking deletion at the same time.</p>
+
+                    <p>If the content prior to deletion is genuinely needed, there is a route. From 6.0, enabling <code>changeStreamPreAndPostImages</code> on the collection through <code>createCollection</code>, <code>create</code> or <code>collMod</code>, and setting <code>fullDocumentBeforeChange</code> to <code>required</code> or <code>whenAvailable</code> in <code>watch()</code>, delivers the document as it was just before deletion. But the documentation lists two cases where pre-images are unavailable: <strong>they were not enabled on the collection at the time of the delete operation</strong>, or <strong>they were removed after the retention time set in <code>expireAfterSeconds</code></strong>. In other words the feature reaches back <strong>exactly as far as it was switched on in advance</strong>. It cannot be enabled after an incident to recover the past.</p>
+
+                    <pre><code class="language-sql">-- A delete event carries only documentKey. The document body does not arrive.
+-- So unless the target key came from _id, the row to remove cannot be identified.
+
+-- Option 1. Logical delete. The disappearance itself is kept as history.
+UPDATE mongo_visits_sync
+SET    deleted_at = $2
+WHERE  mongo_id = $1
+  AND  deleted_at IS NULL;
+
+-- Option 2. Physical delete. Removing an absent row is not an error, so it is idempotent.
+DELETE FROM mongo_visits_sync
+WHERE  mongo_id = $1;
+</code></pre>
+
+                    <p>Which of the two to choose is settled by what the copy is for. For an analytical copy, <strong>logical deletion</strong> is usually better, because when something disappeared is itself a fact and a physical delete erases that fact. The price is that every query has to carry a <code>deleted_at IS NULL</code> predicate, and the one dashboard that forgets it quietly reports the wrong number. If the goal is a copy that looks exactly like the source, physical deletion is right, and there the property that removing an absent row is not an error supplies idempotency for free.</p>
+
+                    <p>Either way, a reconciliation procedure is needed separately. Across any window in which the stream was quietly disconnected, in which the token expired and the load restarted from scratch, or in which a new stream was opened after an invalidate event, delete events pass by entirely. Without a periodic comparison of the key lists on both sides to find <strong>keys present only on the target</strong>, the gaps from those windows stay forever.</p>
+
+                    <h2 id="sec-14">When not to build this at all</h2>
+
+                    <p>That covers what this structure demands. Now for the opposite direction. There is a point at which the cost of keeping two databases aligned <strong>exceeds the cost of collapsing them into one</strong>.</p>
+
+                    <ul>
+                        <li><strong>When the copy is allowed to be stale</strong> - if a few hours of lag is acceptable and the data fits in a reload window, a periodic full reload is overwhelmingly cheaper. No resume token, no idempotency, no deletion detection. Anything absent upstream is absent from the new load, so deletion <strong>matches by definition</strong></li>
+                        <li><strong>When both sides must be read in one transaction</strong> - an atomic read spanning two different databases cannot be manufactured by any synchronization scheme. If that requirement is real, what is needed is consolidation, not sync</li>
+                        <li><strong>When writes happen on both sides</strong> - this moves into a different class of difficulty from a one-way copy. Conflict resolution rules and causality tracking become necessary, and from that point the answer is set by domain rules rather than by a tool</li>
+                        <li><strong>When the mapping keeps moving</strong> - if the upstream team's culture is to add fields to documents freely, flattened columns become a permanent maintenance tax. In that case, keeping the copy in a single JSONB column, or not building the copy at all, is better</li>
+                        <li><strong>Standalone MongoDB</strong> - without a replica set there are no change streams, leaving only polling with the holes described above. Promising real-time alignment on that footing is a promise that cannot be kept</li>
+                    </ul>
+
+                    <p>Conversely, there is a place where this structure clearly fits. MongoDB remains <strong>the source of truth</strong>, and PostgreSQL exists purely as a <strong>read-only copy</strong> for the things SQL is good at: joins, window functions, connecting a BI tool, ad hoc aggregation. The condition that nothing writes to the copy erases half the difficulty described above. How to keep that Postgres side healthy in operational terms is covered in <a href="postgres_startup_survival_2026.html">a startup's PostgreSQL survival guide</a>, and how to make the load job itself retryable inside Postgres is covered in <a href="durable_workflows_postgres_2026.html">durable workflows with Postgres</a>.</p>
+
+                    <p>To put it together: the source article's author, writing that mapping was trickier than synchronization, was half right. Mapping was tricky because those were <strong>decisions that are hard to reverse</strong>, and they are hard to reverse because every one of them was <strong>a precondition for synchronization working at all</strong>. What to use as the key, whether to distinguish absence from <code>null</code>, where to put arrays: these look like schema design questions, but each one settles on the spot whether restart, idempotency and deletion detection are even possible. The right order is not mapping first with sync bolted on afterwards. It is <strong>mapping with the demands of synchronization already in hand</strong>.</p>
+
+                    <h2 id="sec-15">What could not be confirmed</h2>
+
+                    <ul>
+                        <li>The <strong>exact structure of the delta</strong> carried by a change stream update event was not confirmed. What the manual establishes is that by default only the delta of fields during the update operation is returned. The field names and shape inside it live in a separate reference that was not opened, so they were left out of the body</li>
+                        <li>The precise digit and exponent limits of PostgreSQL <code>numeric</code> were not confirmed. What was established is that <code>jsonb</code> rejects numbers outside the <code>numeric</code> range, and that BSON Decimal128 carries 34 digits with an exponent range of -6143 to +6144. Whether one range fully contains the other was not worked out</li>
+                        <li>The internal time resolution of the PostgreSQL <code>timestamp</code> family was not confirmed against primary documentation. The body relies only on the established fact that BSON <code>Date</code> is measured in milliseconds</li>
+                        <li><strong>Exactly which error the server returns</strong> when a resume is attempted with a token outside the oplog window was not confirmed. The manual records only the requirement that sufficient history exist, and carries no error code for the failure case</li>
+                        <li><strong>How frequently</strong> highwatermark tokens are generated, and whether that interval can be tuned, was not confirmed. The documentation says only that the server generates them periodically</li>
+                        <li>How the tool used in the source article <strong>joins the initial full copy to the change stream</strong> was not confirmed. Closing the gap at that seam is the core of any such tool, yet the procedure is not described in the source</li>
+                        <li>The source contains <strong>no numbers at all</strong> for data volume, document count, throughput or latency. Nothing about the performance characteristics of this approach has therefore been carried over</li>
+                    </ul>
+
+                    <h2 id="sec-16">References</h2>
+
+                    <ul>
+                        <li><a href="https://news.hada.io/topic?id=33219" target="_blank" rel="noopener">GeekNews topic 33219</a> — the introduction that prompted this article, carrying the original link and a summary</li>
+                        <li><a href="https://visualeaf.com/blog/copy-and-sync-a-mongodb-collection-to-postgresql/" target="_blank" rel="noopener">Copy and Sync a MongoDB Collection to PostgreSQL (VisuaLeaf)</a> — the source. The choice of ordinary columns for simple fields and JSONB for nested objects and arrays, the <code>mongo_id</code> primary key, the missing key column error and the field name mismatch error all come from here. It is a post introducing the team's own tool</li>
+                        <li><a href="https://www.mongodb.com/docs/manual/changeStreams/" target="_blank" rel="noopener">Change Streams (MongoDB Manual)</a> — replica set and sharded cluster requirements, WiredTiger and protocol version 1, the resume token on <code>_id</code>, event and highwatermark tokens, the differences between <code>resumeAfter</code>, <code>startAfter</code> and <code>startAtOperationTime</code>, invalidate events, and the delta default with the caveats around <code>updateLookup</code></li>
+                        <li><a href="https://www.mongodb.com/docs/manual/reference/change-events/delete/" target="_blank" rel="noopener">delete Event (MongoDB Manual)</a> — the field list of a delete event, <code>documentKey</code> carrying <code>_id</code> and the shard key, the reason <code>fullDocument</code> is omitted, and the 6.0 conditions and retention limits for <code>fullDocumentBeforeChange</code></li>
+                        <li><a href="https://www.mongodb.com/docs/manual/administration/change-streams-production-recommendations/" target="_blank" rel="noopener">Change Streams Production Recommendations (MongoDB Manual)</a> — the 16MB BSON limit and failed notifications, <code>$changeStreamSplitLargeEvent</code> in 6.0.9, streams remaining idle with arbiters present, the oplog sizing recommendation, cold shards and <code>periodicNoopIntervalSecs</code>, and the advice against opening many streams because indexes cannot be used</li>
+                        <li><a href="https://www.mongodb.com/docs/manual/reference/bson-types/" target="_blank" rel="noopener">BSON Types (MongoDB Manual)</a> — the composition and byte order of the 12-byte ObjectId, the explicit statement that it is not necessarily monotonic and the two reasons why, BSON <code>Date</code> as a 64-bit millisecond integer, and Decimal128 precision and exponent range</li>
+                        <li><a href="https://www.postgresql.org/docs/17/datatype-json.html" target="_blank" rel="noopener">JSON Types (PostgreSQL 17)</a> — the storage difference between <code>json</code> and <code>jsonb</code>, preservation of white space, key order and duplicate keys, the recommendation to prefer <code>jsonb</code>, the operators supported by the default GIN class and by <code>jsonb_path_ops</code>, rejection of <code>NaN</code>, infinity and <code>\u0000</code>, and the note that SQL NULL is a different concept</li>
+                        <li><a href="https://www.postgresql.org/docs/17/sql-insert.html" target="_blank" rel="noopener">INSERT (PostgreSQL 17)</a> — how a conflict target is specified, the difference between <code>DO NOTHING</code> and <code>DO UPDATE</code>, the rule that <code>DO UPDATE</code> requires a conflict target, the special <code>excluded</code> table, the deterministic statement and cardinality violation, and the pointer to <code>MERGE</code></li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>Share this post</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X (Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">Copy link</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">Back to list</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Free tools you may find useful</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/iptables_generator.html">iptables Generator 2026</a></li>
+      <li><a href="../static/code_image.html">Code Image Generator</a></li>
+      <li><a href="../static/char_counter.html">Character Counter</a></li>
+      <li><a href="../static/json_formatter.html">JSON Formatter</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">See all tools &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Related Posts</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="sql_not_in_null_empty_result.html">One NULL in a NOT IN List Empties the Whole Result - SQL Three-Valued Logic 2026</a></li>
+      <li><a href="find_process_holding_file.html">Finding the Process Holding a File - When Deleting It Frees Nothing</a></li>
+      <li><a href="log_rotation_pitfalls.html">Where Log Rotation Fails Silently - The Disk Fills and Nobody Notices</a></li>
+      <li><a href="ai_generated_code_disclosure_license.html">Putting AI Authorship in the License - Where Permission and Disclosure Come Apart</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('Link copied. Paste it into the Threads app to share.');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('Link copied.'); });
+    });
+    </script>
+</body>
+</html>

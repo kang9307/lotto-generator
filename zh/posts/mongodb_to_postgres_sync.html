@@ -1,0 +1,671 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>搬一次和一直对齐是两个问题 - 把 MongoDB 集合送进 PostgreSQL 时被迫做出的选择</title>
+    <meta name="description" content="梳理无模式文档进入表时被迫必须做出的那些决定，以及一次性复制变成持续同步的那一刻究竟什么变了。依据 MongoDB 与 PostgreSQL 官方文档，从断点续传、幂等写入一直讲到删除检测与不该采用这套结构的场合。">
+    <meta name="keywords" content="MongoDB, PostgreSQL, 变更流, change stream, resume token, JSONB, 幂等写入, upsert, ON CONFLICT, ObjectId, 模式映射, CDC, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/mongodb_to_postgres_sync.html">
+
+    <meta property="og:title" content="搬一次和一直对齐是两个问题 - 把 MongoDB 集合送进 PostgreSQL 时被迫做出的选择">
+    <meta property="og:description" content="映射不是口味问题，而是结构强加的。文档进入表的那一刻你会放弃什么，以及同步在哪里和复制分道扬镳。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/mongodb_to_postgres_sync.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-09-05">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="搬一次和一直对齐是两个问题">
+    <meta name="twitter:description" content="文档进入表的那一刻被强加的选择，以及同步与复制分岔的地方。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "搬一次和一直对齐是两个问题 - 把 MongoDB 集合送进 PostgreSQL 时被迫做出的选择",
+      "alternativeHeadline": "文档进入表时被决定的东西、捕获变更的方式所造成的约束，以及不该采用这套结构的场合",
+      "datePublished": "2026-09-05",
+      "dateModified": "2026-09-05",
+      "inLanguage": "zh-CN",
+      "articleSection": "开发/基础设施",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "MongoDB, PostgreSQL, 变更流, resume token, JSONB, 幂等写入, ON CONFLICT, ObjectId, 模式映射, CDC",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/mongodb_to_postgres_sync.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "使用 MongoDB 变更流需要什么前提?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "MongoDB 官方手册写明，变更流可用于副本集和分片集群。这些部署必须使用 WiredTiger 存储引擎，并且必须是副本集协议版本 1。在启用静态加密的部署上同样可用。它与多数派读关注的支持与否无关，无论该设置是开启还是关闭，变更流都能使用。反过来说，非副本集的单机服务器根本没有这条通道。这是同步设计的第一个岔路口，因为后续的一切都取决于是否存在有序的变更事件这一原语。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "变更流的恢复令牌在哪里，什么时候会失效?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "手册写明，变更事件通知会把恢复令牌放在 _id 字段上送达。令牌有两种。一种是指向特定变更事件的事件令牌，另一种是高水位令牌，它表示一个没有对应变更事件的时间点，由服务器周期性生成以表明集群时间已经推进。恢复失败的条件有两个。第一，oplog 中必须保留足够的历史，以便定位与该令牌关联的操作。第二，在集合被删除或改名这类失效事件关闭流之后，就不能再用 resumeAfter，必须用 startAfter 开启一条新的流。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "嵌套文档该拍平成列还是留在 JSONB 里?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "判断标准是你打算往这个值上挂什么。拍平成列之后，NOT NULL 与检查约束、外键、按列统计信息以及普通 B-tree 索引全都可以用。代价是上游每多一个字段，DDL 就得跟着改一次。放进 JSONB 则可以在不改模式的前提下接住新字段，PostgreSQL 文档也建议，除非有相当特殊的需求例如对键顺序的历史假设，否则多数应用都应该优先把 JSON 数据存为 jsonb。代价是没有地方挂列级约束，规划器的统计信息也被压缩进了一个列。字段固定就拍平，逐文档不同就用 JSONB，这是实务上的分界线。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "至少一次投递对 PostgreSQL 这一侧提出了什么要求?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "它要求同一个变更被应用两次也得到相同结果，也就是幂等写入。在 PostgreSQL 中承担这件事的工具是 ON CONFLICT DO UPDATE，而在那里冲突目标不是可选项而是必填项。文档写明，DO NOTHING 时指定冲突目标是可选的，但 DO UPDATE 时必须提供。用于更新的值通过名为 excluded 的特殊表来引用。这里有一个陷阱。文档称这条语句是确定性的，说该命令不允许对任何单个既有行作用超过一次，并警告出现这种情况时会抛出基数违规错误。因此批量写入之前必须先按键做一次去重整理。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "为什么轮询捕捉不到删除?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "轮询是按条件筛选出当前存在的文档。被删除的文档已经不存在，因此不匹配任何条件。消失这件事本身根本不会出现在查询结果里。所以基于轮询的同步在结构上对删除是失明的，目标端会不断堆积源端已经没有的行。要填上这个洞，要么改动应用让它写入删除标记而不是真的删掉文档，要么定期比对两端的完整键列表。变更流的删除事件里带有 documentKey，其中包含 _id，这正是让目标端能够定位到那一行的东西。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/mongodb_to_postgres_sync.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/mongodb_to_postgres_sync.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/mongodb_to_postgres_sync.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/mongodb_to_postgres_sync.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/mongodb_to_postgres_sync.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "首页",
+      "item": "https://braindetox.kr/zh/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "开发/基础设施",
+      "item": "https://braindetox.kr/zh/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "搬一次和一直对齐是两个问题 - 把 MongoDB 集合送进 PostgreSQL 时被迫做出的选择",
+      "item": "https://braindetox.kr/zh/posts/mongodb_to_postgres_sync.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="搬一次和一直对齐是两个问题 - 把 MongoDB 集合送进 PostgreSQL 时被迫做出的选择">
+                <meta itemprop="datePublished" content="2026-09-05">
+                <meta itemprop="dateModified" content="2026-09-05">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="MongoDB, PostgreSQL, 变更流, resume token, JSONB, 幂等写入, ON CONFLICT, ObjectId, 模式映射, CDC">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/mongodb_to_postgres_sync.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">搬一次和一直对齐是两个问题 - 把 MongoDB 集合送进 PostgreSQL 时被迫做出的选择</h1>
+                    <h2 class="post-subtitle">文档进入表时必须决定的东西、捕获变更的方式所造成的约束，以及不该采用这套结构的场合</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-05">2026-09-05</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">开发/基础设施</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>把 MongoDB 里的一个集合搬进 PostgreSQL，通常被当作半天的活儿。读出文档、塞进列里，还能有什么难的。确实有些情况就到此为止了，那就是<strong>只需要搬一次</strong>的情况。</p>
+
+                    <p>麻烦从下一句话开始。<strong>然后还要一直对齐。</strong>这一句被加上的瞬间，工作的性质整个变了。前一件事是数据类型转换，后一件事是<strong>分布式系统</strong>。它变成了这样一件工作：先承认两个数据库在不同时刻持有不同的状态，再决定这个差距能容忍到什么程度。</p>
+
+                    <p>下面把这两个问题拆开。先看文档进入表时<strong>不是由口味而是由结构强加</strong>的那些决定是什么，以及每个决定日后会让什么变难。接着按断点、重复投递、删除检测的顺序，说清<strong>同步为什么远比复制难</strong>。最后是反方向：什么时候把两个数据库一直对齐的代价，会超过把它们合成一个的代价。</p>
+
+                    <div class="callout">
+                        下文中关于 MongoDB 变更流、恢复令牌、BSON 类型，以及 PostgreSQL 的 <code>jsonb</code> 与 <code>ON CONFLICT</code> 的所有陈述，都出自 MongoDB 官方手册与 PostgreSQL 17 官方文档。凡是行为随版本而异的条目，都同时标注了版本。这里没有性能数字，因为原文里也没有。
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>本文涵盖的内容</h3>
+                        <ol>
+                            <li><a href="#sec-1">缘起 - 难的是映射，不是同步</a></li>
+                            <li><a href="#sec-2">把两个问题拆开 - 复制与对齐要求的东西不同</a></li>
+                            <li><a href="#sec-3">无模式文档进入表时被强加的五件事</a></li>
+                            <li><a href="#sec-4">用什么来接 _id</a></li>
+                            <li><a href="#sec-5">同一字段在不同文档里类型不同时</a></li>
+                            <li><a href="#sec-6">嵌套文档 - 在拍平与 JSONB 之间</a></li>
+                            <li><a href="#sec-7">数组 - 在子表与单列之间</a></li>
+                            <li><a href="#sec-8">字段缺失和 NULL 不是一回事</a></li>
+                            <li><a href="#sec-9">映射决策表 - 得到什么、放弃什么</a></li>
+                            <li><a href="#sec-10">怎样捕获变更 - 轮询与变更流</a></li>
+                            <li><a href="#sec-11">断点 - 令牌所要求的东西</a></li>
+                            <li><a href="#sec-12">至少一次 - 幂等写入为何成为强制项</a></li>
+                            <li><a href="#sec-13">删除 - 怎样知道一个文档消失了</a></li>
+                            <li><a href="#sec-14">什么时候不该采用这套结构</a></li>
+                            <li><a href="#sec-15">未能确认的部分</a></li>
+                            <li><a href="#sec-16">参考资料</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">缘起 - 难的是映射，不是同步</h2>
+
+                    <p>2026年9月初，韩国的开发者社区转载了一篇题为<strong>把 MongoDB 集合复制并同步到 PostgreSQL</strong> 的文章。原文是一个叫 VisuaLeaf 的团队的博客，记录了把一个装着就诊记录的集合搬进 PostgreSQL 表并持续对齐的过程。作者留下的一句话是本文的起点：<strong>比起同步本身，把 MongoDB 的文档结构映射到 PostgreSQL 的表上更麻烦。</strong></p>
+
+                    <p>先说清原文的性质比较诚实。那是一篇<strong>介绍自家产品的文章</strong>。作者用的是 VisuaLeaf Mongo Sync，理由是想把源集合、目标 PostgreSQL 表、字段映射和同步状态用可视化的方式组织起来。在一篇推荐工具的文章里，最值得相信的部分往往不是成功故事，而是<strong>卡住的地方的记录</strong>，而这篇里留下了两处。</p>
+
+                    <p>第一处是一个报错，说目标端没有键列，因此无法幂等地执行 upsert。作者把 MongoDB 的 <code>_id</code> 接到一个叫 <code>mongo_id</code> 的 <code>TEXT</code> 列上，并在其上建主键，问题就解决了。第二处是字段名不一致：源端是 <code>labResults</code>，目标端是 <code>lab_results</code>，于是报出关系上不存在该列的错误。解法是逐个字段显式映射，或者在 PostgreSQL 一侧用引号保留驼峰命名。</p>
+
+                    <p>这两个错误看上去分量相当，性质却完全不同。后者是<strong>配置失误</strong>，改一次就结束了。前者不是。它不是失误，而是<strong>结构提出的要求</strong>，本文后面出现的绝大部分约束都能追溯到这一点上。接下来有一半篇幅，是在解释那个错误为什么是必然的。</p>
+
+                    <p>原文里<strong>没有</strong>的东西也要说清楚。数据量、文档数、处理速度、延迟，一个数字都没有。初次全量复制与其后的变更接续是按什么顺序衔接的、接缝处的空档怎么填补，也没有写。所以不能拿原文的结果去放大成<strong>这种做法通常很快或者通常安全</strong>的说法。原文展示的是一个集合、一个工具、一个场景。</p>
+
+                    <h2 id="sec-2">把两个问题拆开 - 复制与对齐要求的东西不同</h2>
+
+                    <p>搬一次和一直对齐只是名字连在一起，要求的东西并不相同。最大的差别在于<strong>失败之后你还能做什么</strong>。前者失败了从头再来一遍就行。清空目标表再填一次即可，这个过程按定义就是幂等的。后者做不到。你得知道自己推进到了哪里，那个位置还得依然有效，而且同一个事件来两次结果必须一样。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>需要权衡的点</th><th>一次性复制</th><th>持续同步</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>失败恢复</td><td>整体重跑，没有副作用</td><td>需要断点，而断点会过期</td></tr>
+                            <tr><td>重复</td><td>只读一次，不会发生</td><td>重启区间必然出现，写入必须幂等</td></tr>
+                            <tr><td>顺序</td><td>无关，最终状态对上就行</td><td>同一文档的更新一旦倒序，状态就错乱</td></tr>
+                            <tr><td>删除</td><td>源端没有目标端也没有，自动对上</td><td>需要另一套机制才能知道什么消失了</td></tr>
+                            <tr><td>模式变更</td><td>下次运行用新映射重建即可</td><td>需要一套在运行中修改映射的独立流程</td></tr>
+                            <tr><td>源端负载</td><td>集中在运行时刻，可预测</td><td>常驻，打开的游标持续占用服务器资源</td></tr>
+                            <tr><td>成本增长的轴</td><td>数据量</td><td>运行时长与变更率</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>最后一行在实务中最要紧。一次性复制的成本随数据变大而变大，然后就结束了。同步的成本<strong>随时间累积</strong>。令牌会过期，集合会被删除，上游会多出字段，最终会出现流悄悄停了三天却没人发现的情况。后面讨论的一切，都在这条轴上。</p>
+
+                    <p>只有一侧发生写入这个前提也值得点明。这里讨论的是 MongoDB 为源、PostgreSQL 为副本的<strong>单向</strong>结构。两侧都写入的结构是完全不同的问题，上面还要叠加冲突消解与因果关系追踪，其骨架在<a href="offline_first_database_sync.html">把数据握在手里的代价</a>中另行讨论过。</p>
+
+                    <h2 id="sec-3">无模式文档进入表时被强加的五件事</h2>
+
+                    <p>有些决定在文档数据库里可以一直往后拖。关系表不给你这个方便。要建列就得定类型，要定类型就得先决定这个字段究竟是什么。所以映射工作的实质不是转换，而是<strong>把之前一直拖着的决定一次性结清</strong>。被强加的决定大体有五个。</p>
+
+                    <ul>
+                        <li><strong>标识</strong> - 用什么类型的列来接 <code>_id</code>。它如果不成为主键，后面的一切都会塌</li>
+                        <li><strong>类型推断</strong> - 同一字段在不同文档里类型不同时，往哪一边靠</li>
+                        <li><strong>嵌套</strong> - 文档里的文档是摊成列，还是整块留着</li>
+                        <li><strong>数组</strong> - 是规范化成子表，还是留成数组列或 JSONB</li>
+                        <li><strong>缺失</strong> - 字段不存在和字段为 <code>null</code>，这两种状态要不要区分着保存</li>
+                    </ul>
+
+                    <p>下面逐个来看。它们的共同点是没有任何一个选择是<strong>免费的</strong>。每个选择都把现在变轻松的东西和以后变困难的东西配成了一对。</p>
+
+                    <h2 id="sec-4">用什么来接 _id</h2>
+
+                    <p>这是最先要定、也最难回头的决定。MongoDB 默认的 <code>_id</code> 是 ObjectId，按官方文档它由<strong>12 字节</strong>构成。前 4 字节是以 Unix 纪元为基准、以秒计的创建时间戳，接下来 5 字节是每个客户端进程生成一次的随机值，最后 3 字节是从随机值起步的自增计数器。文档指出，时间戳和计数器<strong>高位字节在前</strong>，这与其他 BSON 值相反。</p>
+
+                    <p>这里还有一句在实务上更重的话。文档明确写道，ObjectId 的值虽然应当随时间递增，但<strong>不一定单调</strong>。给出的理由有两个：时间分辨率只有一秒，因此同一秒内创建的值之间没有顺序保证；而且值由客户端生成，各机器的系统时钟可能不同。也就是说，把 <code>_id</code> <strong>当作变更检测水位线的设计从一开始就是坏的</strong>。这条线索在讲轮询的那一节还会再出现。</p>
+
+                    <p>接收端实际上只有两个选项。像原文那样展开成 24 个字符的十六进制字符串，用 <code>text</code> 主键来接；或者把 12 字节原样用 <code>bytea</code> 接住。前者人能读、任何工具都好处理，但存储量翻倍，索引也随之变大。后者保住了原始尺寸，但查询结果肉眼读不了，工具支持也薄。多数团队选前者，理由不是性能，而是<strong>运维过程中人需要看这个值的场合太多</strong>。</p>
+
+                    <p>无论选哪一个，有一个条件不能让步：<strong>那一列必须是主键。</strong>原文撞上的第一个错误正是这里。没有键就没有幂等的 upsert，没有幂等的 upsert 就吞不下重启带来的重复，那样一来重启本身就不可能。再加上后面会看到的删除事件根本不带文档内容，所以没有一个由 <code>_id</code> 推导出来的键，就<strong>根本没有办法确定该删哪一行</strong>。</p>
+
+                    <p>顺带一提，把随机性很强的值用作主键会对索引造成什么，是另一个主题。ObjectId 因为前段是时间，情况比完全随机的键要好，但这条轴上的通论整理在<a href="uuid_primary_key_sqlite_performance_2026.html">为什么不应把 UUID 作为主键</a>里。</p>
+
+                    <h2 id="sec-5">同一字段在不同文档里类型不同时</h2>
+
+                    <p>这是文档数据库里最常见、也最晚被发现的问题。集合建起来的头一个月，<code>amount</code> 全是整数，然后从某个时点开始混进了字符串，某处又是以 <code>NumberDecimal</code> 进来的，还有一部分文档干脆没有这个字段。MongoDB 不会拦这些。于是写入程序成了系统里第一个把这件事告诉你的东西。</p>
+
+                    <pre><code class="language-javascript">// 同一个集合、同一个字段名。类型逐文档不同。
+db.visits.insertMany([
+  { visitId: "VIS-1", amount: 12000,                  visitDate: ISODate("2026-09-01T09:00:00Z") },
+  { visitId: "VIS-2", amount: "12,000",               visitDate: "2026-09-02" },
+  { visitId: "VIS-3", amount: NumberDecimal("12000"), visitDate: ISODate("2026-09-03T09:00:00Z") },
+  { visitId: "VIS-4",                                 visitDate: null },
+  { visitId: "VIS-5", amount: null,                   visitDate: ISODate("2026-09-05T09:00:00Z") }
+]);
+
+// VIS-4 根本没有 amount 字段，而 VIS-5 有这个字段但值是 null。
+// 用同一个列来接这两者，两种状态的区别就消失了。
+</code></pre>
+
+                    <p>选项有三个，各自放弃的东西不同。第一，<strong>用最宽的类型来接</strong>。全塞进 <code>text</code>，写入就永远不会停。代价是排序和范围查询按字符串规则走，于是 <code>"9000"</code> 排在 <code>"12000"</code> 之上。第二，<strong>用严格类型接，不合就让它失败</strong>。数据质量守住了，但上游一旦混进一个坏值，整条同步立刻停摆。第三，<strong>正常值走类型化的列，异常值分流到另一个列或 JSONB</strong>。要写的代码变多，但同时避开了运行中停摆和静默丢失。</p>
+
+                    <p>BSON 这一侧还要再叠一层。按官方文档，BSON 的 <code>Date</code> 是以 Unix 纪元为基准、以<strong>毫秒</strong>计的 64 位整数，而且带符号，所以能表示 1970 年之前。因此用 <code>timestamptz</code> 来接本身很自然，但值得记住的是：比毫秒更细的精度在源端<strong>从一开始就不存在</strong>。接收端的类型更精密，并不会凭空长出原本没有的信息。</p>
+
+                    <p>数值也一样。BSON 区分 Double、32 位整数、64 位整数和 Decimal128。文档记载 Decimal128 有 34 位十进制有效数字，指数范围从 -6143 到 +6144。如果处理金额的集合用的是 Decimal128，接收端的列就必须是 <code>numeric</code>；一旦用 <code>double precision</code> 去接，为那份精度付出的成本当场作废。</p>
+
+                    <h2 id="sec-6">嵌套文档 - 在拍平与 JSONB 之间</h2>
+
+                    <p>原文的选择很明确：简单字段进普通列，嵌套的对象和数组存成 JSONB。于是 <code>visitId</code>、<code>status</code>、<code>visitDate</code> 分别成为 <code>text</code>、<code>text</code>、<code>timestamptz</code> 列，而 <code>patient</code>、<code>doctor</code>、<code>symptoms</code>、<code>prescriptions</code>、<code>invoice</code>、<code>labResults</code> 这些则全部成了 JSONB 列。这是个合理的默认值，但这个选择买进了什么、卖出了什么，需要说清楚。</p>
+
+                    <h3>拍平占优的情形</h3>
+
+                    <p>把 <code>patient.fullName</code> 摊成 <code>patient_full_name</code> 列之后，就可以<strong>往这个列上挂约束</strong>。<code>NOT NULL</code>、检查约束、唯一性、外键全都可用。规划器用的统计信息也按列采集，选择率估计因此更准，普通的 B-tree 索引就够用了。如果这个值是什么已经确定，而且你打算拿它做连接或过滤，拍平就是答案。</p>
+
+                    <p>代价是<strong>模式必须追着源端跑</strong>。在 MongoDB 一侧往嵌套文档里加一个字段是不需要发布的事，而在接收端每加一次就要跟一次 <code>ALTER TABLE</code> 和映射修改。当源端团队和副本团队不是同一拨人时，这个落差立刻变成运维负债。</p>
+
+                    <h3>JSONB 占优的情形</h3>
+
+                    <p>PostgreSQL 文档把 <code>json</code> 和 <code>jsonb</code> 的差别写得很清楚。<code>json</code> 存的是输入文本的精确副本，处理函数每次执行都得重新解析；<code>jsonb</code> 则以<strong>分解后的二进制格式</strong>存储，因为多了转换开销所以输入稍慢，但由于不需要重新解析，处理起来显著更快。文档的建议是明示的：<strong>除非有相当特殊的需求，例如对对象键顺序的历史假设，否则多数应用都应该优先把 JSON 数据存为 <code>jsonb</code>。</strong></p>
+
+                    <p>作为交换，<code>jsonb</code> 会<strong>扔掉一些东西</strong>。文档写道，它不保留空白，不保留对象键的顺序，也不保留重复键，输入里出现重复键时只保留最后一个值。<code>json</code> 三者都保留。如果原始文档的字段顺序或者字节级的原样以后可能会用到，这个差别就是决定性的。</p>
+
+                    <p>文档也指出索引是 <code>jsonb</code> 的一大优势。不过运算符类的选择会在后面产生影响。默认的 GIN 运算符类支持键存在运算符 <code>?</code>、<code>?|</code>、<code>?&amp;</code>，包含运算符 <code>@&gt;</code>，以及 jsonpath 匹配运算符 <code>@?</code> 和 <code>@@</code>。非默认的 <code>jsonb_path_ops</code> <strong>不支持键存在运算符</strong>，只支持 <code>@&gt;</code>、<code>@?</code>、<code>@@</code>。作为回报，文档称在同样的数据上 <code>jsonb_path_ops</code> 索引通常小得多，而且检索的特异性更好，尤其是查询里包含高频出现的键时。</p>
+
+                    <p>这个选择会挡住什么，在第八节还会再遇上。<strong>需要一个询问键是否存在的查询</strong>的那一刻，你会因为当初选了更小的索引，而没法用索引来回答这个问题。</p>
+
+                    <pre><code class="language-sql">CREATE TABLE mongo_visits_sync (
+    mongo_id     text PRIMARY KEY,        -- ObjectId 以 24 字符十六进制字符串接收
+    visit_id     text,
+    status       text,
+    visit_date   timestamptz,
+    -- 字段构成可变的嵌套文档与数组整块放进 jsonb
+    patient      jsonb,
+    lab_results  jsonb,
+    -- 源文档里没有的列，承载同步过程本身的状态
+    src_ts       timestamptz NOT NULL,
+    deleted_at   timestamptz
+);
+
+-- 要用键存在运算符就必须是默认运算符类
+CREATE INDEX ON mongo_visits_sync USING gin (patient);
+
+-- 只用包含查询和 jsonpath 的话，这个索引要小得多
+CREATE INDEX ON mongo_visits_sync USING gin (lab_results jsonb_path_ops);
+</code></pre>
+
+                    <p>值得留意这份表定义里有两个源端没有的列。<code>src_ts</code> 和 <code>deleted_at</code> 不是文档内容，而是<strong>同步这个流程本身的状态</strong>。需要这类列这件事，就是复制与同步是两个问题的最直观的证据。</p>
+
+                    <h2 id="sec-7">数组 - 在子表与单列之间</h2>
+
+                    <p>数组比嵌套多一个选项，岔路也就更宽。答案取决于它是标量数组还是文档数组。</p>
+
+                    <p>像标签列表这样的<strong>字符串数组</strong>，PostgreSQL 的数组类型 <code>text[]</code> 最自然。数组运算符能用，GIN 索引也能建。麻烦在于，日后如果每个元素要带上元数据，数组列没有地方安放。等到有人提出要给标签记录添加时间，结构就得重做。</p>
+
+                    <p>如果是<strong>文档数组</strong>，问题就压缩成一个：这个元素<strong>是不是要被独立查询的对象</strong>。如果需要按处方项目聚合，需要找出含有某种药品的就诊记录，计划按项目粒度做连接，那么规范化成子表就是正解。这样一来关系型的全套工具都回来了。</p>
+
+                    <p>代价出现在同步这一侧。源端<strong>一个文档发生变更</strong>的一个事件，在接收端必须被翻译成<strong>若干子行的删除与插入</strong>。这多条语句必须在一个事务里原子地完成，中途失败就会留下父行与子行状态对不上的局面。原本一次单行 upsert 就完事的活儿，变成了一套流程。</p>
+
+                    <p>如果元素只会整块读写，那就用一个 JSONB 列更好。<strong>一个文档对应一行</strong>的关系得以保持，写入逻辑仍然是简单的 upsert。代价是每次统计元素个数或者按元素排序都要付展开的成本。判断标准不是数据的形状，而是<strong>你要向这份数据提出的问题的形状</strong>。</p>
+
+                    <h2 id="sec-8">字段缺失和 NULL 不是一回事</h2>
+
+                    <p>这是信息流失得最安静的地方。MongoDB 文档里的某个字段可以处于三种状态：字段<strong>压根不存在</strong>、存在但值为 <strong><code>null</code></strong>、或者<strong>有值</strong>。这三者含义不同。若是问卷作答，它们分别对应<strong>没问过</strong>、<strong>问了但没答</strong>、<strong>答了</strong>。</p>
+
+                    <p>把它拍平成普通列，前两种状态就变成了<strong>同一个 SQL NULL</strong>，没有办法还原。PostgreSQL 文档在 JSON 原始类型对照表里，在 JSON 的 <code>null</code> 所对应的 PostgreSQL 类型那一栏写着<strong>SQL NULL 是另一个概念</strong>。这是在警告：两个世界在用同一个词指不同的东西。</p>
+
+                    <p>要保住这三种状态，就得把值留在 JSONB 里。这样才能通过询问<strong>键是否存在</strong>来把缺失和 <code>null</code> 分开。而上一节的索引选择在这里拖了后腿。询问键存在的 <code>?</code> 运算符<strong>只有默认的 GIN 运算符类才支持</strong>，<code>jsonb_path_ops</code> 不支持。如果当初因为索引更小而选了 <code>jsonb_path_ops</code>，那就变成了保住三种状态却没法用索引去问它们。</p>
+
+                    <p>同一类的陷阱还有两个。PostgreSQL 文档写道，<code>jsonb</code> <strong>会拒绝超出 PostgreSQL <code>numeric</code> 类型范围的数值</strong>，而 <code>json</code> 不会。并且在 JSON 原始类型对照表中，对数值写明<strong><code>NaN</code> 和无穷大不被允许</strong>，对字符串写明<strong><code>\u0000</code> 不被允许，表示数据库编码中不存在字符的 Unicode 转义同样不被允许</strong>。</p>
+
+                    <p>BSON 的 Double 可以装 <code>NaN</code> 和无穷大。如果计算失误让这样一个值混进了集合里的某个文档，那份文档<strong>就进不了 JSONB 列</strong>。字符串里的空字符同理。这两种情况都属于那种在初次全量复制时安静地混过去、某一天在一条变更事件上才第一次炸开的问题。如果映射阶段没有事先决定这类值的去处，那一天的同步就会停在那里等人发现。</p>
+
+                    <h2 id="sec-9">映射决策表 - 得到什么、放弃什么</h2>
+
+                    <p>把前面五个决定汇总成一张表。每一行是一种文档结构、一个接收它的选项，以及那个选项<strong>所放弃的东西</strong>。最后一列就是这张表存在的理由。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>文档结构类型</th><th>PostgreSQL 映射选项</th><th>得到什么</th><th>放弃什么</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>_id</code> (ObjectId)</td><td><code>text</code> 主键</td><td>人能读，工具支持好</td><td>12 字节变成 24 字符，索引也随之变大</td></tr>
+                            <tr><td><code>_id</code> (ObjectId)</td><td><code>bytea</code> 主键</td><td>保持原始尺寸</td><td>查询结果肉眼读不了，工具支持薄</td></tr>
+                            <tr><td>顶层标量，类型一致</td><td>普通列</td><td>约束、索引、连接、统计信息一应俱全</td><td>类型一旦动摇，写入立刻停摆</td></tr>
+                            <tr><td>顶层标量，类型混杂</td><td><code>text</code> 列</td><td>写入不会停</td><td>排序与范围查询按字符串规则走</td></tr>
+                            <tr><td>BSON <code>Date</code></td><td><code>timestamptz</code></td><td>时区运算与索引</td><td>源端到毫秒为止，更细的精度本来就没有</td></tr>
+                            <tr><td>Decimal128</td><td><code>numeric</code></td><td>值与位数得以保留</td><td>指数范围彼此不同，边界值需要核对</td></tr>
+                            <tr><td>Double 的 <code>NaN</code> 与无穷大</td><td>jsonb 无法承载</td><td>-</td><td>jsonb 会拒绝，需要另设列或替代值</td></tr>
+                            <tr><td>嵌套文档，字段固定</td><td>拍平成列</td><td>NOT NULL、检查、外键、按列统计</td><td>上游每多一个字段，DDL 就得跟一次</td></tr>
+                            <tr><td>嵌套文档，字段可变</td><td>一个 <code>jsonb</code> 列</td><td>不改模式也能接住</td><td>没法挂列级约束，统计信息被压成一个</td></tr>
+                            <tr><td>嵌套文档，需要保真</td><td><code>json</code> 列</td><td>空白、键顺序、重复键都保留</td><td>每次查询都要重新解析，没有索引支持</td></tr>
+                            <tr><td>标量数组</td><td><code>text[]</code></td><td>数组运算符与 GIN 索引</td><td>没有地方给单个元素挂元数据</td></tr>
+                            <tr><td>文档数组，元素要被查询</td><td>子表加外键</td><td>元素粒度的查询、聚合与连接</td><td>一个文档的变更变成多行的删除与插入</td></tr>
+                            <tr><td>文档数组，只整块使用</td><td><code>jsonb</code></td><td>一个文档对应一行，upsert 保持简单</td><td>元素的统计与排序每次都要付展开成本</td></tr>
+                            <tr><td>缺失与 <code>null</code> 之别</td><td>拍平成列</td><td>-</td><td>两种状态变成同一个 SQL NULL，区别消亡</td></tr>
+                            <tr><td>缺失与 <code>null</code> 之别</td><td><code>jsonb</code> 配默认 GIN</td><td>三种状态全部留存</td><td>必须放弃 <code>jsonb_path_ops</code> 那个更小的索引</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>贯穿全表有一条规则：<strong>现在灵活的选择会让日后的查询变贵，现在严格的选择会让日后的模式变更变贵。</strong>哪一边更好，不由数据的性质决定，而由<strong>你当初为什么把这份数据送进 PostgreSQL</strong> 决定。为了用 SQL 聚合和连接而送过去的，严格那一边对；为了不丢失原样地留存而送过去的，灵活那一边对。</p>
+
+                    <h2 id="sec-10">怎样捕获变更 - 轮询与变更流</h2>
+
+                    <p>从这里开始就是同步特有的问题了。第一个问题很简单：<strong>怎么知道什么变了。</strong></p>
+
+                    <h3>轮询实际漏掉的东西</h3>
+
+                    <p>最先想到的办法是定期发一条查询，只把最近的取回来。实现容易，也不需要特殊的部署形态。可这个方式有三个洞，而且三个都很安静。</p>
+
+                    <p>第一，<strong>没有合适的列可以当水位线</strong>。用 <code>_id</code> 就会撞上前面说过的 ObjectId 不单调这件事。因为时间分辨率是一秒而客户端时钟各不相同，ObjectId <strong>小于</strong>已处理位置的文档完全可能在之后才被插入。那份文档会被永久跳过。改用 <code>updatedAt</code> 这类应用字段，只要有一条写入路径忘了更新它，结果一模一样。</p>
+
+                    <p>第二，<strong>删除看不见</strong>。轮询是按条件筛选当前存在的文档。已经消失的文档不匹配任何条件。于是目标表里会留下源端没有的行，并且不断堆积。</p>
+
+                    <p>第三，<strong>延迟和负载是在做交换</strong>。周期缩短，查询就不停地扎进源端；周期拉长，副本就变旧。而且在一个周期内变了好几次的文档，只能看到<strong>最后一个状态</strong>。如果下游需要依据中间状态做判断，轮询本来就不是合适的工具。</p>
+
+                    <h3>变更流所要求的东西</h3>
+
+                    <p>MongoDB 的变更流能补上这些洞，但有前提。手册写明变更流<strong>可用于副本集和分片集群</strong>。这些部署必须使用 <strong>WiredTiger 存储引擎</strong>，并且是<strong>副本集协议版本 1</strong>。在启用静态加密的部署上同样可用，而且明确写明其可用性与多数派读关注的支持与否无关。单机部署根本没有这条通道。</p>
+
+                    <p>手册里还有若干运维层面的注意事项，每一条晚知道都要付代价。变更流<strong>无法使用索引</strong>，而且 MongoDB 不支持在 oplog 集合上创建索引，因此文档建议<strong>避免开启大量</strong>针对特定目标的变更流，因为它们会影响服务器性能。意思是，每个集合挂一条流的设计，会随集合数量成比例地啃噬服务器。</p>
+
+                    <p>对于含有仲裁者成员的副本集，文档说如果承载数据的成员不足以让操作达成多数派提交，变更流<strong>可能会保持空闲</strong>。故障时流不是报错，而是变安静。在分片集群上，对该集合几乎没有活动的<strong>冷分片</strong>会拖慢变更流的响应时间，因为 <code>mongos</code> 仍然必须去询问那些分片，才能保证变更的全序。反过来，活动量很大的分片集合上 <code>mongos</code> 可能跟不上所有分片的变更，文档因此建议使用通知过滤器，例如用 <code>$match</code> 只保留关心的操作。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>需要权衡的点</th><th>轮询</th><th>变更流</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>部署要求</td><td>无，单机服务器也能跑</td><td>副本集或分片集群，WiredTiger，pv1</td></tr>
+                            <tr><td>删除检测</td><td>结构上不可能</td><td>以删除事件的形式送达</td></tr>
+                            <tr><td>中间状态</td><td>一个周期内的变更被压平</td><td>按操作粒度全部送达</td></tr>
+                            <tr><td>重启</td><td>一个水位线值，不会过期</td><td>恢复令牌，只在 oplog 历史尚存时有效</td></tr>
+                            <tr><td>顺序</td><td>水位线不单调就会漏掉文档</td><td>流给出顺序，分片上由 <code>mongos</code> 保证</td></tr>
+                            <tr><td>源端负载</td><td>与周期和查询成本成正比</td><td>游标常驻打开，数量一多就影响服务器</td></tr>
+                            <tr><td>静默失败</td><td>水位线不推进也很难察觉</td><td>多数派提交受阻时会保持空闲</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2 id="sec-11">断点 - 令牌所要求的东西</h2>
+
+                    <p>选定变更流之后，下一个问题只有一个：<strong>进程死掉又活过来，从哪里接着读。</strong></p>
+
+                    <p>按手册所述，变更事件通知会<strong>把恢复令牌放在 <code>_id</code> 字段上</strong>送达。令牌有两种：指向特定变更事件的<strong>事件令牌</strong>，以及表示一个没有对应变更事件的时间点、由服务器周期性生成以表明集群时间已推进的<strong>高水位令牌</strong>。第二种的存在在实务上比初看要重要得多，因为它意味着即便在变更稀少的集合上，也能让保存的断点持续往前推。</p>
+
+                    <p>恢复的方式有三种，各自面向不同的处境。<code>resumeAfter</code> 从特定事件之后接着来。<code>startAfter</code> 则是在那个位置之后<strong>建立一条新的流</strong>。<code>startAtOperationTime</code> 在特定时间点打开游标，文档说如果指定的起点在过去，那么<strong>它必须落在 oplog 的时间范围之内</strong>。</p>
+
+                    <p>前两者的差别在出事时才显现。文档明确写道<strong>失效事件关闭流之后不能用 <code>resumeAfter</code> 恢复</strong>，并指引在那种情况下改用 <code>startAfter</code> 开启新流。失效事件的例子里写着集合删除或改名。游标关闭的条件还包括显式关闭、连接断开或超时；在分片集群上移除分片可能会关掉已打开的游标，而且文档警告<strong>这样关闭的游标未必能完全恢复</strong>。</p>
+
+                    <p>令牌失效的条件同样明确。文档写道<strong>oplog 中必须保留足够的历史，以便定位与该令牌关联的操作</strong>。因此可重启时间的上限就是 <strong>oplog 窗口</strong>，而那是数据库的设置，不是同步工具的设置。运维建议文档写道，如果预计会有可观的停机时间，比如升级或重大故障，就应当<strong>考虑加大 oplog 的尺寸，让操作保留的时长超过预估的停机时长</strong>。如果你打算把同步进程停上几天，那句话就是那天唯一的防线。</p>
+
+                    <pre><code class="language-javascript">// 读取保存的断点。没有就从现在开始打开。
+const saved = await loadResumeToken();
+
+const options = { fullDocument: "updateLookup" };
+if (saved) options.resumeAfter = saved;   // 失效事件之后这一句会失败
+
+const stream = db.collection("visits").watch([], options);
+
+for await (const event of stream) {
+  // 每个变更事件的 _id 就是恢复令牌
+  await applyToPostgres(event);           // 先落地
+  await saveResumeToken(event._id);       // 然后再记录位置
+  // 顺序反过来就会丢事件，按这个顺序则会产生重复。
+  // 丢了没法补，重复可以靠幂等吸收，所以这个顺序才是对的。
+}
+</code></pre>
+
+                    <p>注释最后两行就是这一节的结论。落地和保存令牌是<strong>对两个不同系统的两次写入</strong>，没有办法把它们裹进同一个事务。所以必须有一个在先，而无论选哪一个都会出事。先写令牌就是<strong>丢失</strong>，先落地就是<strong>重复</strong>。能补救的只有重复。</p>
+
+                    <h2 id="sec-12">至少一次 - 幂等写入为何成为强制项</h2>
+
+                    <p>上一节的选择直接决定了投递保证的等级。既然决定先落地，这条管道就是<strong>至少一次</strong>。同一个变更可能到达不止一次，这不是缺陷而是被设计出来的性质。于是写入端要承担的东西也就定下来了。</p>
+
+                    <ul>
+                        <li><strong>同一个事件应用两次结果必须一样</strong> - 意思是要把操作表达成覆盖，而不是累加</li>
+                        <li><strong>必须有键</strong> - 无法确定覆盖谁，幂等性就不成立。原文撞上的第一个错误正是这个</li>
+                        <li><strong>迟到的旧事件不得覆盖新状态</strong> - 在顺序保证可能被打破的区间里，需要做版本比较</li>
+                    </ul>
+
+                    <p>在 PostgreSQL 里表达这件事的工具是 <code>ON CONFLICT</code>。文档的定义很简洁：<strong><code>ON CONFLICT DO NOTHING</code> 的替代动作只是回避插入这一行，而 <code>ON CONFLICT DO UPDATE</code> 则更新与待插入行冲突的既有行。</strong>冲突目标既可以通过唯一索引推断来指定，也可以用 <code>ON CONSTRAINT</code> 直接写出约束名。</p>
+
+                    <p>这里有一条容易漏掉的规定。文档写明<strong><code>DO NOTHING</code> 时指定冲突目标是可选的，而 <code>DO UPDATE</code> 时必须提供</strong>。用于更新的值则通过<strong>名为 <code>excluded</code> 的特殊表</strong>来引用。用文档自己的说法，<code>SET</code> 与 <code>WHERE</code> 子句以表名或别名访问既有行，以 <code>excluded</code> 访问待插入的行。</p>
+
+                    <p>最贵的陷阱在最后。文档把带 <code>ON CONFLICT DO UPDATE</code> 的 <code>INSERT</code> 称为<strong>确定性语句</strong>，说该命令<strong>不允许对任何单个既有行作用超过一次</strong>，并警告<strong>出现这种情况时会抛出基数违规错误</strong>。这为什么重要？因为把变更流按批写入时，<strong>同一个文档的多条事件落进同一批是家常便饭</strong>。原样塞进一条语句，整批就失败了。所以写入之前必须做一次按键只留最新一条的整理。</p>
+
+                    <pre><code class="language-sql">-- 同一批里出现两次相同的 mongo_id 就会触发基数违规。
+-- 所以在写入之前，按键只保留最新的一条。
+INSERT INTO mongo_visits_sync AS t (mongo_id, visit_id, status, visit_date, patient, src_ts)
+SELECT DISTINCT ON (mongo_id)
+       mongo_id, visit_id, status, visit_date, patient, src_ts
+FROM   staging_changes
+ORDER  BY mongo_id, src_ts DESC
+ON CONFLICT (mongo_id) DO UPDATE
+SET    visit_id   = EXCLUDED.visit_id,
+       status     = EXCLUDED.status,
+       visit_date = EXCLUDED.visit_date,
+       patient    = EXCLUDED.patient,
+       src_ts     = EXCLUDED.src_ts,
+       deleted_at = NULL
+WHERE  t.src_ts &lt; EXCLUDED.src_ts;   -- 阻止旧事件覆盖更新的状态
+</code></pre>
+
+                    <p>最后那个 <code>WHERE</code> 子句负责第三条要求：既有行的版本如果<strong>比新来的还新，就跳过更新</strong>。没有它，重启区间重放的旧事件就会抹掉这期间已经落地的最新状态。顺带一提，文档也建议，若需要在一条语句里混用 <code>INSERT</code>、<code>UPDATE</code> 和 <code>DELETE</code>，可以考虑 <code>MERGE</code>，并称它是比 <code>ON CONFLICT</code> 更贴近 SQL 标准的替代方案。</p>
+
+                    <p>另外，变更流默认<strong>只返回更新操作中字段的增量</strong>这一点也和幂等性纠缠在一起。要拿到完整文档就得把 <code>fullDocument</code> 设为 <code>updateLookup</code>，而文档把它描述为<strong>从集合中重新读取最新的多数派已提交版本的一次独立查找</strong>。于是就有了附加条件：如果在更新与查找之间文档被删除或集合被删除，<code>fullDocument</code> <strong>可能缺失</strong>；如果这期间还有别的多数派已提交操作改过该文档，返回的文档<strong>可能与更新时刻的文档大不相同</strong>。也就是说 <code>updateLookup</code> 给你的是<strong>此刻的状态，而不是当时的状态</strong>。</p>
+
+                    <p>这个性质也有好的一面。因为查找发生在<strong>重放的时刻</strong>，所以哪怕是重放的旧事件，只要目标是收敛到最终状态，它反而会自我纠正。反过来，如果目标是原样留存变更历史，<code>updateLookup</code> 就不是合适的工具。6.0 起提供的前像与后像才是为那个位置准备的，文档写明插入的文档没有前像，删除的文档没有后像。</p>
+
+                    <p>还有一条尺寸限制。运维建议文档写道，变更流的响应文档<strong>必须遵守 16MB 的 BSON 文档上限</strong>，而根据集合中文档的大小，若生成的通知文档超出该上限，<strong>通知可能失败</strong>。文中举的例子是配置为返回完整更新文档的更新操作，以及插入或替换接近上限的文档。从 6.0.9 起可以用 <code>$changeStreamSplitLargeEvent</code> 聚合阶段把事件拆成更小的片段。如果集合里装着大文档，最好在映射阶段就先把这个限制算清楚。等失败了才知道，那时流已经停了。</p>
+
+                    <h2 id="sec-13">删除 - 怎样知道一个文档消失了</h2>
+
+                    <p>这是同步里最常被漏掉的一项，也是漏掉之后最晚浮上水面的一项。插入和更新出错会让值变得奇怪，所以有人会注意到。漏掉的删除表现为<strong>一行安安稳稳地待在它该在的位置上</strong>，因此没有人觉得哪里不对。</p>
+
+                    <p>变更流的删除事件带什么，参考文档写得很准确。事件里有作为恢复令牌的 <code>_id</code>、对应 oplog 条目时间戳的 <code>clusterTime</code>、命名空间 <code>ns</code>、操作类型 <code>operationType</code>，以及 <code>documentKey</code>。文档把 <code>documentKey</code> 描述为<strong>包含该 CRUD 操作所创建或修改文档的 <code>_id</code> 值的一个文档</strong>，并补充说对分片集合这个字段<strong>还会显示完整的分片键</strong>，而如果 <code>_id</code> 已经是分片键的一部分则不会重复出现。从 6.0 起还会加上服务器日期时间 <code>wallTime</code>。</p>
+
+                    <p>决定性的一句话是这个：<strong><code>fullDocument</code> 被省略，因为在变更流游标把删除事件发给客户端的时刻，那份文档已经不存在了。</strong>也就是说，删除事件告诉你的<strong>只有消失者的标识符</strong>。</p>
+
+                    <p>这一句话事后正当化了前面好几个决定。如果目标表的主键不是从 <code>_id</code> 推导出来的，那么收到删除事件也<strong>没有办法推断该删哪一行</strong>。想按文档内容匹配也不行，因为内容根本不会送来。原文最先撞上的<strong>没有键列因而无法幂等 upsert</strong> 的错误，看起来是插入侧的问题，实际上同时也堵死了删除。</p>
+
+                    <p>如果确实需要删除前的内容，路是有的。从 6.0 起，通过 <code>createCollection</code>、<code>create</code> 或 <code>collMod</code> 在集合上启用 <code>changeStreamPreAndPostImages</code>，并在 <code>watch()</code> 里把 <code>fullDocumentBeforeChange</code> 设为 <code>required</code> 或 <code>whenAvailable</code>，就能一并收到删除前的文档。不过文档列出了两种拿不到前像的情况：<strong>删除操作发生时集合上并未启用该功能</strong>，以及<strong>在 <code>expireAfterSeconds</code> 设定的保留时间之后被清除</strong>。换句话说，这个功能<strong>只能回溯到你事先打开它的那一刻</strong>。它没法在事故之后再打开来找回过去。</p>
+
+                    <pre><code class="language-sql">-- 删除事件只带 documentKey，文档内容不会送来。
+-- 所以目标端的键如果不是来自 _id，就无法定位要删除的对象。
+
+-- 方案一。逻辑删除。把消失这件事本身作为历史留下。
+UPDATE mongo_visits_sync
+SET    deleted_at = $2
+WHERE  mongo_id = $1
+  AND  deleted_at IS NULL;
+
+-- 方案二。物理删除。删除一个已经不存在的行不算错误，因此它本身就是幂等的。
+DELETE FROM mongo_visits_sync
+WHERE  mongo_id = $1;
+</code></pre>
+
+                    <p>选哪一个由副本的用途决定。如果是分析用副本，<strong>逻辑删除</strong>通常更好，因为什么时候消失的本身就是一项事实，而物理删除会把这项事实一并抹掉。代价是所有查询都得带上 <code>deleted_at IS NULL</code> 这个条件，而某个漏掉它的仪表盘会安安静静地给出错误的数字。如果要的是与源端一模一样的样子，物理删除才对，这时删除不存在的行不算错误这个性质本身就提供了幂等性。</p>
+
+                    <p>无论选哪一个，比对流程都得另外准备。流悄悄断掉的那段时间、令牌过期而从头重来的那段时间、失效之后新开一条流的那段时间里，删除事件会被整段跳过。如果没有定期比对两端键列表、找出<strong>只在目标端存在的键</strong>这项工作，那些区间的遗漏就会永远留着。</p>
+
+                    <h2 id="sec-14">什么时候不该采用这套结构</h2>
+
+                    <p>以上就是这套结构所要求的东西。现在轮到看反方向了。存在这样一个点：把两个数据库一直对齐的代价，<strong>超过了把它们并成一个的代价</strong>。</p>
+
+                    <ul>
+                        <li><strong>副本可以旧一点的时候</strong> - 如果几个小时的延迟可以接受，而且数据规模能装进一次重载，那么定期全量重载便宜得多。不需要恢复令牌，不需要幂等，也不需要删除检测。源端没有的东西新一轮加载里也没有，所以删除<strong>按定义自动就对上了</strong></li>
+                        <li><strong>必须在一个事务里同时读两边的时候</strong> - 跨两个不同数据库的原子读取，任何同步方案都造不出来。如果这个需求是真的，那么需要的是整合而不是同步</li>
+                        <li><strong>两侧都发生写入的时候</strong> - 这会转到与单向副本难度不同的问题上。需要冲突消解规则与因果关系追踪，从那时起答案就由领域规则而不是工具来决定</li>
+                        <li><strong>映射一直在动的时候</strong> - 如果上游团队的文化是随意往文档里加字段，那么拍平的列会变成永久的维护税。这种情况下把副本放进一个 JSONB 列，或者干脆不做副本，都更好</li>
+                        <li><strong>单机 MongoDB</strong> - 不是副本集就没有变更流，剩下的只有前面看过的那个满是洞的轮询。在这个基础上承诺实时对齐，是守不住的承诺</li>
+                    </ul>
+
+                    <p>反过来，这套结构确实合适的位置也很清楚：MongoDB 留作<strong>真实之源</strong>，PostgreSQL 只作为<strong>只读副本</strong>存在，用来做 SQL 擅长的事情，即连接、窗口函数、接 BI 工具、临时聚合。副本上没有写入这个条件，抹掉了前面一半的难处。副本这一侧的 Postgres 在运维视角该怎么守住，<a href="postgres_startup_survival_2026.html">创业公司的 Postgres 生存指南</a>讲过；怎样让写入作业本身在 Postgres 内部可重试，<a href="durable_workflows_postgres_2026.html">用 Postgres 构建持久化工作流</a>讲过。</p>
+
+                    <p>归结起来是这样。原文作者写的<strong>比起同步，映射更麻烦</strong>只对了一半。映射之所以麻烦，是因为那些是<strong>难以回头的决定</strong>；之所以难以回头，是因为那些决定全都是<strong>同步得以成立的前提</strong>。用什么当键、要不要区分缺失与 <code>null</code>、数组放在哪里，表面上是模式设计问题，实际上是在当场决定重启、幂等与删除检测是否可能。正确的顺序不是先做映射再把同步接上去，而是<strong>先弄清同步要求什么，再去做映射</strong>。</p>
+
+                    <h2 id="sec-15">未能确认的部分</h2>
+
+                    <ul>
+                        <li>变更流更新事件所携带<strong>增量的确切结构</strong>未能确认。手册里确认到的只是默认只返回更新操作的增量这一句，其中的字段名与形态在另一份参考文档里，那份没有打开，因此没有写进正文</li>
+                        <li>PostgreSQL <code>numeric</code> 的确切位数与指数上限未能确认。确认到的是 <code>jsonb</code> 会拒绝超出 <code>numeric</code> 范围的数值，以及 BSON Decimal128 的 34 位有效数字与 -6143 到 +6144 的指数范围。两个范围之间的包含关系没有算</li>
+                        <li>PostgreSQL <code>timestamp</code> 系列的内部时间分辨率没能对着原始文档确认。正文只以 BSON <code>Date</code> 是毫秒这一已确认事实为依据</li>
+                        <li>用超出 oplog 窗口的恢复令牌尝试恢复时，<strong>服务器究竟返回什么错误</strong>未能确认。手册只写了必须有足够历史这个要求，那份文档里没有失败时的错误码</li>
+                        <li>高水位令牌<strong>生成得有多频繁</strong>、这个周期能否调整，未能确认。文档里只有周期性生成这一句</li>
+                        <li>原文所用的工具<strong>怎样把初次全量复制与变更流衔接起来</strong>未能确认。填补两段接缝处的空档正是这类工具的核心，而原文没有写这套流程</li>
+                        <li>原文里关于数据量、文档数、处理速度、延迟<strong>一个数字都没有</strong>。因此关于这种做法的性能特征，本文什么也没有搬运</li>
+                    </ul>
+
+                    <h2 id="sec-16">参考资料</h2>
+
+                    <ul>
+                        <li><a href="https://news.hada.io/topic?id=33219" target="_blank" rel="noopener">GeekNews 话题 33219</a> — 本文的缘起转载，附有原文地址与摘要</li>
+                        <li><a href="https://visualeaf.com/blog/copy-and-sync-a-mongodb-collection-to-postgresql/" target="_blank" rel="noopener">Copy and Sync a MongoDB Collection to PostgreSQL (VisuaLeaf)</a> — 缘起的原文。简单字段进列、嵌套对象与数组进 JSONB 的选择，<code>mongo_id</code> 主键，键列缺失的错误与字段名不一致的错误都在这里。它是一篇自家工具的介绍文章</li>
+                        <li><a href="https://www.mongodb.com/docs/manual/changeStreams/" target="_blank" rel="noopener">Change Streams (MongoDB Manual)</a> — 副本集与分片集群的要求，WiredTiger 与协议版本 1，恢复令牌放在 <code>_id</code> 上的表述，事件令牌与高水位令牌，<code>resumeAfter</code>、<code>startAfter</code>、<code>startAtOperationTime</code> 的差别，失效事件，默认只返回增量以及 <code>updateLookup</code> 的附加条件</li>
+                        <li><a href="https://www.mongodb.com/docs/manual/reference/change-events/delete/" target="_blank" rel="noopener">delete Event (MongoDB Manual)</a> — 删除事件的字段清单，<code>documentKey</code> 携带 <code>_id</code> 与分片键的表述，<code>fullDocument</code> 被省略的原因，6.0 中 <code>fullDocumentBeforeChange</code> 的启用条件与保留时间限制</li>
+                        <li><a href="https://www.mongodb.com/docs/manual/administration/change-streams-production-recommendations/" target="_blank" rel="noopener">Change Streams Production Recommendations (MongoDB Manual)</a> — 16MB 的 BSON 上限与通知失败，6.0.9 的 <code>$changeStreamSplitLargeEvent</code>，有仲裁者时流可能保持空闲的表述，oplog 尺寸的建议，冷分片与 <code>periodicNoopIntervalSecs</code>，以及因无法使用索引而不要开太多流的建议</li>
+                        <li><a href="https://www.mongodb.com/docs/manual/reference/bson-types/" target="_blank" rel="noopener">BSON Types (MongoDB Manual)</a> — ObjectId 12 字节的构成与字节序，不一定单调的明确说明及其两条理由，BSON <code>Date</code> 是毫秒级 64 位整数，Decimal128 的 34 位与指数范围</li>
+                        <li><a href="https://www.postgresql.org/docs/17/datatype-json.html" target="_blank" rel="noopener">JSON Types (PostgreSQL 17)</a> — <code>json</code> 与 <code>jsonb</code> 存储方式的差别，空白、键顺序与重复键的保留与否，优先使用 <code>jsonb</code> 的建议，默认 GIN 运算符类与 <code>jsonb_path_ops</code> 各自支持的运算符，对 <code>NaN</code>、无穷大与 <code>\u0000</code> 的拒绝，以及 SQL NULL 是另一个概念的注记</li>
+                        <li><a href="https://www.postgresql.org/docs/17/sql-insert.html" target="_blank" rel="noopener">INSERT (PostgreSQL 17)</a> — <code>ON CONFLICT</code> 冲突目标的指定方式，<code>DO NOTHING</code> 与 <code>DO UPDATE</code> 的差别，<code>DO UPDATE</code> 必须提供冲突目标的规定，特殊的 <code>excluded</code> 表，确定性语句与基数违规，以及指向 <code>MERGE</code> 的说明</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>分享本文</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">返回列表</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/iptables_generator.html">iptables 防火墙规则生成器</a></li>
+      <li><a href="../static/code_image.html">代码图片生成器</a></li>
+      <li><a href="../static/char_counter.html">字数统计</a></li>
+      <li><a href="../static/json_formatter.html">JSON 格式化工具</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="sql_not_in_null_empty_result.html">NOT IN 列表里混进一个 NULL，结果就整个变空 - 不报错却返回0行的 SQL 三值逻辑 2026</a></li>
+      <li><a href="find_process_holding_file.html">找出正占着文件的进程 - 删了却不释放空间时</a></li>
+      <li><a href="log_rotation_pitfalls.html">日志轮转悄悄失败的地方 - 磁盘在涨却没人发现</a></li>
+      <li><a href="ai_generated_code_disclosure_license.html">把「这是AI写的」写进许可证 - 授权与来源披露分岔的地方</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制。粘贴到 Threads 应用即可分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制。'); });
+    });
+    </script>
+</body>
+</html>

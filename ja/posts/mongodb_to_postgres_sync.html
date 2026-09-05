@@ -1,0 +1,671 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ja">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>一度移すことと合わせ続けることは別の問題だ - MongoDB コレクションを PostgreSQL へ送るとき強制される選択</title>
+    <meta name="description" content="スキーマのない文書をテーブルに入れるとき強制的に決めねばならないこと、そして一度の複製が継続的な同期に変わる瞬間に何が変わるのかを、MongoDB と PostgreSQL の公式文書に基づいて整理する。再開地点、冪等な取り込み、削除の検知まで扱う。">
+    <meta name="keywords" content="MongoDB, PostgreSQL, 変更ストリーム, change stream, resume token, JSONB, 冪等な取り込み, upsert, ON CONFLICT, ObjectId, スキーママッピング, CDC, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/ja/posts/mongodb_to_postgres_sync.html">
+
+    <meta property="og:title" content="一度移すことと合わせ続けることは別の問題だ - MongoDB コレクションを PostgreSQL へ送るとき強制される選択">
+    <meta property="og:description" content="マッピングは好みではなく構造が強いるものだ。文書がテーブルに入る瞬間に何を諦めることになるのか、そして同期が複製とどこで分かれるのか。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/ja/posts/mongodb_to_postgres_sync.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ja_JP">
+    <meta property="article:published_time" content="2026-09-05">
+    <meta property="article:section" content="開発・インフラ">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="一度移すことと合わせ続けることは別の問題だ">
+    <meta name="twitter:description" content="文書をテーブルに入れる瞬間に強制される選択、そして同期が複製と分かれる地点。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "一度移すことと合わせ続けることは別の問題だ - MongoDB コレクションを PostgreSQL へ送るとき強制される選択",
+      "alternativeHeadline": "文書がテーブルに入るとき決まること、変更の捕まえ方が生む制約、そしてこの構成を選ぶべきでない場合",
+      "datePublished": "2026-09-05",
+      "dateModified": "2026-09-05",
+      "inLanguage": "ja-JP",
+      "articleSection": "開発・インフラ",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "MongoDB, PostgreSQL, 変更ストリーム, resume token, JSONB, 冪等な取り込み, ON CONFLICT, ObjectId, スキーママッピング, CDC",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/ja/posts/mongodb_to_postgres_sync.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "MongoDB の変更ストリームを使うには何が必要か?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "MongoDB の公式マニュアルは、変更ストリームがレプリカセットとシャードクラスタで利用できると記している。そのデプロイは WiredTiger ストレージエンジンを使い、レプリカセットプロトコルバージョン 1 でなければならない。保存時暗号化を使うデプロイでも動作する。多数決リードコンサーンのサポート有無とは無関係で、その設定が有効でも無効でも変更ストリームは使える。裏返せば、レプリカセット構成でない単独サーバーにはこの経路そのものが存在しない。これが同期設計における最初の分岐点であり、順序づけられた変更イベントという素材があるかどうかで後段のすべてが変わる。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "変更ストリームの再開トークンはどこにあり、いつ使えなくなるのか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "マニュアルは、変更イベント通知が再開トークンを _id フィールドに載せて届けると記す。トークンには二種類ある。特定の変更イベントを指すイベントトークンと、変更がなくてもクラスタ時刻が進んだことを示すためにサーバーが定期的に生成するハイウォーターマークトークンである。再開が失敗する条件は二つだ。第一に、そのトークンに対応する操作を見つけられるだけの履歴が oplog に残っていなければならない。第二に、コレクションの削除や名前変更のような無効化イベントがストリームを閉じた後は resumeAfter が使えず、startAfter で新しいストリームを開く必要がある。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "入れ子の文書を平坦化するか JSONB のまま置くかはどう決めるのか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "判断の基準は、その値に何を掛けるつもりかである。列に平坦化すれば NOT NULL や検査制約、外部キー、列単位の統計、通常の B-tree インデックスがすべて使える。代償は、上流にフィールドが一つ増えるたびに DDL が追随しなければならないことだ。JSONB に置けばスキーマ変更なしで受けられ、PostgreSQL の文書はキー順序に関する旧来の前提のような特殊な事情がない限り、ほとんどのアプリケーションは JSON データを jsonb として格納するほうを選ぶべきだと勧めている。代償は列単位の制約を掛ける場所が消え、統計情報が一つの列に潰れることだ。フィールド構成が固定なら平坦化、文書ごとに違うなら JSONB が実務上の境界線になる。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "少なくとも一回の配送は PostgreSQL 側に何を要求するのか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "同じ変更が二度届いても結果が同じであること、すなわち冪等な取り込みを要求する。PostgreSQL でその道具は ON CONFLICT DO UPDATE であり、そこでは競合対象の指定が任意ではなく必須になる。文書は DO NOTHING では競合対象の指定が任意だが DO UPDATE では必ず指定しなければならないと記す。更新に使う値は excluded という特別なテーブル名で参照する。落とし穴が一つある。文書はこの文が決定的であり、単一の既存行に二度以上作用することは許されず、その状況が生じるとカーディナリティ違反エラーが送出されると記している。したがってバッチ取り込みの直前にキーごとの整理が必要になる。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "ポーリングではなぜ削除を捕まえられないのか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "ポーリングは、いま存在する文書を条件で絞って取ってくる方式である。削除された文書はもはや存在しないので、どんな条件にも掛からない。消えたという事実そのものが問い合わせ結果に現れないのだ。したがってポーリングに基づく同期は削除に対して構造的に盲目であり、対象側には元データにない行が積み上がっていく。これを埋めるには、削除の代わりに削除印を残すようアプリケーションを変えるか、定期的に全キーの一覧を突き合わせるしかない。変更ストリームの削除イベントには documentKey が入り、その中に _id があるため、消す対象を特定できる。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/mongodb_to_postgres_sync.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/mongodb_to_postgres_sync.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/mongodb_to_postgres_sync.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/mongodb_to_postgres_sync.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/mongodb_to_postgres_sync.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "ホーム",
+      "item": "https://braindetox.kr/ja/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "開発・インフラ",
+      "item": "https://braindetox.kr/ja/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "一度移すことと合わせ続けることは別の問題だ - MongoDB コレクションを PostgreSQL へ送るとき強制される選択",
+      "item": "https://braindetox.kr/ja/posts/mongodb_to_postgres_sync.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="一度移すことと合わせ続けることは別の問題だ - MongoDB コレクションを PostgreSQL へ送るとき強制される選択">
+                <meta itemprop="datePublished" content="2026-09-05">
+                <meta itemprop="dateModified" content="2026-09-05">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="MongoDB, PostgreSQL, 変更ストリーム, resume token, JSONB, 冪等な取り込み, ON CONFLICT, ObjectId, スキーママッピング, CDC">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/ja/posts/mongodb_to_postgres_sync.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">一度移すことと合わせ続けることは別の問題だ - MongoDB コレクションを PostgreSQL へ送るとき強制される選択</h1>
+                    <h2 class="post-subtitle">文書がテーブルに入るとき決めねばならないこと、変更の捕まえ方が生む制約、そしてこの構成を選ぶべきでない場合</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-05">2026-09-05</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">開発・インフラ</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>MongoDB にあるコレクションを一つ PostgreSQL へ持ってくる作業は、たいてい半日仕事と見なされる。文書を読んで列に入れればいいだけではないか、と。実際そこで終わる場合もある。<strong>一度だけ移せばいい場合</strong>がそれだ。</p>
+
+                    <p>問題はその次の一文から始まる。<strong>そして合わせ続けたい。</strong>この一言が付いた瞬間、作業の性質が丸ごと変わる。前者はデータ型の変換だが、後者は<strong>分散システム</strong>である。二つのデータベースが異なる時刻に異なる状態を持つという事実を前提に、その差をどこまで許容するかを決める仕事になる。</p>
+
+                    <p>ここではその二つの問題を切り分ける。文書をテーブルに入れるとき<strong>好みではなく構造が強いる決定</strong>が何であり、それぞれの決定が後で何を難しくするのかをまず見る。次に<strong>同期がなぜ複製よりはるかに難しいのか</strong>を、再開地点、重複配送、削除検知の順に押さえる。最後は逆方向だ。二つのデータベースを合わせ続ける代わりに、片方へ寄せたほうが安く済むのはどんなときか。</p>
+
+                    <div class="callout">
+                        以下に出てくる MongoDB の変更ストリーム、再開トークン、BSON 型、そして PostgreSQL の <code>jsonb</code> と <code>ON CONFLICT</code> に関する記述は、すべて MongoDB 公式マニュアルと PostgreSQL 17 公式文書の記載である。バージョンによって挙動が分かれる項目にはバージョンを併記した。性能の数値は元記事にないので、この記事にもない。
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>この記事で扱うこと</h3>
+                        <ol>
+                            <li><a href="#sec-1">きっかけ - 難しかったのは同期ではなくマッピングだった</a></li>
+                            <li><a href="#sec-2">二つの問題を切り分ける - 複製と整合は別の要求をする</a></li>
+                            <li><a href="#sec-3">スキーマのない文書がテーブルに入るとき強制される五つ</a></li>
+                            <li><a href="#sec-4">_id を何として受けるか</a></li>
+                            <li><a href="#sec-5">同じフィールドが文書ごとに違う型のとき</a></li>
+                            <li><a href="#sec-6">入れ子の文書 - 平坦化と JSONB のあいだ</a></li>
+                            <li><a href="#sec-7">配列 - 子テーブルと一つの列のあいだ</a></li>
+                            <li><a href="#sec-8">フィールドの不在と NULL は同じではない</a></li>
+                            <li><a href="#sec-9">マッピング決定表 - 何を得て何を失うのか</a></li>
+                            <li><a href="#sec-10">変更をどう捕まえるか - ポーリングと変更ストリーム</a></li>
+                            <li><a href="#sec-11">再開地点 - トークンが要求するもの</a></li>
+                            <li><a href="#sec-12">少なくとも一回 - 冪等な取り込みが強制される理由</a></li>
+                            <li><a href="#sec-13">削除 - 消えた文書をどう知るか</a></li>
+                            <li><a href="#sec-14">この構成を選ぶべきでないのはいつか</a></li>
+                            <li><a href="#sec-15">確認できなかったこと</a></li>
+                            <li><a href="#sec-16">参考資料</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">きっかけ - 難しかったのは同期ではなくマッピングだった</h2>
+
+                    <p>2026年9月初め、韓国の開発者コミュニティに<strong>MongoDB コレクションを PostgreSQL へ複製して同期する</strong>という記事が紹介された。原文は VisuaLeaf というチームのブログ記事で、診療来院記録を収めたコレクション一つを PostgreSQL のテーブルへ移し、合わせ続ける過程を記録している。著者が残した一文がこの記事の出発点だ。<strong>同期そのものより、MongoDB の文書構造を PostgreSQL のテーブルに合わせてマッピングする過程のほうが厄介だった</strong>というものである。</p>
+
+                    <p>原文の性格を先に述べておくほうが誠実だろう。これは<strong>自社ツールを紹介する記事</strong>である。著者は VisuaLeaf Mongo Sync を使い、その理由として、元コレクションと対象テーブル、フィールドマッピング、同期状態を視覚的に構成したかったことを挙げている。ツールを勧める記事で最も信頼できる部分は、たいてい成功談ではなく<strong>詰まった場所の記録</strong>であり、この記事にはそれが二つ残っている。</p>
+
+                    <p>一つ目は、対象テーブルにキー列がないため冪等に upsert できないというエラーだった。著者は MongoDB の <code>_id</code> を <code>mongo_id</code> という <code>TEXT</code> 列で受け、そこに主キーを掛けて解決している。二つ目は、元の <code>labResults</code> と対象の <code>lab_results</code> という名前の食い違いで、列が見つからないというエラーだった。フィールドを一つずつ明示的にマッピングするか、PostgreSQL 側で引用符を使ってキャメルケースをそのまま用いるのが解法である。</p>
+
+                    <p>二つのエラーは見た目の大きさこそ似ているが、性質がまったく違う。後者は<strong>設定の誤り</strong>だ。一度直せば終わる。前者は違う。それは誤りではなく<strong>構造が要求したもの</strong>であり、この記事で後に出てくる制約のほとんどがその一点につながっている。ここから先の半分は、なぜそのエラーが必然だったのかの説明である。</p>
+
+                    <p>原文に<strong>ない</strong>ものも明確にしておく。データ量、文書数、処理速度、遅延といった数値は一つもない。初回の全複製とその後の変更反映をどんな順序でつなぐのか、その継ぎ目に生じる空白をどう埋めるのかも書かれていない。したがって原文の結果を根拠に<strong>この方式が一般に速い、あるいは安全だと広げてはならない</strong>。原文が示したのは、一つのコレクション、一つのツール、一つのシナリオである。</p>
+
+                    <h2 id="sec-2">二つの問題を切り分ける - 複製と整合は別の要求をする</h2>
+
+                    <p>一度移す仕事と合わせ続ける仕事は、名前でつながっているだけで要求するものが違う。最大の差は<strong>失敗したとき何ができるか</strong>にある。前者は失敗すれば最初からやり直せばいい。対象テーブルを空にして詰め直せば済み、その過程は定義上冪等だ。後者はそうはいかない。どこまで反映したかを知っていなければならず、その地点がまだ有効でなければならず、同じイベントが二度来ても結果が同じでなければならない。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>検討すべきこと</th><th>一度の複製</th><th>継続的な同期</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>失敗からの復旧</td><td>全体を再実行。副作用なし</td><td>再開地点が必要で、その地点は失効しうる</td></tr>
+                            <tr><td>重複</td><td>一度しか読まないので発生しない</td><td>再開区間で必然的に発生。取り込みが冪等でなければならない</td></tr>
+                            <tr><td>順序</td><td>無関係。最終状態さえ合えばよい</td><td>同じ文書への更新は順序が入れ替わると状態が狂う</td></tr>
+                            <tr><td>削除</td><td>元になければ対象にもない。自動的に合う</td><td>消えたものを知る別の仕掛けが要る</td></tr>
+                            <tr><td>スキーマ変更</td><td>次回実行時に新しいマッピングで作り直せばよい</td><td>稼働中にマッピングを変える手順が別に要る</td></tr>
+                            <tr><td>元データへの負荷</td><td>実行時に集中。予測できる</td><td>常時。開いたカーソルがサーバー資源を使い続ける</td></tr>
+                            <tr><td>費用が膨らむ軸</td><td>データ量</td><td>運用期間と変更率</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>最後の行が実務では最も重い。一度の複製の費用はデータが大きくなれば大きくなり、それで終わる。同期の費用は<strong>時が経つほど積み上がる</strong>。トークンが失効し、コレクションが削除され、上流にフィールドが増え、やがてストリームが静かに止まっていたのに誰も気づかなかった三日間が生まれる。以降で扱うのはすべてこの軸の上の話だ。</p>
+
+                    <p>片側でしか書き込みが起きないという前提も押さえておく価値がある。ここで扱うのは MongoDB が元で PostgreSQL が写しである<strong>一方向</strong>の構成だ。両側で書き込みが起きる構成は、衝突解決と因果関係の追跡が乗るまったく別の問題であり、その骨格は<a href="offline_first_database_sync.html">データを手元に持つことの代償</a>で別途扱っている。</p>
+
+                    <h2 id="sec-3">スキーマのない文書がテーブルに入るとき強制される五つ</h2>
+
+                    <p>文書データベースでは先送りできた決定がある。関係テーブルはそれを先送りさせてくれない。列を作るには型を決めねばならず、型を決めるにはそのフィールドが何であるかを決めねばならないからだ。だからマッピング作業の実体は変換ではなく、<strong>先送りしてきた決定を一度に清算する仕事</strong>である。強制される決定は大きく五つだ。</p>
+
+                    <ul>
+                        <li><strong>識別子</strong> - <code>_id</code> をどんな型の列で受けるか。これが主キーにならなければ以降のすべてが崩れる</li>
+                        <li><strong>型の推論</strong> - 同じフィールドが文書ごとに違う型のとき、どちらに合わせるか</li>
+                        <li><strong>入れ子</strong> - 文書の中の文書を列に展開するか、一塊のまま置くか</li>
+                        <li><strong>配列</strong> - 子テーブルへ正規化するか、配列列や JSONB のまま置くか</li>
+                        <li><strong>不在</strong> - フィールドがないことと、フィールドが <code>null</code> であることを区別して保存するか</li>
+                    </ul>
+
+                    <p>それぞれを順に見ていく。共通点は、どの選択も<strong>無料ではない</strong>ということだ。選択ごとに、いま楽になることと後で難しくなることが対になっている。</p>
+
+                    <h2 id="sec-4">_id を何として受けるか</h2>
+
+                    <p>最初に決めねばならず、最も戻しにくい決定である。MongoDB の既定の <code>_id</code> は ObjectId であり、公式文書によればそれは<strong>12バイト</strong>で構成される。先頭4バイトは Unix エポック基準の秒単位で表した生成時刻、続く5バイトはクライアント側プロセスごとに一度生成される乱数値、最後の3バイトは乱数から始まって増加するカウンタだ。文書は、タイムスタンプとカウンタについては<strong>上位バイトが先に来る</strong>と記し、これは他の BSON 値と逆であるとしている。</p>
+
+                    <p>ここに実務上さらに重い記述が一つある。文書は、ObjectId の値が時間とともに増加するはずではあるが<strong>必ずしも単調ではない</strong>と明記している。理由は二つ挙げられている。時間解像度が1秒しかないため同じ秒に作られた値どうしには順序の保証がなく、値を作る主体がクライアントなのでシステム時計が互いに違いうる、というものだ。つまり <code>_id</code> を<strong>変更検知用のウォーターマークとして使う設計は最初から壊れている</strong>。この話はポーリングを扱う節でもう一度出てくる。</p>
+
+                    <p>受ける側の選択肢は事実上二つだ。原文のように24文字の16進文字列へほどいて <code>text</code> 主キーで受けるか、12バイトをそのまま <code>bytea</code> で受けるか。前者は人が読めてどんな道具でも扱いやすいが、保存量が二倍になりインデックスもその分大きくなる。後者は元のサイズを保つが、問い合わせ結果を目で読めず道具の対応も薄い。多くのチームが前者を選ぶ理由は性能ではなく、<strong>運用中に人がその値を見る場面が多いから</strong>である。</p>
+
+                    <p>どちらを選ぶにせよ、譲れない条件が一つある。<strong>その列が主キーでなければならない。</strong>原文がぶつかった最初のエラーがまさにこの地点だった。キーがなければ冪等な upsert ができず、冪等な upsert ができなければ再開区間の重複を吸収できず、そうなるとそもそも再開が不可能になる。加えて、後で見る削除イベントは文書の中身を載せてこないので、<code>_id</code> から導かれたキーがなければ<strong>何を消すべきか特定する手段そのものがない</strong>。</p>
+
+                    <p>付け加えると、乱数性の高い値を主キーにする構成がインデックスに何をするかは別の主題だ。ObjectId は先頭が時刻なので完全な乱数キーよりは事情がよいが、その軸の一般論は<a href="uuid_primary_key_sqlite_performance_2026.html">UUIDを主キーにすべきでない理由</a>にまとめてある。</p>
+
+                    <h2 id="sec-5">同じフィールドが文書ごとに違う型のとき</h2>
+
+                    <p>文書データベースで最もよくあり、最も遅く発見される問題である。コレクションを作った最初の月は <code>amount</code> がすべて整数だったのに、ある時点から文字列が混ざり、どこかでは <code>NumberDecimal</code> で入ってきて、一部の文書にはそのフィールド自体がない。MongoDB はこれを止めない。だから取り込み処理が、その事実を初めて教えてくれる存在になる。</p>
+
+                    <pre><code class="language-javascript">// 同じコレクション、同じフィールド名。型が文書ごとに違う。
+db.visits.insertMany([
+  { visitId: "VIS-1", amount: 12000,                  visitDate: ISODate("2026-09-01T09:00:00Z") },
+  { visitId: "VIS-2", amount: "12,000",               visitDate: "2026-09-02" },
+  { visitId: "VIS-3", amount: NumberDecimal("12000"), visitDate: ISODate("2026-09-03T09:00:00Z") },
+  { visitId: "VIS-4",                                 visitDate: null },
+  { visitId: "VIS-5", amount: null,                   visitDate: ISODate("2026-09-05T09:00:00Z") }
+]);
+
+// VIS-4 には amount フィールド自体がなく、VIS-5 にはあるが値が null だ。
+// この二つを一つの列で受けると、両者の区別は消える。
+</code></pre>
+
+                    <p>選択肢は三つあり、それぞれ違うものを諦める。第一に、<strong>最も広い型で受ける</strong>。すべて <code>text</code> に入れれば取り込みは決して止まらない。代わりに整列と範囲問い合わせが文字列の規則に従い、<code>"9000"</code> が <code>"12000"</code> より大きくなる。第二に、<strong>厳密な型で受け、外れたら失敗させる</strong>。データ品質は守られるが、上流に値が一つ誤って入った瞬間に同期全体が止まる。第三に、<strong>正常な値は型付きの列へ、例外は別の列や JSONB へ流す</strong>。実装は増えるが、稼働中の停止と静かな損失を同時に避けられる。</p>
+
+                    <p>ここに BSON 側の事情がもう一つ乗る。公式文書によれば BSON の <code>Date</code> は Unix エポック基準の<strong>ミリ秒</strong>単位の64ビット整数であり、符号付きなので1970年より前も表せる。したがって <code>timestamptz</code> で受けること自体は自然だが、元データにミリ秒より細かい精度は<strong>最初から存在しなかった</strong>という事実は覚えておく値打ちがある。受け側の型がより精密でも、なかった情報が生まれるわけではない。</p>
+
+                    <p>数値も同様だ。BSON は Double、32ビット整数、64ビット整数、Decimal128 を区別する。文書は Decimal128 が有効桁34桁、指数範囲は -6143 から +6144 までだと記している。金額を扱うコレクションが Decimal128 を使っているなら受け側の列は <code>numeric</code> でなければならず、<code>double precision</code> で受けた瞬間にその精度のために払った費用が消える。</p>
+
+                    <h2 id="sec-6">入れ子の文書 - 平坦化と JSONB のあいだ</h2>
+
+                    <p>原文の選択は明確だった。単純なフィールドは通常の列に、入れ子のオブジェクトと配列は JSONB に格納した。<code>visitId</code>、<code>status</code>、<code>visitDate</code> はそれぞれ <code>text</code>、<code>text</code>、<code>timestamptz</code> の列になり、<code>patient</code>、<code>doctor</code>、<code>symptoms</code>、<code>prescriptions</code>、<code>invoice</code>、<code>labResults</code> のようなものはすべて JSONB 列になった。妥当な既定値だが、この選択が何を買い何を売るのかは明確にしておく必要がある。</p>
+
+                    <h3>平坦化が有利な場合</h3>
+
+                    <p><code>patient.fullName</code> を <code>patient_full_name</code> 列に展開すれば、その列に<strong>制約を掛けられる</strong>。<code>NOT NULL</code>、検査制約、一意性、外部キーがすべて可能になる。プランナが使う統計も列単位で採られるので選択率の推定が正確になり、平凡な B-tree インデックスで足りるようになる。値が何であるか定まっていて、それで結合したり絞り込んだりする計画があるなら平坦化が答えだ。</p>
+
+                    <p>代償は<strong>スキーマが元データを追いかけねばならない</strong>点である。MongoDB 側で入れ子の文書にフィールドを一つ足すのはデプロイなしに起きることだが、受け側ではそのたびに <code>ALTER TABLE</code> とマッピング修正がついてくる。元データのチームと写しのチームが別なら、この差はただちに運用上の負債になる。</p>
+
+                    <h3>JSONB が有利な場合</h3>
+
+                    <p>PostgreSQL の文書は <code>json</code> と <code>jsonb</code> の差をはっきり記している。<code>json</code> は入力テキストの正確な複製を格納するので処理関数が実行のたびに再解析しなければならず、<code>jsonb</code> は<strong>分解された二進形式</strong>で格納されるため入力時の変換オーバーヘッドで少し遅い代わりに、再解析が不要なので処理が著しく速い。文書の勧告は明示的だ。<strong>キー順序に関する旧来の前提のような特殊な事情がない限り、ほとんどのアプリケーションは JSON データを <code>jsonb</code> として格納するほうを選ぶべきである。</strong></p>
+
+                    <p>代わりに <code>jsonb</code> が<strong>捨てるもの</strong>がある。文書は、<code>jsonb</code> が空白を保存せず、オブジェクトキーの順序を保存せず、重複キーを残さずに最後の値だけを保持すると記す。<code>json</code> はその三つをすべて保存する。元の文書のフィールド順序やバイト単位の原形が後で必要になりうるなら、この差は決定的だ。</p>
+
+                    <p>インデックスが <code>jsonb</code> の最大の利点だという記述も文書にある。ただし演算子クラスの選択が後に影響する。既定の GIN 演算子クラスはキー存在演算子 <code>?</code>、<code>?|</code>、<code>?&amp;</code> と包含演算子 <code>@&gt;</code>、jsonpath 一致演算子 <code>@?</code>、<code>@@</code> をサポートする。既定でないクラスの <code>jsonb_path_ops</code> は<strong>キー存在演算子をサポートせず</strong>、<code>@&gt;</code>、<code>@?</code>、<code>@@</code> だけを扱う。代わりに文書は、<code>jsonb_path_ops</code> のインデックスが同じデータに対してたいていずっと小さく、特に頻出するキーを含む問い合わせで検索の特異度が優れると記している。</p>
+
+                    <p>この選択が後で何を塞ぐのかは八番目の節でまた出てくる。<strong>キーが存在するかを問う問い合わせ</strong>が必要になった瞬間、小さいインデックスを選んだという理由でその問いにインデックスで答えられなくなるからだ。</p>
+
+                    <pre><code class="language-sql">CREATE TABLE mongo_visits_sync (
+    mongo_id     text PRIMARY KEY,        -- ObjectId を24文字の16進文字列として受ける
+    visit_id     text,
+    status       text,
+    visit_date   timestamptz,
+    -- フィールド構成が可変な入れ子の文書と配列は丸ごと jsonb に置く
+    patient      jsonb,
+    lab_results  jsonb,
+    -- 元の文書にはない、同期そのものの状態を持つ列
+    src_ts       timestamptz NOT NULL,
+    deleted_at   timestamptz
+);
+
+-- キー存在演算子を使うには既定の演算子クラスでなければならない
+CREATE INDEX ON mongo_visits_sync USING gin (patient);
+
+-- 包含と jsonpath だけを使うなら、こちらのインデックスはずっと小さい
+CREATE INDEX ON mongo_visits_sync USING gin (lab_results jsonb_path_ops);
+</code></pre>
+
+                    <p>このテーブル定義に、元データにはない列が二つ入っている点に目を留めたい。<code>src_ts</code> と <code>deleted_at</code> は文書の中身ではなく、<strong>同期という手続きそのものの状態</strong>である。こうした列が必要になるという事実が、複製と同期が別の問題であることの最も目に見える証拠だ。</p>
+
+                    <h2 id="sec-7">配列 - 子テーブルと一つの列のあいだ</h2>
+
+                    <p>配列は入れ子より選択肢が一つ多く、その分だけ分岐が広い。スカラーの配列か文書の配列かで答えが分かれる。</p>
+
+                    <p>タグの一覧のような<strong>文字列の配列</strong>なら PostgreSQL の配列型 <code>text[]</code> が自然だ。配列演算子が使えて GIN インデックスも掛かる。ただし要素ごとに付くメタデータが後から生じると、配列列にはそれを受ける場所がない。タグに登録時刻を付けようという要望が来た瞬間、構造を作り替えることになる。</p>
+
+                    <p><strong>文書の配列</strong>なら、問いは一つに圧縮される。その要素は<strong>独立に問い合わせる対象か</strong>。処方項目ごとの集計が要り、特定の薬品が入った来院記録を探す必要があり、項目単位で結合する計画があるなら、子テーブルへ正規化するのが正解だ。そうすれば本来の関係型の道具がすべて戻ってくる。</p>
+
+                    <p>その代償は同期側で出る。元データで<strong>文書が一つ変わった</strong>というイベント一つが、受け側では<strong>子行の複数の削除と挿入</strong>に翻訳されねばならない。その複数の文が一つのトランザクションの中で原子的に終わらねばならず、途中で失敗すれば親行と子行の状態が食い違ったまま残る。一行の upsert 一回で済んでいた仕事が手続きになるのだ。</p>
+
+                    <p>要素を丸ごとしか読み書きしないなら JSONB 一列のほうがよい。<strong>一文書 = 一行</strong>という対応が保たれるので、取り込みロジックは単純な upsert のまま残る。代わりに要素数を数えたり要素で並べ替えたりするたびに展開の費用を払う。判断の基準はデータの形ではなく、<strong>そのデータに投げる問いの形</strong>である。</p>
+
+                    <h2 id="sec-8">フィールドの不在と NULL は同じではない</h2>
+
+                    <p>最も静かに情報が失われる場所だ。MongoDB の文書であるフィールドは三つの状態を取りうる。フィールドが<strong>そもそもない</strong>か、あるが値が<strong><code>null</code></strong>か、値が<strong>ある</strong>かである。この三つは意味が違う。アンケート回答なら、それぞれ<strong>訊いていない</strong>、<strong>訊いたが答えなかった</strong>、<strong>答えた</strong>に当たる。</p>
+
+                    <p>これを通常の列に平坦化すると、前の二つの状態が<strong>まったく同じ SQL NULL</strong> になる。戻す方法はない。PostgreSQL の文書は JSON 原始型の対応表で、JSON の <code>null</code> に対応する PostgreSQL 型の欄に<strong>SQL NULL は別の概念である</strong>と記している。二つの世界が同じ語で違うものを指しているという警告だ。</p>
+
+                    <p>三つの状態を守るには値を JSONB の中に残すしかない。そうすれば<strong>キーが存在するか</strong>を問うことで不在と <code>null</code> を分けられる。ここで前節のインデックス選択が足を引っ張る。キー存在を問う <code>?</code> 演算子は<strong>既定の GIN 演算子クラスでのみ</strong>サポートされ、<code>jsonb_path_ops</code> ではサポートされない。インデックスが小さいという理由で <code>jsonb_path_ops</code> を選んでいたなら、三つの状態を保存しておきながらそれをインデックスで問えない状態になる。</p>
+
+                    <p>同系統の落とし穴がもう二つある。PostgreSQL の文書は、<code>jsonb</code> が <strong>PostgreSQL の <code>numeric</code> の範囲を外れる数値を拒否する</strong>のに対し <code>json</code> はそうしないと記す。そして JSON 原始型の対応表で、数値については <strong><code>NaN</code> と無限大は許されない</strong>と、文字列については <strong><code>\u0000</code> は許されず、データベースエンコーディングにない文字を表すユニコードエスケープも同様である</strong>と記している。</p>
+
+                    <p>BSON の Double は <code>NaN</code> と無限大を持てる。計算誤りでそうした値が入った文書が一つコレクションに紛れていると、その文書は<strong>JSONB 列に入れない</strong>。文字列の中のヌル文字も同じだ。この二つは、初回の全複製では大人しく通り過ぎ、ある日一件の変更イベントで初めて破裂する種類の問題である。マッピング段階でそうした値の行き先を決めておかなければ、その日の同期は止まったまま発見を待つことになる。</p>
+
+                    <h2 id="sec-9">マッピング決定表 - 何を得て何を失うのか</h2>
+
+                    <p>前述の五つの決定を一つの表にまとめる。各行は文書構造の一類型、それを受ける選択肢、そしてその選択が<strong>諦めるもの</strong>である。最後の列がこの表の存在理由だ。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>文書構造の類型</th><th>PostgreSQL のマッピング選択肢</th><th>得るもの</th><th>失うもの</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>_id</code> (ObjectId)</td><td><code>text</code> 主キー</td><td>人が読めて道具の対応もよい</td><td>12バイトが24文字になる。インデックスもその分大きい</td></tr>
+                            <tr><td><code>_id</code> (ObjectId)</td><td><code>bytea</code> 主キー</td><td>元のサイズをそのまま保つ</td><td>問い合わせ結果を目で読めない。道具の対応が薄い</td></tr>
+                            <tr><td>最上位のスカラー、型が一定</td><td>通常の列</td><td>制約、インデックス、結合、統計のすべて</td><td>型が揺れた瞬間に取り込みが止まる</td></tr>
+                            <tr><td>最上位のスカラー、型が混在</td><td><code>text</code> 列</td><td>取り込みが止まらない</td><td>整列と範囲問い合わせが文字列の規則に従う</td></tr>
+                            <tr><td>BSON <code>Date</code></td><td><code>timestamptz</code></td><td>時間帯の演算とインデックス</td><td>元はミリ秒まで。その下の精度は最初からない</td></tr>
+                            <tr><td>Decimal128</td><td><code>numeric</code></td><td>値と桁数の保存</td><td>指数範囲が互いに違うので境界値の確認が要る</td></tr>
+                            <tr><td>Double の <code>NaN</code> と無限大</td><td>jsonb では不可</td><td>-</td><td>jsonb が拒否する。別列か代替値が必要になる</td></tr>
+                            <tr><td>入れ子の文書、フィールド固定</td><td>列へ平坦化</td><td>NOT NULL、検査、外部キー、列統計</td><td>上流にフィールドが増えるたび DDL が追随する</td></tr>
+                            <tr><td>入れ子の文書、フィールド可変</td><td><code>jsonb</code> 一列</td><td>スキーマ変更なしで受けられる</td><td>列単位の制約が不可。統計が一つに潰れる</td></tr>
+                            <tr><td>入れ子の文書、原形の保存が必要</td><td><code>json</code> 列</td><td>空白、キー順序、重複キーを保存</td><td>問い合わせのたびに再解析。インデックス非対応</td></tr>
+                            <tr><td>スカラーの配列</td><td><code>text[]</code></td><td>配列演算子と GIN インデックス</td><td>要素ごとのメタデータを付ける場所がない</td></tr>
+                            <tr><td>文書の配列、要素が問い合わせ対象</td><td>子テーブル + 外部キー</td><td>要素単位の問い合わせ、集計、結合</td><td>文書一つの変更が複数行の削除と挿入になる</td></tr>
+                            <tr><td>文書の配列、丸ごとのみ利用</td><td><code>jsonb</code></td><td>一文書 = 一行。upsert が単純なまま</td><td>要素の集計と整列に毎回の展開費用</td></tr>
+                            <tr><td>不在 vs <code>null</code></td><td>列へ平坦化</td><td>-</td><td>両状態が同じ SQL NULL になり区別が消滅する</td></tr>
+                            <tr><td>不在 vs <code>null</code></td><td><code>jsonb</code> + 既定 GIN</td><td>三つの状態をすべて保存する</td><td><code>jsonb_path_ops</code> の小さいインデックスを諦める</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>表を貫く規則が一つある。<strong>いま柔軟な選択は後で問い合わせを高くし、いま厳密な選択は後でスキーマ変更を高くする。</strong>どちらがよいかはデータの性質ではなく、そのデータを<strong>なぜ PostgreSQL へ送ったのか</strong>が決める。SQL で集計し結合するために送ったのなら厳密な側が、元データを失わずに保管するために送ったのなら柔軟な側が正しい。</p>
+
+                    <h2 id="sec-10">変更をどう捕まえるか - ポーリングと変更ストリーム</h2>
+
+                    <p>ここから先は同期固有の問題だ。最初の問いは単純である。<strong>何が変わったかをどうやって知るのか。</strong></p>
+
+                    <h3>ポーリングが実際に取りこぼすもの</h3>
+
+                    <p>まず思い浮かぶ方法は、定期的に問い合わせを投げて最近のものだけ取ってくることだ。実装が易しく、特別なデプロイ構成も要らない。しかしこの方式には三つの穴があり、三つとも静かである。</p>
+
+                    <p>第一に、<strong>ウォーターマークに使える列が見当たらない</strong>。<code>_id</code> を使えば、先に見たとおり ObjectId が単調でないという問題に当たる。時間解像度が1秒でクライアントの時計が互いに違うため、すでに処理した地点より<strong>小さい</strong> ObjectId を持つ文書が後から挿入されうる。その文書は永遠に飛ばされる。<code>updatedAt</code> のようなアプリケーションのフィールドを使っても、そのフィールドを更新しない書き込み経路が一つでもあれば同じことが起きる。</p>
+
+                    <p>第二に、<strong>削除が見えない</strong>。ポーリングは、いま存在する文書を条件で絞って取ってくる方式だ。消えた文書はどんな条件にも掛からない。だから対象テーブルには元データにない行が残り続け、積み上がっていく。</p>
+
+                    <p>第三に、<strong>遅延と負荷が取引関係にある</strong>。周期を短くすれば元データに問い合わせが刺さり続け、長くすれば写しが古びる。そしてその周期の中で何度も変わった文書は<strong>最後の状態だけ</strong>見える。中間状態を根拠に何かを判断せねばならない用途なら、ポーリングはそもそも道具ではない。</p>
+
+                    <h3>変更ストリームが要求するもの</h3>
+
+                    <p>MongoDB の変更ストリームはこれらの穴を埋めるが、要件がある。マニュアルは変更ストリームが<strong>レプリカセットとシャードクラスタで利用できる</strong>と記す。そのデプロイは <strong>WiredTiger ストレージエンジン</strong>を使い、<strong>レプリカセットプロトコルバージョン 1</strong> でなければならない。保存時暗号化を使うデプロイでも動作し、多数決リードコンサーンのサポート有無とは無関係だと明示されている。単独サーバー構成ならこの経路そのものがない。</p>
+
+                    <p>運用面の但し書きもマニュアルに複数あり、どれも後から知ると高くつくものばかりだ。変更ストリームは<strong>インデックスを使えず</strong>、MongoDB は oplog コレクションへのインデックス作成をサポートしないので、特定の対象を狙った変更ストリームを<strong>多く開くのは避けよ</strong>と文書は勧告している。コレクションごとにストリームを一つずつ付ける設計が、コレクション数に比例してサーバーを削っていくという意味だ。</p>
+
+                    <p>アービタメンバーのあるレプリカセットでは、データを持つメンバーが足りず操作を多数決コミットできない状況になると<strong>変更ストリームが待機状態にとどまりうる</strong>とも書かれている。障害時にストリームがエラーを出す代わりに静かになるのだ。シャードクラスタでは、活動のほとんどない<strong>コールドシャード</strong>が応答時間を悪化させる。変更の全順序を保証するには <code>mongos</code> がそのシャードにも問い合わせねばならないからである。逆に活動の多いシャードコレクションでは <code>mongos</code> が全シャードの変更に追いつけないことがあり、文書は <code>$match</code> で必要な操作だけを絞る通知フィルタを勧めている。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>検討すべきこと</th><th>ポーリング</th><th>変更ストリーム</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>デプロイ要件</td><td>なし。単独サーバーでも動く</td><td>レプリカセットかシャードクラスタ、WiredTiger、pv1</td></tr>
+                            <tr><td>削除の検知</td><td>構造的に不可能</td><td>削除イベントとして届く</td></tr>
+                            <tr><td>中間状態</td><td>周期の中の変更は潰れる</td><td>操作単位ですべて届く</td></tr>
+                            <tr><td>再開</td><td>ウォーターマークの値。失効しない</td><td>再開トークン。oplog の履歴が残っている限り有効</td></tr>
+                            <tr><td>順序</td><td>ウォーターマークが単調でないと飛ばす</td><td>ストリームが順序を与える。シャードでは <code>mongos</code> が保証する</td></tr>
+                            <tr><td>元データへの負荷</td><td>周期と問い合わせ費用に比例</td><td>カーソルが常時開いている。数が多いとサーバーに影響</td></tr>
+                            <tr><td>静かな失敗</td><td>ウォーターマークが進まなくても気づきにくい</td><td>多数決コミットが塞がれると待機状態にとどまる</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2 id="sec-11">再開地点 - トークンが要求するもの</h2>
+
+                    <p>変更ストリームを選んだなら、次の問いは一つだ。<strong>プロセスが死んで生き返ったら、どこから読み直すのか。</strong></p>
+
+                    <p>マニュアルによれば、変更イベント通知は<strong>再開トークンを <code>_id</code> フィールドに載せて</strong>届く。トークンは二種類ある。特定の変更イベントを指す<strong>イベントトークン</strong>と、変更イベントがなくてもクラスタ時刻が進んだことを示すためにサーバーが定期的に生成する<strong>ハイウォーターマークトークン</strong>だ。二つ目の種類があるという事実は実務でかなり重い。変更が稀なコレクションでも、保存してある再開地点を前へ進め続けられるという意味だからである。</p>
+
+                    <p>再開の方法は三つあり、それぞれ違う状況のためのものだ。<code>resumeAfter</code> は特定のイベントの次から再開する。<code>startAfter</code> はその地点以降で<strong>新しいストリームを作る</strong>。<code>startAtOperationTime</code> は特定の時点でカーソルを開くが、文書はその時点が過去であれば<strong>oplog の時間範囲の中になければならない</strong>と記す。</p>
+
+                    <p>前二者の差は事故のときに露わになる。文書は<strong>無効化イベントがストリームを閉じた後は <code>resumeAfter</code> で再開できない</strong>と明言し、その場合は <code>startAfter</code> で新しいストリームを始めよと案内している。無効化イベントの例としてはコレクションの削除や名前変更が挙げられている。カーソルが閉じる条件はほかにも明示的な終了、接続の切断やタイムアウトがあり、シャードクラスタではシャードの除去が開いていたカーソルを閉じうるうえ、<strong>そうして閉じたカーソルは完全に再開可能とは限らない</strong>と記されている。</p>
+
+                    <p>トークンが失効する条件も明確だ。文書は<strong>そのトークンに対応する操作を見つけられるだけの履歴が oplog に残っていなければならない</strong>と記す。したがって再開可能な時間の上限は<strong>oplog ウィンドウ</strong>であり、これはデータベースの設定であって同期ツールの設定ではない。運用勧告の文書は、アップグレードや大きな障害のように相当のダウンタイムが見込まれるなら<strong>見込みのダウンタイムより長く操作が保持されるよう oplog のサイズを大きくすることを検討せよ</strong>と記している。同期プロセスを数日止めておく計画があるなら、その一文がその日の唯一の防衛線になる。</p>
+
+                    <pre><code class="language-javascript">// 保存してある再開地点を読む。なければ今から開く。
+const saved = await loadResumeToken();
+
+const options = { fullDocument: "updateLookup" };
+if (saved) options.resumeAfter = saved;   // 無効化イベントの後はこれが失敗する
+
+const stream = db.collection("visits").watch([], options);
+
+for await (const event of stream) {
+  // すべての変更イベントの _id がそのまま再開トークンだ
+  await applyToPostgres(event);           // まず反映して
+  await saveResumeToken(event._id);       // その後に地点を書く
+  // この順序を逆にするとイベントを失う。この順序を守ると重複が生じる。
+  // 失うほうは復旧できず、重複は冪等性で吸収できるので、この順序が正しい。
+}
+</code></pre>
+
+                    <p>注釈の最後の二行がこの節の結論だ。反映とトークン保存は<strong>異なるシステムへの二回の書き込み</strong>であり、二つを一つのトランザクションにまとめる方法はない。だからどちらかを先にせねばならず、どちらを選んでも事故が起きる。先にトークンを書けば<strong>取りこぼし</strong>、先に反映すれば<strong>重複</strong>だ。復旧できるのは重複だけである。</p>
+
+                    <h2 id="sec-12">少なくとも一回 - 冪等な取り込みが強制される理由</h2>
+
+                    <p>前節の選択がそのまま配送保証の等級を決める。反映を先にすると決めたなら、このパイプラインは<strong>少なくとも一回</strong>だ。同じ変更が二度以上届きうるし、それは欠陥ではなく設計された性質である。すると取り込み側が引き受けるべきものが定まる。</p>
+
+                    <ul>
+                        <li><strong>同じイベントを二度適用しても結果が同じでなければならない</strong> - 状態を足す演算ではなく上書きする演算として表現せよ、という意味だ</li>
+                        <li><strong>キーがなければならない</strong> - 何を上書きするか特定できなければ冪等性は成立しない。原文がぶつかった最初のエラーがこれだった</li>
+                        <li><strong>遅れて届いた古いイベントが新しい状態を覆ってはならない</strong> - 順序保証が崩れうる区間ではバージョン比較が必要になる</li>
+                    </ul>
+
+                    <p>PostgreSQL でこれを表現する道具が <code>ON CONFLICT</code> だ。文書の定義は簡潔である。<strong><code>ON CONFLICT DO NOTHING</code> は代替動作として行の挿入を単に回避し、<code>ON CONFLICT DO UPDATE</code> は挿入しようとした行と競合する既存行を更新する。</strong>競合対象は一意インデックスの推論で指定するか、<code>ON CONSTRAINT</code> で制約名を直接書く。</p>
+
+                    <p>ここに見落としやすい規定がある。文書は<strong><code>DO NOTHING</code> では競合対象の指定が任意だが <code>DO UPDATE</code> では必ず指定しなければならない</strong>と記す。そして更新に使う値は<strong><code>excluded</code> という特別なテーブル</strong>で参照する。文書の表現では、<code>SET</code> と <code>WHERE</code> 句が既存行にはテーブル名か別名で、挿入しようとした行には <code>excluded</code> でアクセスする。</p>
+
+                    <p>最も高くつく落とし穴は最後にある。文書は <code>ON CONFLICT DO UPDATE</code> を伴う <code>INSERT</code> を<strong>決定的な文</strong>と呼び、この命令が<strong>単一の既存行に二度以上作用することは許されず</strong>、その状況が生じると<strong>カーディナリティ違反エラーが送出される</strong>と記す。なぜこれが重いのか。変更ストリームをバッチにまとめて取り込むと、<strong>同じ文書に対するイベントが一つのバッチに複数入ることが日常的に起きる</strong>からだ。そのまま一つの文に入れればバッチ全体が失敗する。だから取り込みの直前に、キーごとに最新の一件だけを残す整理が必要になる。</p>
+
+                    <pre><code class="language-sql">-- 一つのバッチに同じ mongo_id が二度入るとカーディナリティ違反になる。
+-- だから取り込みの直前に、キーごとに最新の一件だけを残す。
+INSERT INTO mongo_visits_sync AS t (mongo_id, visit_id, status, visit_date, patient, src_ts)
+SELECT DISTINCT ON (mongo_id)
+       mongo_id, visit_id, status, visit_date, patient, src_ts
+FROM   staging_changes
+ORDER  BY mongo_id, src_ts DESC
+ON CONFLICT (mongo_id) DO UPDATE
+SET    visit_id   = EXCLUDED.visit_id,
+       status     = EXCLUDED.status,
+       visit_date = EXCLUDED.visit_date,
+       patient    = EXCLUDED.patient,
+       src_ts     = EXCLUDED.src_ts,
+       deleted_at = NULL
+WHERE  t.src_ts &lt; EXCLUDED.src_ts;   -- 古いイベントが新しい状態を覆わないようにする
+</code></pre>
+
+                    <p>最後の <code>WHERE</code> 句が三つ目の要求を担う。既存行のバージョンが新しく届いたものより<strong>新しければ更新を飛ばす</strong>。これがなければ、再開区間で再生された古いイベントが、その間に反映された最新の状態を消してしまう。ちなみに文書は、<code>INSERT</code>、<code>UPDATE</code>、<code>DELETE</code> を一つの文の中で混ぜる必要があるなら <code>MERGE</code> を検討せよとも案内しており、<code>ON CONFLICT</code> より SQL 標準に近い代案だと記している。</p>
+
+                    <p>加えて、変更ストリームが既定で<strong>更新操作におけるフィールドの差分だけを返す</strong>点も冪等性に絡む。文書全体を受け取るには <code>fullDocument</code> を <code>updateLookup</code> に設定せねばならないが、文書はこれを<strong>最新の多数決コミット済みバージョンをコレクションから読み直す別の照会</strong>だと説明している。だから但し書きが付く。更新と照会のあいだに文書が削除されたりコレクションが削除されたりすると <code>fullDocument</code> が<strong>欠けることがあり</strong>、そのあいだに多数決コミットされた別の操作があったなら返ってきた文書が<strong>更新時点の文書と大きく異なりうる</strong>というものだ。つまり <code>updateLookup</code> が与えるのは<strong>その時点の状態ではなく、いまの状態</strong>である。</p>
+
+                    <p>この性質には明るい面もある。再生された古いイベントであっても照会は<strong>再生時点で</strong>起きるので、最終状態への収束が目的なら、むしろ自ら是正される。逆に変更の履歴をそのまま残したい用途なら <code>updateLookup</code> は適した道具ではない。6.0 から提供される事前イメージと事後イメージがその席のためのものであり、文書は挿入された文書に事前イメージはなく、削除された文書に事後イメージはないと記している。</p>
+
+                    <p>サイズ制限も一つある。運用勧告の文書は、変更ストリームの応答文書が<strong>16MB の BSON 文書制限を守らねばならず</strong>、コレクションの文書サイズによっては通知文書がその限界を超えると<strong>通知が失敗しうる</strong>と記す。文書全体を返すよう設定した更新操作や、限界に近い文書の挿入や置換がその例として挙げられている。6.0.9 からは <code>$changeStreamSplitLargeEvent</code> という集約ステージでイベントを断片に分割できる。大きな文書を扱うコレクションなら、この制限はマッピング段階で先に計算しておくほうがよい。失敗してから知るときには、すでにストリームが止まった後だ。</p>
+
+                    <h2 id="sec-13">削除 - 消えた文書をどう知るか</h2>
+
+                    <p>同期で最も頻繁に抜け落ちる項目であり、抜けた事実が最も遅く表面化する項目でもある。挿入と更新は誤ると値がおかしくなるので目につく。削除の取りこぼしは<strong>あるべき場所にそのままある行</strong>として現れるので、誰も違和感を覚えない。</p>
+
+                    <p>変更ストリームの削除イベントが何を載せるかはリファレンスに正確に書かれている。イベントには再開トークンである <code>_id</code>、oplog エントリのタイムスタンプである <code>clusterTime</code>、名前空間 <code>ns</code>、操作種別 <code>operationType</code>、そして <code>documentKey</code> が入る。文書は <code>documentKey</code> を<strong>当該 CRUD 操作が作成または変更した文書の <code>_id</code> 値を含む文書</strong>だとし、シャードコレクションではこのフィールドが<strong>完全なシャードキーも表示し</strong>、<code>_id</code> がすでにシャードキーの一部なら繰り返されないと記す。6.0 からはサーバーの日時である <code>wallTime</code> が加わる。</p>
+
+                    <p>決定的な一文はこれだ。<strong><code>fullDocument</code> は省略される。変更ストリームのカーソルが削除イベントをクライアントへ送る時点で、その文書はもはや存在しないからである。</strong>つまり削除イベントが教えてくれるのは<strong>何が消えたかという識別子だけ</strong>だという意味だ。</p>
+
+                    <p>この一文が、先のいくつもの決定を事後に正当化する。対象テーブルの主キーが <code>_id</code> から導かれたものでなければ、削除イベントを受け取っても<strong>どの行を消すべきか割り出す方法がない</strong>。文書の中身で照合しようにも、その中身が届かないのだ。原文が最初にぶつかった<strong>キー列がなく冪等な upsert ができない</strong>というエラーは挿入側の問題に見えたが、実際には削除まで同時に塞いでいた。</p>
+
+                    <p>削除前の中身が必要なら手はある。6.0 から <code>createCollection</code>、<code>create</code>、<code>collMod</code> でコレクションに <code>changeStreamPreAndPostImages</code> を有効にし、<code>watch()</code> で <code>fullDocumentBeforeChange</code> を <code>required</code> か <code>whenAvailable</code> に指定すれば、削除直前の文書を併せて受け取れる。ただし文書は二つの場合に事前イメージが使えないと記す。<strong>削除の時点でコレクションにその機能が有効化されていなかった場合</strong>と、<strong><code>expireAfterSeconds</code> で定めた保持時間を過ぎて除去された場合</strong>である。つまりこの機能は<strong>あらかじめ有効にしておいた分だけ</strong>遡る。事故の後に有効化して過去を取り戻す用途には使えない。</p>
+
+                    <pre><code class="language-sql">-- 削除イベントには documentKey しか来ない。文書の中身は来ない。
+-- だから受け側のキーが _id 由来でなければ、消す対象を特定できない。
+
+-- 方法 1。論理削除。消えたという事実そのものを履歴として残す。
+UPDATE mongo_visits_sync
+SET    deleted_at = $2
+WHERE  mongo_id = $1
+  AND  deleted_at IS NULL;
+
+-- 方法 2。物理削除。すでにない行を消してもエラーではないので、それ自体が冪等だ。
+DELETE FROM mongo_visits_sync
+WHERE  mongo_id = $1;
+</code></pre>
+
+                    <p>二つのどちらを選ぶかは写しの用途が決める。分析用の写しなら<strong>論理削除</strong>がたいていよい。いつ消えたかがそれ自体で事実であり、物理削除はその事実を消してしまうからだ。代わりにすべての問い合わせに <code>deleted_at IS NULL</code> の条件が付いて回り、それを一度落としたダッシュボードが静かに誤った数字を出す。元データとまったく同じ姿を求めるなら物理削除が正しく、このときはすでにない行を消すのがエラーでないという性質がそのまま冪等性を与えてくれる。</p>
+
+                    <p>どちらにせよ突き合わせの手順は別に必要だ。ストリームが静かに切れていた区間、トークンが失効して最初からやり直した区間、無効化の後で新しいストリームを開いた区間では、削除イベントが丸ごと通り過ぎる。定期的に両側のキー一覧を突き合わせて<strong>対象側にだけあるキー</strong>を探し出す作業がなければ、その区間の取りこぼしは永遠に残る。</p>
+
+                    <h2 id="sec-14">この構成を選ぶべきでないのはいつか</h2>
+
+                    <p>ここまでがこの構成の要求するものだ。今度は逆方向を見る番である。二つのデータベースを合わせ続ける費用が<strong>片方へ寄せる費用より大きくなる地点</strong>がある。</p>
+
+                    <ul>
+                        <li><strong>写しが古くてもよい場合</strong> - 数時間の遅延が許され、データが再取り込み可能な規模なら、定期的な全体の再取り込みが圧倒的に安い。再開トークンも冪等性も削除検知も要らない。元データにないものは新しい取り込みにもないので、削除は<strong>定義上ひとりでに合う</strong></li>
+                        <li><strong>両方を一つのトランザクションで読まねばならない場合</strong> - 異なる二つのデータベースにまたがる原子的な読み取りは、どんな同期でも作れない。その要求が本物なら、必要なのは同期ではなく統合である</li>
+                        <li><strong>両側で書き込みが起きる場合</strong> - 一方向の写しとは難易度の違う問題へ移る。衝突解決の規則と因果関係の追跡が必要になり、そこからは道具ではなくドメイン規則が答えを決める</li>
+                        <li><strong>マッピングが揺れ続ける場合</strong> - 上流のチームが文書へ自由にフィールドを足す文化なら、平坦化した列は恒久的な保守税になる。この場合は写しを JSONB 一列に置くか、そもそも写しを作らないほうがよい</li>
+                        <li><strong>単独サーバーの MongoDB</strong> - レプリカセットでなければ変更ストリームがなく、残るのは先に見た穴を抱えたポーリングだけだ。この状態でリアルタイムの整合を約束すると守れない</li>
+                    </ul>
+
+                    <p>逆に、この構成が確実に合う場所もはっきりしている。MongoDB が<strong>真実の源</strong>として残り、PostgreSQL は SQL の得意なこと、すなわち結合、ウィンドウ関数、BI ツールとの接続、臨時の集計のための<strong>読み取り専用の写し</strong>としてのみ存在する場合だ。写しに書き込みがないという条件が、先の難しさの半分を消してくれる。写し側の Postgres を運用の観点でどう守るかは<a href="postgres_startup_survival_2026.html">スタートアップのPostgres生存ガイド</a>が、取り込み作業そのものを Postgres の中で再試行可能にする方法は<a href="durable_workflows_postgres_2026.html">Postgresで耐久性のあるワークフローを作る</a>が扱っている。</p>
+
+                    <p>まとめるとこうなる。原文の著者が<strong>同期よりマッピングが厄介だった</strong>と書いたのは半分だけ正しい。マッピングが厄介だった理由はそれが<strong>戻しにくい決定</strong>だったからであり、戻しにくい理由はそれらの決定がすべて<strong>同期が成立するための前提</strong>だったからだ。キーを何にするか、不在と <code>null</code> を区別するか、配列をどこに置くかは見た目こそスキーマ設計の問題だが、実際には再開と冪等性と削除検知が可能かどうかをその場で決める問題である。マッピングを先にして同期を後から付ける順序ではなく、<strong>同期が要求するものを知ったうえでマッピングをする順序</strong>が正しい。</p>
+
+                    <h2 id="sec-15">確認できなかったこと</h2>
+
+                    <ul>
+                        <li>変更ストリームの更新イベントが載せる<strong>差分の正確な構造</strong>は確認できなかった。マニュアルで確認できたのは既定で更新操作のデルタだけを返すという記述までであり、その中のフィールド名と形は別のリファレンスを開いていないので本文に書かなかった</li>
+                        <li>PostgreSQL の <code>numeric</code> の正確な桁数と指数の限界は確認できなかった。確認したのは <code>jsonb</code> が <code>numeric</code> の範囲を外れる数値を拒否するという記述と、BSON Decimal128 の有効桁34桁、指数 -6143 から +6144 までである。二つの範囲の包含関係は計算していない</li>
+                        <li>PostgreSQL の <code>timestamp</code> 系の内部的な時間解像度は原典で確認できなかった。本文では BSON の <code>Date</code> がミリ秒であるという確認済みの事実だけを根拠にした</li>
+                        <li>oplog ウィンドウを外れた再開トークンで再開を試みたとき<strong>サーバーが正確にどんなエラーを返すか</strong>は確認できなかった。マニュアルは履歴が十分でなければならないという要求だけを記し、失敗時のエラーコードはその文書にない</li>
+                        <li>ハイウォーターマークトークンが<strong>どれくらいの頻度で</strong>生成されるのか、その周期を調整できるのかは確認できなかった。文書には定期的に生成するという記述だけがある</li>
+                        <li>原文が使ったツールが<strong>初回の全複製と変更ストリームをどうつなぐのか</strong>は確認できなかった。二つの区間の継ぎ目に生じる空白をどう埋めるかがこの種のツールの核心なのに、原文にその手順が書かれていない</li>
+                        <li>原文にはデータ量、文書数、処理速度、遅延についての<strong>数値が一つもない</strong>。したがってこの方式の性能特性については何も写していない</li>
+                    </ul>
+
+                    <h2 id="sec-16">参考資料</h2>
+
+                    <ul>
+                        <li><a href="https://news.hada.io/topic?id=33219" target="_blank" rel="noopener">GeekNews トピック 33219</a> — この記事のきっかけとなった紹介。原文の所在と要約がある場所</li>
+                        <li><a href="https://visualeaf.com/blog/copy-and-sync-a-mongodb-collection-to-postgresql/" target="_blank" rel="noopener">Copy and Sync a MongoDB Collection to PostgreSQL (VisuaLeaf)</a> — きっかけとなった原文。単純なフィールドは列、入れ子のオブジェクトと配列は JSONB という選択、<code>mongo_id</code> 主キー、キー列不在のエラーとフィールド名不一致のエラーがここにある。自社ツールの紹介記事である</li>
+                        <li><a href="https://www.mongodb.com/docs/manual/changeStreams/" target="_blank" rel="noopener">Change Streams (MongoDB Manual)</a> — レプリカセットとシャードクラスタの要件、WiredTiger とプロトコルバージョン 1、再開トークンが <code>_id</code> に載るという記述、イベントトークンとハイウォーターマークトークン、<code>resumeAfter</code>、<code>startAfter</code>、<code>startAtOperationTime</code> の違い、無効化イベント、既定がデルタであることと <code>updateLookup</code> の但し書き</li>
+                        <li><a href="https://www.mongodb.com/docs/manual/reference/change-events/delete/" target="_blank" rel="noopener">delete Event (MongoDB Manual)</a> — 削除イベントのフィールド一覧、<code>documentKey</code> に <code>_id</code> とシャードキーが載るという記述、<code>fullDocument</code> が省略される理由、6.0 の <code>fullDocumentBeforeChange</code> の有効化条件と保持時間の制約</li>
+                        <li><a href="https://www.mongodb.com/docs/manual/administration/change-streams-production-recommendations/" target="_blank" rel="noopener">Change Streams Production Recommendations (MongoDB Manual)</a> — 16MB の BSON 制限と通知の失敗、6.0.9 の <code>$changeStreamSplitLargeEvent</code>、アービタがあるときストリームが待機状態にとどまりうるという記述、oplog サイズの勧告、コールドシャードと <code>periodicNoopIntervalSecs</code>、インデックスが使えないのでストリームを多く開くなという勧告</li>
+                        <li><a href="https://www.mongodb.com/docs/manual/reference/bson-types/" target="_blank" rel="noopener">BSON Types (MongoDB Manual)</a> — ObjectId 12バイトの構成とバイト順序、単調でないという明記とその二つの理由、BSON <code>Date</code> がミリ秒単位の64ビット整数であること、Decimal128 の34桁と指数範囲</li>
+                        <li><a href="https://www.postgresql.org/docs/17/datatype-json.html" target="_blank" rel="noopener">JSON Types (PostgreSQL 17)</a> — <code>json</code> と <code>jsonb</code> の格納方式の違い、空白とキー順序と重複キーの保存有無、<code>jsonb</code> の勧告、既定の GIN 演算子クラスと <code>jsonb_path_ops</code> がサポートする演算子、<code>NaN</code> と無限大と <code>\u0000</code> の拒否、SQL NULL は別の概念だという注記</li>
+                        <li><a href="https://www.postgresql.org/docs/17/sql-insert.html" target="_blank" rel="noopener">INSERT (PostgreSQL 17)</a> — <code>ON CONFLICT</code> の競合対象の指定方法、<code>DO NOTHING</code> と <code>DO UPDATE</code> の違い、<code>DO UPDATE</code> では競合対象が必須という規定、<code>excluded</code> という特別なテーブル、決定的な文とカーディナリティ違反、<code>MERGE</code> の案内</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>この記事をシェア</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">リンクをコピー</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">一覧に戻る</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">一緒に使うと便利な無料ツール</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/iptables_generator.html">iptables ファイアウォールルール生成ツール</a></li>
+      <li><a href="../static/code_image.html">コード画像ジェネレーター</a></li>
+      <li><a href="../static/char_counter.html">文字数カウント</a></li>
+      <li><a href="../static/json_formatter.html">JSON フォーマッター</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">すべてのツールを見る &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">関連記事</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="sql_not_in_null_empty_result.html">NOT IN のリストに NULL が一つ混ざると結果が丸ごと空になる - エラーなしで0行になる SQL 三値論理 2026</a></li>
+      <li><a href="find_process_holding_file.html">ファイルを掴んでいるプロセスを見つける - 消したのに容量が戻らないとき</a></li>
+      <li><a href="log_rotation_pitfalls.html">ログローテーションが静かに失敗する場所 - ディスクは埋まるのに誰も気づかない</a></li>
+      <li><a href="ai_generated_code_disclosure_license.html">AIが書いたとライセンスに記すと - 利用許諾と出所開示が分かれる場所</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('リンクをコピーしました。Threads アプリに貼り付けて共有してください。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('リンクをコピーしました。'); });
+    });
+    </script>
+</body>
+</html>

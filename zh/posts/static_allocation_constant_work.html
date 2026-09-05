@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<!--
+ * 技术博客文章模板
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>让最坏情况保持恒定，和让平均值变快，是两个不同的目标 - 静态分配与恒定工作量</title>
+    <meta name="description" content="降低平均值和压平最坏情况并不是同一个目标，而且通常互相削弱。本文先给出分辨有截止时间的工作的判据，再讲清楚去掉运行期分配之后消失了什么、又要付出什么代价，并把静态分配、竞技场、对象池、环形缓冲区连同各自的观测指标一起整理成表。">
+    <meta name="keywords" content="静态分配, 恒定工作量, 尾部延迟, P100, 环形缓冲区, 竞技场分配器, 对象池, 截止时间, 缺页, GC 调优, TigerBeetle, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/static_allocation_constant_work.html">
+
+    <meta property="og:title" content="让最坏情况保持恒定，和让平均值变快，是两个不同的目标">
+    <meta property="og:description" content="从如何分辨有截止时间的工作讲起，到静态分配买到了什么、又卖掉了什么，以及该用哪个指标去确认。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/static_allocation_constant_work.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-09-05">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="静态分配与恒定工作量">
+    <meta name="twitter:description" content="平均值快和最坏情况恒定是两个不同的目标，而且通常互相削弱。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "让最坏情况保持恒定，和让平均值变快，是两个不同的目标 - 静态分配与恒定工作量",
+      "alternativeHeadline": "如何分辨有截止时间的工作、每种手法各自换来什么又付出什么、以及用哪个指标去确认",
+      "datePublished": "2026-09-05",
+      "dateModified": "2026-09-05",
+      "inLanguage": "zh-CN",
+      "articleSection": "开发/基础设施",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "静态分配, 恒定工作量, 尾部延迟, P100, 环形缓冲区, 竞技场分配器, 对象池, 截止时间, 缺页, GC 调优",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/static_allocation_constant_work.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "静态分配到底做的是什么?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "在启动时一次性预留程序将要使用的内存上限，此后运行期不再申请新内存。超过上限的请求不是靠多要内存去满足，而是直接拒绝。TigerBeetle 的风格指南把这条规则写成「所有内存都必须在启动时静态分配，初始化之后不得动态分配任何内存，也不得释放后重新分配」。它给出的两个理由是性能可预测，以及避免释放后使用这类缺陷。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "恒定工作量这条原则是什么意思?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "不是只遍历活跃的条目，而是始终遍历整个定长数组，空位上放一个不会改变结果的中性值。触发本文的那篇文章给出两个理由。第一，无条件走完整个数组，对编译器做向量化和对 CPU 缓存做预取都要容易得多。第二，P100 延迟不随负载变化，始终保持平坦。附带的效果是性能不足会在上线时暴露，而不是等到旺季。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "P100 和 P99 有什么区别?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "P99 是丢掉最慢的百分之一之后的最大值，P100 什么都不丢，是真正的最大值。原文说保持平坦的是 P100 而不是 P99。这个区别在有截止时间的工作里是决定性的。一秒钟跑一百次的音频回调，把 P99 当目标就等于允许每秒错过一次截止时间，而那一次是听得见的。在有截止时间的地方，该看的数字既不是平均值也不是 P99，而是最大值和超时次数。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "超过上限的时候应该怎么办?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "只有五个选项：立即拒绝，在同样有上限的队列里等待，丢掉最旧的，丢掉最新的，或者降低精度与功能做降级运行。没有一个是「无论如何都全部处理掉」。动态分配就是在模仿这个无论如何，直到撞上内核的 OOM 杀手，那时候丢的不是一条请求，而是正在处理的全部。所以真正要决定的不是拒不拒绝，而是把丢什么、什么时候丢写进代码里。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "这些规则能直接搬到服务器和 Web 后端吗?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "只能搬过来一部分。搬得最顺的是「给一切都加上限」和「超出的就拒绝」这两条。连接池大小、队列深度、超时、并发上限，本来说的就是同一件事。搬得最不顺的是遍历全部，因为那要在数据结构小到能装进缓存时才成立，而服务器的数据结构通常不是这样。在有垃圾回收的运行时里，它会换一种形式出现：不是消除分配，而是降低分配速率。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/static_allocation_constant_work.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/static_allocation_constant_work.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/static_allocation_constant_work.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/static_allocation_constant_work.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/static_allocation_constant_work.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "首页",
+      "item": "https://braindetox.kr/zh/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "开发/基础设施",
+      "item": "https://braindetox.kr/zh/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "让最坏情况保持恒定，和让平均值变快，是两个不同的目标 - 静态分配与恒定工作量",
+      "item": "https://braindetox.kr/zh/posts/static_allocation_constant_work.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="让最坏情况保持恒定，和让平均值变快，是两个不同的目标 - 静态分配与恒定工作量">
+                <meta itemprop="datePublished" content="2026-09-05">
+                <meta itemprop="dateModified" content="2026-09-05">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="静态分配, 恒定工作量, 尾部延迟, P100, 环形缓冲区, 竞技场分配器, 对象池, 截止时间, 缺页, GC 调优">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/static_allocation_constant_work.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">让最坏情况保持恒定，和让平均值变快，是两个不同的目标 - 静态分配与恒定工作量</h1>
+                    <h2 class="post-subtitle">如何分辨有截止时间的工作、每种手法各自换来什么又付出什么、以及真正用来确认的那个指标</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-05">2026-09-05</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">开发/基础设施</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>说性能改善了，通常就是说变快了。可是在某些场合，<strong>变快根本不是目标</strong>。每一次都花同样的时间才是目标。平均值哪怕降了一半，只要一百次里有一次跳到十倍，在那种场合这不是改善而是恶化。</p>
+
+                    <p>这篇文章要看的，是这两个目标有什么不同，以及为什么它们通常互相削弱。这不是一篇内存分配技巧的合集。它讲的是<strong>去掉运行期分配这个决定究竟买了什么、又卖了什么</strong>，以及这笔交易的结果该用哪个指标去确认。</p>
+
+                    <div class="callout">
+                        本文的引用全部来自一手资料，第一节先把触发本文的那篇文章实际说了什么、没说什么分开。凡是原文里没有的论点，正文都会在当处注明「原文里没有」。
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>本文涵盖的内容</h3>
+                        <ol>
+                            <li><a href="#sec-1">缘起 - 原文说了什么，又没说什么</a></li>
+                            <li><a href="#sec-2">有截止时间的工作和没有的工作</a></li>
+                            <li><a href="#sec-3">平均值和最坏情况为什么互相削弱</a></li>
+                            <li><a href="#sec-4">去掉运行期分配之后，什么消失了</a></li>
+                            <li><a href="#sec-5">恒定工作量把什么反转了过来</a></li>
+                            <li><a href="#sec-6">逐项手法的交易 - 换来什么、失去什么、看哪个指标</a></li>
+                            <li><a href="#sec-7">代价一 - 上限该怎么定</a></li>
+                            <li><a href="#sec-8">代价二 - 溢出的时候做什么</a></li>
+                            <li><a href="#sec-9">代价三 - 没活干也照样满负荷干</a></li>
+                            <li><a href="#sec-10">在有垃圾回收的运行时里会怎样</a></li>
+                            <li><a href="#sec-11">搬到服务器上，哪些成立哪些不成立</a></li>
+                            <li><a href="#sec-12">应该先测什么</a></li>
+                            <li><a href="#sec-13">没能确认的部分</a></li>
+                            <li><a href="#sec-14">参考资料</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">缘起 - 原文说了什么，又没说什么</h2>
+
+                    <p>2026年9月2日，matklad 发表了 <em>Static Allocation, Constant Work</em>。篇幅不长，示例代码是 Zig，用订单撮合引擎来打比方。不过作者本人写明<strong>自己对订单撮合引擎只有模糊的理解</strong>，只是猜测这些手法在那里可能有用。所以这篇文章更适合当成两种设计习惯来读，而不是某个领域的处方。</p>
+
+                    <p>第一种习惯是静态分配。启动时按上限一次取够，之后不再取。原文的例子把上限交给命令行参数，用 <code>const orders: []Order = try gpa.alloc(Order, cli_args.orders_max);</code> 一次预留完。而且<strong>运行期如果来的请求超过上限，多出来的请求就被拒绝</strong>。理由说得很直白。按原文的说法，为了多分配一条订单，内核的 OOM 杀手可能<strong>把整个订单撮合引擎杀掉，让另外一百万条订单一起丢失</strong>，更糟的是连监管进程也一起死掉，连重启都做不到。</p>
+
+                    <p>第二种习惯是恒定工作量。不要用索引或位集单独追踪存活的对象，而是<strong>始终完整遍历一个定长数组</strong>。空着的位置上放一个什么都不做的中性状态。在原文的例子里，订单的标签取 <code>bid</code>、<code>ask</code>、<code>reserved</code> 三个值，最后那个就是中性状态。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>原文实际说了的</th><th>原文里没有的</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>启动时按上限预留，运行期拒绝超出的请求</td><td>这个上限究竟该依据什么算出来</td></tr>
+                            <tr><td>完整遍历对向量化和缓存预取都要有利得多</td><td>支撑这个说法的测量值或基准数据</td></tr>
+                            <tr><td>P100 延迟不随负载变化，始终平坦</td><td>关于 P99 或中位数等其他分位的任何提法</td></tr>
+                            <tr><td>对象池是一个标签联合，标签表示当前住在这个槽位里的是第几代对象</td><td>竞技场分配器，环形缓冲区</td></tr>
+                            <tr><td>按类型分区的分配能缓解类型混淆，而内联枚举会破坏这层防御</td><td>音频回调、游戏帧、控制回路这类应用场景</td></tr>
+                            <tr><td>这是值得放进武器库的一个手法，而不是所有编程问题的万能解</td><td>功耗或电池成本</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>这里有一点需要说清楚。原文说保持平坦的是<strong>P100 而不是 P99</strong>。P99 是丢掉最慢的百分之一之后的最大值，P100 什么都不丢，是真正的最大值。经过转述之后这个区分很容易糊掉，而下一节会看到，<strong>在有截止时间的工作里，被丢掉的那百分之一恰恰就是出问题的那百分之一。</strong></p>
+
+                    <h2 id="sec-2">有截止时间的工作和没有的工作</h2>
+
+                    <p>为什么恒定会成为目标，得先把工作分类才看得出来。判据只有一条。<strong>如果结果没能在某个固定时刻之前出来，这个结果是不是就没用了。</strong>是的话，这份工作有截止时间；不是的话，就没有。</p>
+
+                    <p>有截止时间那一侧的典型是音频回调、游戏的每一帧，以及驱动机器的控制回路。音频设备在固定时刻索要下一段缓冲，那时候数据不在，就会填入静音，声音随之断掉。已经过去的那一刻的声音，事后补出来也没有意义。<strong>迟到结果的价值是零，甚至是负的。</strong>这条轴线原文里没有。原文既没提截止时间，也没提音频或游戏。</p>
+
+                    <p>不过操作系统那边的文档很早就把这个性质记了下来。Linux 的 <code>mlockall(2)</code> 说明写道，<strong>实时应用要求确定性的时序，而和调度一样，分页是造成程序执行出现意外延迟的主要原因之一</strong>。同一份文档还更进一步：使用 <code>mlockall()</code> 来避免缺页延迟的实时进程，<strong>应当在进入时间关键区之前预留足够多的已锁定栈页，这样函数调用也不会引发缺页</strong>。为什么把内存提前全部取好是可预测性的问题而不是速度的问题，答案就在这两句话里。</p>
+
+                    <pre><code>/* 进入实时区之前，锁住当前和将来的所有映射 */
+mlockall(MCL_CURRENT | MCL_FUTURE);</code></pre>
+
+                    <table>
+                        <thead>
+                            <tr><th>该问的问题</th><th>有截止时间</th><th>没有截止时间</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>迟到结果的价值</td><td>是零，甚至有害</td><td>迟到也不影响价值</td></tr>
+                            <tr><td>延迟如何堆积</td><td>推迟下一个周期，逐次累积</td><td>由队列吸收</td></tr>
+                            <tr><td>重试</td><td>不可能，或者没有意义</td><td>可行而且常见</td></tr>
+                            <tr><td>该看的统计量</td><td>最大值和超时次数</td><td>平均值、中位数、吞吐量</td></tr>
+                            <tr><td>改善的定义</td><td>超时次数收敛到零</td><td>单位时间内处理得更多</td></tr>
+                            <tr><td>失败的样子</td><td>声音断掉，画面卡顿</td><td>感觉有点慢</td></tr>
+                            <tr><td>空余资源的用途</td><td>空着不用，只为压低最坏情况</td><td>填满，用来提高处理量</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>最后一行是实务中最容易谈不拢的地方。面对同样空闲的 CPU，有截止时间的系统会<strong>把它空着，用来防备最坏情况</strong>，没有截止时间的系统会<strong>把它填满，用来提高吞吐</strong>。两个团队看着同一块面板得出相反结论，原因就在这里。</p>
+
+                    <h2 id="sec-3">平均值和最坏情况为什么互相削弱</h2>
+
+                    <p>能降低平均值的手法，多数都是同一个形状。<strong>现在不付出代价，攒到以后一次性付。</strong>缓存是这样，延迟初始化是这样，数组按倍数扩容是这样，分代垃圾回收也是这样。绝大多数调用变得很便宜，偶尔有一次变得非常贵。总量下降，最大值上升。</p>
+
+                    <p>这笔交易在只看平均值的面板上<strong>结构性地看不见</strong>。收益落在图里，代价落在图外。所以有截止时间的系统的风格指南，往往会把这一点明确钉死。TigerBeetle 的风格指南写着<strong>给一切都加上限</strong>，并举例说<strong>所有循环和所有队列都必须有固定的上界，以防止无限循环或尾部延迟尖刺</strong>。它把没有上界的循环和没有上界的队列，并排放在尾部延迟的成因位置上。</p>
+
+                    <p>反方向同样成立。<strong>恒定工作量是故意把平均值做差的。</strong>活跃条目只有十个，却把一百个槽位全部走一遍，那就有九十次是白扔的工。总工作量上升，平均值跟着上升。换来的是十个的情形和一百个的情形变成同一种情形。原文关于 P100 的那句话说的正是这笔交易。它<strong>不是把最坏情况压低了，而是把最坏情况变成常态，因而变平了。</strong></p>
+
+                    <p>还有一样东西是白送的，原文把它和性能收益并列写出来。<strong>性能不够这件事，会在系统上线时暴露，而不是在旺季凌晨的值班电话里。</strong>因为没有负载时它做的活和满负载时一样多。从这个意义上说，恒定工作量与其说是性能手法，不如说更接近<strong>可观测性手法</strong>。</p>
+
+                    <h2 id="sec-4">去掉运行期分配之后，什么消失了</h2>
+
+                    <p>把「运行期不分配」这条规则守住之后会消失哪些东西，最好一项一项数出来。数完了才能反过来数清楚，自己的系统里究竟有过其中几项。</p>
+
+                    <ul>
+                        <li><strong>分配调用本身的可变开销</strong> — 要同样多的字节，两次花的时间未必一样。刚好有合适大小的空闲块就便宜，需要切分或合并就贵，得向内核新要一块就贵得多。没有运行期分配，这整个分布都不见了</li>
+                        <li><strong>在分配器前面排队</strong> — 多个线程同时敲同一个分配器时，总得在某处决定先后。没人去调用，也就没人去排队</li>
+                        <li><strong>缺页</strong> — 新拿到的内存第一次触碰时内核要介入。前面引的 <code>mlockall(2)</code> 说明把分页点名为意外延迟的主要成因，说的就是这一处。启动时取好并挨个碰一遍，这份开销就挪到了启动阶段</li>
+                        <li><strong>垃圾回收器的介入</strong> — 不分配就没有触发回收的压力。不过在有垃圾回收的语言里这层关系没那么简单，所以放到第十节单独看</li>
+                        <li><strong>碎片带来的尾部延迟</strong> — 进程跑得越久，越难拿到大块连续内存。这份开销一开始没有，几天之后才出现，所以短时间的测试几乎抓不住</li>
+                        <li><strong>释放后使用的一个分支</strong> — TigerBeetle 的风格指南把避免释放后使用和性能不可预测并列，作为静态分配的理由。既没有释放也没有重新分配，指向已释放内存的指针这个概念本身就萎缩了</li>
+                    </ul>
+
+                    <p>还有一样不在清单上的东西也消失了，那就是<strong>失败的时刻。</strong>启动时就按上限取够，机器上没有那么多余量的话，进程一启动就死。在部署之后立刻死掉，几乎总是比四天后凌晨三点死掉更好。TigerBeetle 的风格指南之所以钉死<strong>所有内存都必须在启动时静态分配，初始化之后不得动态分配任何内存，也不得释放后重新分配</strong>，一半的理由就在这里。</p>
+
+                    <h2 id="sec-5">恒定工作量把什么反转了过来</h2>
+
+                    <p>按通常的直觉，「只做该做的活」才是美德。单独维护一份存活条目的清单，只遍历那份清单。原文把这个直觉反转过来。走完整个数组，空位上放一个不会改变结果的中性值。</p>
+
+                    <pre><code>// 原文不推荐的一侧 - 沿着活跃索引走
+for (orders_active) |order_index| {
+    const order = orders[order_index];
+    process(order);
+}
+
+// 原文推荐的一侧 - 无条件走完每一个槽位
+for (orders) |order| {
+    process(order);
+}</code></pre>
+
+                    <p>原文给出的理由有两个。上面那种写法先读一个索引，再拿这个值回到数组里去找，每个条目要两次有依赖的访问。下面那种则是把内存从前往后顺着扫一遍。按原文的说法，下面这种<strong>对编译器做向量化、对 CPU 缓存做预取都要容易得多</strong>。而且它做的活和存活条目的数量无关，所以<strong>P100 延迟不随负载变化，始终平坦。</strong></p>
+
+                    <p>设计中性状态比看上去麻烦。正确性排在速度前面。</p>
+
+                    <ul>
+                        <li>中性值<strong>不能改变结果</strong>。求和取零，求积取一，求最小值就取可表示的最大值</li>
+                        <li>中性槽位一旦混进聚合，程序不会崩，而是<strong>安静地给出一个错的数</strong>。这类缺陷比性能问题活得久得多</li>
+                        <li>要复用槽位就必须区分代次。这正是原文把对象池看成<strong>以槽位中对象的代次为标签的标签联合</strong>的原因。漏掉代次，旧引用就会指向新对象</li>
+                        <li>只有当处理中性槽位的开销<strong>和处理真实条目差不多时</strong>，这笔交易才成立。中性便宜太多，全遍历就是纯浪费；中性反而更贵，那就完全说不通</li>
+                        <li>数组大到装不进缓存时，全遍历反而是亏的。预取的好处出现在<strong>你确实会用到所走过的那段连续内存</strong>的时候</li>
+                        <li>原文没有讨论分支预测。分支并没有消失，只是处理中性状态的那个分支挪进了循环内部</li>
+                    </ul>
+
+                    <p>原文把同样的思路也用在带提前返回的查找循环上。像 <code>const item = for (items) |item| { if (predicate(item)) break item; } else null;</code> 这样找到就跳出的写法，对平均值有好处，但耗时取决于数据。全部扫一遍则永远花同样的时间。<strong>这同样是卖掉平均值去买恒定。</strong></p>
+
+                    <h2 id="sec-6">逐项手法的交易 - 换来什么、失去什么、看哪个指标</h2>
+
+                    <p>静态分配这个词底下，捆着几种性格相当不同的手法。把每一种各自给什么、拿走什么，尤其是<strong>用什么去确认它真的在起作用</strong>都写出来，选的时候就不会乱。竞技场和环形缓冲区在原文里没有出现，因为属于同一族手法，所以并排放在这里。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>手法</th><th>换来什么</th><th>失去什么</th><th>用什么观测</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><strong>静态分配</strong><br>启动时按上限预留</td><td>根本不存在运行期分配路径。内存用量是个常数。溢出表现为拒绝而不是 OOM 杀手</td><td>始终占着最大量。上限定低了会提早失败，定高了就是浪费</td><td>常驻内存从启动之后是否平坦。拒绝条数。缺页次数</td></tr>
+                            <tr><td><strong>竞技场</strong><br>按阶段整批取，一次性丢弃</td><td>没有逐个释放，释放开销接近常数。生命周期相同的对象当成一整块处理</td><td>阶段结束之前什么都还不回去。阶段一长，峰值占用就跟着变大</td><td>每个阶段的峰值占用。阶段时长的分布。每阶段的复用次数</td></tr>
+                            <tr><td><strong>对象池</strong><br>复用同一类型的槽位</td><td>同样大小的槽位轮着用。按类型分区还能减少类型混淆</td><td>必须定义耗尽时的行为。漏掉代次标签，释放后使用会安静地活下来</td><td>池占用率的峰值。获取失败的次数。各槽位代次推进的速度</td></tr>
+                            <tr><td><strong>定长环形缓冲区</strong><br>靠头尾指针回绕的队列</td><td>不用锁就把生产者和消费者解耦。大小取二的幂时，回绕用按位与而不是取模</td><td>满了就得丢或者阻塞，两者都是策略决定。生产者和消费者必须各只有一个</td><td>占用深度的峰值。丢弃条数。生产者被阻塞的时长</td></tr>
+                            <tr><td><strong>恒定工作量</strong><br>不管死活一律全遍历</td><td>最大值相对负载变得平坦。性能不足在上线时就暴露</td><td>空闲时也照样满负荷干。平均耗时和功耗都会上升</td><td>空闲状态的 CPU 使用率。抬高负载时最大值的斜率</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>环形缓冲区这一行的细节，Linux 内核文档里写得清清楚楚。头是<strong>生产者往缓冲区里插入条目的位置</strong>，尾是<strong>消费者找到下一个条目的位置</strong>。缓冲区取二的幂大小时，回绕可以改用<strong>快得多的按位与指令</strong>。而且<strong>头指针比尾指针小一的时候就是满</strong>，也就是说永远要空出一个位置来区分满和空。要做到无锁，<strong>必须只有一个生产者和一个消费者</strong>，并且不是用一把锁去管住两端，而是生产者侧用 <code>smp_store_release()</code>、消费者侧用 <code>smp_load_acquire()</code> 来保证次序。</p>
+
+                    <h2 id="sec-7">代价一 - 上限该怎么定</h2>
+
+                    <p>静态分配的第一个代价是<strong>必须事先知道上限</strong>。原文把这个问题推到了代码之外，因为上限是从命令行参数进来的。这在某种意义上是对的，上限取决于部署环境而不是代码，本来就不该写死成常量。但<strong>这个值该依据什么定出来，原文里没有。</strong></p>
+
+                    <ul>
+                        <li>先找<strong>物理上限</strong>：机器的内存容量、文件描述符上限、网络队列深度。比它更大的业务上限没有意义</li>
+                        <li>再找<strong>业务上限</strong>：并发连接数、未结订单数、打开的会话数的实测值。要看<strong>观测到的最大值</strong>，不是平均值</li>
+                        <li>观测窗口一短，最大值<strong>永远是低估的</strong>。窗口里至少要包含一次旺季</li>
+                        <li>不要把上限写进代码，放进配置。同一个二进制要能跑在大机器上，也能跑在小机器上</li>
+                        <li><strong>把触达上限的次数作为指标暴露出来。</strong>不去数触达次数，就分不清这个值究竟是上限还是随手写的一个大数</li>
+                        <li>在上限的某个比例处另设告警线。触达之后才知道就晚了</li>
+                        <li>把上限定得很大也不是免费的。始终占着最大量，就意味着<strong>同一台机器上放不下别的东西</strong></li>
+                    </ul>
+
+                    <p>如果还要把内存锁住，就又多一层约束。<code>mlockall(2)</code> 文档写道，自 Linux 2.6.9 起对特权进程能锁多少内存不再设限，而<strong><code>RLIMIT_MEMLOCK</code> 这个软资源上限转而定义非特权进程可以锁定多少内存</strong>。文档还明确写着，若指定了 <code>MCL_FUTURE</code>，那么<strong>之后的 <code>mmap</code>、<code>sbrk</code>、<code>malloc</code> 一旦会让已锁定字节数超过允许的最大值，就可能失败</strong>。也就是说上限的设计不会在应用内部收尾，它和部署环境的资源上限是咬合在一起的。</p>
+
+                    <h2 id="sec-8">代价二 - 溢出的时候做什么</h2>
+
+                    <p>第二个代价更重。<strong>越过上限之后，没有优雅失败的办法。</strong>准确地说，上限之内一切优雅，上限之外只有五个选项，而且没有一个是「无论如何都全部处理掉」。</p>
+
+                    <ul>
+                        <li><strong>立即拒绝</strong> — 原文的选择。只有调用方有重试策略时才有意义，没有的话就只是丢失。拒绝并没有消除问题，只是<strong>把问题交给了调用方</strong></li>
+                        <li><strong>让它等</strong> — 前面放一个队列让人等。可是那个队列也需要上限。没有上界的等待队列，等于把刚刚加上的上限又拆掉了</li>
+                        <li><strong>丢掉最旧的</strong> — 环形缓冲区里常见的选择。适合只有最新状态才有意义的数据，比如传感器读数或者画面刷新</li>
+                        <li><strong>丢掉最新的</strong> — 适合次序本身带有含义的数据。保住先进来的，把后面截掉</li>
+                        <li><strong>降级运行</strong> — 降低精度或者关掉部分功能，继续接收。这是有截止时间的系统里最常见的答案，在那种场合，准时的近似值胜过迟到的准确值</li>
+                    </ul>
+
+                    <p>动态分配一个都不选，而是去模仿那个「无论如何」。模仿走到尽头的地方站着 OOM 杀手。正如原文所指出的，那时候丢掉的不是溢出的那一条，而是<strong>正在处理的全部</strong>，最坏的情况连重启的路径也一并丢掉。设上限这个选择的本质，<strong>不是消除失败，而是挑选失败的形状。</strong></p>
+
+                    <p>所以真正要回答的问题不是「拒不拒绝」，而是<strong>丢什么、什么时候丢</strong>，并且把这个答案写在代码里显眼的地方。这是静态分配的实质好处之一。在动态取内存的代码里，这个决定哪里都没写，所以从来没人评审它。</p>
+
+                    <h2 id="sec-9">代价三 - 没活干也照样满负荷干</h2>
+
+                    <p>第三个代价已经写在名字里了。<strong>恒定工作量</strong>就是说没有负载的时候也干着满负载的活。这看上去纯是好处，只有在专用机器上、守住截止时间是唯一目标的时候才成立。</p>
+
+                    <ul>
+                        <li><strong>靠电池运行的设备</strong> — 空闲不再是空闲。屏幕关着，同一个循环照样在转</li>
+                        <li><strong>按用量计费的环境</strong> — CPU 时间就是钱。为了买一条平坦的最大值曲线，得一直付满额的费用</li>
+                        <li><strong>共享机器</strong> — 自己的空闲开销变成邻居进程的延迟。没有隔离的话，账是邻居替你付</li>
+                        <li><strong>有散热约束的设备</strong> — 长期满负荷会招来降频，于是本来想守住的那个截止时间反而开始晃动</li>
+                        <li><strong>专用机器上截止时间是唯一目标时</strong> — 这份开销根本看不见。反正也没打算拿那颗 CPU 干别的</li>
+                    </ul>
+
+                    <p>原文里没有功耗或电池的内容。上面这份清单是从结构里推出来的代价，支撑它的公开测量值没能得到确认（见第十三节）。所以在自己的环境里，把应用前后的空闲 CPU 使用率各测一次，才是靠得住的做法。</p>
+
+                    <p>也有缓和的变体。不走整个数组，而是<strong>每个周期只扫固定数量</strong>的槽位，下个周期接着往下走。最大值仍然是常数，空闲开销降下来了。代价是<strong>单个条目被处理之前的延迟上界，会随数组大小成比例地变长。</strong>截止时间是按条目算还是按周期算，决定了这个变体是不是答案。</p>
+
+                    <h2 id="sec-10">在有垃圾回收的运行时里会怎样</h2>
+
+                    <p>运行期不分配这条规则，前提是手动管理内存的语言。在有垃圾回收器的运行时里，光是少分配并不会让回收器消失。方向仍然一致，理由写在 Go 官方的 GC 指南里：<strong>GC 的 CPU 开销主要由分配速率和扫描内存的每字节成本决定。</strong></p>
+
+                    <p>看看指南列出的五项延迟来源，就明白分配速率为什么这么关键。第一，GC 在标记与清扫阶段之间切换时的短暂全停顿；第二，标记阶段 GC 占用百分之二十五的 CPU 资源所带来的调度延迟；第三，<strong>为应对高分配速率，用户协程要替 GC 分担工作</strong>；第四，标记阶段中指针写入需要额外的工作；第五，正在运行的协程必须被挂起以便扫描其根。第三项是关键：<strong>大量分配的代码是在自己制造自己的延迟。</strong></p>
+
+                    <pre><code># 用肉眼看见 GC 在干活的最省事的办法
+GODEBUG=gctrace=1 ./myserver</code></pre>
+
+                    <p>在设上限这一侧也有同样的张力。Go 的内存上限是<strong>软上限</strong>。按指南的说法，<strong>Go 运行时不保证在所有情况下都维持这个内存上限，它只承诺付出某种程度的合理努力。</strong>放松的理由写得很明白：<strong>正是这种放松对避免抖动至关重要，因为它给了 GC 一条退路。</strong>具体机制是给 GC 能用的 CPU 时间设一个上限，目前大约是百分之五十，窗口是 <code>2 * GOMAXPROCS</code> 个 CPU 秒。</p>
+
+                    <p>没有这条退路会怎样，同一份文档也写了。把 GOGC 关掉再不断压低上限，<strong>应用的总耗时会开始无限制地增长，因为 GC 在不停地运行，试图维持一个不可能的内存上限。</strong>还有一句像结论的话，和第八节的论点严丝合缝：<strong>在很多情况下，无限期的停顿比内存不足更糟，因为后者往往以快得多的失败收场。</strong></p>
+
+                    <p>归拢起来是这样。原文为了避开 OOM 杀手把上限设得很硬，Go 运行时为了避开无限期停顿把上限设得很软，这是<strong>同一个问题的两端</strong>。无论选哪一端，都还得回答「触到上限之后做什么」。旋钮本身倒是简单，按指南的说法，<strong>把 GOGC 翻倍会让堆内存开销翻倍，而 GC 的 CPU 成本大致减半。</strong>内存和 CPU 之间的交易被暴露在一个旋钮上。<a href="dev_tool_memory_footprint.html">实测工具本身占多少内存</a>和<a href="postgres_startup_survival_2026.html">连接上限设错时会发生什么</a>都另有整理。</p>
+
+                    <h2 id="sec-11">搬到服务器上，哪些成立哪些不成立</h2>
+
+                    <p>这些原则是在截止时间很紧的地方长出来的。搬到服务器和 Web 后端之后，有些早就换了个名字在用，有些则根本不成立。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>原则</th><th>在截止时间很紧的地方</th><th>在服务器与 Web 后端</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>启动时预留最大量</td><td>物理内存是固定的，因此很自然</td><td>在实例弹性伸缩的环境里，单台的最大量就是成本。但换成并发处理条数的上限，就完全成立</td></tr>
+                            <tr><td>拒绝超出的请求</td><td>没有别的选项</td><td>直接成立。它以负载卸除之名，早就是标准做法</td></tr>
+                            <tr><td>全部遍历</td><td>数据结构小，装得进缓存</td><td>基本不成立。遍历全体用户这种事装不进缓存</td></tr>
+                            <tr><td>以 P100 为目标</td><td>有截止时间，理所当然</td><td>按请求计的截止时间很少见，实际目标通常是 P99 或 P99.9</td></tr>
+                            <tr><td>去掉运行期分配</td><td>语言允许这么做</td><td>运行时替你做了。它换成降低分配速率的形式出现</td></tr>
+                            <tr><td>给一切都加上限</td><td>照原样适用</td><td>照原样适用。队列深度、连接池、超时、重试次数说的都是同一件事</td></tr>
+                            <tr><td>用中性状态填满槽位</td><td>数组小，所以便宜</td><td>基本不用。取而代之的是预先建好的连接和工作者池</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>搬得最顺的两条是<strong>给一切都加上限</strong>和<strong>超出的就拒绝</strong>。这两条与语言无关，而且在服务器这边早就换了名字在用。连接池大小、队列深度、超时、并发请求上限，全都是「给一切都加上限」的实例。TigerBeetle 的风格指南说，凡是程序与外部实体交互的地方，<strong>不要直接对外部事件作出反应去做事，而应让程序按自己的节奏运行</strong>，讲的也是同一件事，它给出的理由是<strong>这样更容易维持单位时间内工作量的上界</strong>。</p>
+
+                    <p>搬得最不顺的是全部遍历。它的好处只在<strong>你确实会用到所走过的那段连续内存</strong>时才出现，而服务器的数据结构通常装不进缓存。夹在中间的是启动时预留最大量：把单个进程的内存钉死，在弹性环境里可能是亏的，但换成<strong>并发处理条数的上限</strong>就是净赚。</p>
+
+                    <p>也有既不是嵌入式也不是游戏、却明确采用这条规则的例子。ggml 仓库把<strong>无第三方依赖、运行期零内存分配、支持整数量化</strong>写成了设计目标。一个推理库把运行期零分配挂成目标，理由不是炫耀速度，而更接近<strong>放到哪里都以同样的形态运行</strong>。硬件那边的约束会先替你决定什么，写在<a href="inference_hardware_tradeoffs.html">推理硬件的岔路口</a>里；塞进极小设备时会遇到的问题，写在<a href="esp32_tiny_llm_on_mcu_2026.html">在八美元单片机上跑模型的案例</a>里。内存安全该在多大程度上交给语言的那场争论，整理在<a href="memory_safety_absolutists_rust_filc_2026.html">围绕内存安全绝对主义的讨论</a>里。</p>
+
+                    <h2 id="sec-12">应该先测什么</h2>
+
+                    <p>以上是判断标准，实际动手的顺序很短。改代码之前，有些东西得先测。</p>
+
+                    <h3>第一步 - 先确定有没有截止时间</h3>
+
+                    <p>把这个系统里<strong>迟到的结果会失去价值的地方在哪里</strong>用一句话写下来。写不出来就说明没有截止时间，那本文的多数手法都不需要。如果有，就把那个时刻和可以容忍的超时次数写成数字。「应该要快」不是截止时间。</p>
+
+                    <h3>第二步 - 记录最大值</h3>
+
+                    <p>在平均值和中位数旁边，并排放上<strong>最大值和超时次数</strong>。缺了这两列的面板，看不见第三节讲的那笔交易。同时把在处理的条数、队列深度、池占用率的峰值也一并留下。定上限时要用的正是这些数。</p>
+
+                    <h3>第三步 - 加上限并统计触达次数</h3>
+
+                    <p>只给最大的那一个数据结构加上限，然后<strong>把触达上限的次数作为指标暴露出来。</strong>把代码改成静态分配是之后的事。触达次数为零说明上限定得宽，持续触达则说明上限偏小，或者上游放进来的量太多。这一个数字，就能替你做掉第七节和第八节的大部分决定。</p>
+
+                    <h2 id="sec-13">没能确认的部分</h2>
+
+                    <ul>
+                        <li>区分硬实时与软实时的<strong>规范性的单一定义</strong>，我没能在一手资料里确认。因此正文没有使用这两个术语，只用「有没有截止时间」这个功能性判据来分类</li>
+                        <li>优先级反转的定义及其规避手法同样没能在一手资料里确认，所以<strong>正文里完全没有使用。</strong>锁对截止时间的影响留在本文范围之外</li>
+                        <li>原文所说的向量化与预取收益<strong>并没有附上测量值。</strong>原文只给了结构性的理由而没有给证据，因此本文也没有写任何倍数</li>
+                        <li>音频回调或游戏帧的<strong>具体截止时间数值</strong>没能在一手资料里确认，所以没有写。只用了截止时间存在这一性质</li>
+                        <li>关于竞技场分配器，我没有打开任何具体实现的官方文档。因此表格里竞技场那一行只写了<strong>从定义推出来的性质</strong>，没有放数字</li>
+                        <li>分配器争用究竟造成多少延迟，碎片随时间推移会把尾部延迟拉大多少，这些<strong>公开测量值我都没有找到。</strong>正文的描述来自结构推演，不是实测结果</li>
+                        <li>恒定工作量<strong>对功耗影响的测量值</strong>同样没有找到。第九节的清单是从结构里推出来的代价</li>
+                        <li>TigerBeetle 靠这些规则实际达到的延迟数值我没能确认。引用的只有风格指南里规范性的表述</li>
+                    </ul>
+
+                    <h2 id="sec-14">参考资料</h2>
+
+                    <ul>
+                        <li><a href="https://news.hada.io/topic?id=33198" target="_blank" rel="noopener">GeekNews 话题 33198 - 静态分配与恒定工作量</a> — 触发本文的那条介绍，原文地址就放在那里</li>
+                        <li><a href="https://matklad.github.io/2026/09/02/static-allocation-constant-work.html" target="_blank" rel="noopener">matklad, Static Allocation, Constant Work (2026-09-02)</a> — 本文引用的原文。Zig 示例、把上限交给命令行参数的写法、拒绝超出的请求、OOM 杀手的论据、放了中性状态的定长数组、关于向量化与预取的说法、P100 延迟不随负载变化的那句话，以及并非万能的但书，全都出自这里</li>
+                        <li><a href="https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md" target="_blank" rel="noopener">TigerBeetle, TIGER_STYLE.md</a> — 所有内存在启动时静态分配、初始化之后禁止动态分配这条规则，给一切都加上限以及所有循环与队列都要有固定上界以防尾部延迟尖刺的表述，还有不要直接对外部事件作出反应而应按自己节奏运行的表述，都出自这里</li>
+                        <li><a href="https://www.kernel.org/doc/html/latest/core-api/circular-buffers.html" target="_blank" rel="noopener">Linux kernel documentation, Circular Buffers</a> — 头与尾的定义、二的幂大小时可以改用按位与的说法、头比尾小一即为满的判定、生产者与消费者必须各只有一个的条件，以及用 <code>smp_store_release()</code> 与 <code>smp_load_acquire()</code> 保证次序的说明</li>
+                        <li><a href="https://man7.org/linux/man-pages/man2/mlockall.2.html" target="_blank" rel="noopener">mlockall(2) - Linux manual page</a> — 实时应用要求确定性时序、分页是意外延迟主要成因的表述，进入时间关键区之前预留栈页的建议，<code>MCL_CURRENT</code> 与 <code>MCL_FUTURE</code> 的定义，以及 <code>RLIMIT_MEMLOCK</code> 软上限的作用</li>
+                        <li><a href="https://go.dev/doc/gc-guide" target="_blank" rel="noopener">A Guide to the Go Garbage Collector</a> — GOGC 决定 GC 的 CPU 与内存之间的取舍、把 GOGC 翻倍会让 GC 的 CPU 成本大致减半、内存上限为何是软上限以及它如何避免抖动、GC 的 CPU 上限约为百分之五十且窗口为 <code>2 * GOMAXPROCS</code> 个 CPU 秒、五项延迟来源、无限期停顿比内存不足更糟的那句话，以及 <code>GODEBUG=gctrace=1</code></li>
+                        <li><a href="https://github.com/ggml-org/ggml" target="_blank" rel="noopener">ggml 仓库</a> — 明确把无第三方依赖、运行期零内存分配、支持整数量化写为设计目标。MIT 许可证</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>分享本文</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X (Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">返回列表</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/code_image.html">代码图片生成器</a></li>
+      <li><a href="../static/char_counter.html">字数统计</a></li>
+      <li><a href="../static/json_formatter.html">JSON 格式化工具</a></li>
+      <li><a href="../static/regex_tester.html">正则表达式测试器</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+<!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="pr_cap_queue_effect_2026.html">「最多开3个PR」并不会缩短评审队列 - 上限规则与队列动力学 2026</a></li>
+      <li><a href="percentile_aggregation_error.html">把10台服务器的p99平均了 - 那个数字什么都不是 2026</a></li>
+      <li><a href="software_performance_expectations.html">可以慢下去的共识是怎么形成的 - 硬件越来越快为何体感依旧 2026</a></li>
+      <li><a href="mongodb_to_postgres_sync.html">搬一次和一直对齐是两个问题 - 把 MongoDB 集合送进 PostgreSQL 时被迫做出的选择</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制。粘贴到 Threads 应用即可分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制。'); });
+    });
+    </script>
+</body>
+</html>

@@ -1,0 +1,723 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="en">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>The Model Only Emits Text - Everything Else Is Decided by the Harness</title>
+    <meta name="description" content="In an agent the model only predicts the next token. Running tools, deciding when to stop, whether to retry and where state lives are all harness decisions.">
+    <meta name="keywords" content="agent harness, tool calling, tool_use, function_call, MCP, stop conditions, idempotency, observability, TrueForge, agent loop, LLM agent, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/en/posts/llm_agent_harness_oss.html">
+
+    <meta property="og:title" content="The Model Only Emits Text - Everything Else Is Decided by the Harness">
+    <meta property="og:description" content="Calling the tool, deciding when to stop, choosing whether to retry a failure: none of these are the model's decision. The boundary, drawn with the actual field names from vendor documentation.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/en/posts/llm_agent_harness_oss.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="en_US">
+    <meta property="article:published_time" content="2026-09-05">
+    <meta property="article:section" content="Dev &amp; Infra">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="The Model Only Emits Text">
+    <meta name="twitter:description" content="What an agent actually does is decided outside the model, in the harness that wraps it.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "The Model Only Emits Text - Everything Else Is Decided by the Harness",
+      "alternativeHeadline": "Tool execution, stopping, retries, idempotency and state all belong to the harness",
+      "datePublished": "2026-09-05",
+      "dateModified": "2026-09-05",
+      "inLanguage": "en-US",
+      "articleSection": "Dev & Infra",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "agent harness, tool calling, tool_use, function_call, MCP, stop conditions, idempotency, observability, agent loop",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/en/posts/llm_agent_harness_oss.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "What exactly does an agent harness do?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Everything between one model call and the next. Each time the model is invoked it returns content blocks and a reason for stopping. Even when one of those blocks says a tool should be called, nothing has executed yet. Pulling that block out, invoking the real function, converting the return value into the shape the API expects, putting it back into the conversation and deciding whether to call the model again or finish here is the harness. Stop conditions, failure classification, approval points, observability records, context trimming and session persistence all live in that same layer."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Why does agent behaviour change when the model is swapped?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Much of what looks like a capability gap is a difference in harness contract. Which fields express the tool schema, whether parallel calls are allowed, whether arguments arrive as a JSON string or an object, whether errors come back through a dedicated flag or as plain prose, and when and how the context gets trimmed all differ between vendors. The same model produces different results on a harness with a different contract. So a comparison is only meaningful when the harness configuration is pinned alongside the model."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How should a tool execution error be returned to the model?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "It depends on the vendor. The Claude API documents setting is_error to true inside a tool_result block, and recommends writing what went wrong and what to try next. OpenAI's function_call_output has no dedicated error field at all: the format of the output string is left to the caller. MCP goes one step further and separates the two mechanisms outright. An unknown tool or an invalid argument becomes a JSON-RPC error, while a tool that failed while running is reported inside the result with isError set to true."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "What happens when no stop condition is defined?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "The loop does not end. The model calls one more tool whenever that looks like the plausible next move, and that judgement contains no notion of a budget. Without a step ceiling it repeats variations of the same query, without a cost ceiling the invoice is the first notification, and without a wall-clock ceiling the user is left waiting. In practice quiet waste is the more common failure than a true infinite loop. An agent that takes eighty steps for a twenty-step task looks perfectly normal at the end, so nothing surfaces it until the run is recorded."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Can a hint such as MCP's idempotentHint be trusted for retries?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "No. The MCP schema states that every property in ToolAnnotations is a hint and is not guaranteed to describe tool behaviour faithfully, and it tells clients never to base tool use decisions on annotations received from untrusted servers. The defaults are deliberately conservative: readOnlyHint defaults to false, destructiveHint to true, idempotentHint to false and openWorldHint to true. An unannotated tool is therefore to be treated as destructive and non-idempotent. Retry safety has to be guaranteed by the harness itself, through an idempotency key or a state check before the retry."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 1.5rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; font-size: 0.95rem; }
+        .post-content th, .post-content td { border: 1px solid #e0e0e0; padding: 0.6rem 0.8rem; text-align: left; vertical-align: top; }
+        .post-content th { background-color: #f7f7f7; font-weight: 500; }
+        .post-content pre { background-color: #f6f8fa; padding: 1rem; border-radius: 4px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content code { font-family: Consolas, Monaco, monospace; font-size: 0.9rem; }
+        .callout { background-color: #f8f9fa; border-left: 4px solid #3498db; padding: 1rem 1.2rem; margin: 1.5rem 0; border-radius: 0 4px 4px 0; }
+        .post-toc { background-color: #fafafa; border: 1px solid #eee; border-radius: 4px; padding: 1rem 1.2rem; margin: 1.5rem 0 2rem; }
+        .post-toc h3 { margin-top: 0; }
+        .post-toc ol { margin-bottom: 0; }
+        .share-section { margin-top: 3rem; padding-top: 1.5rem; border-top: 1px solid #eaeaea; }
+        .social-share { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.8rem; }
+        .share-btn { display: inline-flex; align-items: center; gap: 0.3rem; padding: 0.5rem 0.9rem; border: none; border-radius: 4px; cursor: pointer; font-size: 0.9rem; color: #fff; }
+        .kakao-btn { background-color: #fee500; color: #3c1e1e; }
+        .facebook-btn { background-color: #1877f2; }
+        .twitter-btn { background-color: #000; }
+        .threads-btn { background-color: #333; }
+        .link-btn { background-color: #6c757d; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/llm_agent_harness_oss.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/llm_agent_harness_oss.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/llm_agent_harness_oss.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/llm_agent_harness_oss.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/llm_agent_harness_oss.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "Home",
+      "item": "https://braindetox.kr/en/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "Dev & Infra",
+      "item": "https://braindetox.kr/en/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "The Model Only Emits Text - Everything Else Is Decided by the Harness",
+      "item": "https://braindetox.kr/en/posts/llm_agent_harness_oss.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="The Model Only Emits Text - Everything Else Is Decided by the Harness">
+                <meta itemprop="datePublished" content="2026-09-05">
+                <meta itemprop="dateModified" content="2026-09-05">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="agent harness, tool calling, tool_use, function_call, MCP, stop conditions, idempotency, observability, agent loop">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/en/posts/llm_agent_harness_oss.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">The Model Only Emits Text - Everything Else Is Decided by the Harness</h1>
+                    <h2 class="post-subtitle">Calling the tool, deciding when to stop, choosing whether to retry a failure: none of these are the model's decision</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-05">2026-09-05</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">Dev &amp; Infra</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>When an agent deletes a file, the model did not delete it. What the model did was generate one block of structured text saying, in effect, that <strong>calling the delete tool with these arguments would be appropriate</strong>. The program that read that text and made the actual system call sits outside the model entirely.</p>
+
+                    <p>The distinction sounds pedantic until you have run agents in production, at which point it turns out to account for most of the problems. The same model behaves impeccably against one set of tools and repeats the same query ten times against another. In one environment it retries a failed tool once; in another it gives up immediately. A large share of the reports that begin with the words <strong>we swapped the model and the behaviour changed</strong> are actually reports that the contract of the layer wrapping the model changed.</p>
+
+                    <p>The name that layer has acquired is the harness. What follows works through what the harness actually decides, checking each decision against the field names printed in vendor documentation, and then sets out the symptom that appears when each of those decisions is simply left undefined. This is not a framework tour or a feature comparison. The separate question of what shape an agent should take in your codebase was covered in <a href="agent_framework_abstraction.html">what classes, graphs and config files each hide</a>.</p>
+
+                    <div class="callout">
+                        Every field name and default value below is quoted as it appears in the Claude API documentation, the OpenAI function calling guide, the Gemini API type reference, the MCP specification and its JSON schema. Tool calling contracts differ between vendors and get revised within a single vendor, which makes copying field names out of somebody else's write-up the single most common source of error on this topic.
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>What this article covers</h3>
+                        <ol>
+                            <li><a href="#sec-1">The trigger: a repository that led with the word harness</a></li>
+                            <li><a href="#sec-2">What the model actually returns: text and a reason for stopping</a></li>
+                            <li><a href="#sec-3">The boundary of responsibility: who decides what</a></li>
+                            <li><a href="#sec-4">A tool call is a request, not an execution</a></li>
+                            <li><a href="#sec-5">Same concept, different fields: the vendor contracts</a></li>
+                            <li><a href="#sec-6">How failure gets handed back to the model</a></li>
+                            <li><a href="#sec-7">Parallel calls: what one parameter divides</a></li>
+                            <li><a href="#sec-8">What is really behind we swapped the model</a></li>
+                            <li><a href="#sec-9">Stop conditions: when nobody decides when to stop</a></li>
+                            <li><a href="#sec-10">Classifying failure: what to call again and what not to</a></li>
+                            <li><a href="#sec-11">Idempotency: is this a tool you may call twice</a></li>
+                            <li><a href="#sec-12">Approval points: where a person steps in</a></li>
+                            <li><a href="#sec-13">Observability: which tool with which arguments</a></li>
+                            <li><a href="#sec-14">State and context: what disappears when you trim</a></li>
+                            <li><a href="#sec-15">The loop seen as code</a></li>
+                            <li><a href="#sec-16">Build it or adopt one</a></li>
+                            <li><a href="#sec-17">What could not be established</a></li>
+                            <li><a href="#sec-18">References</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">The trigger: a repository that led with the word harness</h2>
+
+                    <p>In early September 2026 a repository called TrueForge was posted to a Korean developer community. The tagline read <strong>an open source harness that runs an LLM as a real agent</strong>. Not a framework, not a library. Leading with the word harness is the part worth noticing.</p>
+
+                    <p>The repository's public numbers, as of 04:22 UTC on 5 September 2026, are as follows. 5,221 stars, 374 forks, 91 open issues, roughly 515 commits, roughly 31 contributors, TypeScript, MIT licence, created on 23 July 2026 and last pushed on 4 September, one day earlier. The most recent tagged releases are the <code>@truefoundry/trueforge@0.2.0-rc.0</code> family from 27 August, and all four npm packages sit at pre-1.0 release candidates. The README requires Node 22.14 or newer.</p>
+
+                    <p>Star count is not a maturity signal. Five thousand stars in six weeks measures attention, not stability, and the 0.2.0-rc version string and the 91 open issues are facts from the same instant. Leaving the interpretation of those numbers to the reader, what is worth taking from the repository here is the <strong>scope it assigns to the word harness</strong>. Its documentation defines a harness as <strong>the runtime layer around an LLM that turns it into a reliable, long-running agent</strong>, and lists its responsibilities as planning, tool routing and execution, context management for long tasks, security boundaries such as sandboxing and human-in-the-loop approvals, and session state that survives reconnects and restarts.</p>
+
+                    <p>What makes that list interesting is that <strong>nothing on it is done by the model</strong>. Planning is managed by the harness, and so is tool routing, context, approval and state. Which leaves the question of what the model does.</p>
+
+                    <h2 id="sec-2">What the model actually returns: text and a reason for stopping</h2>
+
+                    <p>Call a model API once and two things come back. <strong>An array of content blocks</strong> and <strong>the reason generation stopped</strong>. That is the whole of it. Streaming does not change it, and neither does attaching tools.</p>
+
+                    <p>Attach tools and the array may contain <code>tool_use</code> blocks alongside the text blocks. The Claude API documentation states that such a block carries three fields: <code>id</code>, <code>name</code> and <code>input</code>. Respectively, a unique identifier used to match the call up with its result later, the name of the tool being used, and an object of arguments conforming to the tool's <code>input_schema</code>. Nowhere in there is there an <strong>execution</strong>. At the instant the block arrives, the file is still on disk.</p>
+
+                    <p>The <code>stop_reason</code> that carries the reason for stopping is the only signal the harness has for deciding what to do next. Each value demands different handling, and several of them are easy to leave out.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>stop_reason</th><th>What the documentation says it means</th><th>What the harness has to do</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>end_turn</code></td><td>The response finished naturally</td><td>End the loop and use the result as it stands</td></tr>
+                            <tr><td><code>tool_use</code></td><td>A tool is being called and an execution result is expected</td><td>Run the tool, return the result, call again</td></tr>
+                            <tr><td><code>max_tokens</code></td><td>Generation hit the limit set in the request</td><td>Raise the limit or continue the response. If a <code>tool_use</code> block was cut off mid-way, discard that turn</td></tr>
+                            <tr><td><code>stop_sequence</code></td><td>One of the custom stop strings appeared</td><td>Read the <code>stop_sequence</code> field to see which one fired</td></tr>
+                            <tr><td><code>pause_turn</code></td><td>The server-side tool loop reached its iteration limit. The default is 10 per request</td><td>Send the assistant content back as it is to continue. This differs from returning tool results</td></tr>
+                            <tr><td><code>refusal</code></td><td>The model declined. This arrives as a normal 200 response, not an error</td><td>Read the policy category from <code>stop_details</code> and route to a fallback path</td></tr>
+                            <tr><td><code>model_context_window_exceeded</code></td><td>Generation hit the model's context window limit</td><td>Treat the response as truncated. This is a different situation from <code>max_tokens</code></td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>The two most commonly missing branches in practice are <code>pause_turn</code> and <code>model_context_window_exceeded</code>. The first looks like <code>tool_use</code> but is handled in the opposite way, and mistaking the second for <code>max_tokens</code> leads to repeatedly raising a limit that was never the constraint. <strong>A harness with a missing branch simply appears to hang under that condition.</strong></p>
+
+                    <h2 id="sec-3">The boundary of responsibility: who decides what</h2>
+
+                    <p>It is worth laying this out in one place. The left column below lists the decisions that <strong>somebody has to make</strong> in order to run an agent at all, the middle column says where each decision is actually taken, and the right column gives the symptom that appears when nobody takes it.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Decision</th><th>Model's job or harness's job</th><th>Symptom when left undefined</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Choosing which tool to call</td><td>The model. But the candidate list and the descriptions are set by the harness</td><td>Weak descriptions produce wrong choices, or no tool call at all</td></tr>
+                            <tr><td>Actually executing the tool</td><td>Entirely the harness</td><td>The model keeps calling and nothing ever happens</td></tr>
+                            <tr><td>Putting the result back into the conversation</td><td>Entirely the harness</td><td>The same tool is called endlessly. With no result visible, the model concludes it never called it</td></tr>
+                            <tr><td>When to stop</td><td>Entirely the harness</td><td>Step counts climb and cost leaks, and a clean finish cannot be told apart from abandonment</td></tr>
+                            <tr><td>Whether to retry a failure</td><td>Entirely the harness</td><td>A transient blip kills the whole task, or an auth failure is retried twenty times</td></tr>
+                            <tr><td>Preventing duplicate side effects</td><td>Entirely the harness</td><td>The payment or the email goes out twice. The retry is the moment it becomes permanent</td></tr>
+                            <tr><td>Where a human approval is required</td><td>Entirely the harness</td><td>Irreversible operations execute with no notice</td></tr>
+                            <tr><td>Where conversation state lives</td><td>Entirely the harness</td><td>A process restart loses the work in flight</td></tr>
+                            <tr><td>When and how context is trimmed</td><td>Entirely the harness</td><td>Early instructions are forgotten mid-task, or the window is exceeded and the request fails</td></tr>
+                            <tr><td>What gets recorded</td><td>Entirely the harness</td><td>After an incident there is no answer to which tool ran with which arguments</td></tr>
+                            <tr><td>Schema conformance of arguments</td><td>Both. The model generates, the harness validates</td><td>Calls missing required arguments execute as they are</td></tr>
+                            <tr><td>Whether to trust a tool result</td><td>The harness. The model cannot tell incoming text apart</td><td>Instructions embedded in external content are followed verbatim</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>Read the right column top to bottom and it becomes a familiar incident list. And none of those items is fixed by <strong>swapping in a better model</strong>. The last row is the sharpest case. The Claude API documentation notes that tool results frequently carry content from sources outside your control, such as web pages, inbound email, user uploads and third-party APIs, and instructs you to treat that content as <strong>untrusted</strong> and keep it inside <code>tool_result</code> blocks rather than system prompts or plain user text blocks. That is a question of placement, not of model capability.</p>
+
+                    <h2 id="sec-4">A tool call is a request, not an execution</h2>
+
+                    <p>Saying that the model <strong>calls</strong> a tool creates the misunderstanding. What actually happens is closer to filling in a requisition form. The model generates a structure containing a tool name and arguments, and ends its turn there. Everything after that belongs to the outside.</p>
+
+                    <p>Processing that requisition involves at least six decisions the harness has to make.</p>
+
+                    <ul>
+                        <li><strong>Name resolution</strong> - which real function corresponds to the name the model wrote. If the same name exists on several MCP servers, which one wins</li>
+                        <li><strong>Argument validation</strong> - does it match the schema. If not, execute anyway or bounce it back</li>
+                        <li><strong>Permission check</strong> - is this session allowed to call this tool. Is it in a tier that requires approval</li>
+                        <li><strong>Execution environment</strong> - does it run inside the harness process or in an isolated sandbox</li>
+                        <li><strong>Timeout</strong> - how long to wait. The MCP specification tells clients to implement timeouts for tool calls</li>
+                        <li><strong>Result shaping</strong> - if the return value is large, does it go in whole, or does it get summarised or written to a file with only a preview inlined</li>
+                    </ul>
+
+                    <p>The last item has a direct effect on outcomes. Drop a 300KB log straight into the context and every subsequent turn is crushed under it. Insert only a preview and the line that mattered may have been cut away. Whichever branch is taken, <strong>the world the model sees is an edit produced by the harness.</strong> The point at which tool selection itself starts to break down as the catalogue grows, and the ways to narrow it, were covered in <a href="agent_tool_count_accuracy_2026.html">how many tools can you attach</a>.</p>
+
+                    <h2 id="sec-5">Same concept, different fields: the vendor contracts</h2>
+
+                    <p>Tool calling is a shared concept but the contracts differ by vendor. Those differences become branches in the harness code, and they are where porting goes wrong.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Item</th><th>Claude API</th><th>OpenAI function calling</th><th>Gemini API</th><th>MCP</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Tool definition</td><td><code>name</code>, <code>description</code>, <code>input_schema</code></td><td><code>type</code>, <code>name</code>, <code>description</code>, <code>parameters</code>, <code>strict</code></td><td>A function declaration with name, description and parameters</td><td><code>name</code>, <code>title</code>, <code>description</code>, <code>inputSchema</code>, <code>outputSchema</code>, <code>annotations</code></td></tr>
+                            <tr><td>How a call is expressed</td><td>A <code>tool_use</code> block</td><td>A <code>function_call</code> item</td><td>A <code>functionCall</code> part</td><td>A <code>tools/call</code> request</td></tr>
+                            <tr><td>Call identifier</td><td><code>id</code></td><td><code>call_id</code></td><td><code>id</code></td><td>The JSON-RPC <code>id</code></td></tr>
+                            <tr><td>Shape of the arguments</td><td><code>input</code> - an object</td><td><code>arguments</code> - a JSON-encoded string</td><td><code>args</code> - an object</td><td><code>arguments</code> - an object</td></tr>
+                            <tr><td>Returning the result</td><td>A <code>tool_result</code> block inside a <code>user</code> role message</td><td>A <code>function_call_output</code> item</td><td>A <code>functionResponse</code> part</td><td>The <code>content</code> array of the result</td></tr>
+                            <tr><td>Result fields</td><td><code>tool_use_id</code>, <code>content</code>, <code>is_error</code></td><td><code>call_id</code>, <code>output</code></td><td><code>id</code>, <code>name</code>, <code>response</code></td><td><code>content</code>, <code>structuredContent</code>, <code>isError</code></td></tr>
+                            <tr><td>Forcing a call</td><td><code>tool_choice</code> - auto, any, tool, none</td><td><code>tool_choice</code> - auto, required, none, a named function, allowed_tools</td><td><code>mode</code> - AUTO, ANY, NONE, VALIDATED</td><td>Out of scope. The client decides</td></tr>
+                            <tr><td>Schema enforcement</td><td><code>strict: true</code> on the tool definition</td><td><code>strict</code> - every field required, <code>additionalProperties</code> set to false</td><td>The <code>VALIDATED</code> mode</td><td>Given an <code>outputSchema</code>, the server must produce conforming structured results</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>The row that catches the eye first is the shape of the arguments. OpenAI's <code>arguments</code> is a <strong>JSON-encoded string</strong> while the others are objects. That single line adds one more failure path to the harness. When the model emits syntactically broken JSON, that is not a tool failure but an <strong>argument decoding failure</strong>, and routing both down the same channel tangles the retry policy.</p>
+
+                    <p>Where the result goes also splits. The Claude API has no separate <code>tool</code> role and instead puts a <code>tool_result</code> block inside a user message, a difference from other APIs that the documentation calls out explicitly. Attached to it are rules that produce a 400 when broken. <strong>Tool result blocks must immediately follow their corresponding tool use message, and within the user message carrying results, the result blocks must come first in the content array.</strong> Put text ahead of them and the request is rejected.</p>
+
+                    <p>That tool definitions are not free is also part of the contract. The Claude API documentation states that attaching tools automatically inserts a system prompt that enables tool use, and that its token count varies by model and by the <code>tool_choice</code> setting, and it publishes a table. For Claude Opus 5 the figure is 286 tokens under <code>auto</code> or <code>none</code>, and 406 tokens under <code>any</code> or a named tool. The tokens for the tool names, descriptions and schemas are added on top of that.</p>
+
+                    <h2 id="sec-6">How failure gets handed back to the model</h2>
+
+                    <p>Tools fail. The question is <strong>what shape that failure takes when the model sees it</strong>, and that is decided entirely by the harness. The portion fixed by the vendor contract is narrower than people expect.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Surface</th><th>What the contract fixes</th><th>What the harness must decide</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Claude API</td><td><code>is_error: true</code> on the <code>tool_result</code>. The documentation advises writing what went wrong and what to try next</td><td>The wording. Whether to say only that it failed, or to include retry viability and a wait time</td></tr>
+                            <tr><td>OpenAI</td><td>No dedicated error field. The format of <code>output</code> is left to the caller, whether JSON, error codes or plain text</td><td>The entire error convention. The cue that lets the model tell success from failure has to be invented</td></tr>
+                            <tr><td>Gemini</td><td>The <code>response</code> object of a <code>functionResponse</code></td><td>Which key inside that object carries the error</td></tr>
+                            <tr><td>MCP</td><td>Protocol errors and tool execution errors are separated. Unknown tools and invalid arguments become JSON-RPC errors, failures during execution become <code>isError: true</code> in the result</td><td>The criteria deciding which failure goes down which path</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>The reason MCP split the two carries straight over into harness design. <strong>A failure the model needs to see</strong> and <strong>a failure the model has no business seeing</strong> are different things. Calling a tool that does not exist is a protocol violation and a client concern. An API returning 429 is something the model should know about, because it is raw material for deciding to use a different tool or to try again shortly.</p>
+
+                    <p>One common mistake here. <strong>Pasting the error string in verbatim.</strong> Pouring a full stack trace into <code>content</code> eats the context, and internal paths or fragments of credentials can ride along inside it. The principle of passing a reference instead of a value was covered separately in <a href="agent_secret_handling.html">getting work done without handing the agent your credentials</a>. Errors are another place the same principle applies.</p>
+
+                    <h2 id="sec-7">Parallel calls: what one parameter divides</h2>
+
+                    <p>May the model call several tools in one turn? Vendors generally allow it and provide a way to switch it off. The Claude API caps a turn at a single tool call when <code>disable_parallel_tool_use</code> inside <code>tool_choice</code> is set to <code>true</code>. OpenAI ensures exactly zero or one tool is called when <code>parallel_tool_calls</code> is <code>false</code>. Gemini documents native support for both parallel calling and compositional calling chained across turns.</p>
+
+                    <p>That one switch changes the shape of the harness considerably.</p>
+
+                    <ul>
+                        <li><strong>Switched on</strong>, latency drops and round trips fall. In exchange the harness has to gather <strong>all</strong> the results before returning, and has to define what happens when only one of them failed</li>
+                        <li><strong>Left on with side-effecting tools exposed</strong>, ordering guarantees disappear. When a reader and a writer go out in the same turn, which finishes first is decided by the harness execution strategy</li>
+                        <li><strong>Switched off</strong>, tracing gets easier and approval flows get simpler. In exchange the same task needs more model calls, which costs money and time</li>
+                        <li>The Claude API documentation covers the case where a server tool and a client tool land in the <strong>same parallel group</strong>. The user message must then contain only result blocks; appending text ends the turn early and produces a 400</li>
+                    </ul>
+
+                    <p>The point is not that one setting beats the other. It is that <strong>a harness that never made this choice is running on the vendor default</strong>, and the defaults are not the same across vendors.</p>
+
+                    <h2 id="sec-8">What is really behind we swapped the model</h2>
+
+                    <p>Back to the opening observation. When an agent behaves differently after a model swap, how much of that is the model and where does the harness begin?</p>
+
+                    <p>Model capability clearly matters. The documentation states that when a required parameter is missing, Claude Opus is much more likely to recognise this and ask for it, whereas Claude Sonnet might ask but might also infer a plausible value. Differences like that are real. What sits on top of them, however, is a <strong>difference in contract</strong>, and the latter frequently dominates.</p>
+
+                    <ul>
+                        <li><strong>Tool schema expression</strong> - one different line of description changes how often a tool gets selected. If a per-vendor adapter truncates descriptions or flattens schemas, what the model sees changes</li>
+                        <li><strong>Forcing level</strong> - whether it sits at <code>auto</code> or <code>required</code> is a harness setting, not a model setting. If the adapter maps it differently, the same prompt behaves differently</li>
+                        <li><strong>Parallel permission</strong> - exactly as in the previous section. Moving between two vendors with different defaults changes the calling pattern itself</li>
+                        <li><strong>Error expression</strong> - recovery behaviour differs between a harness that signals failure through <code>is_error</code> and one that inlines a bare string</li>
+                        <li><strong>Context trimming</strong> - if the moment and content of summarisation differ, the whole back half of the run behaves differently</li>
+                        <li><strong>System prompt injection</strong> - simply attaching tools causes the vendor to insert a system prompt, whose content and size vary by vendor and by setting</li>
+                    </ul>
+
+                    <p>In practice this means one thing. <strong>Comparing models requires pinning the harness.</strong> Numbers taken from two environments with different harnesses and labelled a model comparison leave behind a conclusion that will not reproduce. Where the boundary of machine-checkable verification lies was set out in <a href="verification_harness_llm_2026.html">the line a verification harness draws</a>.</p>
+
+                    <h2 id="sec-9">Stop conditions: when nobody decides when to stop</h2>
+
+                    <p>From here on come the items the harness <strong>must</strong> decide. Leaving them undefined does not mean falling back to a default; it means <strong>no limit</strong> becomes the implicit default.</p>
+
+                    <p>The model has no notion of a budget. Each turn, if calling one more tool looks like the plausible move, it does that. That judgement does not take remaining cost or elapsed time as inputs. The only place those get measured is outside.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Ceiling</th><th>What it measures</th><th>Symptom without it</th><th>What to do when it trips</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Maximum steps</td><td>Model call round trips</td><td>Variations of the same query repeat. The result still looks correct</td><td>Stop, summarise progress so far and hand it to the user</td></tr>
+                            <tr><td>Cost ceiling</td><td>Cumulative input and output tokens, converted to money</td><td>The invoice is the first notification</td><td>Stop, or step down to a cheaper model</td></tr>
+                            <tr><td>Wall-clock ceiling</td><td>Real elapsed time since the session started</td><td>The user is left waiting for a response</td><td>Emit partial results and ask whether to continue</td></tr>
+                            <tr><td>Per-tool call count</td><td>How many times one tool has been called</td><td>The loop spins inside a single tool while the overall step budget still has room</td><td>Lock that tool for the session and tell the model</td></tr>
+                            <tr><td>No-progress detection</td><td>How many consecutive calls carried identical arguments</td><td>Step counts rise while state stays put</td><td>Report the repetition in the result so a different path gets tried</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>The more common problem in practice is not an infinite loop but <strong>quiet waste</strong>. An agent taking eighty steps over a twenty-step task raises no alarm because the final answer is right. That gap does not surface until a run record is attached. An extreme case of an autonomous agent burning budget is set out in <a href="ai_agent_6531_aws_bill_2026.html">the agent that ran up the bill</a>.</p>
+
+                    <h2 id="sec-10">Classifying failure: what to call again and what not to</h2>
+
+                    <p>When a tool fails, the harness has two questions to answer. <strong>Call it again?</strong> and <strong>tell the model?</strong> They are independent.</p>
+
+                    <ul>
+                        <li><strong>Transient failure</strong> - network timeout, 502, 429. The harness should retry quietly, with backoff and a retry ceiling, and only tell the model once those are exhausted. Reporting every attempt just burns context</li>
+                        <li><strong>Permanent failure</strong> - 404, auth rejection, a resource that does not exist. Retrying produces the same answer. Tell the model at once so it can find another path</li>
+                        <li><strong>Argument error</strong> - schema violation, missing required value, JSON parse failure. The only class the model can actually fix. Return what was missing. The Claude API documentation notes that in this case the model retries with corrections two or three times before apologising to the user</li>
+                        <li><strong>Policy denial</strong> - approval refused, insufficient permission. Not a retry candidate, and the model should be told. Whether the reason is passed through verbatim is a separate judgement</li>
+                        <li><strong>Partial success</strong> - three of ten items failed. The hardest to handle. Whether to treat the whole thing as failed, or to commit the successes and report only the failures, varies tool by tool</li>
+                    </ul>
+
+                    <p>Skip this classification and it breaks in two directions. Retry everything and an auth failure repeats twenty times; hand everything to the model and one transient 502 sends the whole task off course. <strong>Neither is caused by the model being bad.</strong></p>
+
+                    <h2 id="sec-11">Idempotency: is this a tool you may call twice</h2>
+
+                    <p>Introducing retries brings a new question. May that tool be called twice? Payments, emails, ticket creation and deployments happen twice when called twice. A first call that ended in a timeout does not mean it did not run. <strong>Not receiving a response and not having executed are different things.</strong></p>
+
+                    <p>MCP provides a place for a tool to declare its own nature: the four fields of <code>ToolAnnotations</code>. The schema's own description, however, is blunt about their standing.</p>
+
+                    <ul>
+                        <li><code>readOnlyHint</code> - if true, the tool does not modify its environment. <strong>Default false</strong></li>
+                        <li><code>destructiveHint</code> - if true, the tool may perform destructive updates; if false, only additive ones. Meaningful only when <code>readOnlyHint</code> is false. <strong>Default true</strong></li>
+                        <li><code>idempotentHint</code> - if true, calling repeatedly with the same arguments has no additional effect. Also meaningful only when <code>readOnlyHint</code> is false. <strong>Default false</strong></li>
+                        <li><code>openWorldHint</code> - if true, the tool may interact with an open world of external entities. The schema's own example contrasts a web search tool, whose world is open, with a memory tool, whose world is not. <strong>Default true</strong></li>
+                        <li>And the decisive sentence: <strong>all properties in ToolAnnotations are hints and are not guaranteed to provide a faithful description of tool behaviour.</strong> The schema states that clients should never make tool use decisions based on annotations received from untrusted servers</li>
+                    </ul>
+
+                    <p>Notice that every default points in the conservative direction. An unannotated tool is to be treated as <strong>destructive, non-idempotent and interacting with an open world</strong>. And since hints are only hints, retry safety ends up being something the harness has to guarantee on its own side. There are three ways to do it: generate an idempotency key per call and pass it to the tool, check state with a read before retrying, or <strong>exclude side-effecting tools from retry altogether</strong>. The last is the right answer more often than not.</p>
+
+                    <h2 id="sec-12">Approval points: where a person steps in</h2>
+
+                    <p>The MCP specification states, for trust and safety reasons, that <strong>there should always be a human in the loop with the ability to deny tool invocations</strong>, and asks applications for three things: UI that makes clear which tools are exposed to the model, clear visual indicators when tools are invoked, and confirmation prompts. A separate clause asks that <strong>tool inputs be shown to the user before the server is called</strong>, to avoid malicious or accidental data exfiltration.</p>
+
+                    <p>Where to put the approval is a harness policy question. The position is usually one of four.</p>
+
+                    <ul>
+                        <li><strong>Per tool</strong> - certain tools always require approval. Simplest to implement and the most predictable</li>
+                        <li><strong>Per argument</strong> - the same tool splits on its arguments. Deleting inside a temp directory is automatic, any other path needs approval</li>
+                        <li><strong>Cumulative</strong> - after N approvals in this session, the rest go through automatically. Reduces approval fatigue at the cost of a blurred boundary</li>
+                        <li><strong>Per result</strong> - execute, but pause before committing. Only viable for tools that support a dry run</li>
+                    </ul>
+
+                    <p>With no approval point at all, irreversible operations execute with no notice. Put one on everything and people start clicking through without reading. The way to grade this on two axes was set out in <a href="ai_agent_permission_design_2026.html">permission design and where to draw the line</a>, so it is not repeated here. What is worth adding from the harness angle is one thing: <strong>where does the state of a session awaiting approval live?</strong> Keep it in memory only and a single deployment wipes out everything that was waiting.</p>
+
+                    <h2 id="sec-13">Observability: which tool with which arguments</h2>
+
+                    <p>After an incident the questions are fixed. Which tool, with which arguments, at what time, on whose request, and with what result. <strong>Only the harness can produce a record that answers them.</strong> The model does not remember what it called. It only re-reads what remains in the conversation history.</p>
+
+                    <p>The MCP specification asks clients to log tool usage for audit purposes and to validate tool results before passing them to the LLM. The minimum set worth keeping looks like this.</p>
+
+                    <ul>
+                        <li>The call identifier and its matching result - reconstruction after the fact depends on the pairing being intact</li>
+                        <li>Tool name and full arguments - keeping only a summary makes the record useless for an investigation. Since arguments can carry sensitive values, a masking rule has to come with it</li>
+                        <li>Execution timestamp and duration - without these there is no way to know which tool caused the latency</li>
+                        <li>Failure class and retry count - the classification from the previous section has to be recorded for anyone to judge whether the policy was right</li>
+                        <li>Token usage and cumulative cost - recorded per step, otherwise there is no telling which stretch was expensive</li>
+                        <li>Context edit history - without a record of what was cut away, there is no reconstructing why the model made the judgement it made</li>
+                    </ul>
+
+                    <p>The last item is the one most often missing. Summarising and trimming are things the harness does quietly, so they frequently go unlogged, and the result is a system where <strong>the same input no longer produces the same run</strong>. Dissecting a session in terms of token waste was covered in <a href="agent_blackbox_token_analysis_2026.html">the agent blackbox analysis</a>, and the production setup for tracking mistakes in <a href="ai_agent_error_tracking_2026.html">the LLM observability field guide</a>.</p>
+
+                    <h2 id="sec-14">State and context: what disappears when you trim</h2>
+
+                    <p>Long tasks exceed the context window. What the harness does at that point is trimming. The TrueForge documentation enables this by default and sets the trigger at <strong>80 percent of the model's context length</strong>, with a fallback of <strong>50,000 input tokens</strong> where that is unknown. The sentence written alongside it matters more: <strong>compaction is lossy in the working context, while the full session history remains queryable via the API.</strong></p>
+
+                    <p>Those two sentences contain the core of state design. <strong>What the model sees and what the system stores are different objects.</strong> The former is an edit rebuilt on every call; the latter is an append-only record. A harness that treats them as the same thing breaks in one of two directions. With only the edit, nothing can be reconstructed afterwards; with only the record, the window is exceeded and requests fail.</p>
+
+                    <p>Each trimming strategy loses something different.</p>
+
+                    <ul>
+                        <li><strong>Drop oldest first</strong> - the easiest to implement. What is lost is the early instructions and constraints. The classic symptom of violating the original requirement late in a long task comes from here</li>
+                        <li><strong>Replace with a summary</strong> - volume drops, but what the summary keeps is decided by yet another model call. Information lost at the summarisation step does not come back</li>
+                        <li><strong>Offload large results</strong> - write the tool return value to a file and inline only a preview. Loss is small because the model can read it again, but each re-read adds a step</li>
+                        <li><strong>Load tool schemas late</strong> - give names and descriptions first and fetch schemas on demand. The TrueForge documentation states that this defaults to not preloading</li>
+                        <li><strong>Isolate into subagents</strong> - run detail work in a separate context and lift only the final result. Handoff loss and coordination cost appear in exchange, and that boundary was covered in <a href="agent_harness_role_simulation.html">the limits of role-split simulation</a></li>
+                    </ul>
+
+                    <p>Whichever route is taken, <strong>the model does not know what it has forgotten.</strong> Nothing is left to mark the gap. Which is why the trimming policy has to be an observability item.</p>
+
+                    <h2 id="sec-15">The loop seen as code</h2>
+
+                    <p>Placing the preceding items on a single flow gives this shape. What follows is not any particular SDK's API but a skeleton written to expose the decision points. Actual field names follow the vendor contracts in the table above.</p>
+
+                    <pre><code class="language-javascript">// Skeleton of a harness loop - the decision points are annotated
+async function runAgent(task, tools, limits) {
+  const messages = [{ role: 'user', content: task }];
+  let steps = 0, spent = 0;
+  const startedAt = Date.now();
+
+  while (true) {
+    // Decision 1: stop conditions. The model does not measure these
+    if (steps &gt;= limits.maxSteps) return stop('MAX_STEPS', messages);
+    if (spent &gt;= limits.maxCost) return stop('BUDGET', messages);
+    if (Date.now() - startedAt &gt;= limits.maxWallClockMs) return stop('TIMEOUT', messages);
+
+    const res = await model.call({ messages, tools, toolChoice: limits.toolChoice });
+    steps += 1;
+    spent += estimateCost(res.usage);
+    record({ steps, usage: res.usage, stopReason: res.stopReason });  // Decision 6: observability
+
+    // Decision 2: stop_reason branching. One missing branch looks like a hang
+    if (res.stopReason === 'end_turn') return finish(res);
+    if (res.stopReason === 'refusal') return handleRefusal(res);
+    if (res.stopReason === 'max_tokens') return handleTruncated(res);
+    if (res.stopReason === 'pause_turn') { messages.push(asAssistant(res)); continue; }
+
+    const calls = res.content.filter((b) =&gt; b.type === 'tool_use');
+    if (!calls.length) return finish(res);
+
+    // Decision 3: run them in parallel or in sequence
+    const results = limits.parallel
+      ? await Promise.all(calls.map(execute))
+      : await runSequentially(calls, execute);
+
+    messages.push(asAssistant(res));
+    messages.push(asToolResults(results));   // result blocks must come first in the array
+
+    // Decision 4: when context hits the threshold, what gets dropped
+    if (estimateTokens(messages) &gt;= limits.compactAt) await compact(messages);
+  }
+}</code></pre>
+
+                    <p>The part that executes a single tool is where approval and failure classification live. Below, the value returned by <code>classify</code> decides whether to retry, and the idempotency key is what prevents duplicated side effects.</p>
+
+                    <pre><code class="language-javascript">// Tool execution - approval, idempotency and failure classification all meet here
+async function execute(call) {
+  // Decision 5: the approval point. Show the arguments, then ask
+  if (needsApproval(call)) {
+    const verdict = await askUser(call.name, call.input);   // pending state goes to durable storage
+    if (verdict !== 'allow') return toolError(call.id, 'POLICY_DENIED: refused by the user');
+  }
+
+  // Side-effecting tools get a key that is stable across attempts.
+  // An unannotated tool is treated as destructive and non-idempotent
+  const key = isSideEffecting(call) ? idempotencyKey(call) : null;
+
+  let attempt = 0;
+  while (true) {
+    try {
+      const out = await invoke(call.name, call.input, { key, timeoutMs: TOOL_TIMEOUT_MS });
+      return toolResult(call.id, truncateOrOffload(out));   // large results go outside
+    } catch (err) {
+      const kind = classify(err);   // TRANSIENT / PERMANENT / BAD_ARGS / DENIED
+      // Only transient failures are retried quietly. The rest go to the model to judge
+      if (kind === 'TRANSIENT' &amp;&amp; key &amp;&amp; attempt &lt; MAX_RETRY) {
+        await backoff(attempt++);
+        continue;
+      }
+      return toolError(call.id, redact(summarize(err, kind)));   // a masked summary, not the raw text
+    }
+  }
+}</code></pre>
+
+                    <p>Returning the same result to three vendors splits like this. One concept and three sets of fields is exactly why an adapter layer exists.</p>
+
+                    <pre><code class="language-json">// The same failure returned under three contracts - every value is a placeholder
+// Claude API - a result block inside a user message, with a dedicated error flag
+{ "role": "user", "content": [
+  { "type": "tool_result", "tool_use_id": "TOOL_USE_ID",
+    "content": "RateLimited: retry possible after 60 seconds", "is_error": true } ] }
+
+// OpenAI - no dedicated error field. The convention is the harness's to define
+{ "type": "function_call_output", "call_id": "CALL_ID",
+  "output": "{\"ok\":false,\"code\":\"rate_limited\",\"retry_after_s\":60}" }
+
+// MCP - failures during execution go in the result, unknown tools and bad arguments go to JSON-RPC
+{ "jsonrpc": "2.0", "id": 4, "result": {
+  "content": [ { "type": "text", "text": "RateLimited: retry possible after 60 seconds" } ],
+  "isError": true } }</code></pre>
+
+                    <h2 id="sec-16">Build it or adopt one</h2>
+
+                    <p>A harness looks thin. It looks like one loop and a handful of branches, and the first version really does come together in half a day. The problem is that <strong>the items listed above are the harness</strong>. Once stop conditions, failure classification, idempotency, approval, observability, context editing and session persistence are all in, it is no longer thin.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Axis</th><th>Conditions favouring building it</th><th>Conditions favouring adopting one</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Number of tools</td><td>Three or four, fixed, with no plans to grow</td><td>MCP servers will keep being attached</td></tr>
+                            <tr><td>Side effects</td><td>Everything is read-only</td><td>Writes, payments and dispatches are mixed in</td></tr>
+                            <tr><td>Run duration</td><td>It finishes inside one request</td><td>It has to survive reconnects and restarts</td></tr>
+                            <tr><td>Users</td><td>Only the person who built it</td><td>Several people use it and who did what has to be recorded</td></tr>
+                            <tr><td>Vendors</td><td>Pinned to one</td><td>Several are in play. An adapter layer is needed regardless</td></tr>
+                            <tr><td>Approval flow</td><td>Not needed, or everything is automatic</td><td>People intervene mid-run and that state has to survive</td></tr>
+                            <tr><td>Observability demands</td><td>Standard output is enough</td><td>Audit records and cost breakdowns are required</td></tr>
+                            <tr><td>Operational capacity</td><td>One process will do</td><td>There is room to run replicas and a database</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>Two or more matches in the right column and building it costs more than it looks. Conversely, a clean sweep of the left column makes importing someone else's abstraction the losing trade. The isolation problems that appear when several agents are turned loose on one repository sit on a different axis from harness choice, and were covered in <a href="multiple_ai_agents_one_repo_2026.html">collisions and isolation among parallel coding agents</a>.</p>
+
+                    <p>Returning to the repository that triggered this, the feature list its documentation advertises overlaps almost exactly with the right column above. Sandbox as a tool, subagents, deferred loading of tool schemas, large result offloading, compaction, tool approval, asking clarifying questions, generative UI, plus SQLite in local mode and Postgres with Redis in hosted mode. The README states outright that <strong>local mode is for your machine only, has no login by default, and is not a production or internet-facing setup</strong>. Whether a sentence like that exists in the documentation is itself material for an adoption decision.</p>
+
+                    <p>The repository also publishes its own benchmark. Fourteen tasks drawn from DevRev's Enterprise-Bench, run three times per configuration on the same model, the same three MCP servers and the same system prompt, scored by a separate LLM judge, against one closed system and one open source one. That measurement was, however, <strong>carried out by the project itself</strong>, and no third-party reproduction is presented alongside it. A self-run benchmark is meaningful for publishing its setup, but it is a different object from independent verification.</p>
+
+                    <h2 id="sec-17">What could not be established</h2>
+
+                    <ul>
+                        <li>The Gemini function calling documentation <strong>presents two different notations</strong>. The type reference describes <code>functionCall</code> and <code>functionResponse</code> parts carrying <code>args</code> and <code>response</code> objects, while the guide page reads as <code>function_call</code> and <code>function_result</code> with a <code>call_id</code>. Which is canonical for which SDK version is not resolvable from the documentation alone, so the table above carries the type reference notation</li>
+                        <li>Whether Gemini's <code>functionResponse</code> has a <strong>dedicated error field</strong> was not found in the type reference. The text above says only that the error goes inside the <code>response</code> object</li>
+                        <li>The OpenAI documentation has no dedicated field for a tool execution error and states only that the <code>output</code> format is at the caller's discretion. <strong>What shape the model was trained to recognise a failure in</strong> is not in the documentation, so the effect of any error convention remains something to measure locally</li>
+                        <li>Whether the Claude API's default <code>pause_turn</code> limit of 10 can be <strong>adjusted per request</strong> was not stated in that documentation</li>
+                        <li>TrueForge's <strong>retry policy, default maximum step count and cost ceiling configuration</strong> could not be pinned down from the section titles of the public documentation. What is quoted above is limited to the items where the documentation prints a figure, such as the compaction threshold and the deferred loading default</li>
+                        <li>The repository figures are values as of 04:22 UTC on 5 September 2026. What 5,221 stars, roughly 515 commits and roughly 31 contributors <strong>imply about operational stability</strong> cannot be said from those numbers alone</li>
+                        <li>The MCP specification tells clients to implement timeouts for tool calls but offers no <strong>recommended value</strong></li>
+                        <li>The Claude API table of tool use system prompt token counts varies by model, and <strong>what accounts for the differences</strong> is not explained in the documentation</li>
+                    </ul>
+
+                    <h2 id="sec-18">References</h2>
+
+                    <ul>
+                        <li><a href="https://news.hada.io/topic?id=33138" target="_blank" rel="noopener">GeekNews topic 33138</a> - the post that triggered this article, carrying the repository address and a summary</li>
+                        <li><a href="https://github.com/truefoundry/trueforge" target="_blank" rel="noopener">truefoundry/trueforge (GitHub)</a> - the README feature list, the local and hosted mode table, the MIT licence, the Node 22.14 requirement, and the source of the public figures quoted above</li>
+                        <li><a href="https://trueforge.dev/introduction" target="_blank" rel="noopener">Introduction (TrueForge docs)</a> - the sentence defining a harness as a runtime layer, and its list of responsibilities</li>
+                        <li><a href="https://trueforge.dev/key-features/overview" target="_blank" rel="noopener">Harness Capabilities (TrueForge docs)</a> - the 80 percent compaction trigger and the 50,000 input token fallback, the deferred loading default, and the statement that compaction is lossy in the working context</li>
+                        <li><a href="https://trueforge.dev/benchmarking" target="_blank" rel="noopener">Benchmarking (TrueForge docs)</a> - the self-run benchmark setup of fourteen tasks, three runs per configuration and LLM judge scoring</li>
+                        <li><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview" target="_blank" rel="noopener">Tool use with Claude</a> - <code>input_schema</code> in the tool definition, <code>tool_choice</code> and <code>disable_parallel_tool_use</code>, the tool use system prompt token table, and the per-model difference when a required parameter is missing</li>
+                        <li><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls" target="_blank" rel="noopener">Handle tool calls (Claude docs)</a> - the three fields of <code>tool_use</code>, <code>tool_use_id</code> and <code>is_error</code> on <code>tool_result</code>, the rule that result blocks come first in the array, and the warning to treat tool results as untrusted content</li>
+                        <li><a href="https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons" target="_blank" rel="noopener">Handling stop reasons (Claude docs)</a> - the seven <code>stop_reason</code> values in the table above with their handling, and the default 10-iteration limit behind <code>pause_turn</code></li>
+                        <li><a href="https://developers.openai.com/api/docs/guides/function-calling" target="_blank" rel="noopener">Function calling (OpenAI docs)</a> - <code>call_id</code> and the JSON-string <code>arguments</code> on <code>function_call</code>, <code>output</code> on <code>function_call_output</code>, <code>parallel_tool_calls</code>, and the constraints of <code>strict</code> mode</li>
+                        <li><a href="https://ai.google.dev/api/generate-content" target="_blank" rel="noopener">Generate Content type reference (Gemini API)</a> - the fields of <code>functionCall</code> and <code>functionResponse</code>, and <code>mode</code> on <code>functionCallingConfig</code> with AUTO, ANY, NONE and VALIDATED</li>
+                        <li><a href="https://ai.google.dev/gemini-api/docs/function-calling" target="_blank" rel="noopener">Function calling (Gemini docs)</a> - the statement that parallel and compositional calling are natively supported</li>
+                        <li><a href="https://modelcontextprotocol.io/specification/2025-06-18/server/tools" target="_blank" rel="noopener">Tools (MCP specification 2025-06-18)</a> - the fields of <code>tools/list</code> and <code>tools/call</code>, the split between <code>isError</code> and JSON-RPC errors, the human-in-the-loop clause, and the timeout and audit logging guidance</li>
+                        <li><a href="https://github.com/modelcontextprotocol/modelcontextprotocol/blob/main/schema/2025-06-18/schema.json" target="_blank" rel="noopener">MCP JSON schema 2025-06-18</a> - the defaults of the four <code>ToolAnnotations</code> fields and the original note that all of them are only hints</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>Share this post</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X (Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">Copy link</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">Back to list</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Free tools you may find useful</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/yaml_json_converter.html">YAML JSON Converter 2026</a></li>
+      <li><a href="../static/curl_builder.html">curl Command Builder 2026</a></li>
+      <li><a href="../static/http_status_codes.html">HTTP Status Codes Reference 2026</a></li>
+      <li><a href="../static/nginx_generator.html">Nginx Config Generator 2026</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">See all tools &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Related Posts</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="k8s_control_room_questions.html">Why Kubernetes Control Rooms Do Not Answer - The Four Questions You Actually Ask During an Incident 2026</a></li>
+      <li><a href="loop_engineering_practice.html">What Actually Ends a Loop - Termination, Feedback, and State Contamination in Agent Loops 2026</a></li>
+      <li><a href="xargs_parallel_safe_guide.html">xargs -P Parallel Execution - Why Output Interleaves and How to Stop It</a></li>
+      <li><a href="personal_agent_server.html">A Server With a Resident Agent - What Changes When One Person Runs It</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('Link copied. Paste it into the Threads app to share.');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('Link copied.'); });
+    });
+    </script>
+</body>
+</html>

@@ -1,0 +1,631 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>浏览器主线程为什么只有一条 - 谁在分用这一条，什么又能被移出去</title>
+    <meta name="description" content="主线程只有一条这件事究竟决定了什么。本文梳理脚本与渲染互相阻塞的机制，从官方文档核对 INP、TBT 与 Long Animation Frames 的定义和阈值，并划出哪些工作能交给 Worker 和合成线程、哪些永远出不去。">
+    <meta name="keywords" content="主线程, 渲染管线, INP, TBT, Long Animation Frames, Web Worker, OffscreenCanvas, content-visibility, CSS containment, scheduler.yield, 合成线程, 网页性能, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/browser_main_thread_cost.html">
+
+    <meta property="og:title" content="浏览器主线程为什么只有一条 - 谁在分用这一条，什么又能被移出去">
+    <meta property="og:description" content="卡顿的根源往往不是代码有多慢，而是这一条线程正被什么抓着。本文用官方文档的定义梳理清单与边界。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/browser_main_thread_cost.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-09-05">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="浏览器主线程为什么只有一条">
+    <meta name="twitter:description" content="谁在分用这一条线程，又有什么在结构上根本出不去。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "浏览器主线程为什么只有一条 - 谁在分用这一条，什么又能被移出去",
+      "alternativeHeadline": "脚本与渲染互相阻塞的机制、三个指标各自测什么，以及出不去的工作的边界",
+      "datePublished": "2026-09-05",
+      "dateModified": "2026-09-05",
+      "inLanguage": "zh-CN",
+      "articleSection": "开发/基础设施",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "主线程, 渲染管线, INP, TBT, Long Animation Frames, Web Worker, OffscreenCanvas, content-visibility, CSS containment, 合成线程",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/browser_main_thread_cost.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "浏览器主线程究竟负责哪些事情?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Chromium 渲染架构文档写明，渲染进程的主线程负责运行脚本、渲染事件循环、文档生命周期、命中测试、脚本事件派发，以及 HTML 和 CSS 等数据格式的解析。这份清单之所以重要，是因为其中的条目彼此并不独立。只要有一项抓着线程，其余全部都在后面排队。JavaScript 跑得久，样式计算和布局就往后推，期间到达的点击只能积在队列里等着。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "INP 的良好取值标准是多少?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "按 web.dev 文档的说法，200 毫秒以内属于良好响应。超过 200 毫秒且不超过 500 毫秒属于需要改进，超过 500 毫秒则判定为响应性差。判定用的不是平均值而是 75 百分位数，并且区分移动端与桌面端。INP 统计的是点击、轻触以及物理键盘或屏幕键盘的按键，滚动、悬停和缩放都不计入。一次交互被拆成输入延迟、处理时长和呈现延迟三段。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Long Animation Frames 与 Long Tasks 有什么不同?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "两者的阈值同为 50 毫秒，但计数的单位不同。Long Tasks 只抓单个超过 50 毫秒的任务，因此五个 40 毫秒的任务接连堵住一帧时，什么都不会被记录。Long Animation Frames 看的是帧而不是任务。渲染更新被拖延超过 50 毫秒时，这一帧本身就会被记录，同时还会留下是哪个脚本、来自哪个文件的第几个字符、耗时多少。截至 2026 年 9 月，它只能在 Chrome 123 及以上和 Edge 123 及以上使用。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "哪些工作永远无法搬进 Web Worker?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "凡是要碰 DOM 的都不行。MDN 明确指出，在 Worker 内部无法直接操作 DOM，也无法使用 window 对象的部分默认方法和属性。由于拿不到 window、document 和 parent，样式计算、布局、命中测试和输入事件派发在结构上就出不去。能出去的是输入输出只有数据的纯计算。画布是唯一的例外，OffscreenCanvas 允许把渲染控制权单独摘出来交给 Worker。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "content-visibility 到底跳过了什么?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "设置了 content-visibility 为 auto 的元素会获得布局、样式和绘制三种隔离，处于屏幕外时还会额外获得尺寸隔离。在此期间浏览器只对元素盒本身做样式和布局，跳过内容的绘制与命中测试。web.dev 的旅行博客示例中，初次渲染时间从 232 毫秒降到 30 毫秒。要注意的是，尺寸隔离一旦生效，屏幕外元素高度会塌成 0 导致滚动条乱跳，因此必须配合 contain-intrinsic-size 给出占位尺寸。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/browser_main_thread_cost.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/browser_main_thread_cost.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/browser_main_thread_cost.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/browser_main_thread_cost.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/browser_main_thread_cost.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "首页",
+      "item": "https://braindetox.kr/zh/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "开发/基础设施",
+      "item": "https://braindetox.kr/zh/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "浏览器主线程为什么只有一条 - 谁在分用这一条，什么又能被移出去",
+      "item": "https://braindetox.kr/zh/posts/browser_main_thread_cost.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="浏览器主线程为什么只有一条 - 谁在分用这一条，什么又能被移出去">
+                <meta itemprop="datePublished" content="2026-09-05">
+                <meta itemprop="dateModified" content="2026-09-05">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="主线程, 渲染管线, INP, TBT, Long Animation Frames, Web Worker, OffscreenCanvas, content-visibility, CSS containment, 合成线程">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/browser_main_thread_cost.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">浏览器主线程为什么只有一条 - 谁在分用这一条，什么又能被移出去</h1>
+                    <h2 class="post-subtitle">脚本与渲染互相阻塞的机制、三个指标各自测的东西，以及最终出不去的那些工作的边界</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-05">2026-09-05</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">开发/基础设施</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>网页卡顿时，最先冒出来的诊断多半是<strong>代码太慢</strong>。于是改算法、换库、削减打包体积。可这些做完之后体感照旧的情况并不少见。问题从来不是速度，而是<strong>位置</strong>。</p>
+
+                    <p>在一个浏览器标签页里，与画面有关的工作几乎全部发生在<strong>仅有的一条线程</strong>上。JavaScript 在那里跑，样式计算在那里做，布局和绘制指令的生成也在那里。就连判定某个坐标下压着哪个元素这件事也在那里。这份清单上的每一项都<strong>在等其他项</strong>。只要有一项抓着线程，其余就得排队。</p>
+
+                    <p>本文不是优化技巧集。它要看的是这一条线程<strong>被谁分用着</strong>、卡顿这种体感会被哪些指标捕捉到，以及线程上的工作里，哪些<strong>能被移出去、哪些永远出不去</strong>，那条界线画在哪里。知道界线在哪，也就同时看清了哪些优化从一开始就不可能成立。</p>
+
+                    <div class="callout">
+                        以下的指标定义与阈值，全部与 web.dev、Chrome for Developers、W3C 草案、MDN 及 WHATWG HTML 标准原文所载一致。性能指标的阈值是会被修订的，而把旧文章里的数字原样搬过来，正是最常见的错误。下表中的数值同样需要连同引用时点一起读。
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>本文要讲的内容</h3>
+                        <ol>
+                            <li><a href="#sec-1">缘起 - 问题不在代码的速度而在它的位置</a></li>
+                            <li><a href="#sec-2">主线程实际背着的工作清单</a></li>
+                            <li><a href="#sec-3">一次只能一件 - 任务跑完才让出座位</a></li>
+                            <li><a href="#sec-4">帧预算 - 16.6 毫秒里真正属于你的部分</a></li>
+                            <li><a href="#sec-5">互相阻塞的方式 - 五个阶段的依赖关系</a></li>
+                            <li><a href="#sec-6">测量卡顿的三个指标及其阈值</a></li>
+                            <li><a href="#sec-7">为什么只有长任务是不够的</a></li>
+                            <li><a href="#sec-8">让出 - 放开线程再重新抓住的技艺</a></li>
+                            <li><a href="#sec-9">给工作贴上优先级</a></li>
+                            <li><a href="#sec-10">能移出去的一 - 交给 Worker 的计算</a></li>
+                            <li><a href="#sec-11">能移出去的二 - 交给合成线程的动效</a></li>
+                            <li><a href="#sec-12">移不出去的 - 边界画在哪里</a></li>
+                            <li><a href="#sec-13">直接减少工作 - 隔离与跳过</a></li>
+                            <li><a href="#sec-14">本文与那篇引子文章分岔的地方</a></li>
+                            <li><a href="#sec-15">未能确认的部分</a></li>
+                            <li><a href="#sec-16">参考资料</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">缘起 - 问题不在代码的速度而在它的位置</h2>
+
+                    <p>2026 年 9 月初，韩国开发者社区出现了一篇题为<strong>浏览器的主线程很贵</strong>的文章。原文用韩语写成，主旨压缩成一句话就是：问题不在于代码慢，而在于这段代码偏偏抓着主线程。原文在这个判断之上叠了七条处方：切分、合并、优先级、推迟、交给合成线程、送进 Worker，以及干脆把工作本身去掉。原文写道，其中最后一条通常留下的收益最大。</p>
+
+                    <p>处方清单是有用的。但清单不解释<strong>这些处方为什么有效</strong>。切分明明没让任何东西变快，为什么响应会变好？能送进 Worker 的工作和不能送的，分界线是什么？交给合成线程这句话，具体跳过了哪个阶段？这些只有看结构才会浮出来。</p>
+
+                    <p>所以本文用<strong>结构与边界</strong>取代处方。其中也包括原文没有涉及的内容。Long Animation Frames、OffscreenCanvas 和 <code>requestIdleCallback</code> 在原文里没有出现。反过来，原文提到的 <code>content-visibility</code>、INP 与 TBT 这里也会讲，但会把官方文档的定义原样附上。性能话题里最常见的事故，就是<strong>把别人抄过的数字再抄一遍</strong>。</p>
+
+                    <h2 id="sec-2">主线程实际背着的工作清单</h2>
+
+                    <p>Chromium 的渲染架构文档用一句话列举了渲染进程内主线程承担的工作：<strong>运行脚本、渲染事件循环、文档生命周期、命中测试、脚本事件派发，以及 HTML 和 CSS 等数据格式的解析</strong>。同一份文档还写明，渲染进程里另有合成线程和若干辅助线程。也就是说浏览器并不是单线程的，<strong>只是计算画面真相的地方只有一处</strong>。</p>
+
+                    <p>这份清单值得注意的地方在于，条目在性质上完全是不同的事，却<strong>站在同一条队里</strong>。一个排序算法、一次样式重算和一次点击回调之间毫无关系，但一旦共用执行座位，就互相成了对方迟到的原因。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>主线程承担的工作</th><th>具体指什么</th><th>这里堵住时出现的症状</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>脚本执行</td><td>事件处理函数、定时器回调、网络响应处理、框架内部逻辑</td><td>期间到达的输入只能在队列里等</td></tr>
+                            <tr><td>渲染事件循环与文档生命周期</td><td>样式计算、布局、预绘制、绘制指令生成</td><td>帧迟到，画面看上去像卡死了</td></tr>
+                            <tr><td>命中测试</td><td>判定某个坐标下压着哪个元素</td><td>按下去却什么反应都没有</td></tr>
+                            <tr><td>脚本事件派发</td><td>沿捕获与冒泡路径调用已注册的处理函数</td><td>输入延迟原样累积</td></tr>
+                            <tr><td>HTML 与 CSS 等的解析</td><td>解释文档、样式表以及其他数据格式</td><td>首次渲染被往后推</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>表格右列是用户真正遭遇的东西，左列是开发者在代码里看到的东西。在这两列之间搭桥，就是下一节要做的事。</p>
+
+                    <h2 id="sec-3">一次只能一件 - 任务跑完才让出座位</h2>
+
+                    <p>这个结构之所以成为问题，真正的原因不是线程只有一条，而是<strong>执行单元不可被抢占</strong>。JavaScript 任务一旦开始就会跑到底。中途来了更急的事，浏览器也没法把它切开插进去。操作系统调度器会在时间片耗尽时强制切换上下文，事件循环里没有这种机制。</p>
+
+                    <p>所以当一个耗时 300 毫秒的函数正在跑、用户按下按钮时，这次点击会以<strong>已经存在但还没人知道</strong>的状态待在队列里。函数结束派发才开始，处理函数结束才轮到渲染更新。这段等待正是后面要讲的 INP 的第一段，即输入延迟。</p>
+
+                    <p>这里有一个常见误解需要澄清：<strong>异步不等于并行</strong>。<code>async</code> 函数、Promise 链、<code>fetch</code> 的响应处理，最终都会作为主线程上的任务或微任务回来。等网络确实会放开线程，但响应到达之后的解析、状态更新和列表重绘，全都发生在同一个座位上。用异步写法并不会把繁重计算搬到别处去。</p>
+
+                    <h2 id="sec-4">帧预算 - 16.6 毫秒里真正属于你的部分</h2>
+
+                    <p>画面要看起来顺滑，帧就得规律地产出。web.dev 的渲染性能文档写道，在 60Hz 屏幕上浏览器<strong>制作一帧有 16.66 毫秒</strong>。紧接着它就补了一句限定：浏览器每帧都有自己的开销，所以<strong>你的全部工作必须在 10 毫秒内完成</strong>。</p>
+
+                    <p>这个数字重要的地方在于<strong>比例</strong>而不是绝对值。刷新率上去了，预算就等比缩水。120Hz 屏幕上帧间隔减半，可用时间也减半。设备越高端似乎越宽裕，但刷新率一起提高之后，实际上反而更紧。</p>
+
+                    <p>而且这 10 毫秒<strong>并不是 JavaScript 独享的预算</strong>。样式计算、布局、绘制指令生成都要装进去。脚本用掉 8 毫秒，剩下的全部就得在 2 毫秒内结束。重绘列表的代码看起来很快，但只要跟在它后面的布局成本超了预算，帧照样会掉。</p>
+
+                    <h2 id="sec-5">互相阻塞的方式 - 五个阶段的依赖关系</h2>
+
+                    <p>web.dev 把一帧的生成过程称为五个阶段：<strong>JavaScript、样式、布局、绘制、合成</strong>。JavaScript 制造视觉变化，样式阶段匹配哪些 CSS 规则作用于哪些元素并算出计算值。布局决定元素的尺寸和屏幕位置，这个阶段的特点是<strong>一个元素的变化可能扩散到整棵树</strong>。绘制把结果变成填充像素的指令，合成则把画好的图层按正确顺序放到屏幕上。</p>
+
+                    <p>这个顺序本身就是依赖关系。没有布局结果就无法绘制，没有样式计算就无法布局。由此引出两点。</p>
+
+                    <ul>
+                        <li>改哪个属性，决定了<strong>进入管线的入口在哪</strong>。改宽度或位置就要从布局重来，只改颜色则跳过布局从绘制开始</li>
+                        <li>有些属性<strong>能把布局和绘制一起跳过</strong>。web.dev 明确写道，如果改的属性既不需要布局也不需要绘制，浏览器可以直接跳到合成阶段，并称这是管线中最廉价也最理想的路径</li>
+                        <li>在同一帧里<strong>交替进行读和写</strong>，浏览器为了返回最新的布局值会把计算提前执行。所谓先把要读的全读完、再把要写的集中写，习惯的由来就在这里</li>
+                        <li>这种强制计算在代码里很难看出来。一个询问元素尺寸或位置的属性就会当场触发布局，如果它待在循环里，<strong>布局就会跑上和条目数一样多的次数</strong></li>
+                    </ul>
+
+                    <p>归结起来，主线程上的这些工作不只是分用一个座位，它们<strong>互为输入与输出</strong>。所以一处的延迟会蔓延到另一处，一处的节省也会救活另一处。</p>
+
+                    <h2 id="sec-6">测量卡顿的三个指标及其阈值</h2>
+
+                    <p>结构清楚了，下一步是测量。卡顿这个词本身不携带任何信息，不先定好测什么、怎么测，连有没有改善都判断不了。网页上通行的轴有三条。</p>
+
+                    <h3>INP - 从按下去到画面改变</h3>
+
+                    <p>Interaction to Next Paint 通过<strong>观测整次访问期间发生的所有点击、轻触与键盘交互的延迟</strong>，来表示该页面的整体响应性。一次交互被拆成三段：处理函数开始执行前等待的<strong>输入延迟</strong>、各个回调运行的<strong>处理时长</strong>，以及回调结束后到下一帧被绘制出来的<strong>呈现延迟</strong>。滚动、悬停和缩放不计入 INP。INP 在 2024 年成为稳定的核心网页指标，取代了 FID。</p>
+
+                    <h3>TBT - 加载期间主线程被堵住的总量</h3>
+
+                    <p>Total Blocking Time 指 First Contentful Paint 之后，主线程<strong>被占用到足以妨碍输入响应的时间总和</strong>。算法简单到值得直接背下来：在主线程上运行超过 50 毫秒的任务叫长任务，每个长任务<strong>只把超出 50 毫秒的那部分</strong>累加。一个 120 毫秒的任务贡献 70 毫秒，一个 45 毫秒的任务贡献 0。TBT 是实验室指标。web.dev 写道，在真实环境中测量虽然可行，但用户交互会让数值大幅波动、报告方差变大，因此不推荐。</p>
+
+                    <h3>LoAF - 按帧看延迟，并附上肇事者</h3>
+
+                    <p>Long Animation Frames 数的是<strong>帧</strong>而不是任务。W3C 草案把持续时间超过 50 毫秒的两种情形定义为长动画帧：一个之后不需要更新渲染的任务，以及一个之后需要更新渲染的任务<strong>直到渲染真正被更新为止</strong>的区间。条目里包含 <code>startTime</code>、<code>duration</code>、<code>renderStart</code>、<code>styleAndLayoutStart</code>、<code>blockingDuration</code>、<code>firstUIEventTimestamp</code>，以及归因脚本数组 <code>scripts</code>。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>指标</th><th>测的是什么</th><th>在哪里测</th><th>官方文档给出的良好值</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>INP</td><td>点击、轻触或按键之后到下一次绘制的延迟，覆盖整次访问</td><td>真实用户现场数据，用于核心网页指标判定</td><td>200 毫秒以内为良好。超过 200 且不超过 500 需要改进。超过 500 为差。按 75 百分位数判定</td></tr>
+                            <tr><td>TBT</td><td>FCP 之后长任务超出 50 毫秒部分的总和</td><td>实验室工具。web.dev 不推荐现场测量</td><td>在中等移动硬件上小于 200 毫秒</td></tr>
+                            <tr><td>LoAF</td><td>渲染更新被拖延超过 50 毫秒的每一帧，以及肇事脚本</td><td>用 <code>PerformanceObserver</code> 观测。Chrome 123 及以上、Edge 123 及以上</td><td>没有单一阈值。帧的持续时间超过 50 毫秒即被记录</td></tr>
+                            <tr><td>参考：核心网页指标三项</td><td>LCP 看加载，INP 看交互，CLS 看视觉稳定性</td><td>现场数据，移动端与桌面端分开汇总</td><td>LCP 2.5 秒以内、INP 200 毫秒以内、CLS 0.1 以内，均取 75 百分位数</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>三个指标从不同角度看同一件事。TBT 是<strong>加载区间的总量</strong>，INP 是<strong>真实用户遭遇的响应性</strong>，LoAF 则告诉你<strong>哪一帧出了问题、是谁干的</strong>。当作改进流程来用，就是：用 LoAF 找出肇事者，用 TBT 防止回归，用 INP 确认修复真的落到了用户身上。</p>
+
+                    <h2 id="sec-7">为什么只有长任务是不够的</h2>
+
+                    <p>Long Tasks API 长期是观察主线程占用的基本工具。但这个 API 有个结构性的盲区：<strong>只有单个任务超过 50 毫秒</strong>才会被记录。五个 40 毫秒的任务接连堵住一帧长达 200 毫秒，长任务一个都抓不到。用户等了 200 毫秒，仪表盘却安静如常。</p>
+
+                    <p>LoAF 以帧为粒度补上了这个盲区。Chrome for Developers 的文档说明，因为 LoAF 看的是整帧而不是单个任务，所以能捕捉到<strong>多个小任务合起来阻塞渲染</strong>的情形，并且在时序拆解和脚本归因上都好得多。这里 <code>blockingDuration</code> 的算法很有意思。W3C 草案写道，把帧内任务的持续时间降序排列，如果发生了渲染就把渲染时长并入最长的那个任务，然后把每一项超出 50 毫秒的部分加起来。这是把 TBT 的计算规则挪进了一帧的内部。</p>
+
+                    <p>脚本归因在实务中的体感也很大。<code>PerformanceScriptTiming</code> 条目里带有调用方信息 <code>invoker</code> 与 <code>invokerType</code>、执行起始时刻 <code>executionStart</code>、指向源码位置的 <code>sourceURL</code> 与 <code>sourceFunctionName</code> 与 <code>sourceCharPosition</code>，以及该脚本强制触发的样式与布局耗时 <code>forcedStyleAndLayoutDuration</code>。最后这一项，正是把前面说的读写交错成本<strong>以数字形式还给你的地方</strong>。</p>
+
+                    <p>但支持范围很窄。它只在 Chrome 123 及以上和 Edge 123 及以上工作，Firefox 与 Safari 目前都没有。因此 LoAF 是<strong>诊断工具</strong>，不是覆盖全体用户的仪表盘。把这个区别弄模糊，在 Safari 用户占比较大的服务上就会产生错误的安心感。</p>
+
+                    <h2 id="sec-8">让出 - 放开线程再重新抓住的技艺</h2>
+
+                    <p>既然没有抢占，剩下的办法就只有<strong>主动放手</strong>。把长活切成若干任务，在碎片之间留出让浏览器插进来的缝隙。这里有一点必须挑明：<strong>让出并不会减少总工作量</strong>。恰恰因为任务切换的开销，整体时间还会略微变长。换来的是中间多出了输入处理和渲染可以进入的位置。这是一笔做同样多的活、只买响应性的交易。</p>
+
+                    <p>让出的手段有好几种，性质各不相同。用 <code>setTimeout</code> 推迟，任务会被挂到<strong>队列最末尾</strong>。如果期间涌进了大量其他任务，自己的活就要等很久才恢复。而且嵌套一深还会被钳制。WHATWG HTML 标准规定，当嵌套层级大于 5 且超时值小于 4 时，<strong>把超时值提升为 4</strong>。</p>
+
+                    <p><code>scheduler.yield()</code> 正面处理了这个问题。web.dev 说明它就是一个返回 Promise 的函数，而且<strong>当前任务的后续部分会先于其他同类任务</strong>执行。也就是说让出但不用排到队尾。支持情况为 Chrome 129 及以上、Edge 129 及以上、Firefox 142 及以上，Safari 不支持。</p>
+
+                    <pre><code class="language-javascript">// 分批处理长列表，每帧都把主线程放开一次。
+async function processInChunks(items, work) {
+  const CHUNK_BUDGET_MS = 5;        // 一次抓住线程的时长 (经验值)
+  let start = performance.now();
+
+  for (let i = 0; i &lt; items.length; i++) {
+    work(items[i]);
+
+    // 预算还没用完就继续抓着。
+    if (performance.now() - start &lt; CHUNK_BUDGET_MS) continue;
+
+    // 有 scheduler.yield 就用它。
+    // 后续部分会先于其他同类任务回来。
+    if (typeof scheduler !== 'undefined' &amp;&amp; 'yield' in scheduler) {
+      await scheduler.yield();
+    } else {
+      // 兜底路径。会排到队尾，嵌套过深还会被钳制到 4ms。
+      await new Promise((resolve) =&gt; setTimeout(resolve, 0));
+    }
+    start = performance.now();
+  }
+}
+</code></pre>
+
+                    <p>这里有一条已被废弃的建议需要点出来。只在有输入等待时才让出、因而使用 <code>isInputPending()</code> 的写法曾经流传了一阵。web.dev 现在<strong>不再推荐这个 API</strong>，并明确建议<strong>无论是否有输入在等待都应当让出</strong>，理由是可能出现假阴性且覆盖范围不完整。旧博客文章里残留的代码最好不要照搬。</p>
+
+                    <h2 id="sec-9">给工作贴上优先级</h2>
+
+                    <p>光靠让出有时还不够，因为<strong>放开的座位由谁先占</strong>仍然没有定。Prioritized Task Scheduling API 负责这一块。<code>scheduler.postTask()</code> 接受三档优先级，MDN 写道执行会<strong>按优先级顺序、同优先级内按声明顺序</strong>进行。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>优先级</th><th>怎么指定</th><th>贴给什么样的工作</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>user-blocking</code></td><td>在选项里显式写明</td><td>用户正在等结果、且挡住了画面更新的工作</td></tr>
+                            <tr><td><code>user-visible</code></td><td>省略时就是它 (默认值)</td><td>画面上看得见但没那么即时的工作</td></tr>
+                            <tr><td><code>background</code></td><td>在选项里显式写明</td><td>没人在等的工作，比如预计算或日志上报</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>如果优先级以后可能需要改，就不能把值直接写进选项。MDN 建议，<strong>可变的优先级要创建 <code>TaskController</code>、把它的信号传给选项，再用 <code>setPriority()</code> 调整</strong>。原本从容预算的工作因为用户点了一下而突然变急，正是这种情形。</p>
+
+                    <p>相邻的位置上还有 <code>requestIdleCallback</code>。MDN 说明它把函数排进浏览器的空闲期，从而能够<strong>在不影响动画和输入响应这类延迟敏感事件的前提下</strong>，在主线程上跑后台低优先级工作。回调会收到 <code>IdleDeadline</code>，用 <code>timeRemaining()</code> 询问剩余时间，用 <code>didTimeout</code> 确认自己是不是因为超时才被调用的。有两条限定：对于必须执行的工作<strong>强烈建议使用 <code>timeout</code> 选项</strong>；而一旦超时到期，即便<strong>冒着造成负面性能影响的风险</strong>回调也会被排入队列。可用性并不宽，MDN 标注它因为在部分最广泛使用的浏览器上无法工作而不属于 Baseline。这个 API 在原文里没有出现。</p>
+
+                    <h2 id="sec-10">能移出去的一 - 交给 Worker 的计算</h2>
+
+                    <p>从这里开始才是本文的正题：主线程上的工作里，<strong>真正能出去的</strong>是什么？第一条通道是 Web Worker。</p>
+
+                    <p>Worker 的边界画得异常清晰。MDN 明确指出，在 Worker 内部<strong>无法直接操作 DOM，也无法使用 <code>window</code> 对象的部分默认方法和属性</strong>。Worker 里做不到的核心是直接影响父页面，其中就包括操作 DOM 和使用该页面的对象。因为全局作用域是 <code>DedicatedWorkerGlobalScope</code> 而不是 <code>Window</code>，所以没有 <code>window</code>、没有 <code>document</code>、没有 <code>parent</code>。反过来，<code>fetch</code>、<code>XMLHttpRequest</code>、定时器、标准内置对象和 <code>importScripts()</code> 都可以用。</p>
+
+                    <p>第二件要知道的事是<strong>数据怎么过去</strong>。默认是复制。照搬 MDN 的表述：主页面与 Worker 之间传递的数据是被复制而不是共享的，对象在交出时被序列化、在另一端被反序列化，页面与 Worker 不共享同一个实例，结果是<strong>两边各自多出一份副本</strong>。这就是结构化克隆。所以每帧来回搬运大数组，会让搬进 Worker 得到的收益被序列化成本抵消掉。</p>
+
+                    <p>可转移对象解决了这个问题。所有权整体移交，所以不发生复制。MDN 写道，把 <code>ArrayBuffer</code> 转移给 Worker 之后，<strong>原来的 <code>ArrayBuffer</code> 会被清空、不再可用</strong>，内容是字面意义上被转移走了。</p>
+
+                    <pre><code class="language-javascript">// main.js - 大缓冲区不要复制，把所有权整个交出去。
+const worker = new Worker('./heavy.js');
+const pixels = new Uint8ClampedArray(width * height * 4);
+// ... 填充 pixels ...
+
+worker.postMessage(
+  { buffer: pixels.buffer, width, height },
+  [pixels.buffer]                 // 第二个参数是转移列表
+);
+// 这一行之后 pixels.buffer 就空了 (byteLength === 0)
+
+worker.onmessage = (e) =&gt; {
+  const out = new ImageData(new Uint8ClampedArray(e.data.buffer), e.data.width);
+  ctx.putImageData(out, 0, 0);    // 碰 DOM 的活在这里，在主线程上
+};
+
+// heavy.js - 这里没有 DOM。只进数据，只出数据。
+self.onmessage = (e) =&gt; {
+  const { buffer, width, height } = e.data;
+  const buf = new Uint8ClampedArray(buffer);
+  for (let i = 0; i &lt; buf.length; i += 4) {
+    const g = (buf[i] * 0.299 + buf[i + 1] * 0.587 + buf[i + 2] * 0.114) | 0;
+    buf[i] = buf[i + 1] = buf[i + 2] = g;
+  }
+  self.postMessage({ buffer: buf.buffer, width, height }, [buf.buffer]);
+};
+</code></pre>
+
+                    <p>画布在这条边界上开了一扇例外的门。OffscreenCanvas <strong>把 DOM 与 Canvas API 解耦</strong>，让 <code>&lt;canvas&gt;</code> 元素不再完全依赖 DOM。MDN 说明渲染操作可以在 Worker 上下文中运行，从而<strong>把繁重的工作从主线程挪走</strong>。用法是通过 <code>transferControlToOffscreen()</code> 摘下控制权并转移给 Worker，而且在 Worker 里连 <code>requestAnimationFrame()</code> 都能用。文档标注它自 2023 年 3 月起已在各浏览器上普遍可用。这个 API 同样没有出现在原文里。</p>
+
+                    <h2 id="sec-11">能移出去的二 - 交给合成线程的动效</h2>
+
+                    <p>第二条通道性质不同。你不是在搬运代码，而是在<strong>把条件凑齐，让浏览器自己把活放到另一条线程上处理</strong>。</p>
+
+                    <p>Chromium 文档写道，渲染进程里的合成线程负责处理输入、执行滚动与动画，并协调图像解码和光栅任务。它还明确指出，<strong>把主线程与合成线程分开，对于把动画和滚动从主线程工作中做性能隔离至关重要</strong>。更具体地说：视觉效果动画与滚动可以跳过布局、预绘制和绘制，而只要这三个阶段能被跳过，它们<strong>就能完全在合成线程上运行并跳过主线程</strong>。</p>
+
+                    <p>落到实务上，规则就很简单了。用 <code>left</code> 和 <code>top</code> 做位移动画，每帧都要跑布局，而布局属于主线程。同样的位移改用 <code>transform</code>，布局和绘制都被跳过，只剩合成。不透明度也是一样。<strong>主线程再忙也依旧顺滑的动画</strong>和一行脚本就卡死的动画，分野就在这里。</p>
+
+                    <p>滚动适用同一原理，但这里有个开发者自己把好处退回去的常见陷阱：事件监听器的 <code>passive</code> 选项。MDN 说明把 <code>passive</code> 设为 <code>true</code>，就是声明该监听器不会取消默认动作，因而<strong>浏览器可以不等监听器执行完就立即开始默认动作</strong>。反过来，只要挂着可取消的监听器，浏览器无从知道 <code>preventDefault()</code> 会不会被调用，就<strong>必须等</strong>。那段等待就是滚动延迟。</p>
+
+                    <p>默认值需要记准。MDN 写道，未指定时 <code>passive</code> 为 <code>false</code>，<strong>但在 Safari 以外的浏览器中</strong>，对于挂在 <code>Window</code>、<code>Document</code>、<code>Document.body</code> 这些文档级节点上的 <code>wheel</code>、<code>mousewheel</code>、<code>touchstart</code>、<code>touchmove</code>，默认为 <code>true</code>。也就是说挂在具体元素而非文档级节点上的触摸监听器，默认仍然是 <code>false</code>。这是应当养成显式写 <code>{ passive: true }</code> 习惯的地方。</p>
+
+                    <h2 id="sec-12">移不出去的 - 边界画在哪里</h2>
+
+                    <p>现在看另一侧。有些工作无论怎么折腾都出不去，原因不在性能而在<strong>定义</strong>。</p>
+
+                    <h3>必须碰 DOM 的工作</h3>
+
+                    <p>Worker 里没有 <code>document</code>，这是设计而不是实现未完成。DOM 是一棵多线程同时触碰就无法保持一致性的可变树，所以访问被收拢到一条线程上。接受这个决定，<strong>样式计算与布局就一并被收拢了</strong>，因为两者都得读 DOM 树和样式表。Chromium 文档把文档生命周期写成主线程的工作，说的正是这个意思。</p>
+
+                    <h3>必须保留可取消性的输入</h3>
+
+                    <p>命中测试与事件派发同理。要知道某个坐标下压着哪个元素就需要最新的布局，而布局在主线程上。再者，监听器有可能调用 <code>preventDefault()</code> 这一可能性本身就<strong>会让浏览器等待</strong>。即便滚动正由合成线程处理，只要出现可取消的监听器，判定就得回头问主线程。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>想做的事</th><th>能否移出主线程</th><th>为什么</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>解析、压缩、排序、图像像素处理这类纯计算</td><td>能 — Web Worker</td><td>不使用 DOM，输入输出只有数据</td></tr>
+                            <tr><td>往画布上绘制</td><td>能 — OffscreenCanvas 加 Worker</td><td>画布可以从 DOM 上摘下来，只把控制权交给 Worker</td></tr>
+                            <tr><td><code>transform</code> 与 <code>opacity</code> 动画</td><td>能 — 合成线程</td><td>布局、预绘制和绘制都能跳过</td></tr>
+                            <tr><td>滚动</td><td>多数情况能 — 合成线程</td><td>但挂上可取消的监听器就得回头问主线程</td></tr>
+                            <tr><td>读写 DOM</td><td>不能</td><td>Worker 里没有 <code>window</code>、<code>document</code>、<code>parent</code></td></tr>
+                            <tr><td>样式计算与布局</td><td>不能</td><td>文档生命周期被定义为主线程的工作</td></tr>
+                            <tr><td>运行输入事件处理函数</td><td>不能</td><td>脚本事件派发本身就发生在主线程上</td></tr>
+                            <tr><td>命中测试</td><td>不能</td><td>必须读到最新布局才能判定</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>这张表给出的结论相当干脆：<strong>腾空主线程的最好办法不是搬走而是减少</strong>。能搬的只有表格上面那四行，而真实网页应用里最吃时间的通常是下面那四行。</p>
+
+                    <h2 id="sec-13">直接减少工作 - 隔离与跳过</h2>
+
+                    <p>减少工作的办法里最具结构性的是 CSS 隔离。MDN 说明 CSS containment 能<strong>把页面的子树与其余 DOM 隔离开</strong>，从而让浏览器通过优化这些独立部分的渲染来提升性能。<code>contain</code> 属性的各个值各自关住不同的东西：<code>size</code> 把元素的尺寸计算与其内容切开，<code>layout</code> 把布局重算约束在该元素及其后代之内，<code>style</code> 对应样式重算，<code>paint</code> 把绘制关在元素边界之内。<code>content</code> 是 <code>layout</code>、<code>style</code>、<code>paint</code> 三者的简写，不含尺寸。<code>strict</code> 在此之上再加 <code>size</code>，是最强的形态。</p>
+
+                    <p>隔离真正变成收益的代表性场景是 <code>content-visibility</code>。web.dev 文档写道，带有 <code>content-visibility: auto</code> 的元素<strong>会获得布局、样式和绘制隔离，处于屏幕外时还会获得尺寸隔离</strong>。在此期间浏览器只对元素盒本身做样式和布局，不绘制内容也不做命中测试。同一份文档的旅行博客示例里，渲染时间<strong>从 232 毫秒降到 30 毫秒</strong>，文档称之为 7 倍提升。</p>
+
+                    <pre><code class="language-css">/* 跳过屏幕外卡片的样式、布局与绘制 */
+.feed-card {
+  content-visibility: auto;
+
+  /* 跳过期间使用的占位尺寸。
+     没有它，屏幕外元素高度会塌成 0，
+     滚动条长度会不停乱跳。 */
+  contain-intrinsic-size: auto 480px;
+}
+
+/* 只在连尺寸也可以隔离的地方才用 strict。
+   strict = size + layout + style + paint */
+.widget-frame {
+  contain: strict;
+  width: 320px;
+  height: 240px;
+}
+</code></pre>
+
+                    <p><code>contain-intrinsic-size</code> 指定的是<strong>元素受尺寸隔离影响时所使用的自然尺寸</strong>。没有它，屏幕外元素会塌成零高度，滚动条大小随之抖动。web.dev 把这个属性称作替代已渲染内容的占位尺寸。</p>
+
+                    <p>有一点需要留意。被 <code>content-visibility: auto</code> 跳过的内容<strong>仍然可以被页内查找搜到并跳转过去</strong>，无需等待其加载完成。这既是它与 <code>display: none</code>、<code>visibility: hidden</code> 的区别，也是它的优点。但也正因如此，屏幕外的地标元素会照样出现在无障碍树里，所以文档建议在需要时加上 <code>aria-hidden</code> 来整理。也就是说，拿到性能的同时还要另外照顾<strong>不把无障碍树弄乱</strong>这一平衡。</p>
+
+                    <p>走到这里，原文为什么说最大的收益通常来自把工作删掉，也就说得通了。能搬的本来就少，搬运本身还有成本，而压根没做的工作<strong>在任何线程上都不占时间</strong>。</p>
+
+                    <h2 id="sec-14">本文与那篇引子文章分岔的地方</h2>
+
+                    <p>原文给的是处方。它把该做什么分成七支，配上例子展示出来，是实务中可以直接取用的形态，尤其切分、合并、优先级这三支具体到不用框架也能落地。原文列出的数字与本文也不冲突：16.6 毫秒的帧预算、50 毫秒的长任务标准，以及同时提到 INP 与 TBT 的部分都是如此。</p>
+
+                    <p>本文画的是边界。在处方之前先把<strong>什么因为什么原因必须待在什么位置</strong>定下来，日后出现新处方时就能自己判断它该放在哪里。为此，下面三样是从原文之外拿来补上的。</p>
+
+                    <ul>
+                        <li><strong>Long Animation Frames</strong> — 原文里没有。只靠长任务标准抓不到小任务合起来堵住一帧的情形，补上这个盲区的正是这个 API</li>
+                        <li><strong>OffscreenCanvas</strong> — 原文里没有。它是 Worker 不能碰 DOM 这条规则上唯一实用的缺口，讲边界时无法略过</li>
+                        <li><strong><code>requestIdleCallback</code></strong> — 原文里没有。它处在优先级话题的另一端，是处理最低档位的老手段，可用范围狭窄这一事实也要一起看</li>
+                        <li>反过来 <strong><code>content-visibility</code></strong> 原文是提到的。原文把它简短介绍为用一行 CSS 追求类似效果的属性，而本文把它获得的隔离种类以及必须搭配使用的属性都摊开了讲</li>
+                    </ul>
+
+                    <p>关于测量再补一句：感受到的迟滞与仪表盘上的数值经常对不上。处理这段落差的文章是<a href="software_performance_expectations.html">可以慢下去的共识是怎么形成的</a>，而画面状态一致性如何转化为信任，则由<a href="every_frame_perfect_ui_trust_2026.html">每一帧都要完美</a>来讲。把渲染搬进画布会失去什么，写在<a href="html_in_canvas_rendering.html">把 HTML 画进 canvas 的 API</a> 里；用虚拟化扛住海量列表的具体案例，已经在 <a href="trees_file_tree_rendering_library_2026.html">Trees 文件树渲染库</a>整理过，这里就不重复了。</p>
+
+                    <p>最后提一个顺序建议。动代码之前先看<strong>是哪一帧迟到、为什么迟到</strong>。用 LoAF 找出肇事脚本，再确认这个脚本做的事属于上面表格的哪一行。属于上面四行就搬走，属于下面四行就减少。光是把这个判断做对，<strong>把时间花在根本不成立的优化上</strong>这件事就会消失。</p>
+
+                    <h2 id="sec-15">未能确认的部分</h2>
+
+                    <ul>
+                        <li>嵌套定时器的最小延迟值在不同文档里写法不一致。WHATWG HTML 标准规定嵌套层级大于 5 且超时值小于 4 时提升为 4，而 web.dev 的长任务文档写的是<strong>5 毫秒</strong>。正文采用了标准一侧的数值，但两份文档为何不同未能确认</li>
+                        <li><code>IdleDeadline.timeRemaining()</code> 返回值是否存在<strong>50 毫秒之类的上限</strong>，在 MDN 文档里没有找到明确说明。这是被频繁引用的数字，但因为没有直接确认到规范原句，正文里没有采用</li>
+                        <li>INP 取代 FID 的<strong>确切日期</strong>未能确认。确认到的只是核心网页指标文档中「2024 年成为稳定指标」的表述，以及公告文章里只写着「今天就是这一天」这一事实</li>
+                        <li>Long Animation Frames 的 50 毫秒标准<strong>是否可调</strong>，以及这个指标今后是否有升格为核心网页指标的计划，都未能确认</li>
+                        <li>OffscreenCanvas 是否支持 <strong>WebGPU 上下文</strong>，在 MDN 概览文档里未能确认。该文档给出的示例只有 2D 与 WebGL</li>
+                        <li>原文提出的<strong>每帧 5 毫秒的分块预算</strong>是经验值而非规范。这个数值的出处或依据原文没有写，因而无法确认。正文示例中也标注了它是经验值</li>
+                        <li>Safari 对 <code>requestIdleCallback</code> 与 <code>scheduler.yield()</code> 的支持情况，只确认到 MDN「在部分最广泛使用的浏览器上无法工作」的表述与 web.dev「Safari 不支持」的说明，<strong>逐版本兼容性表</strong>没有直接打开查看</li>
+                        <li>WHATWG HTML 标准中<strong>「update the rendering」子步骤的顺序</strong>虽然打开了文档，但相关章节被截断因而未能确认。正文的管线顺序依据的是 web.dev 与 Chromium 架构文档的表述</li>
+                    </ul>
+
+                    <h2 id="sec-16">参考资料</h2>
+
+                    <ul>
+                        <li><a href="https://news.hada.io/topic?id=33205" target="_blank" rel="noopener">GeekNews 话题 33205</a> — 本文的缘起帖，附有原文地址与摘要</li>
+                        <li><a href="https://kciter.so/posts/the-expensive-main-thread/" target="_blank" rel="noopener">浏览器的主线程很贵 (kciter.so)</a> — 作为缘起的韩语原文。七条处方、16.6 毫秒与 50 毫秒的标准、<code>content-visibility</code>、<code>scheduler.yield()</code> 支持不均都在这里</li>
+                        <li><a href="https://developer.chrome.com/docs/chromium/renderingng-architecture" target="_blank" rel="noopener">RenderingNG architecture (Chrome for Developers)</a> — 主线程职责清单、合成线程的角色，以及滚动与视觉效果动画可以跳过主线程这一表述的出处</li>
+                        <li><a href="https://web.dev/articles/rendering-performance" target="_blank" rel="noopener">Rendering performance (web.dev)</a> — JavaScript、样式、布局、绘制、合成五个阶段，16.66 毫秒的帧与 10 毫秒的工作预算，以及跳过布局与绘制的路径</li>
+                        <li><a href="https://web.dev/articles/inp" target="_blank" rel="noopener">Interaction to Next Paint (web.dev)</a> — INP 的定义，输入延迟、处理时长、呈现延迟三段，200 毫秒与 500 毫秒阈值，以及滚动、悬停、缩放的排除</li>
+                        <li><a href="https://web.dev/articles/tbt" target="_blank" rel="noopener">Total Blocking Time (web.dev)</a> — TBT 定义，长任务 50 毫秒标准与超出部分的累加规则，FCP 之后的区间，实验室指标的定位，以及低于 200 毫秒的目标</li>
+                        <li><a href="https://web.dev/articles/vitals" target="_blank" rel="noopener">Web Vitals (web.dev)</a> — LCP 2.5 秒、INP 200 毫秒、CLS 0.1 与 75 百分位数的汇总规则，以及 INP 于 2024 年成为稳定指标的表述</li>
+                        <li><a href="https://developer.chrome.com/docs/web-platform/long-animation-frames" target="_blank" rel="noopener">Long Animation Frames API (Chrome for Developers)</a> — 50 毫秒阈值与 Long Tasks 相同、以帧为单位观察的理由、条目字段，以及 Chrome 123 及以上的支持情况</li>
+                        <li><a href="https://w3c.github.io/long-animation-frames/" target="_blank" rel="noopener">Long Animation Frames API 草案 (W3C)</a> — 长动画帧的规范定义、<code>blockingDuration</code> 的计算步骤，以及 <code>PerformanceScriptTiming</code> 的属性清单</li>
+                        <li><a href="https://web.dev/articles/optimize-long-tasks" target="_blank" rel="noopener">Optimize long tasks (web.dev)</a> — 50 毫秒长任务定义、<code>setTimeout</code> 会排到队尾的说明、<code>scheduler.yield()</code> 的行为与支持范围，以及 <code>isInputPending()</code> 的不再推荐</li>
+                        <li><a href="https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html" target="_blank" rel="noopener">Timers (WHATWG HTML Standard)</a> — 嵌套层级大于 5 时把超时值提升为 4 的规定</li>
+                        <li><a href="https://developer.mozilla.org/en-US/docs/Web/API/Scheduler/postTask" target="_blank" rel="noopener">Scheduler.postTask() (MDN)</a> — 三档优先级与默认值、先按优先级再按声明顺序的执行规则，以及用 <code>TaskController</code> 变更的方法</li>
+                        <li><a href="https://developer.mozilla.org/en-US/docs/Web/API/Window/requestIdleCallback" target="_blank" rel="noopener">Window.requestIdleCallback() (MDN)</a> — 排入空闲期的定义、<code>IdleDeadline</code> 与 <code>timeout</code> 选项的限定，以及不属于 Baseline 的标注</li>
+                        <li><a href="https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API/Using_web_workers" target="_blank" rel="noopener">Using Web Workers (MDN)</a> — 不能操作 DOM、结构化克隆会在两侧各留一份副本的表述、可转移对象以及原缓冲区被清空的说明</li>
+                        <li><a href="https://developer.mozilla.org/en-US/docs/Web/API/OffscreenCanvas" target="_blank" rel="noopener">OffscreenCanvas (MDN)</a> — DOM 与 Canvas API 的解耦、<code>transferControlToOffscreen()</code>，以及自 2023 年 3 月起各浏览器普遍可用</li>
+                        <li><a href="https://developer.mozilla.org/en-US/docs/Web/CSS/CSS_containment" target="_blank" rel="noopener">CSS containment (MDN)</a> — <code>contain</code> 各个值分别关住什么、<code>content</code> 与 <code>strict</code> 的构成，以及 <code>contain-intrinsic-size</code> 的作用</li>
+                        <li><a href="https://web.dev/articles/content-visibility" target="_blank" rel="noopener">content-visibility (web.dev)</a> — <code>auto</code> 所获得的隔离种类、从 232 毫秒降到 30 毫秒的示例，以及页内查找保留与 <code>aria-hidden</code> 的注意事项</li>
+                        <li><a href="https://developer.mozilla.org/en-US/docs/Web/API/EventTarget/addEventListener" target="_blank" rel="noopener">EventTarget.addEventListener() (MDN)</a> — <code>passive</code> 选项的含义与默认值，以及仅对文档级节点上的滚轮与触摸事件默认为 true 的例外</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>分享本文</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">返回列表</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/base64_encoder.html">Base64 编码器/解码器</a></li>
+      <li><a href="../static/yaml_json_converter.html">YAML JSON转换器 2026</a></li>
+      <li><a href="../static/curl_builder.html">curl命令生成器 2026</a></li>
+      <li><a href="../static/http_status_codes.html">HTTP状态码完全参考 2026</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="software_performance_expectations.html">可以慢下去的共识是怎么形成的 - 硬件越来越快为何体感依旧 2026</a></li>
+      <li><a href="llm_simultaneous_outage.html">同一时刻停摆并不等于同一原因 - 多个AI服务一起宕机的那天</a></li>
+      <li><a href="dev_tool_tos_account_risk.html">当条款里的一句话足以停掉账号 - 引入开发工具前要读的六类条款</a></li>
+      <li><a href="aws_config_attack_paths.html">AWS 检查项全部通过，路径却还在 - 把资源之间的关系放进检查清单</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制。粘贴到 Threads 应用即可分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制。'); });
+    });
+    </script>
+</body>
+</html>

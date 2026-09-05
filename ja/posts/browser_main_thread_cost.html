@@ -1,0 +1,631 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ja">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ブラウザのメインスレッドはなぜ一本しかないのか - その一本を分け合うもの、外に出せるもの</title>
+    <meta name="description" content="メインスレッドが一本しかないという事実が何を決めるのかを整理する。スクリプトとレンダリングが互いを塞ぐ仕組み、INP・TBT・Long Animation Frames の定義としきい値、そしてワーカーとコンポジタへ出せる仕事の境界を引く。">
+    <meta name="keywords" content="メインスレッド, レンダリングパイプライン, INP, TBT, Long Animation Frames, Web Worker, OffscreenCanvas, content-visibility, CSS containment, scheduler.yield, コンポジタ, ウェブ性能, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/ja/posts/browser_main_thread_cost.html">
+
+    <meta property="og:title" content="ブラウザのメインスレッドはなぜ一本しかないのか - その一本を分け合うもの、外に出せるもの">
+    <meta property="og:description" content="遅さの正体はコードの速度ではなく、一本しかないスレッドを何が掴んでいるかだ。その一覧と境界を公式文書の定義で整理する。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/ja/posts/browser_main_thread_cost.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ja_JP">
+    <meta property="article:published_time" content="2026-09-05">
+    <meta property="article:section" content="開発・インフラ">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="ブラウザのメインスレッドはなぜ一本しかないのか">
+    <meta name="twitter:description" content="一本のスレッドを何が分け合い、何が構造的にそこから出られないのか。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "ブラウザのメインスレッドはなぜ一本しかないのか - その一本を分け合うもの、外に出せるもの",
+      "alternativeHeadline": "スクリプトとレンダリングが互いを塞ぐ仕組み、三つの指標が測るもの、そして出られない仕事の境界",
+      "datePublished": "2026-09-05",
+      "dateModified": "2026-09-05",
+      "inLanguage": "ja-JP",
+      "articleSection": "開発・インフラ",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "メインスレッド, レンダリングパイプライン, INP, TBT, Long Animation Frames, Web Worker, OffscreenCanvas, content-visibility, CSS containment, コンポジタ",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/ja/posts/browser_main_thread_cost.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "ブラウザのメインスレッドは正確に何を担当しているのか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Chromium のレンダリングアーキテクチャ文書は、レンダープロセスのメインスレッドがスクリプトの実行、レンダリングのイベントループ、ドキュメントライフサイクル、ヒットテスト、スクリプトイベントのディスパッチ、そして HTML や CSS をはじめとするデータ形式のパースを担うと記している。この一覧が重要なのは、項目どうしが独立していないからだ。どれか一つがスレッドを掴んでいる間、残りはすべてその後ろで待つ。JavaScript が長く回ればスタイル計算とレイアウトが後ろにずれ、その間に届いたクリックはキューに積まれたまま待たされる。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "INP の良い値の基準はいくつか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "web.dev の文書によれば、200ミリ秒以下が良い応答性である。200ミリ秒を超えて500ミリ秒以下なら改善が必要、500ミリ秒を超えると応答性が悪いと分類される。判定は平均ではなく75パーセンタイルで行い、モバイルとデスクトップを分けて見る。INP が測るのはクリック、タップ、物理または画面キーボードの入力であり、スクロールとホバーと拡大は数えない。一回の操作は入力遅延、処理時間、表示遅延の三区間に分かれる。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Long Animation Frames は Long Tasks と何が違うのか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "しきい値はどちらも50ミリ秒で同じだが、数える単位が違う。Long Tasks はタスク一つが50ミリ秒を超えた場合しか捉えない。だから40ミリ秒のタスクが五つ連なって一フレームを塞いでも、何も記録されない。Long Animation Frames はタスクではなくフレームを見る。レンダリングの更新が50ミリ秒を超えて遅れると、そのフレーム自体が記録され、どのスクリプトがどのファイルの何文字目からどれだけ掛かったかまで一緒に残る。2026年9月時点で Chrome 123 以上と Edge 123 以上でのみ使える。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Web Worker に移せない仕事は何か?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "DOM に触れる仕事のすべてだ。MDN はワーカーの中から DOM を直接操作できず、window オブジェクトの既定のメソッドやプロパティの一部も使えないと明記している。window も document も parent も参照できないため、スタイル計算、レイアウト、ヒットテスト、入力イベントのディスパッチは構造的に外へ出られない。出せるのは入出力がデータだけの純粋な計算である。ただしキャンバスだけは例外で、OffscreenCanvas によって描画の制御権だけを切り離してワーカーへ渡せる。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "content-visibility は何を省かせるのか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "content-visibility を auto にした要素はレイアウト、スタイル、ペイントの封じ込めを得て、画面外にある間はサイズの封じ込めまで得る。その間ブラウザは要素ボックス自体のスタイルとレイアウトだけを行い、中身のペイントとヒットテストは省く。web.dev の旅行ブログの例では初期レンダリング時間が232ミリ秒から30ミリ秒へ縮んだ。ただしサイズの封じ込めが効くと画面外の要素の高さが0に潰れてスクロールバーが揺れるため、contain-intrinsic-size で代替サイズを一緒に指定する必要がある。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/browser_main_thread_cost.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/browser_main_thread_cost.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/browser_main_thread_cost.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/browser_main_thread_cost.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/browser_main_thread_cost.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "ホーム",
+      "item": "https://braindetox.kr/ja/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "開発・インフラ",
+      "item": "https://braindetox.kr/ja/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "ブラウザのメインスレッドはなぜ一本しかないのか - その一本を分け合うもの、外に出せるもの",
+      "item": "https://braindetox.kr/ja/posts/browser_main_thread_cost.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="ブラウザのメインスレッドはなぜ一本しかないのか - その一本を分け合うもの、外に出せるもの">
+                <meta itemprop="datePublished" content="2026-09-05">
+                <meta itemprop="dateModified" content="2026-09-05">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="メインスレッド, レンダリングパイプライン, INP, TBT, Long Animation Frames, Web Worker, OffscreenCanvas, content-visibility, CSS containment, コンポジタ">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/ja/posts/browser_main_thread_cost.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">ブラウザのメインスレッドはなぜ一本しかないのか - その一本を分け合うもの、外に出せるもの</h1>
+                    <h2 class="post-subtitle">スクリプトとレンダリングが互いを塞ぐ仕組み、三つの指標がそれぞれ測るもの、そして最後まで出られない仕事の境界</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-05">2026-09-05</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">開発・インフラ</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>ウェブ画面がもたつくとき、真っ先に出てくる診断はたいてい<strong>コードが遅い</strong>というものだ。だからアルゴリズムを直し、ライブラリを差し替え、バンドルを削る。ところがそこまでやっても体感が変わらないことが少なくない。問題は速度ではなく<strong>場所</strong>だったからである。</p>
+
+                    <p>ブラウザのタブ一つの中で、画面に関わる仕事はほぼすべてが<strong>たった一本のスレッド</strong>の上で起きる。JavaScript もそこで回り、スタイル計算もそこで行い、レイアウトもペイント命令の生成もそこだ。押された座標にどの要素があるかを判定する仕事さえそこにある。この一覧に載っているものは<strong>互いを待つ</strong>。一つがスレッドを掴んでいる間、残りは列を作る。</p>
+
+                    <p>この記事は最適化のコツ集ではない。その一本のスレッドを<strong>何が分け合っているのか</strong>、遅いという体感がどの指標で捉えられるのか、そしてその上の仕事のうち外へ<strong>出せるものと最後まで出られないもの</strong>の境界がどこに引かれているのかを見る。境界を知れば、どの最適化がそもそも成り立たないのかも同時に見えてくる。</p>
+
+                    <div class="callout">
+                        以下の指標の定義としきい値は、すべて web.dev、Chrome for Developers、W3C 草案、MDN、WHATWG HTML 標準の原文に書かれているとおりである。性能指標のしきい値は改訂されるため、古い記事に書かれた数字をそのまま写すのが最もよくある誤りだ。下の表の値も、引用した時点と一緒に読む必要がある。
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>この記事で扱うこと</h3>
+                        <ol>
+                            <li><a href="#sec-1">きっかけ - 問題はコードの速度ではなく場所だ</a></li>
+                            <li><a href="#sec-2">メインスレッドが実際に背負っている仕事の一覧</a></li>
+                            <li><a href="#sec-3">一度に一つ - タスクは最後まで回ってから席を譲る</a></li>
+                            <li><a href="#sec-4">フレーム予算 - 16.6ミリ秒のうち実際に使えるもの</a></li>
+                            <li><a href="#sec-5">互いを塞ぐ仕組み - 五段階の依存関係</a></li>
+                            <li><a href="#sec-6">遅さを測る三つの指標としきい値</a></li>
+                            <li><a href="#sec-7">ロングタスクだけでは足りなかった理由</a></li>
+                            <li><a href="#sec-8">譲る - スレッドを手放してまた掴む技術</a></li>
+                            <li><a href="#sec-9">仕事に優先度を付けるということ</a></li>
+                            <li><a href="#sec-10">出せるもの その一 - ワーカーへ出る計算</a></li>
+                            <li><a href="#sec-11">出せるもの その二 - コンポジタへ出る動き</a></li>
+                            <li><a href="#sec-12">出せないもの - 境界はどこに引かれているか</a></li>
+                            <li><a href="#sec-13">仕事そのものを減らす - 封じ込めと省略</a></li>
+                            <li><a href="#sec-14">きっかけとなった記事とこの記事が分かれる地点</a></li>
+                            <li><a href="#sec-15">確認できなかったこと</a></li>
+                            <li><a href="#sec-16">参考資料</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">きっかけ - 問題はコードの速度ではなく場所だ</h2>
+
+                    <p>2026年9月初め、韓国の開発者コミュニティに<strong>ブラウザのメインスレッドは高価だ</strong>という記事が上がった。韓国語で書かれた原文で、要旨は一文に圧縮されている。コードが遅いからではなく、そのコードがよりによってメインスレッドを掴んでいるから問題になるのだ、というものだ。原文はその診断の上に七つの処方を積む。分割、まとめ、優先度、先送り、コンポジタへ載せる、ワーカーへ送る、そして仕事そのものをなくす、である。原文はこのうち最後のものが最も大きく残ると書いている。</p>
+
+                    <p>処方の一覧は役に立つ。ただし一覧は<strong>なぜその処方が効くのか</strong>を説明しない。分割すると速くならないのになぜ反応が良くなるのか、ワーカーへ送れる仕事と送れない仕事を分ける線が何なのか、コンポジタへ載せるという言葉が正確にどの段階を飛ばすことなのかは、構造を見なければ出てこない。</p>
+
+                    <p>そこでこの記事は処方の代わりに<strong>構造と境界</strong>を整理する。原文が扱っていないものも含まれる。Long Animation Frames、OffscreenCanvas、<code>requestIdleCallback</code> は原文には出てこない。逆に原文が扱った <code>content-visibility</code>、INP、TBT はここでも扱うが、公式文書の定義をそのまま添える。性能の話で最もよくある事故は<strong>誰かが写した数字をまた写すこと</strong>だからだ。</p>
+
+                    <h2 id="sec-2">メインスレッドが実際に背負っている仕事の一覧</h2>
+
+                    <p>Chromium のレンダリングアーキテクチャ文書は、レンダープロセスの中のメインスレッドが担う仕事を一文で列挙している。<strong>スクリプトの実行、レンダリングのイベントループ、ドキュメントライフサイクル、ヒットテスト、スクリプトイベントのディスパッチ、そして HTML や CSS をはじめとするデータ形式のパース</strong>である。同じ文書は、レンダープロセスにコンポジタスレッドと複数の補助スレッドが別にあることも併せて記す。つまりブラウザはシングルスレッドではない。<strong>画面の真実を計算する場所が一つなだけだ。</strong></p>
+
+                    <p>この一覧で注目すべきなのは、項目どうしが性質としてはまったく別物なのに<strong>同じ列に並んでいる</strong>という点だ。ソートのアルゴリズムとスタイルの再計算とクリックハンドラの呼び出しには何の関係もないが、実行の席を共有した瞬間、互いの遅れの原因になる。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>メインスレッドが担う仕事</th><th>具体的には何か</th><th>ここで詰まると出る症状</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>スクリプトの実行</td><td>イベントハンドラ、タイマーのコールバック、ネットワーク応答の処理、フレームワークの内部ロジック</td><td>その間に届いた入力がキューで待たされる</td></tr>
+                            <tr><td>レンダリングのイベントループとドキュメントライフサイクル</td><td>スタイル計算、レイアウト、プリペイント、ペイント命令の生成</td><td>フレームが遅れて画面が止まって見える</td></tr>
+                            <tr><td>ヒットテスト</td><td>どの座標にどの要素が置かれているかの判定</td><td>押したのに何も起こらない</td></tr>
+                            <tr><td>スクリプトイベントのディスパッチ</td><td>キャプチャとバブルの経路に沿って登録済みハンドラを呼ぶ</td><td>入力遅延がそのまま積み上がる</td></tr>
+                            <tr><td>HTML・CSS などのパース</td><td>文書とスタイルシート、その他のデータ形式の解釈</td><td>初期レンダーが後ろへずれる</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>表の右の列が利用者が実際に遭うもので、左の列が開発者がコードで見るものだ。この二つの列に橋を架けるのが次の節である。</p>
+
+                    <h2 id="sec-3">一度に一つ - タスクは最後まで回ってから席を譲る</h2>
+
+                    <p>この構造が問題になる本当の理由は、スレッドが一本だという事実そのものではなく<strong>実行単位がプリエンプトされない</strong>ところにある。JavaScript のタスクは一度始まれば最後まで回る。途中でもっと急ぐ仕事が届いても、ブラウザがそれを切って割り込ませることはできない。OS のスケジューラならタイムスライスが尽きたところで強制的にコンテキストを切り替えるが、イベントループにそういう仕掛けはない。</p>
+
+                    <p>だから300ミリ秒かかる関数が回っている間に利用者がボタンを押すと、そのクリックは<strong>存在するがまだ誰も知らない状態</strong>でキューに置かれる。関数が終わってからディスパッチが始まり、ハンドラが終わってからレンダリング更新の番が来る。この待ち区間が後で見る INP の最初の区間、すなわち入力遅延である。</p>
+
+                    <p>ここでよくある誤解を一つ片付けておく必要がある。<strong>非同期は並列ではない。</strong> <code>async</code> 関数も、プロミスチェーンも、<code>fetch</code> の応答処理も、結局はメインスレッドのタスクかマイクロタスクとして戻ってくる。ネットワーク待ちはスレッドを手放すが、応答が届いた後にそれをパースし、状態を更新し、一覧を描き直す仕事はすべて同じ席で起きる。非同期で書いたからといって重い計算がどこかへ移るわけではない。</p>
+
+                    <h2 id="sec-4">フレーム予算 - 16.6ミリ秒のうち実際に使えるもの</h2>
+
+                    <p>画面が滑らかに見えるにはフレームが規則的に出なければならない。web.dev のレンダリング性能の文書は、60Hz の画面でブラウザが<strong>フレーム一つを作るのに16.66ミリ秒</strong>を持つと書く。そしてすぐに但し書きを付ける。ブラウザ自体のオーバーヘッドがフレームごとにあるので、<strong>開発者の作業は10ミリ秒以内に終わらなければならない</strong>というものだ。</p>
+
+                    <p>この数字が重要なのは絶対値よりも<strong>比率</strong>のほうだ。画面のリフレッシュレートが上がれば予算はその分だけ減る。120Hz の画面ではフレーム間隔が半分になるので使える時間も半分になる。高性能な機器ほど余裕が生まれそうに思えるが、リフレッシュレートも一緒に上がるなら実際にはむしろ厳しくなるわけだ。</p>
+
+                    <p>そして10ミリ秒は<strong>JavaScript だけの予算ではない。</strong> スタイル計算、レイアウト、ペイント命令の生成が全部その中に入らなければならない。スクリプトが8ミリ秒を使えば残り全部が2ミリ秒で終わらなければならないということだ。一覧を描き直すコードが速く見えても、その後ろに付くレイアウトの費用が予算を超えればフレームはそのまま落ちる。</p>
+
+                    <h2 id="sec-5">互いを塞ぐ仕組み - 五段階の依存関係</h2>
+
+                    <p>web.dev はフレーム一つが作られる過程を五段階と呼ぶ。<strong>JavaScript、スタイル、レイアウト、ペイント、合成</strong>である。JavaScript が視覚的な変化を作り、スタイル段階がどの CSS 規則がどの要素に適用されるかを突き合わせて計算値を出す。レイアウトは要素の大きさと画面上の位置を決めるが、この段階の特徴は<strong>ある要素の変化がツリー全体に波及しうる</strong>ことだ。ペイントはその結果をピクセル塗りの命令に変え、合成は描かれたレイヤーを正しい順序で画面に載せる。</p>
+
+                    <p>この順序がそのまま依存関係である。レイアウトの結果なしにペイントはできず、スタイル計算なしにレイアウトはできない。ここから二つのことが導かれる。</p>
+
+                    <ul>
+                        <li>どのプロパティを変えるかによって<strong>パイプラインへの入り口が変わる。</strong> 幅や位置を変えればレイアウトからやり直し、色だけ変えればレイアウトを飛ばしてペイントから始まる</li>
+                        <li>レイアウトとペイントを<strong>両方とも飛ばせるプロパティ</strong>がある。web.dev は、レイアウトもペイントも必要としないプロパティを変えればブラウザは直ちに合成段階へ進めるとし、これが最も安価で望ましい経路だと明記している</li>
+                        <li>同じフレームの中で<strong>読みと書きを交互に行うと</strong>、ブラウザは最新のレイアウト値を返すために計算を前倒しで実行する。読むものを先に全部読み、書くものを後でまとめて書く習慣が要るのはこのためだ</li>
+                        <li>この強制計算はコードでは見えにくい。要素の大きさや位置を尋ねるプロパティ一つがその場でレイアウトを誘発し、それがループの中にあれば<strong>項目の数だけレイアウトが回る</strong></li>
+                    </ul>
+
+                    <p>まとめると、メインスレッドの仕事は単に席を分け合っているのではなく<strong>互いの入力であり出力</strong>だ。だから一箇所の遅れが別の場所へ波及し、一箇所の節約が別の場所まで救う。</p>
+
+                    <h2 id="sec-6">遅さを測る三つの指標としきい値</h2>
+
+                    <p>構造が分かったら次は測定だ。遅いという言葉はそのままでは何の情報でもなく、何をどう測る値なのかを決めておかなければ改善したかどうかも分からない。ウェブで通用する軸は三つある。</p>
+
+                    <h3>INP - 押してから画面が変わるまで</h3>
+
+                    <p>Interaction to Next Paint は、訪問の期間全体で発生した<strong>すべてのクリック・タップ・キー入力の遅延を観測して</strong>そのページの全体的な応答性を表す値だ。一回の操作は三区間に割れる。ハンドラが実行され始めるまで待った<strong>入力遅延</strong>、ハンドラのコールバックが回る<strong>処理時間</strong>、そしてコールバックが終わってから次のフレームが描かれるまでの<strong>表示遅延</strong>である。スクロールとホバーと拡大は INP の計算に入れない。INP は2024年に安定したコアウェブバイタルとなり FID を置き換えた。</p>
+
+                    <h3>TBT - 読み込み中にメインスレッドが塞がっていた総量</h3>
+
+                    <p>Total Blocking Time は First Contentful Paint 以降、メインスレッドが<strong>入力への応答を妨げるほど長く掴まれていた時間の合計</strong>である。計算方法が単純なので定義をそのまま覚えておく価値がある。メインスレッドで50ミリ秒を超えて回るタスクをロングタスクと呼び、各ロングタスクで<strong>50ミリ秒を超えた分だけ</strong>を足す。120ミリ秒のタスクは70ミリ秒を寄与し、45ミリ秒のタスクは0を寄与する。TBT はラボ指標だ。web.dev は、フィールドで測ること自体は可能だが利用者の操作が値を大きく揺らしてばらつきが増えるため勧めないと書いている。</p>
+
+                    <h3>LoAF - フレーム単位で見る遅れと、その犯人</h3>
+
+                    <p>Long Animation Frames はタスクではなく<strong>フレーム</strong>を数える。W3C 草案の定義は、継続時間が50ミリ秒を超える二つの場合をロングアニメーションフレームとする。レンダリングの更新が必要でないタスク一つ、そしてレンダリングの更新が必要なタスクで<strong>レンダリングが実際に更新されるまで</strong>の区間だ。エントリには <code>startTime</code>、<code>duration</code>、<code>renderStart</code>、<code>styleAndLayoutStart</code>、<code>blockingDuration</code>、<code>firstUIEventTimestamp</code>、そして原因スクリプトの配列である <code>scripts</code> が入る。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>指標</th><th>何を測るか</th><th>どこで測るか</th><th>公式文書が言う良い値</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>INP</td><td>クリック・タップ・キー入力の後、次のペイントまでの遅延。訪問全体で観測</td><td>実利用者のフィールドデータ。コアウェブバイタルの判定用</td><td>200ミリ秒以下は良い。200超500以下は改善が必要。500超は悪い。判定は75パーセンタイル</td></tr>
+                            <tr><td>TBT</td><td>FCP 以降、ロングタスクが50ミリ秒を超えた分の合計</td><td>ラボのツール。フィールド測定は web.dev が勧めない</td><td>平均的なモバイル機器で200ミリ秒未満</td></tr>
+                            <tr><td>LoAF</td><td>レンダリング更新が50ミリ秒を超えて遅れたフレーム一つひとつと、その原因スクリプト</td><td><code>PerformanceObserver</code> で観測。Chrome 123 以上、Edge 123 以上</td><td>単一のしきい値はない。フレームの継続が50ミリ秒を超えれば記録対象</td></tr>
+                            <tr><td>参考: コアウェブバイタル三種</td><td>LCP は読み込み、INP は操作性、CLS は視覚的安定性</td><td>フィールドデータ。モバイルとデスクトップを分けて集計</td><td>LCP 2.5秒以下、INP 200ミリ秒以下、CLS 0.1以下。いずれも75パーセンタイル</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>三つの指標は同じ現象を別の角度から見る。TBT は<strong>読み込み区間の総量</strong>であり、INP は<strong>実利用者が遭った応答性</strong>であり、LoAF は<strong>どのフレームで誰がやったか</strong>だ。改善作業の順序として使えば、LoAF で犯人を見つけ、TBT で回帰を防ぎ、INP で実際の利用者に届いたかを確かめる流れになる。</p>
+
+                    <h2 id="sec-7">ロングタスクだけでは足りなかった理由</h2>
+
+                    <p>Long Tasks API は長らくメインスレッドの占有を見る基本の道具だった。ところがこの API には構造的な死角がある。<strong>タスク一つが50ミリ秒を超えないと</strong>記録されないという点だ。40ミリ秒のタスクが五つ続けて並び一フレームを200ミリ秒塞いでも、ロングタスクは一つも捉えられない。利用者は200ミリ秒待ったのに計器盤は静かなままである。</p>
+
+                    <p>LoAF はこの死角をフレーム単位で埋める。Chrome for Developers の文書は、LoAF がタスクではなくフレーム全体を見るため<strong>複数の小さなタスクが集まってレンダリングを塞ぐ状況</strong>を捉えられ、詳細なタイミングの分解とスクリプトの帰属がはるかに優れていると説明する。ここで <code>blockingDuration</code> の計算方法が面白い。W3C 草案は、フレーム内のタスクの継続時間を降順に並べ、レンダリングがあったなら最も長いタスクにレンダー区間を足し、各項目で50ミリ秒を超えた分を合計すると記す。TBT の計算規則をフレームの内側へ移した形だ。</p>
+
+                    <p>スクリプトの帰属も実務での体感が大きい。<code>PerformanceScriptTiming</code> の項目には呼び出し元の情報である <code>invoker</code> と <code>invokerType</code>、実行開始時刻の <code>executionStart</code>、ソース位置を指す <code>sourceURL</code> と <code>sourceFunctionName</code> と <code>sourceCharPosition</code>、そしてそのスクリプトが強制的に誘発したスタイル・レイアウト時間である <code>forcedStyleAndLayoutDuration</code> が入っている。最後の項目は前節で述べた読み書きの交錯の費用を<strong>数字で返してくれる場所</strong>だ。</p>
+
+                    <p>ただし対応範囲は狭い。Chrome 123 以上と Edge 123 以上でのみ動き、Firefox と Safari にはまだない。したがって LoAF は<strong>診断の道具</strong>であって利用者全体の計器盤ではない。この区別を曖昧にすると、Safari 利用者の比率が大きいサービスで誤った安心をしてしまう。</p>
+
+                    <h2 id="sec-8">譲る - スレッドを手放してまた掴む技術</h2>
+
+                    <p>プリエンプションがないなら、残る方法は<strong>自ら手放すこと</strong>だけだ。長い仕事を複数のタスクに切って、断片の間にブラウザが割り込む隙間を作ってやる。ここで必ず押さえておくべき点がある。<strong>譲っても総作業量は減らない。</strong> むしろタスク切り替えの費用のせいで全体の時間は少し増える。代わりにその間に入力処理とレンダリングが入る場所が生まれる。同じ仕事をしながら応答性だけを買う取引だ。</p>
+
+                    <p>譲る手段はいくつかあり性質が違う。<code>setTimeout</code> で先送りするとその作業は<strong>キューの一番後ろ</strong>に付く。その間に他のタスクがたくさん入っていれば自分の作業はずっと後で再開される。しかも入れ子が深くなるとクランプが掛かる。WHATWG HTML 標準は、入れ子レベルが5を超えタイムアウトが4より小さければ<strong>タイムアウトを4に引き上げる</strong>と規定している。</p>
+
+                    <p><code>scheduler.yield()</code> はこの問題を正面から扱う。web.dev は、これがプロミスを返す関数であり、<strong>現在のタスクの続きが同じ種類の他のタスクより先に</strong>実行されると説明する。つまり譲るが列の最後尾には行かない。対応は Chrome 129 以上、Edge 129 以上、Firefox 142 以上で、Safari にはない。</p>
+
+                    <pre><code class="language-javascript">// 長い一覧を分けて処理しながら、フレームごとにメインスレッドを手放す。
+async function processInChunks(items, work) {
+  const CHUNK_BUDGET_MS = 5;        // 一度に掴む時間 (経験則)
+  let start = performance.now();
+
+  for (let i = 0; i &lt; items.length; i++) {
+    work(items[i]);
+
+    // 予算をまだ使い切っていなければ掴んだまま進む。
+    if (performance.now() - start &lt; CHUNK_BUDGET_MS) continue;
+
+    // scheduler.yield があればそれを使う。
+    // 続きの実行が同じ種類の他のタスクより先に戻ってくる。
+    if (typeof scheduler !== 'undefined' &amp;&amp; 'yield' in scheduler) {
+      await scheduler.yield();
+    } else {
+      // 代替経路。キューの最後尾へ行き、入れ子が深いと 4ms にクランプされる。
+      await new Promise((resolve) =&gt; setTimeout(resolve, 0));
+    }
+    start = performance.now();
+  }
+}
+</code></pre>
+
+                    <p>ここで廃れた助言を一つ押さえておく必要がある。入力が待機中のときだけ譲ろうという発想で <code>isInputPending()</code> を使うパターンがしばらく出回った。web.dev は今やこの API を勧めておらず、<strong>入力が待機中かどうかに関わらず譲れ</strong>と明記している。偽陰性の可能性と対象範囲の不完全さが理由だ。古いブログ記事に残っているコードをそのまま持ってこないほうがよい。</p>
+
+                    <h2 id="sec-9">仕事に優先度を付けるということ</h2>
+
+                    <p>譲るだけでは足りない場面がある。手放した席を<strong>誰が先に取るか</strong>はまだ決まっていないからだ。Prioritized Task Scheduling API がその部分を担う。<code>scheduler.postTask()</code> は三段階の優先度を受け取り、MDN は実行が<strong>優先度の順、同じ優先度の中では宣言の順</strong>で起きると記す。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>優先度</th><th>指定の仕方</th><th>どんな仕事に付けるか</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>user-blocking</code></td><td>オプションに明示する</td><td>利用者が結果を待っていて画面更新を塞いでいる仕事</td></tr>
+                            <tr><td><code>user-visible</code></td><td>省略すればこれ (既定値)</td><td>画面には見えるが即時性が低い仕事</td></tr>
+                            <tr><td><code>background</code></td><td>オプションに明示する</td><td>誰も待っていない仕事。事前計算やログ送信のようなもの</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>優先度を後で変える必要があるなら、オプションに値を直接入れてはいけない。MDN は<strong>変わりうる優先度は <code>TaskController</code> を作ってそのシグナルを渡し、<code>setPriority()</code> で調整せよ</strong>と案内する。あらかじめゆっくり計算していた仕事が利用者のクリック一つで急に急ぎになる状況がまさにこの場合だ。</p>
+
+                    <p>似た場所に <code>requestIdleCallback</code> もある。MDN は、これがブラウザのアイドル区間に関数を予約し、<strong>アニメーションや入力応答のような遅延に敏感なイベントに影響を与えずに</strong>背景の低優先度作業を回せるようにすると説明する。コールバックは <code>IdleDeadline</code> を受け取り <code>timeRemaining()</code> で残り時間を尋ね、<code>didTimeout</code> でタイムアウトのために呼ばれたかを確かめる。但し書きが二つある。必ず実行されなければならない作業なら<strong><code>timeout</code> オプションを強く勧める</strong>ということと、そのタイムアウトが満了すると<strong>性能に悪影響を与える危険を冒してでも</strong>コールバックがキューに載るということだ。対応状況は広くなく、MDN は最も広く使われるブラウザの一部で動かないため Baseline ではないと表示する。この API は原文には出てこない。</p>
+
+                    <h2 id="sec-10">出せるもの その一 - ワーカーへ出る計算</h2>
+
+                    <p>ここからが本論だ。メインスレッド上の仕事のうち<strong>本当に外へ出られるもの</strong>は何か。最初の通路はウェブワーカーである。</p>
+
+                    <p>ワーカーの境界は非常に鮮明だ。MDN は、ワーカーの中から<strong>DOM を直接操作できず、<code>window</code> オブジェクトの既定のメソッドやプロパティの一部も使えない</strong>と釘を刺す。ワーカーでできない核心は親ページに直接影響を与えることであり、そこには DOM の操作とそのページのオブジェクトの使用が含まれる。グローバルスコープが <code>Window</code> ではなく <code>DedicatedWorkerGlobalScope</code> なので <code>window</code>、<code>document</code>、<code>parent</code> はない。逆に <code>fetch</code>、<code>XMLHttpRequest</code>、タイマー、標準の組み込みオブジェクト、<code>importScripts()</code> は使える。</p>
+
+                    <p>二つ目に知っておくべきは<strong>データがどう渡るか</strong>だ。既定はコピーである。MDN の表現をそのまま移すと、メインページとワーカーの間でやり取りされるデータは共有されるのではなくコピーされ、渡すときに直列化され反対側で逆直列化されて<strong>両側にそれぞれ複製ができる</strong>。これが構造化クローンだ。だから大きな配列を毎フレームやり取りすると、ワーカーへ移した利得が直列化の費用で相殺される。</p>
+
+                    <p>転送可能オブジェクトがこの問題を解く。所有権を丸ごと渡すのでコピーが起きない。MDN は、<code>ArrayBuffer</code> をワーカーへ転送すると<strong>元の <code>ArrayBuffer</code> は空になりもう使えなくなる</strong>と記す。文字どおり中身が移ったのだ。</p>
+
+                    <pre><code class="language-javascript">// main.js - 大きなバッファはコピーせず所有権ごと渡す。
+const worker = new Worker('./heavy.js');
+const pixels = new Uint8ClampedArray(width * height * 4);
+// ... pixels を埋める ...
+
+worker.postMessage(
+  { buffer: pixels.buffer, width, height },
+  [pixels.buffer]                 // 第二引数が転送リストだ
+);
+// この行の後から pixels.buffer は空になる (byteLength === 0)
+
+worker.onmessage = (e) =&gt; {
+  const out = new ImageData(new Uint8ClampedArray(e.data.buffer), e.data.width);
+  ctx.putImageData(out, 0, 0);    // DOM に触れる仕事はここ、メインスレッドで
+};
+
+// heavy.js - DOM はない。データだけ入り、データだけ出る。
+self.onmessage = (e) =&gt; {
+  const { buffer, width, height } = e.data;
+  const buf = new Uint8ClampedArray(buffer);
+  for (let i = 0; i &lt; buf.length; i += 4) {
+    const g = (buf[i] * 0.299 + buf[i + 1] * 0.587 + buf[i + 2] * 0.114) | 0;
+    buf[i] = buf[i + 1] = buf[i + 2] = g;
+  }
+  self.postMessage({ buffer: buf.buffer, width, height }, [buf.buffer]);
+};
+</code></pre>
+
+                    <p>キャンバスはこの境界に例外的な扉を一つ持っている。OffscreenCanvas は<strong>DOM とキャンバス API を分離して</strong> <code>&lt;canvas&gt;</code> 要素が DOM に全面的に依存しないようにする。MDN は、描画処理をワーカーのコンテキストの中で回すことで<strong>重い仕事をメインスレッドから外せる</strong>と説明する。使い方は <code>transferControlToOffscreen()</code> で制御権を切り離しワーカーへ転送することで、ワーカーの中で <code>requestAnimationFrame()</code> まで使える。ブラウザ全般で2023年3月から使えると表示されている。この API も原文には出てこない。</p>
+
+                    <h2 id="sec-11">出せるもの その二 - コンポジタへ出る動き</h2>
+
+                    <p>二つ目の通路は性質が違う。コードを移すのではなく<strong>ブラウザが自ら別のスレッドで処理するように条件を整えてやること</strong>だ。</p>
+
+                    <p>Chromium の文書は、レンダープロセスのコンポジタスレッドが入力処理、スクロール、アニメーションを担い、画像デコードとラスタ処理を調整すると記す。そして<strong>メインスレッドとコンポジタスレッドを分離することが、アニメーションとスクロールをメインスレッドの作業から性能的に隔離するうえで決定的に重要だ</strong>と明記する。より具体的には、視覚効果のアニメーションとスクロールはレイアウトとプリペイントとペイントを飛ばすことができ、その三段階を飛ばせるなら<strong>すべてコンポジタスレッドで回りメインスレッドを飛ばせる</strong>と書かれている。</p>
+
+                    <p>実務に移すと規則は単純になる。位置を動かすアニメーションを <code>left</code>/<code>top</code> で作れば毎フレームレイアウトが回り、そのレイアウトはメインスレッドの仕事だ。同じ動きを <code>transform</code> で作ればレイアウトとペイントを飛ばして合成だけが残る。不透明度も同様である。だから<strong>メインスレッドが重い状態でも滑らかなままのアニメーション</strong>と、スクリプト一行で止まってしまうアニメーションが分かれる。</p>
+
+                    <p>スクロールにも同じ原理が働くが、ここには開発者が自分で元へ戻してしまうよくある落とし穴がある。イベントリスナーの <code>passive</code> オプションだ。MDN は、<code>passive</code> を <code>true</code> にするとリスナーが既定動作を取り消さないと宣言することになるので、<strong>ブラウザはリスナーの終了を待たずに直ちに既定動作を始められる</strong>と説明する。逆に取り消し可能なリスナーが付いていると、ブラウザは <code>preventDefault()</code> が呼ばれるかどうかを知りようがないので<strong>待たなければならない。</strong> その待ち時間がすなわちスクロールの遅延である。</p>
+
+                    <p>既定値を正確に知っておく必要がある。MDN は、<code>passive</code> が指定されなければ <code>false</code> だが、<strong>Safari 以外のブラウザでは</strong> <code>Window</code>、<code>Document</code>、<code>Document.body</code> という文書レベルのノードに付く <code>wheel</code>、<code>mousewheel</code>、<code>touchstart</code>、<code>touchmove</code> に限って <code>true</code> が既定だと記す。つまり文書レベルでない特定の要素に付けたタッチリスナーは依然として既定が <code>false</code> だ。明示的に <code>{ passive: true }</code> と書く習慣が要る場所である。</p>
+
+                    <h2 id="sec-12">出せないもの - 境界はどこに引かれているか</h2>
+
+                    <p>ここからは反対側だ。どう工夫しても出られない仕事があり、その理由は性能ではなく<strong>定義</strong>にある。</p>
+
+                    <h3>DOM に触れなければならない仕事</h3>
+
+                    <p>ワーカーに <code>document</code> がないのは実装の未整備ではなく設計だ。DOM は複数のスレッドが同時に触れば一貫性を保てない可変のツリーであり、だからアクセスを一つのスレッドに束ねた。この決定を受け入れると<strong>スタイル計算とレイアウトも一緒に束ねられる。</strong> どちらも DOM ツリーとスタイルシートを読まなければならないからだ。Chromium の文書がドキュメントライフサイクルをメインスレッドの仕事として記しているのは、まさにこの意味である。</p>
+
+                    <h3>取り消されうる必要がある入力</h3>
+
+                    <p>ヒットテストとイベントディスパッチも同様だ。どの座標にどの要素があるかを知るには最新のレイアウトが要り、レイアウトはメインスレッドにある。そしてリスナーが <code>preventDefault()</code> を呼べるという可能性そのものが<strong>ブラウザを待たせる。</strong> スクロールをコンポジタで処理していても、取り消し可能なリスナーが現れれば判定をメインスレッドに問い合わせなければならない。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>やろうとしている仕事</th><th>メインスレッドの外へ出られるか</th><th>なぜそうなのか</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>パース、圧縮、ソート、画像のピクセル処理のような純粋計算</td><td>出られる — ウェブワーカー</td><td>DOM を使わず入出力がデータだけだ</td></tr>
+                            <tr><td>キャンバスに描く仕事</td><td>出られる — OffscreenCanvas とワーカー</td><td>キャンバスを DOM から切り離し制御権だけワーカーへ渡せる</td></tr>
+                            <tr><td><code>transform</code>・<code>opacity</code> のアニメーション</td><td>出られる — コンポジタスレッド</td><td>レイアウトとプリペイントとペイントを飛ばせる</td></tr>
+                            <tr><td>スクロール</td><td>おおむね出られる — コンポジタスレッド</td><td>ただし取り消し可能なリスナーが付くとメインスレッドに問い直す必要がある</td></tr>
+                            <tr><td>DOM の読み書き</td><td>出られない</td><td>ワーカーには <code>window</code>・<code>document</code>・<code>parent</code> がない</td></tr>
+                            <tr><td>スタイル計算とレイアウト</td><td>出られない</td><td>ドキュメントライフサイクルがメインスレッドの仕事として定義されている</td></tr>
+                            <tr><td>入力イベントハンドラの実行</td><td>出られない</td><td>スクリプトイベントのディスパッチ自体がメインスレッドで起きる</td></tr>
+                            <tr><td>ヒットテスト</td><td>出られない</td><td>最新のレイアウトを読まなければ判定できない</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>この表が与える結論はやや断固としている。<strong>メインスレッドを空ける最善の方法は移すことではなく減らすことだ。</strong> 移せる項目は表の上の四つだけで、実際のウェブアプリケーションで最も時間を食うのはたいてい下の四つだからである。</p>
+
+                    <h2 id="sec-13">仕事そのものを減らす - 封じ込めと省略</h2>
+
+                    <p>減らす方法のうち最も構造的なのが CSS の封じ込めだ。MDN は、CSS containment が<strong>ページのサブツリーを残りの DOM から隔離し</strong>、ブラウザがその独立した部分のレンダリングを最適化できるようにすると説明する。<code>contain</code> プロパティの値はそれぞれ別のものを閉じ込める。<code>size</code> は要素の大きさの計算を内容から切り離し、<code>layout</code> はレイアウトの再計算をその要素と子孫の中に束ね、<code>style</code> はスタイルの再計算を、<code>paint</code> はペイントを要素の境界の内側に閉じ込める。<code>content</code> は <code>layout</code>・<code>style</code>・<code>paint</code> をまとめた短縮形で大きさは含まない。<code>strict</code> はそこに <code>size</code> まで加えた最も強い形だ。</p>
+
+                    <p>封じ込めが実際の利得に変わる代表的な場所が <code>content-visibility</code> である。web.dev の文書は、<code>content-visibility: auto</code> が付いた要素が<strong>レイアウト・スタイル・ペイントの封じ込めを得て、画面外にあれば大きさの封じ込めまで得る</strong>と記す。その間ブラウザは要素ボックス自体のスタイルとレイアウトだけを行い、中身のペイントとヒットテストは行わない。同じ文書の旅行ブログの例で初期レンダリング時間は<strong>232ミリ秒から30ミリ秒へ</strong>縮み、文書はこれを7倍の向上と呼んでいる。</p>
+
+                    <pre><code class="language-css">/* 画面外のカードのスタイル・レイアウト・ペイントを省く */
+.feed-card {
+  content-visibility: auto;
+
+  /* 省いている間に使う代替サイズ。
+     これがないと画面外の要素の高さが 0 に潰れ、
+     スクロールバーの長さが揺れ続ける。 */
+  contain-intrinsic-size: auto 480px;
+}
+
+/* 大きさまで隔離してよい場所にだけ strict を使う。
+   strict = size + layout + style + paint */
+.widget-frame {
+  contain: strict;
+  width: 320px;
+  height: 240px;
+}
+</code></pre>
+
+                    <p><code>contain-intrinsic-size</code> は<strong>大きさの封じ込めが効いたときに使う自然な大きさ</strong>を指定するプロパティだ。これがないと画面外の要素が高さ0に潰れスクロールバーの大きさが揺れる。web.dev はこのプロパティを、描画された内容の代わりに置かれるプレースホルダーの大きさと呼ぶ。</p>
+
+                    <p>一つ気を付ける点がある。<code>content-visibility: auto</code> で省かれた内容は<strong>ページ内検索が効き、その場所へ移動できる。</strong> <code>display: none</code> や <code>visibility: hidden</code> と違う点であり利点でもある。ただしそのために画面外のランドマーク要素がアクセシビリティツリーにそのまま現れるので、必要なら <code>aria-hidden</code> を付けて整理せよと文書は案内する。性能を得ながら<strong>アクセシビリティツリーを散らかさない均衡</strong>を別途配慮せよということだ。</p>
+
+                    <p>ここまで来ると、なぜ原文が仕事そのものをなくすところから最も大きな利得が出ると書いたのかが説明される。移せるものは少なく、移すのにも費用が掛かり、そもそもしなかった仕事は<strong>どのスレッドでも時間を使わない。</strong></p>
+
+                    <h2 id="sec-14">きっかけとなった記事とこの記事が分かれる地点</h2>
+
+                    <p>原文は処方を与える。何をすればよいかを七つに分けて例と一緒に見せる。実務ですぐ手に取れる形であり、とくに分割・まとめ・優先度の三つはフレームワークなしでも適用できる水準に具体的だ。原文が挙げた数字もこの記事のものと食い違わない。16.6ミリ秒のフレーム予算、50ミリ秒のロングタスク基準、INP と TBT を併せて言及する部分がそうである。</p>
+
+                    <p>この記事は境界を描く。処方の前に<strong>何がなぜその場所になければならないのか</strong>を先に定めておけば、新しい処方が出たときそれがどこに入るのかを自分で判断できる。そこで次の三つを原文の外から持ってきて添えた。</p>
+
+                    <ul>
+                        <li><strong>Long Animation Frames</strong> — 原文には出てこない。ロングタスクの基準だけでは小さなタスクが集まってフレームを塞ぐ状況を捉えられず、その死角を埋めるのがこの API だ</li>
+                        <li><strong>OffscreenCanvas</strong> — 原文には出てこない。ワーカーが DOM に触れないという規則に空いた唯一の実用的な穴なので、境界の話から外せない</li>
+                        <li><strong><code>requestIdleCallback</code></strong> — 原文には出てこない。優先度の話の反対側、すなわち最も低い等級を扱う古い手段であり、対応範囲が狭いという事実まで一緒に見る必要がある</li>
+                        <li>逆に <strong><code>content-visibility</code></strong> は原文も言及する。原文は似た効果を CSS 一行で狙うプロパティだと短く紹介し、この記事はそれが得る封じ込めの種類と一緒に使うべきプロパティまで広げた</li>
+                    </ul>
+
+                    <p>測定の話を一つ添えると、遅れを感じる感覚と計器盤の値はしばしば食い違う。その隔たりを扱った記事として<a href="software_performance_expectations.html">遅くてもいいという合意はどう作られたか</a>があり、画面状態の一貫性が信頼につながる側は<a href="every_frame_perfect_ui_trust_2026.html">すべてのフレームを完璧に</a>が扱う。描画をキャンバスへ移したとき何を失うかは<a href="html_in_canvas_rendering.html">canvas に HTML を描く API</a>で、大量の一覧を仮想化で乗り切る具体例は<a href="trees_file_tree_rendering_library_2026.html">Trees というファイルツリー描画ライブラリ</a>ですでに整理したので、ここでは繰り返さない。</p>
+
+                    <p>最後に順序を一つ提案する。コードを直す前に<strong>どのフレームがなぜ遅れたのかから</strong>見る。LoAF で原因スクリプトを見つけ、そのスクリプトがしている仕事が上の表のどの行に属するかを確かめる。上の四つなら移し、下の四つなら減らす。この判定さえきちんとできれば<strong>成り立たない最適化に時間を使うこと</strong>はなくなる。</p>
+
+                    <h2 id="sec-15">確認できなかったこと</h2>
+
+                    <ul>
+                        <li>入れ子タイマーの最小遅延の値が文書ごとに違って書かれている。WHATWG HTML 標準は入れ子レベルが5を超えタイムアウトが4より小さければ4に引き上げると規定するのに対し、web.dev のロングタスクの文書は<strong>5ミリ秒</strong>と書く。本文は標準側の値を使ったが、なぜ二つの文書が違うのかは確認できなかった</li>
+                        <li><code>IdleDeadline.timeRemaining()</code> が返す値に<strong>50ミリ秒のような上限</strong>があるかは MDN の文書で明示を見つけられなかった。よく引用される値だが規格の文を直接確認できなかったので本文には入れなかった</li>
+                        <li>INP が FID を置き換えた<strong>正確な日付</strong>は確認できなかった。確認できたのはコアウェブバイタルの文書の「2024年に安定指標になった」という記述と、発表記事に「今日がその日だ」とだけ書かれているという事実までである</li>
+                        <li>Long Animation Frames の50ミリ秒の基準を<strong>調整できるのか</strong>、そしてこの指標が今後コアウェブバイタルへ昇格する計画があるのかは確認できなかった</li>
+                        <li>OffscreenCanvas が<strong>WebGPU のコンテキスト</strong>に対応するかは MDN の概要文書で確認できなかった。その文書に出ている例は 2D と WebGL だけである</li>
+                        <li>原文が示した<strong>一フレームあたり5ミリ秒のチャンク予算</strong>は規格ではなく経験則だ。その値の出典や根拠は原文に書かれておらず確認できなかった。本文の例にも経験則と表示しておいた</li>
+                        <li>Safari の <code>requestIdleCallback</code>・<code>scheduler.yield()</code> 対応の可否は、MDN の「最も広く使われるブラウザの一部で動かない」という記述と web.dev の「Safari 非対応」までしか確認できず、<strong>バージョン別の互換性表</strong>は直接開いていない</li>
+                        <li>WHATWG HTML 標準の<strong>「update the rendering」の下位手順の順序</strong>は文書を開いたが該当節が切れていて確認できなかった。本文のパイプラインの順序は web.dev と Chromium アーキテクチャ文書の記述を根拠に書いた</li>
+                    </ul>
+
+                    <h2 id="sec-16">参考資料</h2>
+
+                    <ul>
+                        <li><a href="https://news.hada.io/topic?id=33205" target="_blank" rel="noopener">GeekNews トピック 33205</a> — この記事のきっかけとなった紹介。原文のアドレスと要約がある場所</li>
+                        <li><a href="https://kciter.so/posts/the-expensive-main-thread/" target="_blank" rel="noopener">ブラウザのメインスレッドは高価だ (kciter.so)</a> — きっかけとなった韓国語の原文。七つの処方と16.6ミリ秒・50ミリ秒の基準、<code>content-visibility</code>、<code>scheduler.yield()</code> の対応の偏りがここにある</li>
+                        <li><a href="https://developer.chrome.com/docs/chromium/renderingng-architecture" target="_blank" rel="noopener">RenderingNG architecture (Chrome for Developers)</a> — メインスレッドが担う仕事の一覧、コンポジタスレッドの役割、スクロールと視覚効果のアニメーションがメインスレッドを飛ばせるという記述の出典</li>
+                        <li><a href="https://web.dev/articles/rendering-performance" target="_blank" rel="noopener">Rendering performance (web.dev)</a> — JavaScript・スタイル・レイアウト・ペイント・合成の五段階、16.66ミリ秒のフレームと10ミリ秒の作業予算、レイアウトとペイントを飛ばす経路</li>
+                        <li><a href="https://web.dev/articles/inp" target="_blank" rel="noopener">Interaction to Next Paint (web.dev)</a> — INP の定義、入力遅延・処理時間・表示遅延の三区間、200ミリ秒と500ミリ秒のしきい値、スクロール・ホバー・拡大の除外</li>
+                        <li><a href="https://web.dev/articles/tbt" target="_blank" rel="noopener">Total Blocking Time (web.dev)</a> — TBT の定義、ロングタスク50ミリ秒の基準と超過分の合算規則、FCP 以降の区間、ラボ指標であること、200ミリ秒未満の基準</li>
+                        <li><a href="https://web.dev/articles/vitals" target="_blank" rel="noopener">Web Vitals (web.dev)</a> — LCP 2.5秒、INP 200ミリ秒、CLS 0.1 と75パーセンタイルの集計規則、INP が2024年に安定指標になったという記述</li>
+                        <li><a href="https://developer.chrome.com/docs/web-platform/long-animation-frames" target="_blank" rel="noopener">Long Animation Frames API (Chrome for Developers)</a> — 50ミリ秒の基準が Long Tasks と同じであること、フレーム単位で見る理由、エントリのフィールド、Chrome 123 以上の対応</li>
+                        <li><a href="https://w3c.github.io/long-animation-frames/" target="_blank" rel="noopener">Long Animation Frames API 草案 (W3C)</a> — ロングアニメーションフレームの規範的定義と <code>blockingDuration</code> の計算手順、<code>PerformanceScriptTiming</code> の属性一覧</li>
+                        <li><a href="https://web.dev/articles/optimize-long-tasks" target="_blank" rel="noopener">Optimize long tasks (web.dev)</a> — 50ミリ秒のロングタスクの定義、<code>setTimeout</code> がキューの最後尾へ行くという説明、<code>scheduler.yield()</code> の挙動と対応範囲、<code>isInputPending()</code> の非推奨</li>
+                        <li><a href="https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html" target="_blank" rel="noopener">Timers (WHATWG HTML Standard)</a> — 入れ子レベルが5を超えるとタイムアウトを4に引き上げるという規定</li>
+                        <li><a href="https://developer.mozilla.org/en-US/docs/Web/API/Scheduler/postTask" target="_blank" rel="noopener">Scheduler.postTask() (MDN)</a> — 三つの優先度と既定値、優先度の順のあとに宣言の順という実行規則、<code>TaskController</code> で変える方法</li>
+                        <li><a href="https://developer.mozilla.org/en-US/docs/Web/API/Window/requestIdleCallback" target="_blank" rel="noopener">Window.requestIdleCallback() (MDN)</a> — アイドル区間への予約の定義、<code>IdleDeadline</code> と <code>timeout</code> オプションの但し書き、Baseline ではないという表示</li>
+                        <li><a href="https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API/Using_web_workers" target="_blank" rel="noopener">Using Web Workers (MDN)</a> — DOM 操作の不可、構造化クローンで複製が両側にできるという記述、転送可能オブジェクトと元のバッファが空になるという説明</li>
+                        <li><a href="https://developer.mozilla.org/en-US/docs/Web/API/OffscreenCanvas" target="_blank" rel="noopener">OffscreenCanvas (MDN)</a> — DOM とキャンバス API の分離、<code>transferControlToOffscreen()</code>、2023年3月からブラウザ全般で使用可能</li>
+                        <li><a href="https://developer.mozilla.org/en-US/docs/Web/CSS/CSS_containment" target="_blank" rel="noopener">CSS containment (MDN)</a> — <code>contain</code> の各値が閉じ込めるもの、<code>content</code> と <code>strict</code> の構成、<code>contain-intrinsic-size</code> の役割</li>
+                        <li><a href="https://web.dev/articles/content-visibility" target="_blank" rel="noopener">content-visibility (web.dev)</a> — <code>auto</code> が得る封じ込めの種類、232ミリ秒から30ミリ秒へ縮んだ例、ページ内検索の維持と <code>aria-hidden</code> の注意</li>
+                        <li><a href="https://developer.mozilla.org/en-US/docs/Web/API/EventTarget/addEventListener" target="_blank" rel="noopener">EventTarget.addEventListener() (MDN)</a> — <code>passive</code> オプションの意味と既定値、文書レベルのノードのホイール・タッチイベントにのみ <code>true</code> が既定という例外</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>この記事をシェア</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">リンクをコピー</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">一覧に戻る</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">一緒に使うと便利な無料ツール</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/base64_encoder.html">Base64 エンコーダー/デコーダー</a></li>
+      <li><a href="../static/yaml_json_converter.html">YAML JSON変換器 2026</a></li>
+      <li><a href="../static/curl_builder.html">curlコマンド生成器 2026</a></li>
+      <li><a href="../static/http_status_codes.html">HTTPステータスコード完全ガイド 2026</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">すべてのツールを見る &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">関連記事</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="software_performance_expectations.html">遅くてもいいという合意はどう作られたか - ハードウェアが速くなっても体感が変わらない理由 2026</a></li>
+      <li><a href="llm_simultaneous_outage.html">同じ時刻に止まったからといって同じ原因とは限らない - 複数のAIサービスが一斉に落ちた日</a></li>
+      <li><a href="dev_tool_tos_account_risk.html">約款の一文がアカウントを止めうるとき - 開発ツールを導入する前に読む六つの条項</a></li>
+      <li><a href="aws_config_attack_paths.html">AWS の点検項目はすべて通ったのに経路が残る - リソース間の関係を点検リストに入れる方法</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('リンクをコピーしました。Threads アプリに貼り付けて共有してください。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('リンクをコピーしました。'); });
+    });
+    </script>
+</body>
+</html>
