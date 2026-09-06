@@ -1,0 +1,601 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="en">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>What the No-Execute Bit Actually Prevents - The Work NX Does Outside Security, and What It Costs</title>
+    <meta name="description" content="What the no-execute bit really prevents, why it also stops speculative instruction fetch, and what a runtime code generator pays to hold W^X.">
+    <meta name="keywords" content="NX bit, no-execute, W^X, page permissions, mprotect, mmap, JIT, XN, PXN, UXN, DEP, speculative execution, memfd, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/en/posts/nx_bit_beyond_security.html">
+
+    <meta property="og:title" content="What the No-Execute Bit Actually Prevents - The Work NX Does Outside Security, and What It Costs">
+    <meta property="og:description" content="The no-execute bit does real work in places where no attacker appears. What it actually governs in the page tables, and what the programs that respect it pay.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/en/posts/nx_bit_beyond_security.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="en_US">
+    <meta property="article:published_time" content="2026-09-06">
+    <meta property="article:section" content="Dev &amp; Infra">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="What the No-Execute Bit Actually Prevents">
+    <meta name="twitter:description" content="NX is an architectural attribute governing speculation before it is a defense.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "What the No-Execute Bit Actually Prevents - The Work NX Does Outside Security, and What It Costs",
+      "alternativeHeadline": "When readable meant executable, the second face of the bit in speculative instruction fetch, and the price of holding W^X",
+      "datePublished": "2026-09-06",
+      "dateModified": "2026-09-06",
+      "inLanguage": "en-US",
+      "articleSection": "Dev & Infra",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "NX bit, no-execute, W^X, page permissions, mprotect, JIT, XN, PXN, UXN, speculative execution, memfd",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/en/posts/nx_bit_beyond_security.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "What exactly is the NX bit?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "It is an execute permission recorded in each entry of the virtual memory translation tables. For one page at a time, a bit says whether the bytes in that page may be fetched as instructions. In the Linux kernel sources the x86 side reserves bit 63 of the page table entry for this purpose, defines the mask only for 64-bit builds or PAE, and defines it as zero everywhere else. The arm64 side uses two separate execute-never bits, one per privilege level. On the application side the same idea appears as PROT_EXEC in the prot argument of mmap and mprotect, and the man page notes that whether PROT_EXEC has an effect different from PROT_READ depends on the processor architecture, the kernel version and the process state."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "What does it mean to say the NX bit is not just about security?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "The author of the article that prompted this piece fixed a bare-metal ARM64 hypervisor that would not boot on a real phone by marking memory execute-never. No attacker appears anywhere in the story. The branch predictor was mispredicting to address zero, and under the one-to-one mapping that address held locked-out bootrom. The ARM documentation the author quotes says that marking a region as Device prevents speculative data accesses only, and that preventing speculative instruction accesses requires marking the region non-executable. The execute permission is therefore an architectural attribute governing what the processor may touch on speculation, before it is a hardening feature."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How does a JIT compiler run code under a W^X policy?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "There are two common routes. One flips permissions: open a writable mapping, fill it with machine code, then call mprotect to turn it into read plus execute. The flip lands on page granularity and applies to the whole address space, so every thread in the process sees the window while it is open. The other splits the mapping: map the same file descriptor twice as a shared mapping, using one address as the write window and the other as the execute window. The physical pages stay single and only the virtual addresses double. Apple silicon adds a third route in which the region is created with MAP_JIT and the flip applies to the current thread only."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How does the no-execute bit differ across architectures?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "On x86 it is a single bit at position 63 of the page table entry. A 32-bit entry has no room for it, so Linux defines the mask only when the build is 64-bit or uses PAE, and a source comment records that the bit is valid only after a cpuid check. On arm64 there are two bits, one for the privileged level and one for the unprivileged level, which makes states such as executable by user space but not by the kernel expressible. ARM also carries a separate memory type axis that distinguishes Normal from Device memory, and the fact that these two axes prevent different things is the core of the article that prompted this piece."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Do techniques that use page faults as signals rely on the execute bit?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "That family runs on the read and write axes instead. The userfaultfd facility delegates page fault handling to a user-space application, and the man page names lazy restore for checkpoint and restore mechanisms plus post-copy migration as its purposes. Its registration modes cover access to a missing page, a write to a write-protected page, and a minor fault where the page exists but the page table entries do not. There is no execute mode on that list. Execute permission is used to forbid an access outright rather than to raise a notification. The article that prompted this piece went the same way, since it removed the situation that would have faulted instead of handling a fault."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/nx_bit_beyond_security.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/nx_bit_beyond_security.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/nx_bit_beyond_security.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/nx_bit_beyond_security.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/nx_bit_beyond_security.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "Home",
+      "item": "https://braindetox.kr/en/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "Dev & Infra",
+      "item": "https://braindetox.kr/en/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "What the No-Execute Bit Actually Prevents - The Work NX Does Outside Security, and What It Costs",
+      "item": "https://braindetox.kr/en/posts/nx_bit_beyond_security.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="What the No-Execute Bit Actually Prevents - The Work NX Does Outside Security, and What It Costs">
+                <meta itemprop="datePublished" content="2026-09-06">
+                <meta itemprop="dateModified" content="2026-09-06">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="NX bit, no-execute, W^X, page permissions, mprotect, JIT, XN, PXN, UXN, speculative execution, memfd">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/en/posts/nx_bit_beyond_security.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">What the No-Execute Bit Actually Prevents - The Work NX Does Outside Security, and What It Costs</h1>
+                    <h2 class="post-subtitle">When readable meant executable, the second face of the bit in speculative instruction fetch, and the price of holding W^X</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-06">2026-09-06</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">Dev &amp; Infra</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>The no-execute bit is almost always introduced in the language of attack and defense. Push machine code into a buffer and it will not run from there. Data pages and code pages live on opposite sides of a line. None of that is wrong. But the range that this bit <strong>actually governs inside the page tables</strong> is wider than that story, and the extra width shows up most clearly in situations where no attacker appears at all.</p>
+
+                    <p>A recent article made that width very concrete. A developer building a bare-metal ARM64 hypervisor spent weeks on a phone that refused to boot, and in the end fixed it by marking a mapping <strong>execute-never</strong>. The culprit was not an intruder. It was the <strong>branch predictor</strong>. And once the fix was in, the hypervisor picked up a layer of defense in depth as a side effect. The usual order of that story is completely reversed.</p>
+
+                    <p>What follows is that reversed order. Exactly what an execute permission is inside a translation table, what <strong>readable implies executable</strong> meant in the era before the bit existed, what kind of failure is solved by the property that execute-never also stops <strong>speculative fetch</strong>, and what a program that generates its own machine code at runtime hands over in exchange for respecting that property.</p>
+
+                    <div class="callout">
+                        The flag names, macro definitions and documented behavior below are as written in the primary sources: Linux man pages, kernel documentation and kernel source, Apple developer documentation, and the OpenBSD man pages. Where a vendor architecture manual could not be cross-checked directly, the gap is collected with its reason in the second-to-last section.
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>What this article covers</h3>
+                        <ol>
+                            <li><a href="#sec-1">The trigger - a hypervisor that would not boot, fixed by a security bit</a></li>
+                            <li><a href="#sec-2">What an execute permission is - a bit attached to one page</a></li>
+                            <li><a href="#sec-3">Before that - readable meant executable</a></li>
+                            <li><a href="#sec-4">W^X - never both permissions at the same moment</a></li>
+                            <li><a href="#sec-5">What the source article actually claims - speculative instruction fetch</a></li>
+                            <li><a href="#sec-6">Already baked into the kernel source - execute-never on device mappings</a></li>
+                            <li><a href="#sec-7">Faults as signals - same machinery, different bit</a></li>
+                            <li><a href="#sec-8">The table - what each technique buys and what it pays</a></li>
+                            <li><a href="#sec-9">How a JIT holds W^X</a></li>
+                            <li><a href="#sec-10">Apple silicon - flipping per thread</a></li>
+                            <li><a href="#sec-11">Where the cost really sits - syscalls, page granularity, caches</a></li>
+                            <li><a href="#sec-12">Where architectures differ</a></li>
+                            <li><a href="#sec-13">Where operating systems differ</a></li>
+                            <li><a href="#sec-14">Execute permission as policy - the no-exec seal</a></li>
+                            <li><a href="#sec-15">Where the source article and this write-up part ways</a></li>
+                            <li><a href="#sec-16">What could not be confirmed</a></li>
+                            <li><a href="#sec-17">References</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">The trigger - a hypervisor that would not boot, fixed by a security bit</h2>
+
+                    <p>The article in question is a guest post by a writer named Sonya on the purplesyringa blog. The subject is a bare-metal ARM64 hypervisor for postmarketOS. The symptom is simple enough to state in one line. Turn on the interception of reads to a particular system register and the phone hangs and resets. The same code runs perfectly well under QEMU.</p>
+
+                    <p>Half the article is the sound of hypotheses collapsing one after another. The idea that the exception handler was corrupting registers fell apart under single-stepping in QEMU. The idea that this was an instruction cache versus data cache coherency problem was addressed by moving a sorting step to build time. The idea that the hardware was behaving out of spec led to more exception handlers being installed, and none of them caught anything.</p>
+
+                    <p>The breakthrough came from comparing binaries. The difference between the version that worked and the version that died was <strong>two forms that are semantically identical</strong>. A static direct branch, with the destination baked into the instruction itself, survived. An indirect branch that reads its destination out of a register died. There is only one thing that difference can point at: <strong>branch prediction</strong>.</p>
+
+                    <p>The predictor was mispredicting to address zero. And under the hypervisor's one-to-one mapping, that address held <strong>locked-out bootrom</strong>. The fix the author chose was to mark that region execute-never, and at that moment the phone booted for the first time. The closing sentence of the article captures the shape of the whole thing: since a way to map memory non-executable had to be implemented anyway, everything except the payload was mapped non-executable, and so the hypervisor finally got a bit of defense in depth too. <strong>Security arrived as a by-product rather than as the goal.</strong></p>
+
+                    <h2 id="sec-2">What an execute permission is - a bit attached to one page</h2>
+
+                    <h3>Permissions attach at page granularity</h3>
+
+                    <p>In virtual memory the smallest unit of address translation is the page. Each entry in the translation table records not only which physical frame a page maps to, but also <strong>what may be done with that page</strong>. May it be read. May it be written. And may the bytes inside it be <strong>fetched as instructions</strong>.</p>
+
+                    <p>On the application side, the window onto those three questions is the <code>prot</code> argument of <code>mmap</code> and <code>mprotect</code>. The man pages define each value in a single sentence. <code>PROT_READ</code> means the memory can be read, <code>PROT_WRITE</code> means it can be modified, <code>PROT_EXEC</code> means it can be executed, and <code>PROT_NONE</code> means the memory cannot be accessed at all. The prototype is <code>int mprotect(void *addr, size_t size, int prot);</code>, and the starting address has to be aligned to a page boundary.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Flag</th><th>Definition in the man page</th><th>What it means in practice</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>PROT_READ</td><td>The memory can be read</td><td>Reachable as data. Load instructions succeed</td></tr>
+                            <tr><td>PROT_WRITE</td><td>The memory can be modified</td><td>Store instructions succeed. On i386 this implies read access</td></tr>
+                            <tr><td>PROT_EXEC</td><td>The memory can be executed</td><td>Instruction fetch is allowed. Meaningful only where the hardware separates the axis</td></tr>
+                            <tr><td>PROT_NONE</td><td>The memory cannot be accessed at all</td><td>Any access faults. Used to build guard pages</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h3>What happens on hardware with no execute axis</h3>
+
+                    <p>Here the careful qualifier in the man page matters. Whether <code>PROT_EXEC</code> has any effect different from <code>PROT_READ</code> <strong>depends on the processor architecture, the kernel version and the process state</strong>. The same document notes that when the <code>READ_IMPLIES_EXEC</code> personality is set on a process, specifying <code>PROT_READ</code> will implicitly add <code>PROT_EXEC</code>.</p>
+
+                    <p>So having three flags in the API does not mean the hardware has three axes. The API has always accepted three, but the execute axis only started carrying real meaning <strong>once the hardware gained a place to record it separately</strong>. Until then the execute axis rode along on the read axis, and a page you could read was a page you could run.</p>
+
+                    <h2 id="sec-3">Before that - readable meant executable</h2>
+
+                    <p>The reason is a question of room. A traditional 32-bit x86 page table entry is 32 bits wide. Address bits and assorted status bits already filled that width, and there was no spare position to carve out for an execute permission. The no-execute bit arrived in page tables only after entries grew wider.</p>
+
+                    <p>That history is still visible in the Linux kernel source. The x86 page type header reserves position <strong>63</strong> for the no-execute bit and attaches a comment saying it is valid only after a cpuid check. The actual mask is then defined to use that bit position only when the build is 64-bit or uses PAE, and to be <strong>zero</strong> in every other configuration. On hardware without the bit, the mask becomes a value that sets nothing at all.</p>
+
+                    <p>So the arrival of the no-execute bit is less a story about one more protection feature and more a story about <strong>one more state the translation table can express</strong>. Before it, there was simply no way to write down the difference between a page you may read and a page you may run. The separation of data from code was a convention observed by programs rather than a property enforced by hardware.</p>
+
+                    <p>That distinction is the root of everything that follows. Once a state becomes expressible, the expression does not stay confined to the single purpose that motivated it. Execute-never was introduced for defense, but the moment it occupied a place in the translation table it began to be used as a general statement about <strong>how the processor is permitted to treat that page</strong>.</p>
+
+                    <h2 id="sec-4">W^X - never both permissions at the same moment</h2>
+
+                    <p>Once the execute axis existed, the principle known as W^X followed immediately. No page may hold write permission and execute permission <strong>at the same time</strong>. The no-execute bit does not enforce this by itself. The bit only makes states writable; the prohibition on a particular combination is a policy laid on top of it. Which is why the layer and the strength of that enforcement differ from system to system.</p>
+
+                    <p>OpenBSD holds the line most tightly. Its man page states plainly that mappings requesting both write and execute are not permitted, and it narrows the exception path to two conditions that must hold together. The filesystem has to be mounted <code>wxallowed</code> and the process has to be link-time tagged <code>wxneeded</code>. A violation comes back as <code>ENOTSUP</code>, and the documentation even points at <code>kern.wxabort</code> as a way to diagnose where the failure happened.</p>
+
+                    <p>Apple silicon is also on the strict side. Apple's developer documentation states that memory protection is enabled for all apps regardless of whether they adopt the Hardened Runtime, in contrast with Intel-based Mac computers where it applied only to apps that adopted it. The rule while that protection is on is written as a single sentence too: a thread cannot write to a memory region and execute instructions in that region at the same time.</p>
+
+                    <p>Linux picks a different place to stand. Neither the <code>mmap</code> nor the <code>mprotect</code> documentation says that the write plus execute combination is rejected. The controls live in other layers instead. Mount a filesystem no-exec and any attempt to map a file from it with <code>PROT_EXEC</code> is refused with <code>EPERM</code>, as the <code>mmap</code> man page records. The no-exec seal on memory files, which appears later in this article, belongs to the same family.</p>
+
+                    <h2 id="sec-5">What the source article actually claims - speculative instruction fetch</h2>
+
+                    <h3>Same meaning, only one of them died</h3>
+
+                    <p>The contrast that turned the debugging around looks like this in shape.</p>
+
+                    <pre><code class="language-asm">    bl   get_ctr_el0     // static direct branch — destination is baked into the instruction
+    blr  x1              // indirect branch — destination is read from a register at run time</code></pre>
+
+                    <p>Both lines call the same function. The only difference is <strong>when the destination becomes known</strong>. A direct branch already has its destination at the moment the instruction is fetched. An indirect branch makes the processor <strong>predict</strong> a destination before the register value is ready. When the prediction misses, the results are discarded later, but the instructions along that path have <strong>already been fetched</strong>.</p>
+
+                    <h3>What a Device marking does not close</h3>
+
+                    <p>On ARM, memory-mapped I/O regions are marked as Device memory rather than Normal memory. A common assumption grows out of that: mark it Device and the processor will not touch it casually. The ARM documentation sentence quoted in the source article narrows that assumption by exactly one notch. There is a subtle distinction that is easy to miss, and it is this: marking a region as Device prevents speculative <strong>data</strong> accesses only, while preventing speculative <strong>instruction</strong> accesses requires marking the region <strong>non-executable</strong>.</p>
+
+                    <p>The situation in the article fell precisely into that gap. Because the mapping was one-to-one, address zero was locked-out bootrom, and a mispredicted indirect branch tried to fetch instructions from it. The data axis was already closed by the Device marking; the instruction axis was still open. Hence the fix was execute-never. What got reduced was not attack surface but <strong>the range the processor can touch on speculation alone</strong>.</p>
+
+                    <p>This is the point the title of the source article is aiming at. The no-execute bit functions as an <strong>architectural attribute that governs speculative behavior</strong> before it functions as a defense. Read data execution prevention purely as a countermeasure to stack overflows and you will miss the hardware-level failures that the very same bit catches.</p>
+
+                    <h2 id="sec-6">Already baked into the kernel source - execute-never on device mappings</h2>
+
+                    <p>General purpose operating systems already ship that conclusion as a default. The arm64 page protection header in Linux shows it at a glance.</p>
+
+                    <pre><code class="language-c">#define PROT_DEFAULT		(PTE_TYPE_PAGE | PTE_MAYBE_NG | PTE_MAYBE_SHARED | PTE_AF)
+
+#define PROT_DEVICE_nGnRnE	(PROT_DEFAULT | PTE_PXN | PTE_UXN | PTE_WRITE | PTE_ATTRINDX(MT_DEVICE_nGnRnE))
+#define PROT_DEVICE_nGnRE	(PROT_DEFAULT | PTE_PXN | PTE_UXN | PTE_WRITE | PTE_ATTRINDX(MT_DEVICE_nGnRE))
+#define PROT_NORMAL		(PROT_DEFAULT | PTE_PXN | PTE_UXN | PTE_WRITE | PTE_ATTRINDX(MT_NORMAL))</code></pre>
+
+                    <p>The base attribute set, <code>PROT_DEFAULT</code>, carries no execute-never bit at all. What device mappings add on top of it is <code>PTE_PXN</code> and <code>PTE_UXN</code> <strong>together</strong>, and the normal memory the kernel uses does the same. Each macro then ends with a separate memory type selector. The fact that <strong>the execute axis and the memory type axis are filled in independently</strong> is visible right there in a single line of code.</p>
+
+                    <p>Two things follow. First, arm64 has not one execute-never bit but <strong>two</strong>. They are split by privilege level, which makes it possible to express a page that user space may execute but the kernel may not. Second, executable kernel text is produced by <strong>removing</strong> those bits rather than by adding an execute permission. The default is prohibition and permission is the exception. That ordering matters more than it looks.</p>
+
+                    <p>Which means the property the author of the source article had to implement by hand is a property that a general purpose kernel already lays down for free. Someone writing page tables directly on bare metal inherits none of those defaults. In the place where the operating system's quiet convention used to sit, a subtle distinction in the architecture manual showed up immediately as a boot failure.</p>
+
+                    <h2 id="sec-7">Faults as signals - same machinery, different bit</h2>
+
+                    <p>Violate a page permission and you get a fault, and the fault goes to the kernel. But there is a whole family of techniques that treat that fault not as an error but as a <strong>notification</strong>. A protection mechanism turned into an observation mechanism. On Linux the representative of that family is <code>userfaultfd</code>.</p>
+
+                    <p>The man page defines it as the delegation of page-fault handling to a user-space application. The purposes it names are lazy restore for checkpoint and restore mechanisms, and post-copy migration that allows nearly uninterrupted execution when moving virtual machines and containers from one host to another. The mechanism is spelled out as well. When a fault occurs in a registered region, the faulting thread is put to sleep, an event is generated that can be read through the file descriptor, and user space reads it and responds.</p>
+
+                    <p>There are three registration modes: access to a page that is missing, a write to a page that is write-protected, and a minor fault where the page exists but the page table entries do not. The documentation positions the facility as an <strong>alternative</strong> to traditional user-space paging techniques based on the use of the <code>SIGSEGV</code> signal.</p>
+
+                    <p>And here comes the fact that matters most for the axis of this article. <strong>There is no execute mode on that list.</strong> The fault-as-signal family runs on the read and write axes. Execute permission is used less to generate a notification and more to <strong>stop the access from happening in the first place</strong>. The source article went the same direction exactly. It did not catch a fault and handle it; it removed the situation that would have faulted.</p>
+
+                    <p>So the structure by which a security feature ends up doing other work splits into two branches. One borrows the <strong>event</strong> that a fault represents. The other borrows the <strong>range of hardware behavior</strong> that a permission bit defines. The no-execute bit belongs to the second branch.</p>
+
+                    <h2 id="sec-8">The table - what each technique buys and what it pays</h2>
+
+                    <p>Put the techniques already covered next to the ones still to come and their natures separate cleanly. The third column is the property each technique actually borrows from the execute permission, and the fourth is the price.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Technique</th><th>What it is used for</th><th>Property the execute permission provides</th><th>Cost</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Blocking speculative instruction fetch</td><td>Keeps speculation out of locked or device regions</td><td>A page marked execute-never is not fetched as instructions even speculatively</td><td>That region genuinely cannot be executed. A separate mapping is needed if it must be</td></tr>
+                            <tr><td>Data execution prevention</td><td>Stops bytes that arrived as data from becoming an execution path</td><td>The read axis and the execute axis can be written down separately</td><td>Does not hold on hardware without an execute axis</td></tr>
+                            <tr><td>W^X policy</td><td>Keeps a writable page from becoming executable in the same breath</td><td>Provides grounds for rejecting the combination of two permissions</td><td>Programs that generate code absorb a flip or a double mapping</td></tr>
+                            <tr><td>JIT by permission flip</td><td>Fills a region with machine code and then makes it executable</td><td>A guarantee that nothing is executable while it is being written</td><td>One syscall per flip. Page granularity, and the whole address space is affected</td></tr>
+                            <tr><td>JIT by double mapping</td><td>Separates the write window from the execute window by address</td><td>Different execute permissions can sit on the same physical pages</td><td>Two sets of virtual addresses. Collides head-on with the no-exec seal</td></tr>
+                            <tr><td>Per-thread flip</td><td>Opens the write window on one thread only</td><td>Execute permission can be seen differently per thread</td><td>Platform-specific API and entitlements. Instruction caches must be flushed by hand</td></tr>
+                            <tr><td>No-exec seal</td><td>Nails a memory file so it can never become executable later</td><td>Turns execute permission into an irreversible state</td><td>No execute window can be built from that file descriptor</td></tr>
+                            <tr><td>No-exec mount</td><td>Prevents the contents of a filesystem from being executed</td><td>Rejects the execute request at the mapping stage</td><td>Legitimate tooling running out of temporary directories is blocked too</td></tr>
+                            <tr><td>Faults as signals</td><td>Lets user space handle page faults</td><td>Uses the missing and write-protect axes rather than the execute axis</td><td>A user-space round trip per fault. There is no execute mode here</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2 id="sec-9">How a JIT holds W^X</h2>
+
+                    <p>A program that produces executable code while it is running collides with W^X directly. Machine code has to be <strong>written and then run</strong>, and the principle forbids holding both permissions in the same instant. What just-in-time compilation is trying to buy in the first place is covered in the article on <a href="perry_typescript_llvm_compiler_2026.html">Perry, the compiler that lowers TypeScript straight to LLVM machine code</a>; the concern here is narrower and only about <strong>how the permissions are handled</strong>.</p>
+
+                    <h3>Flipping the permission</h3>
+
+                    <pre><code class="language-c">/* Open a write window, fill it with machine code, then make it executable */
+void *p = mmap(NULL, len, PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+if (p == MAP_FAILED) return -1;
+
+emit_code(p, len);                       /* up to here the page is not executable */
+
+if (mprotect(p, len, PROT_READ | PROT_EXEC) != 0) return -1;
+/* from this point the same page is executable and no longer writable */</code></pre>
+
+                    <p>This is the simplest shape. Open an anonymous mapping for reading and writing, fill it with machine code, then flip it to read plus execute with <code>mprotect</code>. Before the flip it cannot be executed and after the flip it cannot be written, so at no instant do write and execute stand together on the same page.</p>
+
+                    <h3>Splitting the mapping in two</h3>
+
+                    <pre><code class="language-c">/* Attach two virtual addresses with different permissions to the same physical pages */
+int fd = memfd_create("jit", MFD_CLOEXEC);
+if (fd == -1) return -1;
+ftruncate(fd, len);
+
+void *rw = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+void *rx = mmap(NULL, len, PROT_READ | PROT_EXEC,  MAP_SHARED, fd, 0);
+
+emit_code(rw, len);   /* write only through rw, execute only through rx */</code></pre>
+
+                    <p>The same file descriptor is mapped <strong>twice as a shared mapping</strong>. The <code>mmap</code> man page states that updates to a shared mapping are visible to others mapping the same region, so bytes written through <code>rw</code> are read as instructions through <code>rx</code>. The physical pages stay single, only the virtual addresses double, and the permissions differ between them.</p>
+
+                    <p>The flip syscall disappears and something else takes its place. Two sets of addresses must be carried around, and the question of <strong>which window a relative branch target was computed against</strong> keeps coming back. And if the no-exec seal described later is in force, this approach does not exist at all.</p>
+
+                    <h2 id="sec-10">Apple silicon - flipping per thread</h2>
+
+                    <p>Apple built a third route. A JIT region is created by passing the <code>MAP_JIT</code> flag to <code>mmap</code>. An app that adopts the Hardened Runtime needs the <code>com.apple.security.cs.allow-jit</code> entitlement before the system allows it to call <code>mmap</code> with that flag, and an app that does not adopt the capability does not need the entitlement to use the flag at all. With the Hardened Runtime and that entitlement together, however, an app can create <strong>only one</strong> memory region with <code>MAP_JIT</code> set.</p>
+
+                    <p>The flip itself is done through <code>pthread_jit_write_protect_np</code>. The documentation also describes a newer path. Adding the <code>com.apple.security.cs.jit-write-allowlist</code> entitlement lets an app write into its JIT region through <code>pthread_jit_write_with_callback_np</code>, and an app carrying that entitlement can <strong>no longer call</strong> <code>pthread_jit_write_protect_np</code>. A further entitlement exists for updating the allowlist at run time when libraries are loaded dynamically.</p>
+
+                    <p>The structurally interesting part is the <strong>scope</strong> of the flip. The documentation says the callback route makes the memory region writable and not executable <strong>for the current thread only</strong>, and that on the way back it makes the region executable and not writable for the current thread. <code>mprotect</code> from the previous section does nothing of the kind. It changes the mapping in the address space, so for as long as the window is open <strong>every thread</strong> in the process sees that page as writable. The per-thread flip narrows that window to one thread.</p>
+
+                    <p>And permissions are not the whole job. Apple's documentation insists that <code>sys_icache_invalidate</code> be called before executing the machine instructions on a recently updated memory page. On Apple silicon the instruction caches are not coherent with the data caches, and executing without invalidating can produce unexpected results. The same call is documented as safe on Intel-based Mac computers, where it does nothing.</p>
+
+                    <p>This overlaps with the source article. One of the hypotheses that fell there was instruction versus data cache coherency as well. Anything that produces its own machine code has to handle <strong>permissions and caches together</strong>. Get only one of the two right and the symptom looks identical either way: an irreproducible hang.</p>
+
+                    <h2 id="sec-11">Where the cost really sits - syscalls, page granularity, caches</h2>
+
+                    <p>The price of holding W^X splits into several parts. Whichever approach is chosen, some of these are always paid.</p>
+
+                    <ul>
+                        <li><strong>Syscalls</strong> — the flip approach enters and leaves the kernel every time a batch of machine code is produced. The more finely code generation is divided, the more often this cost lands.</li>
+                        <li><strong>Page granularity</strong> — permissions change for a whole page, not for a range of bytes. Pack several small code fragments into one page and opening it to fix one of them makes all the others writable along with it.</li>
+                        <li><strong>The whole address space</strong> — <code>mprotect</code> changes the mapping for the process. In a multithreaded program, the interval where the flip is open is an interval open to every thread.</li>
+                        <li><strong>Doubled virtual addresses</strong> — double mapping trades the syscall away for two addresses. Address arithmetic inside the generated code has to stay consistent about which window it is based on.</li>
+                        <li><strong>Instruction caches</strong> — on some platforms a cache maintenance step is mandatory before freshly written bytes are executed as instructions.</li>
+                        <li><strong>Policy collisions</strong> — with certain hardening knobs turned on, some of the approaches above simply do not exist. The no-exec seal in the next section is the example.</li>
+                    </ul>
+
+                    <p>One intuition tends to go wrong here. Setting or clearing the no-execute bit itself costs essentially nothing. What costs is <strong>changing that state</strong>, and the reason for changing it is that the program manufactures code while it runs. In a process that only ever runs statically compiled code, this entire cost is effectively zero.</p>
+
+                    <h2 id="sec-12">Where architectures differ</h2>
+
+                    <p>The x86 definition is exactly as described earlier. Seeing the shape makes it obvious where the condition sits.</p>
+
+                    <pre><code class="language-c">#define _PAGE_BIT_NX		63	/* No execute: only valid after cpuid check */
+
+#if defined(CONFIG_X86_64) || defined(CONFIG_X86_PAE)
+#define _PAGE_NX	(_AT(pteval_t, 1) << _PAGE_BIT_NX)
+#else
+#define _PAGE_NX	(_AT(pteval_t, 0))
+#endif</code></pre>
+
+                    <p>The bit position is fixed at a single number, but whether that bit actually exists depends on the configuration. The mask is raised only for 64-bit builds or PAE, and is zero otherwise. The comment carries the same message. Being valid only after a cpuid check means the capability was not there from the start but was <strong>added later as an option</strong>.</p>
+
+                    <p>arm64 is structured differently. Execute-never comes in <strong>two</strong> pieces split by privilege level, and a separate memory type axis sits alongside them. The macros in the earlier section, where both axes are filled on the same line, are the evidence.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Architecture</th><th>How execute-never is expressed</th><th>Name in the Linux source</th><th>Axis that must be read alongside</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>x86-64 and PAE</td><td>A single bit at position 63 of the page table entry</td><td>_PAGE_BIT_NX and _PAGE_NX</td><td>None. The execute axis is singular</td></tr>
+                            <tr><td>32-bit x86 without PAE</td><td>The bit does not exist</td><td>_PAGE_NX is defined as zero</td><td>The read axis doubles as the execute axis</td></tr>
+                            <tr><td>arm64 privileged level</td><td>A bit forbidding execution at the privileged level</td><td>PTE_PXN</td><td>A separate memory type axis exists</td></tr>
+                            <tr><td>arm64 unprivileged level</td><td>A bit forbidding execution at the unprivileged level</td><td>PTE_UXN</td><td>A separate memory type axis exists</td></tr>
+                            <tr><td>arm64 device regions</td><td>Both bits are included in device mappings by default</td><td>PROT_DEVICE_nGnRnE and PROT_DEVICE_nGnRE</td><td>A Device marking closes the data axis only</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>The last row of that table is the wall the source article ran into. Writing Device does not close the execute axis automatically. The two axes <strong>govern different things.</strong></p>
+
+                    <h2 id="sec-13">Where operating systems differ</h2>
+
+                    <p>Given the same hardware bit, operating systems layer different policies on top. Restricted to what the documentation actually says, it comes out like this.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>System</th><th>Mappings asking for write and execute</th><th>Exception path</th><th>Supporting machinery</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>OpenBSD</td><td>Not permitted. Rejected with ENOTSUP</td><td>Filesystem mounted wxallowed and the process link-time tagged wxneeded</td><td>kern.wxabort to locate the failure</td></tr>
+                            <tr><td>macOS on Apple silicon</td><td>A thread cannot write and execute in the same region at once</td><td>MAP_JIT regions plus dedicated entitlements</td><td>The flip is per thread. Instruction cache invalidation is mandatory</td></tr>
+                            <tr><td>macOS on Intel</td><td>Protection applies only to apps that adopt the Hardened Runtime</td><td>The same entitlement scheme</td><td>The cache invalidation call does nothing there</td></tr>
+                            <tr><td>Linux</td><td>No statement in the mmap or mprotect docs forbidding the combination</td><td>The policy is applied in other layers</td><td>No-exec mounts and the no-exec seal on memory files</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>The Linux row is easy to misread. The absence of a prohibition in the documentation means that <strong>the base syscall layer does not reject the combination</strong>, not that W^X cannot be enforced on Linux. Linux moved that decision out to mount options, to per-object seals, and to separate security modules. Only the location of the policy is different. The same question about where to draw a trust boundary shows up on the web side in <a href="client_trust_boundary_web_security.html">the article on why you cannot trust the client</a>.</p>
+
+                    <h2 id="sec-14">Execute permission as policy - the no-exec seal</h2>
+
+                    <p>Linux memory files contain a case where execute permission stopped being a page bit and became <strong>a property of an object</strong>. The kernel documentation defines three controls.</p>
+
+                    <ul>
+                        <li><strong>The no-exec seal flag</strong> — when this bit is set, the memory file is created non-executable and an execute seal is applied together with it, so the file cannot be modified to add execute permission later.</li>
+                        <li><strong>The exec flag</strong> — when this bit is set, the memory file is created carrying execute permission.</li>
+                        <li><strong>The system-wide setting</strong> — at value zero, a call specifying neither flag behaves as if execution were allowed; at one it behaves as if the no-exec seal had been requested; and at two a call without the seal is <strong>rejected outright</strong>.</li>
+                    </ul>
+
+                    <p>The kernel documentation is explicit about the reasoning. Executable memory files become a route for confused deputy style misuse and for bypassing no-exec policy, yet there are clearly <strong>legitimate uses</strong> such as a container runtime executing a binary, so a way to tell the two apart was needed.</p>
+
+                    <p>What that design demonstrates lands right on the axis of this write-up. Execute permission became <strong>a state that cannot be reversed once chosen</strong>. What used to be a single bit in a page table now attaches to a file descriptor as an object and governs the rest of that object's life. A bit that entered as a protection mechanism has been promoted into the vocabulary of resource management.</p>
+
+                    <p>And it collides head-on with the double-mapped JIT from the earlier section. With the system-wide setting at its strictest value, a memory file for a JIT <strong>cannot be created at all.</strong> One hardening knob switches off one legitimate capability. Which side is right depends on what that system is running, and no default value can make the judgment on anyone's behalf.</p>
+
+                    <h2 id="sec-15">Where the source article and this write-up part ways</h2>
+
+                    <p>The claim in the source article is narrow and clear. It is a debugging record for one bare-metal ARM64 hypervisor, and the conclusion is that a Device marking and an execute-never marking <strong>prevent different things</strong>. The author lost weeks to missing that fact, and the problem dissolved once it was known.</p>
+
+                    <p>What is not in that article deserves to be stated just as plainly. The origin of the no-execute bit, the per-system differences in W^X policy, JIT implementation strategies and the x86 situation are not its subject. Everything filling those sections above rests on the primary text of each document and source file, and none of it stretches the source article's claim.</p>
+
+                    <p>One line should be drawn against over-generalization as well. The article's conclusion is that <strong>a Device marking must not be read as closing the instruction axis</strong>, not that turning on execute-never resolves speculation-related problems in general. That would be an entirely different claim, and the article does not make it.</p>
+
+                    <p>What remains is a single sentence. A mechanism introduced for defense turned out to be expressing a different architectural rule all along, and for the developer who needed that rule, <strong>security arrived as a by-product</strong>. A gap between the purpose of introduction and the eventual use is not a failure. Once one more state becomes expressible, the expression always travels further than the place it started.</p>
+
+                    <h2 id="sec-16">What could not be confirmed</h2>
+
+                    <ul>
+                        <li>The architecture documentation pages on the ARM developer site are rendered by script, so their body text could not be opened. The ARM documentation sentence quoted in the source article was cross-checked only through that article, and the manual's section and revision numbers could not be pinned down.</li>
+                        <li>The Intel and AMD architecture manual PDFs could not be opened. The bit at position 63 on x86 and its conditional definition were cross-checked only against the definition and comment in the Linux kernel header. Vendor naming does not appear in that header, so no vendor name is used in the body text.</li>
+                        <li>The expansion of the names PXN and UXN was read off the macro names and could not be confirmed against the ARM manual text. The body describes only the function, which is execute-never per privilege level.</li>
+                        <li>In the disassembly in the source article, the register number used by the indirect branch appeared differently across renderings. Since the point rests on the contrast between direct and indirect branches, the prose keeps the shape and drops the number.</li>
+                        <li>Figures for the real cost of a permission flip or a double mapping were not found in any primary source. Only the kinds of cost are listed, never their magnitude.</li>
+                        <li>The macOS version that introduced Apple's callback-based write API could not be established. The documentation describes the entitlement and the behavior without a version note.</li>
+                        <li>Text about the execute seal on memory files was not found on the man page side, so the kernel documentation was used instead. The gap looks like a difference in revision timing between the two documents.</li>
+                        <li>The Linux kernel source quotations are taken from the main development branch rather than pinned to a release tag. Macro composition can differ between versions.</li>
+                    </ul>
+
+                    <h2 id="sec-17">References</h2>
+
+                    <ul>
+                        <li><a href="https://news.hada.io/topic?id=33250" target="_blank" rel="noopener">GeekNews topic 33250</a> — the introduction that prompted this article, carrying the original link and a summary</li>
+                        <li><a href="https://purplesyringa.moe/blog/guest/the-nx-bit-is-not-just-about-security/" target="_blank" rel="noopener">The NX bit is not just about security (purplesyringa.moe)</a> — the source article. The ARM64 hypervisor debugging record, the contrast between direct and indirect branches, the distinction between a Device marking and an execute-never marking, and the closing line about defense in depth all live here</li>
+                        <li><a href="https://man7.org/linux/man-pages/man2/mprotect.2.html" target="_blank" rel="noopener">mprotect(2) (man7.org)</a> — the prototype and page alignment requirement, the definitions of the four protection flags, the note that the effect of the execute flag depends on architecture and kernel and process state, and the behavior of READ_IMPLIES_EXEC</li>
+                        <li><a href="https://man7.org/linux/man-pages/man2/mmap.2.html" target="_blank" rel="noopener">mmap(2) (man7.org)</a> — the protection flag definitions, the statement that updates to a shared mapping are visible to others mapping the same region, and the error condition covering execute requests on a no-exec mount</li>
+                        <li><a href="https://man7.org/linux/man-pages/man2/userfaultfd.2.html" target="_blank" rel="noopener">userfaultfd(2) (man7.org)</a> — delegation of page-fault handling to user space, lazy restore and post-copy migration as stated purposes, the three registration modes, and its position as an alternative to signal-based techniques</li>
+                        <li><a href="https://docs.kernel.org/userspace-api/mfd_noexec.html" target="_blank" rel="noopener">Introduction of non-executable mfd (kernel documentation)</a> — the definitions of the no-exec seal and the exec flag, the behavior of the three system-wide values, and the stated reason for adding these controls</li>
+                        <li><a href="https://github.com/torvalds/linux/blob/master/arch/arm64/include/asm/pgtable-prot.h" target="_blank" rel="noopener">arch/arm64/include/asm/pgtable-prot.h (Linux kernel)</a> — the definitions showing that the base attribute set carries no execute-never bit while device and normal mappings both carry two of them</li>
+                        <li><a href="https://github.com/torvalds/linux/blob/master/arch/x86/include/asm/pgtable_types.h" target="_blank" rel="noopener">arch/x86/include/asm/pgtable_types.h (Linux kernel)</a> — the bit 63 definition with its cpuid comment, and the conditional mask that is raised only for 64-bit or PAE builds and is zero otherwise</li>
+                        <li><a href="https://developer.apple.com/documentation/apple-silicon/porting-just-in-time-compilers-to-apple-silicon" target="_blank" rel="noopener">Porting just-in-time compilers to Apple silicon (Apple)</a> — MAP_JIT and the entitlements, the limit on the number of regions, the per-thread flip, the instruction cache invalidation requirement, and the difference in protection coverage between Apple silicon and Intel Macs</li>
+                        <li><a href="https://man.openbsd.org/mmap.2" target="_blank" rel="noopener">mmap(2) (OpenBSD)</a> — the prohibition on mappings asking for both write and execute, the two-layer exception path of a mount option plus a link-time tag, and the error value and diagnostic control on rejection</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>Share this post</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X (Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">Copy link</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">Back to list</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Free tools you may find useful</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/iptables_generator.html">iptables Generator 2026</a></li>
+      <li><a href="../static/code_image.html">Code Image Generator</a></li>
+      <li><a href="../static/char_counter.html">Character Counter</a></li>
+      <li><a href="../static/json_formatter.html">JSON Formatter</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">See all tools &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Related Posts</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="agent_tool_selection_measured.html">When an Agent Picks a Vendor, Which Agent Was It - Measuring Third-Party Choices Across 16,893 Coding Agent Runs</a></li>
+      <li><a href="exploited_vulnerability_priority.html">The One Line That Reorders Everything - A Score Measures Severity, Exploitation Is a Fact</a></li>
+      <li><a href="llm_simultaneous_outage.html">Failing at the Same Time Does Not Mean Failing for the Same Reason - The Day Several AI Services Went Down Together</a></li>
+      <li><a href="browser_main_thread_cost.html">Why the Browser Has Only One Main Thread - What Shares It, and What Can Actually Leave</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('Link copied. Paste it into the Threads app to share.');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('Link copied.'); });
+    });
+    </script>
+</body>
+</html>

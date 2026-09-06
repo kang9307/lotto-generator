@@ -1,0 +1,601 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>禁止执行位到底挡住了什么 - NX 在安全之外做的事以及它的代价</title>
+    <meta name="description" content="梳理禁止执行位真正挡住的东西。页权限究竟是什么，在它出现之前可读为何就等于可执行，为什么连投机性的指令取出也会被一并拦下，以及想守住 W^X 的程序要付出哪些代价，全部依据架构手册与各家操作系统的原始文档逐条划分开来。">
+    <meta name="keywords" content="NX 位, 禁止执行, W^X, 页权限, mprotect, mmap, JIT, XN, PXN, UXN, DEP, 投机执行, memfd, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/nx_bit_beyond_security.html">
+
+    <meta property="og:title" content="禁止执行位到底挡住了什么 - NX 在安全之外做的事以及它的代价">
+    <meta property="og:description" content="即使一个攻击者都不出现，禁止执行位依然在工作。它在页表里真正规定了什么，以及守住它的一方要付出什么。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/nx_bit_beyond_security.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-09-06">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="禁止执行位到底挡住了什么">
+    <meta name="twitter:description" content="NX 在成为防御手段之前，先是一条规定投机行为的架构属性。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "禁止执行位到底挡住了什么 - NX 在安全之外做的事以及它的代价",
+      "alternativeHeadline": "可读即可执行的年代、投机性取指这第二副面孔，以及守住 W^X 所要付的价钱",
+      "datePublished": "2026-09-06",
+      "dateModified": "2026-09-06",
+      "inLanguage": "zh-CN",
+      "articleSection": "开发/基础设施",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "NX 位, 禁止执行, W^X, 页权限, mprotect, JIT, XN, PXN, UXN, 投机执行, memfd",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/nx_bit_beyond_security.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "NX 位到底是什么?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "它是记录在虚拟内存转换表每个条目里的执行权限标记。以一个页为单位，用一个比特写明这个页里的字节是否可以被当作指令取出来。在 Linux 内核源码里，x86 一侧把页表条目的第 63 位留给这个用途，只有在 64 位或启用 PAE 时才使用真正的比特值，其余情况下定义为零。arm64 一侧则使用按特权级别分开的两个禁止执行位。应用程序一侧的表现是 mmap 与 mprotect 的 prot 参数中的 PROT_EXEC，而这个标志是否会产生与 PROT_READ 不同的效果，man page 写明取决于处理器架构、内核版本和进程状态。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "说 NX 位不只是为了安全是什么意思?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "引发这篇文章的原文作者，是用禁止执行的标记修好了一台真机上无法启动的 ARM64 裸机虚拟机监控程序。整个故事里没有出现任何攻击者。分支预测器误预测到地址 0，而在一对一映射下那个位置正是被锁住的 bootrom。作者引用的 ARM 文档写道，把一个区域标记为 Device 只能阻止投机性的数据访问，若要阻止投机性的指令访问，就必须把该区域标记为不可执行。也就是说，禁止执行位在成为防御功能之前，先是一条规定处理器仅凭投机就能触及多大范围的架构属性。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "在 W^X 之下 JIT 是怎么执行代码的?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "大致有两条路。一条是翻转权限，先以可写方式打开页面并填入机器码，再用 mprotect 改成可读加可执行的组合。翻转以页为粒度生效并作用于整个地址空间，所以同一进程里的其他线程也会看到那个状态。另一条是把映射拆成两份，把同一个文件描述符以共享映射的方式挂两次，一份当写入窗口，另一份当执行窗口。物理页仍然只有一份，只有虚拟地址变成两组。Apple 芯片则走了第三条路，先创建 MAP_JIT 区域，再把翻转只应用到当前线程。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "禁止执行位在不同架构上有什么差别?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "在 x86 系上它是页表条目里第 63 位这一个比特。32 位的条目里没有那个位置，所以 Linux 只在 64 位或启用 PAE 时定义这个掩码，源码注释还补了一句说它要通过 cpuid 检查之后才有效。在 arm64 上，特权级别用的和非特权级别用的各有一个，因此可以表达出内核不能执行而用户空间可以执行这样的状态。除此之外 ARM 还有一条与执行权限彼此独立的内存类型轴，用来区分 Normal 与 Device，而这两条轴挡住的东西并不相同，正是引发这篇文章的原文的核心。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "把缺页异常当作信号来用的技法也依赖禁止执行位吗?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "那一支基本上跑在读与写这两条轴上。userfaultfd 是把缺页异常的处理委托给用户空间应用程序的机制，man page 列出的用途是检查点与恢复机制中的延迟恢复，以及后拷贝迁移。注册模式有三种，分别是访问缺失的页、向写保护的页写入，以及页存在但页表条目不存在的次要缺页。这份清单里没有执行这条轴。执行权限更多被用在从一开始就不让那次访问发生的一侧，而不是用来产生通知。引发这篇文章的原文走的也是同一个方向，它不是接住异常再处理，而是把会产生异常的局面本身消掉了。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/nx_bit_beyond_security.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/nx_bit_beyond_security.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/nx_bit_beyond_security.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/nx_bit_beyond_security.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/nx_bit_beyond_security.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "首页",
+      "item": "https://braindetox.kr/zh/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "开发/基础设施",
+      "item": "https://braindetox.kr/zh/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "禁止执行位到底挡住了什么 - NX 在安全之外做的事以及它的代价",
+      "item": "https://braindetox.kr/zh/posts/nx_bit_beyond_security.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="禁止执行位到底挡住了什么 - NX 在安全之外做的事以及它的代价">
+                <meta itemprop="datePublished" content="2026-09-06">
+                <meta itemprop="dateModified" content="2026-09-06">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="NX 位, 禁止执行, W^X, 页权限, mprotect, JIT, XN, PXN, UXN, 投机执行, memfd">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/nx_bit_beyond_security.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">禁止执行位到底挡住了什么 - NX 在安全之外做的事以及它的代价</h1>
+                    <h2 class="post-subtitle">可读即可执行的年代、投机性取指这第二副面孔，以及守住 W^X 所要付的价钱</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-06">2026-09-06</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">开发/基础设施</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>禁止执行位几乎总是在攻防的语境里被介绍。把机器码塞进缓冲区也不会在那里跑起来，数据区与代码区之间划着一条线。这些说法本身并没有错。只是这个比特在<strong>页表里真正规定的范围</strong>要比那个故事更宽，而这份额外的宽度，恰恰在一个攻击者都不出现的场合里显露得最清楚。</p>
+
+                    <p>最近的一篇文章把那份宽度写得非常具体。一位开发者在做 ARM64 裸机虚拟机监控程序，为一台开不了机的手机耗了几个星期，最后是靠给映射打上<strong>禁止执行的标记</strong>解决的。凶手不是入侵者，而是<strong>分支预测器</strong>。等修好之后，这个监控程序还顺带获得了一层纵深防御。平时讲这类故事的顺序在这里被彻底倒了过来。</p>
+
+                    <p>下面要谈的就是这个被倒过来的顺序。执行权限这个比特在转换表里究竟是什么，在它还不存在的年代里<strong>可读即可执行</strong>意味着什么，禁止执行连<strong>投机性取指</strong>一起挡下来这条性质能解开哪一类故障，以及想守住这条性质的程序，尤其是自己生产可执行代码的程序，要交出什么作为代价。</p>
+
+                    <div class="callout">
+                        下面出现的标志名称、宏定义与文档表述，都与 Linux 的 man page、内核文档和内核源码、Apple 开发者文档以及 OpenBSD man page 的原文一致。凡是尚未与架构厂商手册原本核对上的地方，都连同原因一起收在倒数第二节里。
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>本文要讲的内容</h3>
+                        <ol>
+                            <li><a href="#sec-1">缘起 - 修好开不了机的监控程序的是一个安全比特</a></li>
+                            <li><a href="#sec-2">执行权限是什么 - 挂在一个页上的比特</a></li>
+                            <li><a href="#sec-3">在那之前 - 可读就意味着可执行</a></li>
+                            <li><a href="#sec-4">W^X - 不在同一瞬间给出两种权限</a></li>
+                            <li><a href="#sec-5">原文真正主张的东西 - 投机性取指</a></li>
+                            <li><a href="#sec-6">内核源码里早已写死的东西 - 设备映射的禁止执行</a></li>
+                            <li><a href="#sec-7">把异常当信号用的技法 - 同一套机器，不同的比特</a></li>
+                            <li><a href="#sec-8">汇总表 - 为什么用它，又付出什么</a></li>
+                            <li><a href="#sec-9">JIT 是怎么守住 W^X 的</a></li>
+                            <li><a href="#sec-10">Apple 芯片 - 以线程为单位翻转</a></li>
+                            <li><a href="#sec-11">代价的真面目 - 系统调用、页粒度、缓存</a></li>
+                            <li><a href="#sec-12">各架构之间的差别</a></li>
+                            <li><a href="#sec-13">各操作系统之间的差别</a></li>
+                            <li><a href="#sec-14">把执行权限当作策略来处理 - 禁止执行封印</a></li>
+                            <li><a href="#sec-15">原文与本文分道扬镳的地方</a></li>
+                            <li><a href="#sec-16">未能确认的部分</a></li>
+                            <li><a href="#sec-17">参考资料</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">缘起 - 修好开不了机的监控程序的是一个安全比特</h2>
+
+                    <p>引发这篇文章的原文，是一位署名 Sonya 的作者发在 purplesyringa 博客上的客座文章。对象是给 postmarketOS 用的 ARM64 裸机虚拟机监控程序。症状一句话就能说清：一旦打开对某个系统寄存器读取的拦截，手机就会卡住并重启；同一份代码在 QEMU 上跑得好好的。</p>
+
+                    <p>文章有一半篇幅是假设一个接一个倒下的声音。异常处理程序把寄存器弄坏了这个假设，在 QEMU 的单步跟踪下站不住。这是指令缓存与数据缓存一致性问题这个假设，靠把排序工作挪到构建期得到了处理。硬件跑出了规范之外这个假设，让作者又加装了几个异常处理程序，结果什么也没抓到。</p>
+
+                    <p>突破口来自二进制比对。能跑的那一版和会死的那一版，差别是<strong>在语义上完全等价的两种写法</strong>。目的地被编进指令本身的静态直接分支活了下来，从寄存器里读目的地的间接分支死掉了。这个对比指向的只有一件事：<strong>分支预测</strong>。</p>
+
+                    <p>预测器把目的地误判到了地址 0。而在这个监控程序的一对一映射下，那个位置放着<strong>被锁住的 bootrom</strong>。作者选择的解法是给那块区域打上禁止执行，就在那一刻手机第一次启动成功。文章最后一句话概括了整件事的性质：反正都得把映射成不可执行这条路打通，那就把除载荷之外的一切都映射成不可执行，于是这个监控程序终于也有了一点纵深防御。<strong>安全不是目的，而是副产品。</strong></p>
+
+                    <h2 id="sec-2">执行权限是什么 - 挂在一个页上的比特</h2>
+
+                    <h3>权限是按页挂上去的</h3>
+
+                    <p>在虚拟内存里，地址转换的最小单位是页。转换表的每个条目里写的不只是这个页对应到哪个物理帧，还一并写着<strong>这个页可以被怎样对待</strong>：可不可以读，可不可以写，以及里面装着的字节可不可以<strong>被当作指令取出来</strong>。</p>
+
+                    <p>应用程序一侧碰这三件事的窗口，是 <code>mmap</code> 与 <code>mprotect</code> 的 <code>prot</code> 参数。man page 用一句话定义了每个取值。<code>PROT_READ</code> 是这块内存可以被读，<code>PROT_WRITE</code> 是可以被修改，<code>PROT_EXEC</code> 是可以被执行，<code>PROT_NONE</code> 则是根本无法访问。<code>mprotect</code> 的原型是 <code>int mprotect(void *addr, size_t size, int prot);</code>，起始地址必须对齐到页边界。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>标志</th><th>man page 里的定义</th><th>实务上意味着什么</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>PROT_READ</td><td>这块内存可以被读</td><td>可以作为数据访问，加载指令能通过</td></tr>
+                            <tr><td>PROT_WRITE</td><td>这块内存可以被修改</td><td>存储指令能通过。在 i386 上它蕴含读权限</td></tr>
+                            <tr><td>PROT_EXEC</td><td>这块内存可以被执行</td><td>允许取指。只有在硬件把这条轴分开时才有意义</td></tr>
+                            <tr><td>PROT_NONE</td><td>这块内存根本无法访问</td><td>任何访问都会产生异常，用来做守卫页</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h3>在没有执行轴的硬件上会发生什么</h3>
+
+                    <p>这里 man page 谨慎加上的那句限定很关键。<code>PROT_EXEC</code> 是否会产生与 <code>PROT_READ</code> 不同的效果，<strong>取决于处理器架构、内核版本和进程状态</strong>。同一份文档还写道，当进程带上 <code>READ_IMPLIES_EXEC</code> 这个人格标志时，只指定 <code>PROT_READ</code> 也会被隐式地加上 <code>PROT_EXEC</code>。</p>
+
+                    <p>也就是说，API 里有三个标志，并不代表硬件上也有三条轴。API 一直接受三个，但其中执行这条轴，是<strong>在硬件获得了单独记录它的位置之后</strong>才真正带上意义的。在那之前，执行这条轴一直搭在读这条轴上。</p>
+
+                    <h2 id="sec-3">在那之前 - 可读就意味着可执行</h2>
+
+                    <p>为什么会这样，可以用位置不够来解释。32 位 x86 传统的页表条目宽 32 位，地址位和各种状态位已把宽度填满，没有可为执行权限新划的位置。禁止执行位进入页表是在条目变宽之后。</p>
+
+                    <p>这段来历原封不动地留在 Linux 内核源码里。x86 一侧的页类型头文件把禁止执行位定在<strong>第 63 位</strong>，旁边还加了一句注释说它要通过 cpuid 检查之后才有效。而真正的掩码只在 64 位或启用 PAE 时才使用那个比特值，在其余配置下被定义为<strong>零</strong>。</p>
+
+                    <p>所以禁止执行位的引入，与其说是多了一项保护功能，不如说是<strong>转换表能够表达的状态多了一种</strong>。在那之前，根本没有办法把可读的页与可执行的页区分着写下来。数据与代码的分界是程序之间的约定，而不是硬件强制的性质。</p>
+
+                    <p>这个差别是后面所有内容的根。一旦某种状态变得可以表达，这种表达就不会只停在最初设想的那一个用途上。禁止执行是为了防御而引入的，但它一在转换表里占住位置，就开始被当作关于<strong>处理器可以怎样对待这个页</strong>的一般性规定来使用。</p>
+
+                    <h2 id="sec-4">W^X - 不在同一瞬间给出两种权限</h2>
+
+                    <p>执行这条轴一出现，紧跟着来的原则就是 W^X：任何页都不<strong>同时</strong>持有可写与可执行。禁止执行位本身并不强制这条原则，它只是让状态可以被写下来，禁止某种组合的是叠在它上面的策略。</p>
+
+                    <p>施加得最重的是 OpenBSD。它的 man page 明说同时要求写与执行的映射不被允许，并把例外通道收窄成必须同时成立的两个条件：文件系统以 <code>wxallowed</code> 挂载，<strong>并且</strong>进程在链接期被打上 <code>wxneeded</code> 标记。违规会以 <code>ENOTSUP</code> 返回，文档里甚至写明了 <code>kern.wxabort</code> 这个用来定位失败点的开关。</p>
+
+                    <p>Apple 芯片也在偏严的一侧。Apple 的开发者文档写道，内存保护对所有应用都生效，与它是否采用 Hardened Runtime 无关，这与 Intel 平台的 Mac 上只对采用了该能力的应用生效形成对照。保护开启时的规则同样只有一句：一个线程不能在向某块区域写入的同时执行那块区域里的指令。</p>
+
+                    <p>Linux 打的是另一个位置。<code>mmap</code> 与 <code>mprotect</code> 的文档里，并没有拒绝写加执行这一组合的表述。开关被放在了别的层。把文件系统以 no-exec 挂载之后，试图用 <code>PROT_EXEC</code> 映射其上文件的请求本身就会被 <code>EPERM</code> 拒绝，这一点写在 <code>mmap</code> 的 man page 里。后面会看到的内存文件禁止执行封印，属于同一支。</p>
+
+                    <h2 id="sec-5">原文真正主张的东西 - 投机性取指</h2>
+
+                    <h3>意思一样，却只死了一个</h3>
+
+                    <p>把那个成为调试转折点的对比落到形式上，就是下面这样。</p>
+
+                    <pre><code class="language-asm">    bl   get_ctr_el0     // 静态直接分支 —— 目的地被编进了指令本身
+    blr  x1              // 间接分支 —— 目的地在运行时从寄存器里读出来</code></pre>
+
+                    <p>这两行调用的是同一个函数。差别只在<strong>目的地是什么时候确定的</strong>。直接分支在取指的那一刻目的地就已经定了。间接分支则会让处理器在寄存器的值备好之前先<strong>预测</strong>一个目的地。预测落空时结果会在稍后被丢弃，但那条路径上的指令<strong>早已被取了进来</strong>。</p>
+
+                    <h3>标成 Device 也堵不住的东西</h3>
+
+                    <p>在 ARM 上，内存映射输入输出的区域会被标成 Device 内存而不是 Normal 内存。常见的误解就从这里长出来：标成 Device，处理器就不会随便去碰那块区域。原文引用的那句 ARM 文档，把这个理解恰好收窄了一格。其中有一个很容易被漏掉的微妙区别：把一个区域标记为 Device，只能阻止投机性的<strong>数据</strong>访问；要阻止投机性的<strong>指令</strong>访问，就必须把该区域标记为<strong>不可执行</strong>。</p>
+
+                    <p>原文里的局面正好掉进了那道缝里。因为是一对一映射，地址 0 就是被锁住的 bootrom，而一次误预测的间接分支想从那里取指。数据那条轴已经被 Device 标记关上了，指令那条轴却还开着。所以解法才是禁止执行。被缩小的不是攻击面，而是<strong>处理器仅凭预测就能触及的范围</strong>。</p>
+
+                    <p>这里正是原文标题所指的地方。禁止执行位在成为防御装置之前，先作为<strong>规定投机行为的架构属性</strong>在工作。若只把数据执行防护读成针对栈溢出的对策，就会把同一个比特替你接住的硬件层面故障整个漏掉。</p>
+
+                    <h2 id="sec-6">内核源码里早已写死的东西 - 设备映射的禁止执行</h2>
+
+                    <p>通用操作系统早就把那个结论铺成了默认值。看一眼 Linux 的 arm64 页保护头文件，答案一目了然。</p>
+
+                    <pre><code class="language-c">#define PROT_DEFAULT		(PTE_TYPE_PAGE | PTE_MAYBE_NG | PTE_MAYBE_SHARED | PTE_AF)
+
+#define PROT_DEVICE_nGnRnE	(PROT_DEFAULT | PTE_PXN | PTE_UXN | PTE_WRITE | PTE_ATTRINDX(MT_DEVICE_nGnRnE))
+#define PROT_DEVICE_nGnRE	(PROT_DEFAULT | PTE_PXN | PTE_UXN | PTE_WRITE | PTE_ATTRINDX(MT_DEVICE_nGnRE))
+#define PROT_NORMAL		(PROT_DEFAULT | PTE_PXN | PTE_UXN | PTE_WRITE | PTE_ATTRINDX(MT_NORMAL))</code></pre>
+
+                    <p>作为基础属性的 <code>PROT_DEFAULT</code> 里并没有禁止执行位。在它之上把 <code>PTE_PXN</code> 与 <code>PTE_UXN</code> <strong>两个都</strong>加上去的，才是设备映射，内核使用的普通内存映射也一样。而每个宏的末尾还另外挂着一个指定内存类型的项。<strong>执行这条轴与内存类型那条轴是分别填进去的</strong>，这个事实就明明白白摆在一行代码里。</p>
+
+                    <p>从这里能看出两件事。第一，arm64 的禁止执行位不是一个而是<strong>两个</strong>，按特权级别分开，因此可以表达出内核不能执行而用户空间可以执行这样的状态。第二，可执行的内核代码区是靠<strong>去掉</strong>这些比特做出来的：默认是禁止，允许才是例外。</p>
+
+                    <p>换句话说，原文那位开发者必须亲手实现的性质，通用内核早就当成默认值铺好了。在裸机上直接写页表的一方并不会继承那份默认值。在操作系统原本替你守着的惯例消失的地方，架构文档里那个微妙的区别立刻以启动失败的形式现了身。</p>
+
+                    <h2 id="sec-7">把异常当信号用的技法 - 同一套机器，不同的比特</h2>
+
+                    <p>违反页权限就会产生异常，异常会进内核。可是另有一支技法，把这个异常当成的不是错误而是<strong>通知</strong>，等于把保护装置改用作观测装置。在 Linux 上，这一支的代表是 <code>userfaultfd</code>。</p>
+
+                    <p>man page 把它定义为把缺页异常的处理<strong>委托</strong>给用户空间应用程序的机制。文档列出的用途是检查点与恢复机制中的延迟恢复，以及在主机之间搬运虚拟机和容器时让执行几乎不中断的后拷贝迁移。运作方式也写得很明确：注册过的区域一旦发生异常，触发异常的线程会被挂起睡眠，一个事件会经由文件描述符送上来，由用户空间读取并处理。</p>
+
+                    <p>注册模式有三种：访问了缺失的页时、向写保护的页写入时，以及页存在但页表条目不存在时。文档写明，这个机制是过去依赖 <code>SIGSEGV</code> 信号的用户空间分页技法的<strong>替代方案</strong>。</p>
+
+                    <p>而这里出现了一个与本文主轴直接相关的事实：<strong>那份清单里没有执行这条轴。</strong>把异常当信号用的这一支，跑在读与写的轴上。执行权限被用在<strong>从一开始就不让那次访问发生</strong>的一侧，多过被用来制造通知。原文的案例走的正是这个方向：它不是接住异常再处理，而是把会产生异常的局面本身消掉了。</p>
+
+                    <p>于是，安全功能被挪去做别的事这件事的结构，就分成了两支。一支借的是异常这个<strong>事件</strong>，另一支借的是权限比特所规定的<strong>硬件行为范围</strong>。禁止执行位属于后者。</p>
+
+                    <h2 id="sec-8">汇总表 - 为什么用它，又付出什么</h2>
+
+                    <p>把前面出现过的技法和后面要看的技法放进同一张表，性质就分开了。第三列是这项技法真正从禁止执行位那里借来的性质，第四列是它的代价。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>技法</th><th>用来做什么</th><th>禁止执行提供的性质</th><th>代价</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>阻断投机性取指</td><td>不让预测执行进入被锁区域或设备区域</td><td>打了禁止执行的页即使在投机状态下也不会被当作指令取出</td><td>那块区域就真的执行不了了，需要执行就得另开一份映射</td></tr>
+                            <tr><td>数据执行防护</td><td>不让以数据身份进来的字节直接变成执行路径</td><td>读这条轴与执行这条轴可以分开写</td><td>在没有执行轴的硬件上根本不成立</td></tr>
+                            <tr><td>W^X 策略</td><td>不让可写的页转手就变成可执行</td><td>为拒绝两种权限的组合提供了依据</td><td>生产代码的程序要背上翻转或者双重映射</td></tr>
+                            <tr><td>翻转权限式 JIT</td><td>填完机器码之后再改成可执行</td><td>保证写入期间不可执行</td><td>每次翻转一次系统调用，按页生效并作用于整个地址空间</td></tr>
+                            <tr><td>双重映射式 JIT</td><td>用地址把写入窗口和执行窗口分开</td><td>同一批物理页上可以挂不同的执行权限</td><td>虚拟地址变成两组，与禁止执行封印正面冲突</td></tr>
+                            <tr><td>线程级翻转</td><td>只对一个线程打开写入窗口</td><td>执行权限可以按线程呈现出不同状态</td><td>平台专用的 API 与授权，还得自己清理指令缓存</td></tr>
+                            <tr><td>禁止执行封印</td><td>钉死内存文件，使其日后无法变成可执行</td><td>把执行权限变成不可撤销的状态</td><td>用那个文件描述符就再也建不出执行窗口</td></tr>
+                            <tr><td>no-exec 挂载</td><td>不让某个文件系统上的内容被执行</td><td>在映射阶段就拒绝执行请求</td><td>在临时目录里运行的正常工具也会一起被挡</td></tr>
+                            <tr><td>把异常当信号用</td><td>由用户空间处理缺页异常</td><td>用的是缺失与写保护两条轴，而不是执行轴</td><td>每次异常都要往返用户空间，执行轴上没有这种模式</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2 id="sec-9">JIT 是怎么守住 W^X 的</h2>
+
+                    <p>在运行过程中生产可执行代码的程序，会与 W^X 正面相撞。机器码必须<strong>先写完再执行</strong>，而这条原则禁止在同一瞬间持有这两种权限。即时编译这种方式本身在图什么，已经整理在 <a href="perry_typescript_llvm_compiler_2026.html">介绍把 TypeScript 直接编译成 LLVM 机器码的 Perry 的那篇文章</a>里，这里只看<strong>权限是怎么处理的</strong>。</p>
+
+                    <h3>翻转权限的做法</h3>
+
+                    <pre><code class="language-c">/* 打开写入窗口，填入机器码，再改成可执行 */
+void *p = mmap(NULL, len, PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+if (p == MAP_FAILED) return -1;
+
+emit_code(p, len);                       /* 到这里为止这个页还不可执行 */
+
+if (mprotect(p, len, PROT_READ | PROT_EXEC) != 0) return -1;
+/* 从这一刻起同一个页不可写但可执行 */</code></pre>
+
+                    <p>这是最简单的形态。以读加写打开一份匿名映射，填入机器码，再用 <code>mprotect</code> 翻成读加执行。翻之前执行不了，翻之后写不了，所以在任何一个瞬间，写与执行都不会同时站在同一个页上。</p>
+
+                    <h3>把映射拆成两份的做法</h3>
+
+                    <pre><code class="language-c">/* 给同一批物理页挂上两个权限不同的虚拟地址 */
+int fd = memfd_create("jit", MFD_CLOEXEC);
+if (fd == -1) return -1;
+ftruncate(fd, len);
+
+void *rw = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+void *rx = mmap(NULL, len, PROT_READ | PROT_EXEC,  MAP_SHARED, fd, 0);
+
+emit_code(rw, len);   /* 只经 rw 写入，只经 rx 执行 */</code></pre>
+
+                    <p>把同一个文件描述符<strong>以共享映射的方式挂两次</strong>。<code>mmap</code> 的 man page 写道，对共享映射的更新对映射同一区域的其他一方也是可见的。所以经 <code>rw</code> 写下的字节，会经 <code>rx</code> 被当作指令读出来。物理页仍旧只有一份，只有虚拟地址变成两个，权限互不相同。</p>
+
+                    <p>省下了翻转的系统调用，换来的是别的负担。要随身带着两组地址，而以相对地址算出来的分支目的地<strong>究竟以哪个窗口为基准</strong>这个问题会反复回来。而且，只要后面要讲的禁止执行封印生效，这条路本身就不成立。</p>
+
+                    <h2 id="sec-10">Apple 芯片 - 以线程为单位翻转</h2>
+
+                    <p>Apple 造了第三条路。JIT 用的区域是给 <code>mmap</code> 传 <code>MAP_JIT</code> 标志创建的。采用了 Hardened Runtime 的应用，需要有 <code>com.apple.security.cs.allow-jit</code> 授权，系统才允许它带着这个标志调用 <code>mmap</code>；没有采用这项能力的应用，则不需要授权也能用这个标志，文档是这么写的。不过在 Hardened Runtime 与该授权并用的组合下，应用只能创建<strong>唯一一个</strong>带 <code>MAP_JIT</code> 的内存区域。</p>
+
+                    <p>翻转是用 <code>pthread_jit_write_protect_np</code> 做的。除此之外文档还指出了一条新路径：加上 <code>com.apple.security.cs.jit-write-allowlist</code> 授权之后，应用要通过 <code>pthread_jit_write_with_callback_np</code> 往自己的 JIT 区域里写，而带着这项授权的应用<strong>就再也不能调用</strong> <code>pthread_jit_write_protect_np</code>。为了动态加载的库，还有一项在运行期更新名单的单独授权。</p>
+
+                    <p>在结构上最耐人寻味的是翻转的<strong>作用范围</strong>。文档写道，回调方式会把那块区域变成可写且不可执行，但<strong>只针对当前线程</strong>；换回去的时候，也是针对当前线程把它变成可执行且不可写。上一节的 <code>mprotect</code> 并非如此，它改的是地址空间里的映射，所以只要翻转的窗口开着，同一进程里的<strong>所有线程</strong>都会把那个页看成可写状态。线程级的翻转把那扇窗收窄到了一个线程。</p>
+
+                    <p>而且光处理权限还不算完。Apple 的文档特意叮嘱，在执行一个刚刚更新过的内存页上的机器指令之前，必须先调用 <code>sys_icache_invalidate</code>。因为在 Apple 芯片上指令缓存与数据缓存并不一致，不做失效处理就执行可能会得到意料之外的结果。文档还补充说，在 Intel 平台的 Mac 上调用同一个函数也是安全的，只是它在那边什么都不做。</p>
+
+                    <p>这一段与原文重叠。那篇文章里倒下的假设之一，同样是指令缓存与数据缓存的一致性。自己生产机器码的一方，必须<strong>把权限和缓存一起</strong>处理。两者只对上一个，症状在两种情况下都表现为无法复现的停顿。</p>
+
+                    <h2 id="sec-11">代价的真面目 - 系统调用、页粒度、缓存</h2>
+
+                    <p>守住 W^X 的价钱分成好几笔。无论选哪种做法，其中几笔都是必付的。</p>
+
+                    <ul>
+                        <li><strong>系统调用</strong> —— 翻转做法每生产一批机器码就要进一次内核再出来。代码生成的单位切得越碎，这笔开销就落得越频繁。</li>
+                        <li><strong>页粒度</strong> —— 权限不是按字节而是按整页改变的。把好几段小代码塞进同一个页里，为了改其中一段而打开的那一刻，其余全部也跟着变成可写。</li>
+                        <li><strong>整个地址空间</strong> —— <code>mprotect</code> 改的是进程的映射。在多线程程序里，翻转开着的那段区间，就是对所有线程都开着的区间。</li>
+                        <li><strong>虚拟地址的双份化</strong> —— 双重映射用两个地址换掉了系统调用。代码里的地址运算以哪一边为基准，必须一致地管起来。</li>
+                        <li><strong>指令缓存</strong> —— 在把刚写下的字节当指令执行之前，清理缓存这一步在某些平台上是必需的。</li>
+                        <li><strong>策略冲突</strong> —— 加固开关一旦打开，上面几种做法里的一部分就根本不成立。下一节的禁止执行封印就是例子。</li>
+                    </ul>
+
+                    <p>这里有一处直觉常常出错：把禁止执行位本身立起来或放下去，几乎不花什么代价。花代价的是<strong>改变那个状态这件事</strong>，而要改的理由是程序在运行中生产代码。在只跑静态编译代码的进程里，这笔开销实际上是零。</p>
+
+                    <h2 id="sec-12">各架构之间的差别</h2>
+
+                    <p>x86 一侧的定义就是前面提到的样子。看形式就能看清条件卡在哪里。</p>
+
+                    <pre><code class="language-c">#define _PAGE_BIT_NX		63	/* No execute: only valid after cpuid check */
+
+#if defined(CONFIG_X86_64) || defined(CONFIG_X86_PAE)
+#define _PAGE_NX	(_AT(pteval_t, 1) << _PAGE_BIT_NX)
+#else
+#define _PAGE_NX	(_AT(pteval_t, 0))
+#endif</code></pre>
+
+                    <p>比特编号固定在一个数上，但那个比特是否真的存在，取决于配置。只有 64 位或启用 PAE 时掩码才立得起来，其余情况下是零。注释里的限定说的是同一件事：要通过 cpuid 询问之后才有效，意味着这项能力不是一开始就有的，而是<strong>后来才追加的选项</strong>。</p>
+
+                    <p>arm64 的结构不一样。禁止执行按特权级别分成<strong>两个</strong>，旁边还并排挂着内存类型这条独立的轴。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>架构</th><th>禁止执行的表达方式</th><th>Linux 源码里的名字</th><th>必须一起看的轴</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>x86-64 与 PAE</td><td>页表条目里第 63 位这一个比特</td><td>_PAGE_BIT_NX 与 _PAGE_NX</td><td>没有，执行轴是单一的</td></tr>
+                            <tr><td>32 位 x86 非 PAE</td><td>相应的比特并不存在</td><td>_PAGE_NX 被定义为零</td><td>读这条轴兼作执行轴</td></tr>
+                            <tr><td>arm64 特权级别</td><td>禁止在特权级别执行的比特</td><td>PTE_PXN</td><td>另有一条内存类型轴</td></tr>
+                            <tr><td>arm64 非特权级别</td><td>禁止在非特权级别执行的比特</td><td>PTE_UXN</td><td>另有一条内存类型轴</td></tr>
+                            <tr><td>arm64 设备区域</td><td>设备映射默认带上这两个比特</td><td>PROT_DEVICE_nGnRnE 与 PROT_DEVICE_nGnRE</td><td>Device 标记只关上数据那条轴</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>表的最后一行，就是原文撞上的那堵墙。写了 Device，并不等于执行那条轴会自动关上。这两条轴<strong>规定的是不同的东西。</strong></p>
+
+                    <h2 id="sec-13">各操作系统之间的差别</h2>
+
+                    <p>面对同一个硬件比特，各操作系统叠上去的策略并不相同。只按文档写明的内容整理，大致如下。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>系统</th><th>同时要求写与执行的映射</th><th>例外通道</th><th>配套机制</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>OpenBSD</td><td>不被允许，以 ENOTSUP 拒绝</td><td>文件系统以 wxallowed 挂载且进程在链接期带上 wxneeded 标记</td><td>用 kern.wxabort 定位失败点</td></tr>
+                            <tr><td>Apple 芯片上的 macOS</td><td>一个线程不能在同一瞬间边写边执行</td><td>MAP_JIT 区域与专用授权</td><td>翻转按线程生效，指令缓存失效是必需的</td></tr>
+                            <tr><td>Intel 平台的 macOS</td><td>只有采用 Hardened Runtime 的应用才受保护</td><td>同一套授权体系</td><td>缓存失效的调用在那边什么也不做</td></tr>
+                            <tr><td>Linux</td><td>mmap 与 mprotect 文档里没有禁止该组合的表述</td><td>策略放在别的层去施加</td><td>no-exec 挂载与内存文件的禁止执行封印</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>Linux 那一行不能读错。文档里没有禁止组合的表述，意思是<strong>基础的系统调用层不拒绝这个组合</strong>，而不是说在 Linux 上没法施加 W^X。Linux 把这个决定挪到了挂载选项、按对象施加的封印，以及单独的安全模块那一侧。信任边界该画在哪里这同一个问题在 Web 一侧是怎么显现的，另有 <a href="client_trust_boundary_web_security.html">讲为什么不能信任客户端的那篇文章</a>做了整理。</p>
+
+                    <h2 id="sec-14">把执行权限当作策略来处理 - 禁止执行封印</h2>
+
+                    <p>执行权限越过页比特、变成<strong>对象自身的性质</strong>的例子，就在 Linux 的内存文件上。内核文档定义了三个开关。</p>
+
+                    <ul>
+                        <li><strong>禁止执行封印标志</strong> —— 立起这个比特，内存文件就以禁止执行的状态创建，并同时打上执行封印，此后无法再被改成带有执行权限。</li>
+                        <li><strong>允许执行标志</strong> —— 立起这个比特，则以带着执行权限的状态创建。</li>
+                        <li><strong>系统全局设置</strong> —— 取值为零时，两者都不指定的调用会按允许执行的一侧行事；取 1 则按禁止执行封印的一侧行事；取 2 时，没有指定封印的调用本身会被<strong>拒绝</strong>。</li>
+                    </ul>
+
+                    <p>内核文档交代的背景也很清楚：可执行的内存文件会成为混淆代理人式滥用和绕过禁止执行策略的通道，但像容器运行时执行二进制这样的<strong>正当用途</strong>确实存在，所以需要一种把两者区分开来的办法。</p>
+
+                    <p>这套设计所展示的东西，正好落在本文的主轴上。执行权限变成了<strong>一旦决定就无法撤回的状态</strong>。原本只是页表里的一个比特，如今挂在文件描述符这个对象上，规定着这个对象余生的性质。以保护装置身份进来的比特，被提拔进了资源管理的词汇表。</p>
+
+                    <p>而它与上一节的双重映射式 JIT 正面冲突。系统全局设置一旦取到最严格的值，给 JIT 用的内存文件<strong>根本就建不出来。</strong>一个加固开关关掉了一项正常功能。哪一边对，取决于那个系统在跑什么，而没有任何默认值能替人做这个判断。</p>
+
+                    <h2 id="sec-15">原文与本文分道扬镳的地方</h2>
+
+                    <p>原文主张的范围既窄又清楚。它是一台 ARM64 裸机虚拟机监控程序的调试记录，结论是 Device 标记与禁止执行标记<strong>挡住的是不同的东西</strong>。</p>
+
+                    <p>那篇文章里没有的东西也需要说清楚。禁止执行位的引入经过、W^X 策略在各系统间的差异、JIT 的实现方式、x86 一侧的情形，都不是它的主题。上面各节里填补这些内容所依据的，全部是各份文档与源码的原文，并没有把原文的主张往外拉扯。</p>
+
+                    <p>还值得划一条不该过度推广的线。原文的结论是<strong>不能因为标了 Device 就认为指令那条轴也关上了</strong>，而不是说打开禁止执行就能普遍解决与投机执行相关的问题。后者是完全不同的主张，原文并没有这么说。</p>
+
+                    <p>留下的只有一句话。以安全功能身份进来的机制，其实一直在替架构表达另一条规定；而对需要那条规定的开发者来说，<strong>安全是作为副产品到来的</strong>。引入的目的与实际的用法之间出现错位并不是失败。只要能被表达的状态多出一种，这种表达就总会走得比它最初的位置更远。</p>
+
+                    <h2 id="sec-16">未能确认的部分</h2>
+
+                    <ul>
+                        <li>ARM 开发者网站上的架构文档页面是靠脚本渲染的结构，正文没能打开。原文引用的那句 ARM 文档只通过那篇文章核对过，手册的章节号与版本号未能确定。</li>
+                        <li>Intel 与 AMD 的架构手册 PDF 原本没能打开。x86 的第 63 位及其条件式定义，只与 Linux 内核头文件里的定义和注释核对过。厂商使用的名称写法并不在那份头文件里，因此正文中没有使用厂商名称。</li>
+                        <li>PXN 与 UXN 这两个名字的展开读法是从宏名里读出来的，未能与 ARM 手册原文核对确定。正文里只写了按特权级别禁止执行这一功能层面的说明。</li>
+                        <li>原文的反汇编里，间接分支所用的寄存器编号在不同引用版本中看起来并不一致。论点在于静态分支与间接分支的对比，因此正文叙述中去掉了编号，只保留形态。</li>
+                        <li>表示权限翻转与双重映射实际开销的数值，在一手资料里没有找到。文中只写了代价的种类，没有写它的大小。</li>
+                        <li>Apple 那套回调式写入 API 是在哪个 macOS 版本引入的，未能查实。文档里只写了授权与行为，没有找到版本标注。</li>
+                        <li>关于内存文件执行封印的表述，在 man page 一侧没有找到，改从内核文档一侧核对。看起来是两份文档修订时点的差异。</li>
+                        <li>Linux 内核源码的引用以主开发分支的时点为准，并未固定到某个发布标签。宏的构成可能随版本而变。</li>
+                    </ul>
+
+                    <h2 id="sec-17">参考资料</h2>
+
+                    <ul>
+                        <li><a href="https://news.hada.io/topic?id=33250" target="_blank" rel="noopener">GeekNews 话题 33250</a> —— 引发本文的那则介绍，原文地址与摘要都在这里</li>
+                        <li><a href="https://purplesyringa.moe/blog/guest/the-nx-bit-is-not-just-about-security/" target="_blank" rel="noopener">The NX bit is not just about security (purplesyringa.moe)</a> —— 引发本文的原文。ARM64 虚拟机监控程序的调试记录、静态分支与间接分支的对比、Device 标记与禁止执行标记的区分，以及最后那句关于纵深防御的话都在这里</li>
+                        <li><a href="https://man7.org/linux/man-pages/man2/mprotect.2.html" target="_blank" rel="noopener">mprotect(2) (man7.org)</a> —— 原型与页边界要求、四个保护标志的定义、执行标志的效果取决于架构与内核与进程状态的表述，以及 READ_IMPLIES_EXEC 的行为</li>
+                        <li><a href="https://man7.org/linux/man-pages/man2/mmap.2.html" target="_blank" rel="noopener">mmap(2) (man7.org)</a> —— 保护标志的定义、对共享映射的更新对映射同一区域的其他一方可见的表述，以及 no-exec 挂载下执行请求被拒绝的错误条件</li>
+                        <li><a href="https://man7.org/linux/man-pages/man2/userfaultfd.2.html" target="_blank" rel="noopener">userfaultfd(2) (man7.org)</a> —— 缺页异常处理向用户空间的委托、延迟恢复与后拷贝迁移这两项用途、三种注册模式，以及它作为信号式技法替代方案的定位</li>
+                        <li><a href="https://docs.kernel.org/userspace-api/mfd_noexec.html" target="_blank" rel="noopener">Introduction of non-executable mfd (内核文档)</a> —— 禁止执行封印与允许执行标志的定义、系统全局设置三个取值的行为，以及做出这些开关的理由</li>
+                        <li><a href="https://github.com/torvalds/linux/blob/master/arch/arm64/include/asm/pgtable-prot.h" target="_blank" rel="noopener">arch/arm64/include/asm/pgtable-prot.h (Linux 内核)</a> —— 基础属性里没有禁止执行，而设备映射与普通映射都一并带上两个禁止执行位的定义</li>
+                        <li><a href="https://github.com/torvalds/linux/blob/master/arch/x86/include/asm/pgtable_types.h" target="_blank" rel="noopener">arch/x86/include/asm/pgtable_types.h (Linux 内核)</a> —— 第 63 位的定义与 cpuid 检查的注释，以及只在 64 位或 PAE 下立起掩码、其余情况为零的条件式定义</li>
+                        <li><a href="https://developer.apple.com/documentation/apple-silicon/porting-just-in-time-compilers-to-apple-silicon" target="_blank" rel="noopener">Porting just-in-time compilers to Apple silicon (Apple)</a> —— MAP_JIT 与各项授权、区域数量的限制、按线程的翻转、指令缓存失效的要求，以及 Apple 芯片与 Intel 平台 Mac 在保护覆盖范围上的差别</li>
+                        <li><a href="https://man.openbsd.org/mmap.2" target="_blank" rel="noopener">mmap(2) (OpenBSD)</a> —— 对同时要求写与执行的映射的禁止、挂载选项加链接期标记这双重例外通道，以及被拒绝时的错误值与诊断开关</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>分享本文</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">返回列表</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/iptables_generator.html">iptables 防火墙规则生成器</a></li>
+      <li><a href="../static/code_image.html">代码图片生成器</a></li>
+      <li><a href="../static/char_counter.html">字数统计</a></li>
+      <li><a href="../static/json_formatter.html">JSON 格式化工具</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="agent_tool_selection_measured.html">说是智能体选的，那主语到底是谁 - 用16,893次执行测量三款编码智能体的第三方选择</a></li>
+      <li><a href="exploited_vulnerability_priority.html">「正在被实际利用」这一行改变排序 - 评分衡量严重度，利用则是事实</a></li>
+      <li><a href="llm_simultaneous_outage.html">同一时刻停摆并不等于同一原因 - 多个AI服务一起宕机的那天</a></li>
+      <li><a href="browser_main_thread_cost.html">浏览器主线程为什么只有一条 - 谁在分用这一条，什么又能被移出去</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制。粘贴到 Threads 应用即可分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制。'); });
+    });
+    </script>
+</body>
+</html>
