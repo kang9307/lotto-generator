@@ -1,0 +1,664 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>「有备份」与「能恢复」是两个不同的命题 - 成功的备份在哪里说谎，以及恢复验证真正要求什么</title>
+    <meta name="description" content="备份作业以退出码 0 结束，也可能根本恢复不了。转储期间的架构变更、只带架构的部分备份、排序规则版本不一致、全局对象与存储例程缺失，分别在备份还是恢复阶段才暴露；以及「做过恢复测试」要成立需要隔离到什么程度，全部依据官方文档梳理。">
+    <meta name="keywords" content="备份, 恢复验证, RPO, RTO, 灾难恢复, 数据库备份, pg_dump, pg_restore, mysqldump, 完整性, 恢复演练, 3-2-1, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/backup_restore_verification.html">
+
+    <meta property="og:title" content="「有备份」与「能恢复」是两个不同的命题 - 成功的备份在哪里说谎，以及恢复验证真正要求什么">
+    <meta property="og:description" content="退出码 0 只保证一件事：转储程序完成了它自己的工作。本文丈量这个事实与服务真正重新活过来之间的距离。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/backup_restore_verification.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-09-07">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="「有备份」与「能恢复」是两个不同的命题">
+    <meta name="twitter:description" content="有些缺陷能原封不动地通过行数比对。本文按层拆解恢复验证真正要求的东西。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "「有备份」与「能恢复」是两个不同的命题 - 成功的备份在哪里说谎，以及恢复验证真正要求什么",
+      "alternativeHeadline": "退出码 0 覆盖的范围、隔离的目标与不依赖原库的资源，以及应用是否真的能起来",
+      "datePublished": "2026-09-07",
+      "dateModified": "2026-09-07",
+      "inLanguage": "zh-CN",
+      "articleSection": "开发/基础设施",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "备份, 恢复验证, RPO, RTO, 灾难恢复, 数据库备份, 完整性, 恢复演练",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/backup_restore_verification.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "备份作业显示成功，却真的会恢复不了吗？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "会，而且其中一部分在恢复阶段同样不报错。MySQL 8.4 文档写明，在 --single-transaction 转储进行期间，其他连接不应使用 ALTER TABLE、CREATE TABLE、DROP TABLE、RENAME TABLE、TRUNCATE TABLE，因为一致性读并不与这些语句隔离，转储可能取到错误的表内容或者失败。取到错误内容的那一支并不是失败：转储以退出码 0 结束，文件是语法有效的 SQL，恢复也安静地完成，出错的只有内容本身。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "要说「已经做过恢复测试」，最低限度需要做到什么？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "四件事。第一是与原库隔离的目标，如果共用同一个服务进程或同一套凭据，这场验证其实是在依赖原库还活着。第二是遇错即停的设置，pg_restore 的默认行为是继续执行并在结束时打印错误计数。第三是比对，不只是行数，还要看对象数量、序列当前值和例程数量。第四是把应用挂上去启动。文件能打开和服务能活着，是两个不同的命题。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "RPO 与 RTO 到底各自决定什么？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "按 NIST SP 800-34 Rev. 1 的定义，RPO 是故障之后数据必须被恢复到的时间点，RTO 是信息系统组件在对组织使命或业务流程产生负面影响之前可以停留在恢复阶段的总时长。落到实务上，RPO 决定备份周期与写入日志的保留方式，RTO 决定备份的格式与恢复路径的结构。没有这两个数，判断任何周期是否足够都缺少依据。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "3-2-1 是标准吗？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "它是流传很广的惯例，而不是标准化组织作为要求条款发布的规定。常被引用的出处是摄影师彼得·克罗格的著作。标准这一侧真正要求的句子形状不同：NIST 网络安全框架 2.0 的 PR.DS-11 是数据的备份被创建、保护、维护和测试，其实现示例中包含对所有类型的数据源至少每年测试一次备份与恢复。副本数量排在测试与隔离之后。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "恢复验证能否完全自动化？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "只有基准值位于数据内部的那部分可以。恢复是否无错完成、对象数量是否与上次一致、行数是否落在预期区间、应用是否启动并响应健康检查，这些都能在没有人判断的情况下分出真假。而全量恢复演练的耗时是否在 RTO 之内、手册是否还与当前架构相符、负责人不在时由谁做什么，基准值都在组织内部，自动检查挂不上去。PostgreSQL 18 的 pg_verifybackup 文档也明确写着，即便用了这个工具，仍应执行测试恢复。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/backup_restore_verification.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/backup_restore_verification.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/backup_restore_verification.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/backup_restore_verification.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/backup_restore_verification.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "首页",
+      "item": "https://braindetox.kr/zh/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "开发/基础设施",
+      "item": "https://braindetox.kr/zh/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "「有备份」与「能恢复」是两个不同的命题 - 成功的备份在哪里说谎，以及恢复验证真正要求什么",
+      "item": "https://braindetox.kr/zh/posts/backup_restore_verification.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="「有备份」与「能恢复」是两个不同的命题 - 成功的备份在哪里说谎，以及恢复验证真正要求什么">
+                <meta itemprop="datePublished" content="2026-09-07">
+                <meta itemprop="dateModified" content="2026-09-07">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="备份, 恢复验证, RPO, RTO, 灾难恢复, 数据库备份, 完整性, 恢复演练">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/backup_restore_verification.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">「有备份」与「能恢复」是两个不同的命题 - 成功的备份在哪里说谎，以及恢复验证真正要求什么</h1>
+                    <h2 class="post-subtitle">退出码 0 覆盖的范围、隔离的目标与不依赖原库的资源，以及应用是否真的能起来</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-07">2026-09-07</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">开发/基础设施</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>备份面板显示绿色，多数团队就把这一天的活儿算完了。作业以退出码 0 结束，文件按预期大小落进了存储，通知也到了。可这盏绿灯真正证明的命题只有一个：<strong>转储程序完成了它自己的工作</strong>。</p>
+
+                    <p>「能恢复」是另一个命题。要有一个空数据库接住它，架构要在里面立起来，数据要穿过约束进去，序列、权限和扩展要各就各位，排序规则要与索引的前提相符，最后应用要在这之上起来。这条链子上没有任何一环是备份作业检查过的。</p>
+
+                    <p>两个命题之间的距离，在事故发生之前没人去量。而量它的办法只有一个，就是真的做一次恢复。麻烦在于，<strong>「做过恢复测试」这句话要成立，条件比看上去苛刻</strong>。本文把这些条件拆成层来排。</p>
+
+                    <div class="callout">
+                        本文出现的每个选项和默认值都带版本。PostgreSQL 指 18（文档中为 18.6），MySQL 指 8.4。同名选项在不同引擎家族和不同版本之间行为不一致是常事，因此按自己环境的版本重新对一遍更稳妥。凭记忆写下的选项，通常已经落后两代。
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>本文讨论的内容</h3>
+                        <ol>
+                            <li><a href="#sec-1">缘起 - 「验证到真实恢复」实际覆盖多大范围</a></li>
+                            <li><a href="#sec-2">退出码 0 观测到什么，又没观测到什么</a></li>
+                            <li><a href="#sec-3">成功的备份说谎的六个地方</a></li>
+                            <li><a href="#sec-4">各类故障分别在哪个阶段暴露</a></li>
+                            <li><a href="#sec-5">恢复工具的默认行为是「继续」</a></li>
+                            <li><a href="#sec-6">恢复验证真正要求什么</a></li>
+                            <li><a href="#sec-7">把目标定成数字 - RPO 与 RTO</a></li>
+                            <li><a href="#sec-8">3-2-1 是标准还是惯例</a></li>
+                            <li><a href="#sec-9">自动化的边界 - 每次做的与偶尔做的</a></li>
+                            <li><a href="#sec-10">自托管的代价 - 那个工具的备份由谁来做</a></li>
+                            <li><a href="#sec-11">只靠只读命令能确认的事</a></li>
+                            <li><a href="#sec-12">未能确认的部分</a></li>
+                            <li><a href="#sec-13">参考资料</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">缘起 - 「验证到真实恢复」实际覆盖多大范围</h2>
+
+                    <p>促成这个角度的，是一款自托管备份工具把「验证到真实恢复」摆在了最前面。碰上这类说法，该看的地方是固定的：<strong>恢复完成之后比对了什么</strong>。</p>
+
+                    <p>该项目 README 记录的流程是这样：每次备份结束后，或者按小时、天、周、月乃至 cron 表达式定义的周期，启动一个数据库容器，在里面跑一次恢复，把恢复后的体积与备份比对，然后产出一份列出每张表及其行数的报告。还可以选择只推送失败告警。</p>
+
+                    <p>这句宣传不算夸大。它没有停在文件完整性检查，而是真的跑了恢复。但这份验证抵达的位置是<strong>恢复完成了，并且给出了每张表的行数</strong>。应用能否在其上起来是更高一层的问题，而下文会看到，<strong>有好几类缺陷能原封不动地通过行数比对</strong>。本文要谈的正是那一层。</p>
+
+                    <p>仓库本身的数值如下，取自 2026-09-07 20:54 KST，即 11:54 UTC 的 GitHub API 响应。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>项目</th><th>数值</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>仓库</td><td>databasus/databasus</td></tr>
+                            <tr><td>许可证</td><td>Apache-2.0</td></tr>
+                            <tr><td>仓库创建</td><td>2025-06-05</td></tr>
+                            <tr><td>最近推送</td><td>2026-09-06</td></tr>
+                            <tr><td>最新发布</td><td>v3.57.0，2026-09-06</td></tr>
+                            <tr><td>星标与分叉</td><td>8,452 与 526</td></tr>
+                            <tr><td>未关闭议题</td><td>2</td></tr>
+                            <tr><td>贡献者</td><td>31 人，最多的一位提交 900 次</td></tr>
+                            <tr><td>主要语言</td><td>TypeScript</td></tr>
+                            <tr><td>覆盖范围（按 README）</td><td>PostgreSQL 14 至 18 物理与逻辑 / MySQL 5.7、8.0、8.4、9 逻辑 / MariaDB 10、11、12 逻辑 / MongoDB 4.2 及以上 逻辑</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>星标数不是成熟度指标。这张表里能诚实读出来的，是仓库已经活了约十五个月，发布一直持续到最近，以及大部分提交出自一个人之手。这些事实在各自的组织里意味着什么，由采纳的一方去定。</p>
+
+                    <p>有一处细小但值得记下的错位。GitHub 仓库说明只写它是 PostgreSQL 备份工具，README 却列了四个引擎家族。即便在同一个仓库里，一句话简介给出的范围和文档给出的范围也不一样。这正是选型时该读 README 和发布说明、而不是那行简介的理由。这款工具所处的那条轴，也就是用一个 Web 界面统一管理备份，已经在<a href="databasement_selfhosted_db_backup_2026.html">此前讨论自托管备份管理工具的文章</a>里整理过，这里不再重复。</p>
+
+                    <h2 id="sec-2">退出码 0 观测到什么，又没观测到什么</h2>
+
+                    <p>逻辑备份也就是转储，是向服务端发查询、把结果写成 SQL 语句的过程。直接搬用 MySQL 8.4 的分类：逻辑备份在服务端<strong>运行的状态下</strong>进行，并且不包含日志文件、配置文件以及其他不属于数据库的相关文件。至于哪些东西没被包含，转储文件里任何地方都没有记录。</p>
+
+                    <p>当备份作业报告成功时，真正被观测到的信号大约三个：进程退出码、输出文件大小、传输是否完成。没有被观测到的是下面这些。</p>
+
+                    <ul>
+                        <li>转储内容是否代表某一个时间点上一致的状态</li>
+                        <li>架构与数据是否彼此对得上</li>
+                        <li>目标环境是否具备接住这份转储的前提条件</li>
+                        <li>打开这个文件所需的密钥是否还活在别处</li>
+                        <li>恢复所需的时间是否落在能承受的范围里</li>
+                    </ul>
+
+                    <p>这五项有一个共同点：<strong>在备份时刻它们的取值都无法确定，只有到恢复时刻才被定下来。</strong>备份流水线上的那盏绿灯，在原理上没有办法替代这五项中的任何一项。</p>
+
+                    <h2 id="sec-3">成功的备份说谎的六个地方</h2>
+
+                    <h3>1. 转储进行期间架构发生变更</h3>
+
+                    <p>MySQL 提供 <code>--single-transaction</code>，让 InnoDB 表可以不加表锁地在线转储。但文档附了条件：转储进行期间，其他连接不应使用 <code>ALTER TABLE</code>、<code>CREATE TABLE</code>、<code>DROP TABLE</code>、<code>RENAME TABLE</code>、<code>TRUNCATE TABLE</code>，因为一致性读并不与这些语句隔离。若这类语句落在正被转储的表上，读取可能取到错误内容，或者干脆失败。</p>
+
+                    <p>值得盯住的是「失败」的反面。<strong>取到错误内容并不是失败。</strong>转储正常结束，文件是语法有效的 SQL，日后恢复也不会报错，出错的只有内容。在架构迁移的发布时间与夜间备份窗口重叠的组织里，这个条件不是理论。</p>
+
+                    <p>PostgreSQL 这边情况不同。<code>pg_dump</code> 即使在并发使用中也能产出一致的导出，按文档的措辞，转储代表<strong>pg_dump 开始运行那一刻的数据库快照</strong>。这不等于别处没有同类风险，而是两个家族的失效方式不同，也正因如此，一份为两者共用的公司流程往往对其中一方是错的。</p>
+
+                    <h3>2. 只有架构，或者只有数据</h3>
+
+                    <p>用 <code>--schema-only</code> 取的转储恢复之后，所有表都在，行数是 0，不报任何错。反过来，用 <code>--data-only</code> 取的转储灌进空目标会因为没有表接住而失败，灌进已有架构的目标则会在约束和装载顺序上部分失败。</p>
+
+                    <p>PostgreSQL 文档明确写着大对象被视为数据：<code>--data-only</code> 会包含，<code>--schema-only</code> 不会。在把架构转储和数据转储分开取、事后再拼起来的运维方式里，两个文件的时刻一旦错开，落在这段间隙里的行两边都不存在。而这种缺失在恢复日志里不留下任何痕迹。</p>
+
+                    <h3>3. 默认不会被带走的东西</h3>
+
+                    <p>在 <code>mysqldump</code> 里，<code>--triggers</code> 默认开启，所以转储表时会带上这张表的触发器。相比之下 <code>--routines</code> 与 <code>--events</code> <strong>默认关闭，必须显式指定才会被带走</strong>。存储过程、存储函数和事件调度器条目都落在这一侧。</p>
+
+                    <p>这个默认值造成的缺陷形态很特别：它在恢复阶段完全不露面。表都在，行数也对得上。缺的是夜间汇总事件和存储过程，而它们要等到各自的执行时刻到了，缺席才会被人知道。<strong>能通过行数比对的缺陷</strong>，第一个例子就出现在这里，后面还会反复出现。</p>
+
+                    <h3>4. 活在数据库之外的东西</h3>
+
+                    <p><code>pg_dump</code> 只转储一个数据库。角色和表空间这类横跨整个集群的对象不在其中，那一侧归 <code>pg_dumpall</code> 管。往没有角色的目标里恢复，设置属主的语句就会卡住。<code>pg_restore</code> 默认会发出 <code>ALTER OWNER</code> 或 <code>SET SESSION AUTHORIZATION</code>，而按文档所述，除非首个连接由超级用户、或者由拥有全部对象的那个用户建立，否则这些语句会失败。</p>
+
+                    <p>扩展的性质也一样。转储带走的是「创建这个扩展」的指令，而不是扩展的实现。目标主机上没装对应的包，恢复就停在那里。序列则相反，属于安静的一侧：值确实会跟着走，但在只单独装载数据的做法里，序列会带着落后的位置被恢复，而这个事实要等到下一次插入撞上主键冲突时才被知道。</p>
+
+                    <h3>5. 字符集与排序规则 - 不会随数据一起搬走的东西</h3>
+
+                    <p>转储默认以源数据库的字符集生成。搬走的是字节和它的字符集声明，而不是目标服务端的配置。因此创建目标数据库时选什么字符集，本身就是恢复的一部分；而这个选择通常写在目标准备脚本而非恢复脚本里，归属也就变得模糊。</p>
+
+                    <p>排序规则安静得多。PostgreSQL 在创建排序规则对象时把提供方的版本记进系统目录，每次使用时与当前版本比对，不一致就发警告。文档的解释很直白：排序规则定义一旦变化，<strong>可能导致索引损坏以及其他问题</strong>，因为数据库依赖已存储对象具有某种确定的排序顺序。</p>
+
+                    <p>而且这件事不只在异常路径上发生。文档举出的正常情形，是把操作系统升级到新的主版本，以及用 <code>pg_upgrade</code> 升级到链接了更新 ICU 的服务端二进制。<strong>恢复目标主机与原机跑着不同发行版，在灾难恢复里不是例外，反而更接近默认。</strong></p>
+
+                    <p>上面还叠着一个陷阱。消掉警告的 <code>ALTER COLLATION ... REFRESH VERSION</code> 只更新目录里记录的版本。文档钉死了一句话：该命令<strong>并不会真的检查所有受影响的对象是否已被正确重建</strong>。消警告和修索引是两件事，顺序上 <code>REINDEX</code> 在前。</p>
+
+                    <h3>6. 密钥与介质 - 文件在，却读不了</h3>
+
+                    <p>加密备份的解密密钥若只存在于与备份源相同的系统上，那么摧毁这套系统的事故会把备份一并带走。这个缺陷在备份阶段绝对看不见，因为加密是成功的。它现身的时刻是恢复尝试的头一分钟，这反而算好的一类，因为它立刻暴露。</p>
+
+                    <p>介质损坏则相反。PostgreSQL 给每个数据页带上校验和，写入时更新、读取时校验，从 18 起这项保护默认开启。但保护范围文档写得很清楚：<strong>只有数据页</strong>受保护，内部数据结构与临时文件不在其中。再说，这讲的是一个活着的集群，而不是在对象存储里躺了半年的转储文件。那一侧要靠存储层提供的完整性机制，加上针对备份产物本身的清单。</p>
+
+                    <h2 id="sec-4">各类故障分别在哪个阶段暴露</h2>
+
+                    <p>把以上条目排进一张表，会显出一条规律：<strong>几乎没有故障是在备份阶段可见的。</strong>所以无论把备份侧的告警铺得多密，这份清单都不会变短。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>故障类型</th><th>备份阶段可见吗</th><th>恢复阶段可见吗</th><th>确认方法</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>转储期间混入 DDL 导致内容偏差</td><td>不可见，退出码 0</td><td>不可见，有效 SQL 会安静灌入</td><td>分离转储窗口与发布窗口，与源库比对聚合值</td></tr>
+                            <tr><td>只备份了架构</td><td>不可见</td><td>不可见，行数为 0 且正常结束</td><td>恢复库的分表行数、查看归档目录</td></tr>
+                            <tr><td>只备份了数据</td><td>不可见</td><td>可见，目标缺失或违反约束</td><td>在空目标上做恢复演练，查看错误计数</td></tr>
+                            <tr><td>存储例程与事件缺失</td><td>不可见，默认不带</td><td>不可见，表与行数都正常</td><td>比对例程、事件、触发器的数量</td></tr>
+                            <tr><td>角色等集群级对象缺失</td><td>不可见，设计上不在范围内</td><td>可见，设置属主的语句失败</td><td>单独转储全局对象并一并保存</td></tr>
+                            <tr><td>目标主机上没有该扩展</td><td>不可见</td><td>可见，在创建扩展处失败</td><td>查询恢复库的扩展清单与版本</td></tr>
+                            <tr><td>序列落后</td><td>不可见</td><td>不可见，恢复是成功的</td><td>查询序列当前值，试插入一条</td></tr>
+                            <tr><td>排序规则版本不一致</td><td>不可见</td><td>仅以警告形式出现，刷新后消失</td><td>目录版本比对查询、重建索引</td></tr>
+                            <tr><td>字符集不一致</td><td>不可见，按源字符集生成</td><td>可见，或者出现乱码</td><td>在创建目标数据库时指定字符集</td></tr>
+                            <tr><td>解密密钥缺失</td><td>不可见，加密是成功的</td><td>可见，立即失败</td><td>把密钥放在不同信任边界并做恢复演练</td></tr>
+                            <tr><td>介质位腐烂</td><td>不可见</td><td>可见，解压或校验和失败</td><td>清单校验、存储侧完整性功能</td></tr>
+                            <tr><td>恢复过程中出错但继续执行</td><td>不适用</td><td>只表现为错误计数，退出状态仍是成功</td><td>遇错即停选项、单事务恢复</td></tr>
+                            <tr><td>应用起不来</td><td>不可见</td><td>不可见，数据库本身正常</td><td>把应用挂到恢复库上做健康检查</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h2 id="sec-5">恢复工具的默认行为是「继续」</h2>
+
+                    <p>表里倒数第二行是最常被漏掉的地方。在主要的恢复路径上，出错时的默认处理是<strong>继续而不是停下</strong>。</p>
+
+                    <p><code>pg_restore</code> 中 <code>--exit-on-error</code> 的说明把这个默认值原样写了出来：默认是继续执行，并在恢复结束时显示错误计数。「显示」这个动作，只有在有人盯着屏幕时才成立。如果调度器只读退出状态，那么出了 40 个错的恢复和一个错都没有的恢复，送达的是同一个信号。</p>
+
+                    <p>用 <code>psql</code> 装载纯文本转储也一样。按文档的措辞，默认情况下 psql 脚本在遇到 SQL 错误之后会继续执行；设置 <code>ON_ERROR_STOP</code> 变量则会在出错时以退出码 3 退出。而文档随后补的那句话才是结论：无论哪种方式，<strong>你拿到的都只是一个部分恢复的数据库</strong>。区别只在于你是否知道这件事。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>恢复路径</th><th>出错时的默认行为</th><th>如何让它停下</th><th>判定的性质</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>pg_restore，归档格式</td><td>继续执行，结束时打印错误计数</td><td>遇错退出的选项</td><td>默认之下，部分成功看起来像成功</td></tr>
+                            <tr><td>pg_restore，单事务</td><td>要么全部提交，要么什么都不落盘</td><td>本身已隐含遇错退出</td><td>判定变成二值，适合用于验证</td></tr>
+                            <tr><td>psql，纯文本转储</td><td>遇到 SQL 错误后继续执行</td><td>设置 ON_ERROR_STOP，退出码 3</td><td>同一个文件因设置不同而判定不同</td></tr>
+                            <tr><td>mysql，重新装载转储</td><td>文档未写明默认行为</td><td>由继续执行选项的存在反推</td><td>无法凭文档句子确定，留到后文</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>单事务恢复适合用于验证，理由就在第二行：要么全部成功、要么什么都不落盘，判定因此变成二值。验证性恢复的目的不是救数据，而是<strong>取得一个真或假</strong>。</p>
+
+                    <p>还有一个与格式相关的陷阱。<code>pg_restore</code> 无法恢复纯文本格式的转储，归档必须是自定义、目录或 tar 格式之一。把验证流程按 <code>pg_restore</code> 来设计、备份却实际以纯文本产出的组合，可能在验证一次都没跑过的状态下持续很久。</p>
+
+                    <h2 id="sec-6">恢复验证真正要求什么</h2>
+
+                    <h3>隔离的目标，以及不依赖原库的资源</h3>
+
+                    <p>「做过恢复测试」要成立，恢复目标必须与原库分离。分离到只是换个数据库名是不够的。若共用同一个服务进程、同一块磁盘、同一套凭据、同一条网络路径，那么这场验证<strong>正靠着原库还活着这件事撑着</strong>。为原库消失而准备的流程如果依赖原库，那它就不是准备。</p>
+
+                    <p>PostgreSQL 文档给恢复目标附的条件也属同类：如果集群对 <code>template1</code> 有过本地追加，就必须恢复到一个真正为空的数据库，为此要以 <code>template0</code> 为模板来创建。目标不干净，成功与失败就会混在一起，而混在一起的结果给不出判定。</p>
+
+                    <p>每次起一个新容器来做恢复之所以成为通行做法，原因就在于初始状态永远相同。不过容器只是隔离的一个轴。若这个容器与原库处在同一台主机、同一套存储、同一个云账号之上，隔离就停在进程层面。资源隔离要做到什么程度，应当按所要防备的事故规模来定。</p>
+
+                    <h3>比对什么</h3>
+
+                    <p>行数便宜又好用。但如前所述，<strong>有若干缺陷能通过行数比对</strong>：存储例程缺失、事件缺失、序列落后、排序顺序错位，全都属于此类。</p>
+
+                    <p>校验和高一个层次，但附带条件。MySQL 的 <code>CHECKSUM TABLE</code> 正是为了确认备份或回滚前后内容是否一致而设的语句。文档给它附了两条限定：其值<strong>依赖表的行格式</strong>，行格式一变校验和也跟着变；而且哈希函数并不保证无碰撞，两张并不相同的表在原理上可能给出同一个值。文档甚至举了例子：时间类型的存储格式曾在某个版本边界发生变化，升级后的表校验和可能因此改变。</p>
+
+                    <p>结论很清楚：<strong>在跨版本进行的验证性恢复里，校验和不一致未必是损坏的证据。</strong>只有在两侧运行同一版本时它才成为信号。因此比对最好按层来搭。</p>
+
+                    <ul>
+                        <li><strong>第 1 层，对象数量</strong> — 表、索引、序列、扩展、例程、事件、触发器。因默认值而整类丢失的东西在这里被抓住。</li>
+                        <li><strong>第 2 层，分表行数</strong> — 抓部分装载和被中断的恢复。足够便宜，每次恢复都跑。</li>
+                        <li><strong>第 3 层，核心表的聚合值</strong> — 求和、最大值、最近时间戳。行数一致而内容有偏差的情况在这一层暴露。</li>
+                        <li><strong>第 4 层，应用真正会发出的几条查询</strong> — 要挑带连接和排序的，否则索引与排序规则的问题永远不会现身。</li>
+                    </ul>
+
+                    <p>分层是因为成本不同。第 1、2 层便宜到可以每次恢复都跑，第 4 层不是。把什么放在哪一层，直接接上下一节的自动化边界。</p>
+
+                    <h3>文件能打开，与服务能活着</h3>
+
+                    <p>把这条边界写得最清楚的，是 PostgreSQL 自家备份校验工具的文档。<code>pg_verifybackup</code> 把 <code>pg_basebackup</code> 取得的备份，与服务端在备份时生成的清单比对，检查其完整性。而文档紧接着写道：该工具执行的校验<strong>并不包含、也不可能包含运行中的服务端在真正使用这份备份时会做的全部检查</strong>。即便使用了这个工具，仍应执行测试恢复，确认得到的数据库按预期工作、并且看起来包含正确的数据。</p>
+
+                    <p>同一页还把限度写得更细：这种程度的校验足以发现文件缺失或内部校验和不匹配之类的明显问题，但不足以发现恢复时可能出现的每一种问题。它举的例子是校验和正确、却指定了毫无意义动作的日志记录。形式正确而含义错误，正是任何校验器的盲区。</p>
+
+                    <p>再往前一步，连测试恢复也不是最后一层。数据库起来和服务起来之间，还横着架构迁移的版本、应用期待的扩展、连接账号的权限、放在外部存储里的附件、以及只存在于缓存中的会话。一份从未穿过这一层的恢复计划，会在真实事故中抵达那一层之后才遇上新问题。可恢复性是<a href="firmware_bricking_recovery_basics.html">设计的产物而非事后努力</a>这个论点，此前已在设备固件那一侧梳理过，数据库也没有不同。</p>
+
+                    <h2 id="sec-7">把目标定成数字 - RPO 与 RTO</h2>
+
+                    <p>没有这两个数，备份设计无从开始，因为判断哪个周期够用、需要多快的恢复速度都缺少依据。被引用得最多的定义来自 NIST SP 800-34 Rev. 1。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>术语</th><th>定义</th><th>决定什么</th><th>若未确定</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>RPO，恢复点目标</td><td>故障之后数据必须被恢复到的时间点</td><td>备份周期与写入日志的保留方式</td><td>周期之争沦为技术口味之争</td></tr>
+                            <tr><td>RTO，恢复时间目标</td><td>系统组件在对组织使命或业务流程产生负面影响之前可以停留在恢复阶段的总时长</td><td>备份的格式与恢复路径的结构</td><td>恢复花上几天也不算违反任何规格</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>RPO 是 24 小时，夜间转储就够。RPO 是 5 分钟，转储够不着，必须有东西持续外送写入日志：PostgreSQL 这边是 WAL，MySQL 这边是二进制日志。MySQL 8.4 默认开启二进制日志，而时间点恢复的素材是<strong>在全量备份之后生成的</strong>那批二进制日志文件。如果习惯在备份结束后清理日志来腾磁盘，RPO 就只剩下纸面上的数字。把二进制日志当作可回退历史来用的思路，已在<a href="dbtrail_mysql_time_machine_2026.html">讨论可回退数据时光机的文章</a>里单独整理过。</p>
+
+                    <p>RTO 决定备份的格式，逻辑备份的代价在这里浮出来。MySQL 文档对 <code>mysqldump</code> 的自我描述是<strong>它并非为备份大量数据而设计的快速或可扩展方案</strong>，并补充说数据量大时恢复可能非常慢。理由也写在旁边：重放 SQL 语句这件事伴随着插入和建索引所需的磁盘 I/O。</p>
+
+                    <p>这里有个常见的误判：<strong>用转储文件的大小去估 RTO，几乎总是偏乐观。</strong>取转储的时间和灌回去的时间并不对称，而这个不对称的幅度由索引结构决定。恢复时间只能靠测量得知，不能靠估算。</p>
+
+                    <p>最后，这两个数没定下来会发生什么，和数字本身同样重要。「备份周期定几小时」是一场永远得不出结论的技术争论。换成「这个服务能承受丢多少分钟的订单」，能拍板的人就确定了。这两个值不是工程参数，而是<strong>业务同意承受的损失规模</strong>，所以它们不属于基础设施工程师一个人能定的那类数字。这种性质在<a href="postgres_startup_survival_2026.html">小团队如何守住 Postgres</a> 里也出现在同一个位置。</p>
+
+                    <h2 id="sec-8">3-2-1 是标准还是惯例</h2>
+
+                    <p>3-2-1 常被称作规则或标准：三份副本、两种介质、一份异地。顺着出处追下去，通向的不是标准文档，而是摄影师彼得·克罗格在《The DAM Book》（O 社出版）中整理出的经验法则。它被广泛引用、大体也站得住，但并不是标准化组织作为要求条款发布的规定。<strong>叫惯例比叫规则更准确。</strong></p>
+
+                    <p>标准那一侧真正要求的句子形状不同。NIST 网络安全框架 2.0 的子类别 PR.DS-11 写的是：数据的备份被创建、保护、维护和<strong>测试</strong>。随附的实现示例包含以下条目。</p>
+
+                    <ul>
+                        <li>对关键数据进行近实时的持续备份，其他数据按约定的日程频繁备份</li>
+                        <li><strong>对所有类型的数据源，至少每年测试一次备份与恢复</strong></li>
+                        <li>把部分备份安全地保存在离线且异地的位置，使事故或灾害不会损坏它们</li>
+                        <li>对备份存储实施地理分离与地理位置限制</li>
+                    </ul>
+
+                    <p>读下来会发现，<strong>测试</strong>和<strong>隔离</strong>排在副本数量之前。一个把 3-2-1 执行得完美却一次都没恢复过的组织，和一个只有两份副本但每季度做一次恢复演练的组织，哪一个能在真实事故中活下来是显而易见的。副本好数，所以审计先数它；测试难数，所以往后拖。这个顺序是反的。</p>
+
+                    <p>补一句，异地这个条目也常被读得太窄。要点不只是物理距离，而是<strong>信任边界</strong>是否不同。同一个云账号下的另一个区域在地理上是分开的，但一套凭据就能把两边一起抹掉。把保管交给别人时如何不丢掉访问权本身，已在<a href="archive_access_vendor_lockin.html">归档访问权与厂商锁定</a>那一侧从合同角度梳理过。</p>
+
+                    <h2 id="sec-9">自动化的边界 - 每次做的与偶尔做的</h2>
+
+                    <p>在恢复验证里，区分能自动化与不能自动化的标准只有一个：<strong>基准值在哪里。</strong></p>
+
+                    <table>
+                        <thead>
+                            <tr><th>条目</th><th>执行者</th><th>频度</th><th>基准值所在</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>恢复是否无错完成</td><td>机器</td><td>每次备份</td><td>退出状态，单事务判定</td></tr>
+                            <tr><td>对象数量是否与上次一致</td><td>机器</td><td>每次备份</td><td>上一次成功恢复的取值</td></tr>
+                            <tr><td>分表行数是否落在预期区间</td><td>机器</td><td>每次备份</td><td>源库同一时刻的聚合</td></tr>
+                            <tr><td>应用是否启动并响应健康检查</td><td>机器</td><td>每周至少一次</td><td>健康检查端点</td></tr>
+                            <tr><td>恢复耗时的趋势</td><td>机器测量，人判定</td><td>每次记录，每季度评审</td><td>测量自动，阈值来自 RTO</td></tr>
+                            <tr><td>全量恢复演练</td><td>人</td><td>每季度或每半年</td><td>业务定下的 RTO 与 RPO</td></tr>
+                            <tr><td>手册的时效性</td><td>人</td><td>每次架构变更</td><td>当前配置与文档之间的差</td></tr>
+                            <tr><td>负责人不在时的流程</td><td>人</td><td>每半年</td><td>组织架构与授权规定</td></tr>
+                            <tr><td>保留期限与合规要求的一致性</td><td>人</td><td>每年</td><td>合同与法规</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>机器侧条目的共同点，是基准值在<strong>数据内部</strong>。它们能在没有人判断的情况下分出真假，分出来的结果还能转成告警。人侧条目的共同点，是基准值在<strong>组织内部</strong>。恢复演练耗时 40 分钟这个事实本身既不真也不假，只有当业务判定这 40 分钟是否落在 RTO 之内，它才产生意义。</p>
+
+                    <p>处在边界上的是表里第五行。恢复耗时的趋势由机器测量，但这条趋势何时变得危险由人来定。数据变大，恢复时间必然跟着变长，而变长的时间越过 RTO 的那一天不会带任何告警到来。每次都记录恢复耗时之所以便宜，理由在此；这些记录之所以容易堆着没人看，理由也在此。收集了却无人阅读的数据，与<a href="observability_data_unused.html">收集来的观测数据为何没人读</a>里谈的是同一个形状。</p>
+
+                    <p>硬要把机器代替不了的东西自动化，也是常见的尝试。校验器能判定与不能判定的一般界线，已在<a href="verification_harness_llm_2026.html">校验框架划下的那条线</a>那边整理好。要旨相同：<strong>机器守住下限，上限由人来定。</strong></p>
+
+                    <h2 id="sec-10">自托管的代价 - 那个工具的备份由谁来做</h2>
+
+                    <p>自己把备份工具立起来，就多出一个问题：<strong>那个工具的状态由谁来备份。</strong></p>
+
+                    <p>备份工具握着日程、连接信息、保留策略、存储凭据、加密密钥，以及执行历史。丢掉这份状态，即便备份文件一个不少，恢复流程也少了一半。尤其当「哪个文件对应哪个时点的哪个数据库」「用哪把密钥打开」这些映射只存在于那个工具内部时，更是如此。</p>
+
+                    <p>循环依赖就是在这里生成的。工具把自己的状态备份进自己的存储，而那套存储凭据又只存在于工具内部，这就画成了一个圆。事故当中，圆上任何一点断掉，整体就停住。切开它的办法并不特别。</p>
+
+                    <ul>
+                        <li>把工具配置以人可读的格式导出到<strong>工具之外</strong>，纳入配置管理。以代码形式管理，即便重新立一套工具也能复现同一状态。</li>
+                        <li>把解密密钥放在与备份产物<strong>不同的信任边界</strong>里。同一个存储桶、同一个账号、同一个容器之内，一次事故就会把两者一起带走。</li>
+                        <li>把「工具不在时如何打开一个备份文件」的流程写进文档，并且真的走一遍。能在没有 Web 界面的情况下恢复，这个工具才不再是单点故障。</li>
+                        <li>让备份清单在工具之外也能读到。存储侧的文件命名规则加上清单文件就能担起这个角色。</li>
+                    </ul>
+
+                    <p>这份代价不构成放弃自托管的理由。用托管服务并不会让问题消失，只是把它<strong>转移给了供应商</strong>，同时换来合同与访问权这另一层的问题。无论走哪条路，圆在哪里被切开，得由自己心里有数。把部署平台放到自己服务器上会消掉哪些成本、又会新增哪些成本，已在<a href="openship_selfhost_deploy_2026.html">讨论自托管部署平台的文章</a>里以同样的方式拆开过。</p>
+
+                    <h2 id="sec-11">只靠只读命令能确认的事</h2>
+
+                    <p>以下全部属于只读与检查一类，没有放入会修改或删除目标的命令。主机、账号、模式名都是占位符，替换成各自的取值即可。</p>
+
+                    <h3>不做恢复，只看归档目录</h3>
+
+                    <pre><code># 归档目录。不执行恢复，只列出里面有什么。
+pg_restore --list /PATH/TO/backup.dump
+
+# 把物理备份与服务端生成的清单做比对。
+pg_verifybackup /PATH/TO/basebackup
+
+# 只查询页校验和是否已启用。
+psql -h HOST -U USER -d DBNAME -c 'SHOW data_checksums'</code></pre>
+
+                    <h3>数一数恢复库里到底来了什么</h3>
+
+                    <pre><code>-- 按模式统计表数量。先抓整类丢失的东西。
+SELECT table_schema, count(*) AS tables
+  FROM information_schema.tables
+ WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
+ GROUP BY 1 ORDER BY 1;
+
+-- 转储里只带了创建扩展的指令。看它在目标主机上是否真的立住了。
+SELECT extname, extversion FROM pg_extension ORDER BY 1;
+
+-- 序列带着落后的位置被恢复，下一次插入就会撞上主键冲突。
+SELECT schemaname, sequencename, last_value
+  FROM pg_sequences ORDER BY 1, 2;</code></pre>
+
+                    <h3>找出排序规则版本已经对不上的对象</h3>
+
+                    <pre><code>-- PostgreSQL 文档中给出的查询，仅把比较运算符写成了 !=。
+SELECT pg_describe_object(refclassid, refobjid, refobjsubid) AS collation_name,
+       pg_describe_object(classid, objid, objsubid)          AS object_name
+  FROM pg_depend d
+  JOIN pg_collation c
+    ON refclassid = 'pg_collation'::regclass AND refobjid = c.oid
+ WHERE c.collversion != pg_collation_actual_version(c.oid)
+ ORDER BY 1, 2;</code></pre>
+
+                    <h3>数一数 MySQL 这边被默认值落下的东西</h3>
+
+                    <pre><code>-- 触发器默认会带，例程和事件不会。源库与恢复库各数一遍。
+SELECT routine_type, count(*) AS n
+  FROM information_schema.routines
+ WHERE routine_schema = 'APPDB' GROUP BY routine_type;
+
+SELECT count(*) AS events   FROM information_schema.events
+ WHERE event_schema   = 'APPDB';
+SELECT count(*) AS triggers FROM information_schema.triggers
+ WHERE trigger_schema = 'APPDB';
+
+-- 内容指纹。取值依赖行格式与版本，所以只在同版本之间比较。
+CHECKSUM TABLE APPDB.ORDERS;</code></pre>
+
+                    <p>最后那条语句虽属只读，却不是免费的。在大表上它会整表扫描，因此不是营业时段对着源库跑的东西。对着恢复库跑才是正确形态，而这也正是隔离目标在上一节先行出现的原因。</p>
+
+                    <h2 id="sec-12">未能确认的部分</h2>
+
+                    <ul>
+                        <li>促成本文的那款工具，其恢复验证在体积与分表行数之外还比对什么，超出 README 的描述范围之后未能确认。它是否检查约束、索引、例程的存在，能否挂上应用层检查，这里不作断言。</li>
+                        <li>同一仓库的 GitHub 说明只称它为 PostgreSQL 工具，README 却列出四个引擎家族。哪一个反映当下的意图，未能确认。</li>
+                        <li><code>mysql</code> 客户端在读取脚本时遇到 SQL 错误的默认行为未能敲定。选项文档把继续执行选项写作「即使发生 SQL 错误也继续」，却没有显式陈述默认值。可以反推，但无法凭文档句子确定。</li>
+                        <li>没有找到把 3-2-1 作为要求条款发布的标准或政府文件。常被引用的出处是一本书，而 NIST CSF 2.0 的 PR.DS-11 要求的是创建、保护、维护与测试，不是副本数量。</li>
+                        <li>MariaDB 与 MongoDB 家族的转储默认值未被纳入本文依据，只使用了 PostgreSQL 18 与 MySQL 8.4 的官方文档。</li>
+                        <li>无法给出恢复耗时的通用数值。它受数据规模、硬件、索引结构左右，RTO 的判断只能依据各自环境的实测。</li>
+                    </ul>
+
+                    <h2 id="sec-13">参考资料</h2>
+
+                    <ul>
+                        <li><a href="https://news.hada.io/topic?id=33305" target="_blank" rel="noopener">GeekNews - Databasus，验证到真实恢复的自托管数据库备份工具</a> — 促成本文的介绍帖</li>
+                        <li><a href="https://github.com/databasus/databasus" target="_blank" rel="noopener">databasus/databasus</a> — 恢复验证流程、支持的版本、许可证。正文表中的数值为 2026-09-07 20:54 KST 的 GitHub API 响应</li>
+                        <li><a href="https://www.postgresql.org/docs/current/app-pgdump.html" target="_blank" rel="noopener">PostgreSQL 18 - pg_dump</a> — 只转储单个数据库的范围、大对象的处理、字符集默认值</li>
+                        <li><a href="https://www.postgresql.org/docs/current/app-pgrestore.html" target="_blank" rel="noopener">PostgreSQL 18 - pg_restore</a> — 出错继续的默认值、单事务选项、不支持纯文本格式</li>
+                        <li><a href="https://www.postgresql.org/docs/current/backup-dump.html" target="_blank" rel="noopener">PostgreSQL 18 - SQL Dump</a> — 起始时刻快照、全局对象与 pg_dumpall、ON_ERROR_STOP 与部分恢复</li>
+                        <li><a href="https://www.postgresql.org/docs/current/app-pgverifybackup.html" target="_blank" rel="noopener">PostgreSQL 18 - pg_verifybackup</a> — 校验的范围，以及仍需测试恢复的明确表述</li>
+                        <li><a href="https://www.postgresql.org/docs/current/sql-altercollation.html" target="_blank" rel="noopener">PostgreSQL 18 - ALTER COLLATION</a> — 排序规则版本不一致警告、索引损坏风险、刷新版本不检查重建的那句话，以及正文中的查询</li>
+                        <li><a href="https://www.postgresql.org/docs/current/checksums.html" target="_blank" rel="noopener">PostgreSQL 18 - Data Checksums</a> — 是否默认启用，以及保护范围仅限数据页的表述</li>
+                        <li><a href="https://dev.mysql.com/doc/refman/8.4/en/mysqldump.html" target="_blank" rel="noopener">MySQL 8.4 - mysqldump</a> — 单事务与 DDL 条件，以及不适合大量数据的自我定位</li>
+                        <li><a href="https://dev.mysql.com/doc/refman/8.4/en/mysqldump-stored-programs.html" target="_blank" rel="noopener">MySQL 8.4 - Dumping Stored Programs</a> — 触发器默认包含，例程与事件默认排除</li>
+                        <li><a href="https://dev.mysql.com/doc/refman/8.4/en/backup-types.html" target="_blank" rel="noopener">MySQL 8.4 - Backup Types</a> — 逻辑备份的性质与在线备份所需的加锁</li>
+                        <li><a href="https://dev.mysql.com/doc/refman/8.4/en/point-in-time-recovery-binlog.html" target="_blank" rel="noopener">MySQL 8.4 - Point-in-Time Recovery Using Binary Log</a> — 全量备份之后生成的二进制日志是时间点恢复素材的表述</li>
+                        <li><a href="https://dev.mysql.com/doc/refman/8.4/en/checksum-table.html" target="_blank" rel="noopener">MySQL 8.4 - CHECKSUM TABLE</a> — 对行格式与版本的依赖，以及关于碰撞的限定说明</li>
+                        <li><a href="https://csrc.nist.gov/glossary/term/recovery_point_objective" target="_blank" rel="noopener">NIST CSRC Glossary - Recovery Point Objective</a> — SP 800-34 Rev. 1 的 RPO 定义</li>
+                        <li><a href="https://csrc.nist.gov/glossary/term/recovery_time_objective" target="_blank" rel="noopener">NIST CSRC Glossary - Recovery Time Objective</a> — SP 800-34 Rev. 1 的 RTO 定义</li>
+                        <li><a href="https://www.nist.gov/cyberframework" target="_blank" rel="noopener">NIST Cybersecurity Framework 2.0</a> — PR.DS-11 及其实现示例的出处</li>
+                        <li><a href="databasement_selfhosted_db_backup_2026.html">用一个 Web 界面统一管理多个数据库备份意味着什么</a> — 管理层解决了什么，又留下了什么</li>
+                        <li><a href="linux_server_guide_09_backup.html">Linux 服务器备份与恢复策略</a> — 文件系统层面的备份工具与自动化骨架</li>
+                        <li><a href="homeserver_guide_08_backup.html">家庭服务器备份策略与监控</a> — 小规模环境下的副本布局与告警</li>
+                        <li><a href="cloud_backup_guide.html">云备份与同步的决定性差异</a> — 把同步误当成备份时会发生什么</li>
+                        <li><a href="mongodb_to_postgres_sync.html">搬一次与持续对齐</a> — 一次性迁移与持续同步属于不同问题的同类区分</li>
+                    </ul>
+
+                </div>
+
+                <div class="share-section">
+                    <h3>分享本文</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">返回列表</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/iptables_generator.html">iptables 防火墙规则生成器</a></li>
+      <li><a href="../static/code_image.html">代码图片生成器</a></li>
+      <li><a href="../static/char_counter.html">字数统计</a></li>
+      <li><a href="../static/json_formatter.html">JSON 格式化工具</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="databasement_selfhosted_db_backup_2026.html">databasement深度分析 - 用Web UI统一管理多种数据库备份的自托管工具，实力与局限 2026</a></li>
+      <li><a href="linux_server_guide_09_backup.html">Linux服务器管理完全攻略 第9篇：备份与恢复策略</a></li>
+      <li><a href="llvm_backed_go_compiler.html">决定去用别的语言的库，究竟要背下什么 - 一个基于LLVM的Go编译器暴露出的边界账单</a></li>
+      <li><a href="agent_grep_over_lsp.html">如果准确的工具没人用，问题就不在工具 - 实测编码智能体为何舍LSP而选grep</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制。粘贴到Threads应用即可分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制。'); });
+    });
+    </script>
+</body>
+</html>

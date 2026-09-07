@@ -1,0 +1,629 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>决定去用别的语言的库，究竟要背下什么 - 一个基于LLVM的Go编译器暴露出的边界账单</title>
+    <meta name="description" content="从Go标准工具链为何给调用C标了价，到基于LLVM的编译器换掉运行时把这笔价钱抹掉之后又新背上了什么。本文按症状把边界上会坏掉的项目逐条拆开，谈内存所有权、回收器看不见的指针与线程约定，并给出引入之前该问的判断标准。">
+    <meta name="keywords" content="LLGo, LLVM, Go编译器, cgo, FFI, 互操作, 内存所有权, 垃圾回收, Python全局锁, 构建可复现性, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/llvm_backed_go_compiler.html">
+
+    <meta property="og:title" content="决定去用别的语言的库，究竟要背下什么 - 一个基于LLVM的Go编译器暴露出的边界账单">
+    <meta property="og:description" content="cgo为什么不是普通的函数调用，换掉运行时为什么能抹掉这笔价钱，以及被抹掉的地方又新添了哪些账目。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/llvm_backed_go_compiler.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-09-07">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="决定去用别的语言的库，究竟要背下什么">
+    <meta name="twitter:description" content="跨越边界的调用从来不是免费的。谁来释放内存，回收器看不看得见那个指针，线程约定又归谁管。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "决定去用别的语言的库，究竟要背下什么 - 一个基于LLVM的Go编译器暴露出的边界账单",
+      "alternativeHeadline": "从cgo为什么不是普通的函数调用，到换掉运行时之后新冒出来的那些账目",
+      "datePublished": "2026-09-07",
+      "dateModified": "2026-09-07",
+      "inLanguage": "zh-CN",
+      "articleSection": "开发/基础设施",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "LLGo, LLVM, Go编译器, cgo, FFI, 互操作, 内存所有权, Python全局锁",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/llvm_backed_go_compiler.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "基于LLVM的Go编译器是标准Go的子集吗",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "在语法和标准库这两个轴上，子集这个说法并不成立。仓库写明它兼容Go 1.20及以后的源码，支持完整的Go 1.27语言语法，并且在受支持的原生平台上完整支持Go标准库。真正分岔的是运行时语义。协程与操作系统线程一对一绑定，栈是固定大小的原生栈，默认回收器采用保守式。所以准确的说法不是「子集」，而是「语法全都要，运行时保证不一样」。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "标准Go里说cgo调用很贵，究竟贵在哪里",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "按运行时源码里的注释，调用一个C函数时，运行时先声明进入系统调用，再在汇编层离开当前协程栈、切到操作系统分配的g0栈上，然后才去调C函数。返回时要切回原来的栈并执行系统调用退出，而这个退出会一直阻塞，直到本线程可以在不违反并行上限的前提下继续跑Go代码。也就是说，一次调用附带两次栈切换和两次调度器状态变更。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "既然换掉运行时就能消掉边界成本，为什么不是人人都这么做",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "因为成本不是消失，而是换了地方。把协程与操作系统线程一对一绑定，栈切换确实没有了，但一个协程就占住一个线程，栈也失去了按需增长的性质。改用保守式回收器不必再维护精确的指针图，代价是精确存活判定和终结器时机与标准实现对不上。该项目登记为「不在兼容目标内」的条目，多数都能追回到这两个选择上。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "跨越边界时最先坏掉的是什么",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "是内存所有权，以及回收器看不见的指针。标准cgo文档明确写着，构造C字符串之后释放的责任在调用方；C代码若要在调用返回之后仍持有Go指针，必须用固定机制把那块内存按住。基于LLVM的实现这边也留下了同一类事故的记录。只放在线程局部存储里的裸指针回收器看不见，延迟调用的节点被回收掉，沿着这些节点执行的代码就崩了。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "这类项目的成熟度该怎么判断",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "不看星标数，看四样东西。第一是发布标签是否已经走到正式版本号，以及节奏如何；第二不是未解决议题的绝对数量，而是它们属于哪一类；第三是兼容性声明究竟是一句话，还是一份可以核对的清单；第四是项目自己把标准符合范围写到了什么程度。这个项目把兼容性例外拆成两个清单文件，每一条都附了理由。这份清单存在本身，就比星标数说明得多。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/llvm_backed_go_compiler.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/llvm_backed_go_compiler.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/llvm_backed_go_compiler.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/llvm_backed_go_compiler.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/llvm_backed_go_compiler.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "首页",
+      "item": "https://braindetox.kr/zh/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "开发/基础设施",
+      "item": "https://braindetox.kr/zh/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "决定去用别的语言的库，究竟要背下什么 - 一个基于LLVM的Go编译器暴露出的边界账单",
+      "item": "https://braindetox.kr/zh/posts/llvm_backed_go_compiler.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="决定去用别的语言的库，究竟要背下什么 - 一个基于LLVM的Go编译器暴露出的边界账单">
+                <meta itemprop="datePublished" content="2026-09-07">
+                <meta itemprop="dateModified" content="2026-09-07">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="LLGo, LLVM, Go编译器, cgo, FFI, 互操作, 内存所有权, Python全局锁">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/llvm_backed_go_compiler.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">决定去用别的语言的库，究竟要背下什么 - 一个基于LLVM的Go编译器暴露出的边界账单</h1>
+                    <h2 class="post-subtitle">从cgo为什么不是普通的函数调用，到换掉运行时之后新冒出来的那些账目</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-07">2026-09-07</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">开发/基础设施</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>在Go写的程序里调用NumPy，跑起PyTorch，用raylib画出画面。这句话听着很有吸引力，因为它描绘的图景是：你原有的代码不用动，别人的整个生态就跟着一起过来了。可这句话实际下达的指令只有一条，就是<strong>把两套彼此不同的执行模型叠进同一个进程里</strong>。</p>
+
+                    <p>一叠，边界必然出现。边界上一定标着价。内存由谁释放，回收器看不看得见那个指针，一边的异常会不会翻译成另一边的panic，线程约定归谁管，这些全都得在那条边界上重新决定一遍。而在只用一门语言的时候，它们本来是编译器和运行时替你默默守住的。</p>
+
+                    <p>一个把LLVM当作后端来编译Go、并且能直接调用C与Python库的实现，已经带着正式版本号发布了。这里要看的不是这件工具怎么用，而是<strong>「决定去用别的语言的库」这件事本身要背下什么</strong>。那个实现正好是一份格外清晰的样本，因为它没有绕开问题，而是正面接了下来，并且把接下来的代价写成了文档。</p>
+
+                    <div class="callout">
+                        下文凡是描述标准Go行为的段落，都不越过官方文档与运行时源码注释实际写下的范围。实现一侧的数值与声明来自仓库文档和公开接口的查询结果，<strong>查询时刻为2026-09-07 11:56 KST</strong>。性能与体积数字出自该项目自己跑的持续集成度量，所以必须当作<strong>自测</strong>来读。它们不是第三方复现。
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>本文要讲的内容</h3>
+                        <ol>
+                            <li><a href="#sec-1">缘起 - 「Go编译器」这个说法遮住了什么</a></li>
+                            <li><a href="#sec-2">Go原本为什么这么做 - 自建后端的代价</a></li>
+                            <li><a href="#sec-3">cgo为什么不是普通的函数调用</a></li>
+                            <li><a href="#sec-4">指针传递规则 - 守住它的不是编译器而是约定</a></li>
+                            <li><a href="#sec-5">把运行时整个换掉这个选择</a></li>
+                            <li><a href="#sec-6">在「完整支持」与「不在兼容目标内」之间</a></li>
+                            <li><a href="#sec-7">改用LLVM之后会变什么</a></li>
+                            <li><a href="#sec-8">一个自测数字 - WebAssembly的文件体积</a></li>
+                            <li><a href="#sec-9">跨越边界时真正会坏掉的东西</a></li>
+                            <li><a href="#sec-10">调用Python意味着 - 一把锁跟着过来</a></li>
+                            <li><a href="#sec-11">这个选择在什么时候是对的</a></li>
+                            <li><a href="#sec-12">怎么读成熟度 - 别看星标数</a></li>
+                            <li><a href="#sec-13">引入之前必须答的五个问题</a></li>
+                            <li><a href="#sec-14">未能确认的部分</a></li>
+                            <li><a href="#sec-15">参考资料</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">缘起 - 「Go编译器」这个说法遮住了什么</h2>
+
+                    <p>介绍文字通常都很短。写着「基于LLVM的Go编译器」，多数人就把它读成一件原样接收标准Go、只是吐出不同机器码的东西。这个读法只对了一半。</p>
+
+                    <p>仓库给自己划定的范围是这样的：兼容Go 1.20及以后的源码，支持<strong>完整的Go 1.27语言语法</strong>，也接受<code>cgo</code>。在受支持的原生平台上<strong>完整支持标准库</strong>。只读到这里，子集这个词是错的。</p>
+
+                    <p>可同一份文档在下一节又说了别的话。<strong>它的运行时与标准工具链不同。</strong>原生协程与操作系统线程一对一绑定，栈是固定大小的原生栈，默认回收器是保守式的Boehm系回收器。裸机目标则改用另一套保守式的标记清除回收器。语法全都接受，可是<strong>这些语法跑在上面的地板换了一块。</strong></p>
+
+                    <p>所以要用一句话概括这件东西，「标准Go的子集」不准确，「兼容标准Go」也不准确。准确的概括是<strong>语法与标准库全都要，运行时保证不一样</strong>。有些介绍只把支持平台写成Linux与macOS，而仓库文档同时列出了Windows的amd64与arm64，并分成MSVC与MinGW两条线，还罗列了多种WebAssembly目标和嵌入式开发板。摘要总是更新得更慢。</p>
+
+                    <h2 id="sec-2">Go原本为什么这么做 - 自建后端的代价</h2>
+
+                    <p>Go团队在项目早期考察过LLVM，最后没有采用。官方常见问题里留下了一句话作为理由：<strong>他们判断它太大也太慢，达不到性能目标</strong>。这里说的性能不是生成代码的执行速度，而是<strong>编译器自身的速度</strong>。同一份文档在另一处把目标写得很明白：在一台机器上构建一个大型可执行文件，<strong>最多只应花几秒钟</strong>。</p>
+
+                    <p>这一个选择连锁式地决定了这门语言的性格。用自建后端和自建链接器，工具链就小；默认静态链接，部署就简单；用两个环境变量切换目标操作系统与架构，交叉编译就便宜。代价则是：优化的深度赶不上积累了数十年的通用后端，支持的架构广度也没有那么宽。</p>
+
+                    <p>同样这个选择，还决定了<code>cgo</code>的性格。在一个用自己的调用约定、自己的栈管理、自己的调度器的运行时里调用C函数，这件事就成了<strong>暂时走进别人的约定再走回来</strong>。走过去再走回来的这套手续，本身就是成本。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>标准工具链选了什么</th><th>换来了什么</th><th>因此放弃了什么</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>自建的编译器后端</td><td>大型可执行文件也在秒级完成构建</td><td>通用后端积攒下来的优化深度</td></tr>
+                            <tr><td>自建链接器与默认静态链接</td><td>一个文件就结束的部署</td><td>小体积二进制。运行时与类型信息总是被带上</td></tr>
+                            <tr><td>用环境变量指定目标平台</td><td>不需要C工具链的交叉编译</td><td>一旦用上C库，这份简单立刻消失</td></tr>
+                            <tr><td>可增长的协程栈</td><td>开到几十万个也扛得住的并发</td><td>无法把C代码直接跑在那种栈上</td></tr>
+                            <tr><td>依赖精确指针图的回收器</td><td>精确的存活判定与可预期的终结时机</td><td>要碰回收器不认识的内存，就得靠约定</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>表格最后两行预告了本文余下的全部内容。正是那套把并发与自动内存管理做得很便宜的设计，在跨越边界的一瞬间转身变成了收费的一方。</p>
+
+                    <h2 id="sec-3">cgo为什么不是普通的函数调用</h2>
+
+                    <p>Go运行时源码里那个叫<code>cgocall</code>的文件，开头有一段很长的注释，把整条调用路径讲了一遍。这段注释就是「贵」这个字的实际内容。</p>
+
+                    <p>Go代码调用C函数时，生成的代码会去调运行时的<code>cgocall</code>。<code>cgocall</code>首先调<code>entersyscall</code>，为的是不挡住其他协程和回收器。注释把这次调用的目的写明了：<strong>告诉调度器，在本线程跑进外部代码的这段时间里，需要再造一个线程来跑其他协程</strong>。</p>
+
+                    <p>接着汇编层的<code>asmcgocall</code><strong>离开当前协程栈，切到<code>g0</code>栈上。</strong>注释连理由都写了：<code>g0</code>栈被假定为操作系统分配的栈，所以把C编译器生成的代码放上去是安全的。反过来说就是，<strong>C代码不能就这么跑在协程栈上。</strong>一个会按需增长的栈，不是执行C函数的地方。</p>
+
+                    <p>C函数结束后回到原来的协程栈，<code>cgocall</code>调用<code>exitsyscall</code>。注释用一句话交代了这个函数的性质：它<strong>会一直阻塞，直到本线程可以在不违反并行上限的前提下跑Go代码</strong>。也就是说，返回不是立刻发生的，而是<strong>一道等待调度器许可的手续</strong>。</p>
+
+                    <p>如果C那边反过来调Go函数，这道楼梯还要反方向再走一遍。适配器把C的调用约定换成Go的调用约定，再从<code>g0</code>栈切回原来的协程栈，然后在那里再一次等待上限。一次回调，往返切换就叠成了两层。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>阶段</th><th>运行时做的事</th><th>为什么必须做</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>进入声明</td><td>标记为进入系统调用</td><td>好在本线程被占住期间安排另一个线程去跑协程</td></tr>
+                            <tr><td>栈切换</td><td>从协程栈切到操作系统栈</td><td>因为C代码不能跑在可增长的栈上</td></tr>
+                            <tr><td>真正的调用</td><td>从帧里取出参数并调用C函数</td><td>两边调用约定不同，需要有人居中转接</td></tr>
+                            <tr><td>返回切换</td><td>切回原来的协程栈</td><td>Go代码只能在自己的栈上继续</td></tr>
+                            <tr><td>退出等待</td><td>阻塞到并行上限允许为止</td><td>为了维持并发执行数量的账目</td></tr>
+                            <tr><td>如果有回调</td><td>同一道楼梯反方向再走一遍</td><td>从C进入Go走的是同一条边界</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>把这张表摆开就能看清，「调用很贵」讲的不是一个微秒级的固定延迟。<strong>调度器的账目和栈的所有权，每次调用都要易手一回。</strong>所以把一大块计算一次性交出去几乎不受影响，而密集地调用小函数，那就不是调参问题，而是结构问题。</p>
+
+                    <h2 id="sec-4">指针传递规则 - 守住它的不是编译器而是约定</h2>
+
+                    <p>比成本更危险的是规则。<code>cgo</code>文档把传指针的条件钉死了。要把Go指针传给C，<strong>该指针所指向的内存里不能含有指向未固定内存的Go指针</strong>。而且<strong>C代码不得在调用返回之后仍保留Go指针的副本</strong>，唯一的例外是那块内存被固定装置按住的情形。</p>
+
+                    <p>作为参数传过去的Go指针，<strong>只在调用持续期间</strong>被隐式固定。调用一结束，这份保证也就结束了。字符串更简单：<code>C.CString</code>会在C堆上做一份副本，文档写明<strong>安排释放是调用方的责任</strong>。</p>
+
+                    <pre><code class="language-go">// 标准Go的cgo - 跨越边界的值会被复制，释放的责任留在调用方
+cs := C.CString(s)                  // 在C堆上做一份副本
+defer C.free(unsafe.Pointer(cs))    // 少了这一行就会一直漏
+n := C.strlen(cs)                   // 从这里开始就是C的内存了
+</code></pre>
+
+                    <p>如果C在调用结束之后还得握着Go内存，那就要用固定装置。标准库里的<code>Pinner</code>会把对象按住，<strong>让回收器既不能移动它也不能回收它</strong>。如果被固定的对象又指向别的Go对象，而C还要顺着追下去，那些对象也必须单独固定。</p>
+
+                    <pre><code class="language-go">// 当C必须在调用结束后继续持有Go指针时
+var pinner runtime.Pinner
+pinner.Pin(p)            // 按住它，让回收器既不能移动也不能回收
+defer pinner.Unpin()     // 只有在解开之前，C那边的引用才是有效的
+</code></pre>
+
+                    <p>这里值得盯住的是规则的<strong>执行者</strong>。这些规则类型检查器不会替你抓。编译照样通过，违反之后的后果也不会立刻显现。只有当回收器真的去移动或回收那块内存时，症状才出现。这是一类要等到负载升高、或者堆长大之后才第一次爆出来的缺陷。</p>
+
+                    <ul>
+                        <li><strong>能传什么的条件</strong> — 所指向的内存里不能有未固定的Go指针。结构体里装着切片或字符串，就会撞上这个条件</li>
+                        <li><strong>禁止保留</strong> — C要在调用之后继续持有Go指针就必须固定，而固定一解开，那个引用立刻失去依据</li>
+                        <li><strong>释放的归属</strong> — 在C堆上造出来的，就按C的约定释放。Go的回收器不统计那块内存，所以泄漏是悄悄堆起来的</li>
+                    </ul>
+
+                    <p>同一个问题能不能在语言层面收窄，是<a href="rust_extern_filc_safe_c.html">Rust FFI 边界上中断的安全保证</a>那篇处理的轴。那边走的是<strong>把边界本身缩小</strong>的路子，而这里要看的是<strong>为了消掉边界干脆换掉地板</strong>的路子。</p>
+
+                    <h2 id="sec-5">把运行时整个换掉这个选择</h2>
+
+                    <p>第三节那道楼梯，全都建立在一个前提上：<strong>协程栈和调度器不属于C。</strong>把这个前提抹掉，楼梯也就没了。基于LLVM的实现选的正是这条路。</p>
+
+                    <p>仓库文档的措辞很简洁：原生协程与操作系统线程一对一绑定，栈是固定大小的原生栈，因此<strong>直接调用C时既不需要Go到C的栈切换，也不需要调度器切换</strong>。绑定方式也不经过包装层，一条Go声明直接绑到C ABI的符号上。</p>
+
+                    <pre><code class="language-go">import _ "unsafe" // 要使用 go:linkname 指令就需要它
+
+//go:linkname Sqrt C.sqrt
+func Sqrt(x float64) float64
+</code></pre>
+
+                    <p>这条指令本身在标准编译器里也有。官方文档这样描述它的性质：它<strong>指定Go变量或函数声明所使用的目标文件符号</strong>，让两个Go符号指向同一个符号，并且只在导入了<code>unsafe</code>的文件里才启用。同一页还明确写着，这条指令可以<strong>绕开对未导出声明的常规封装，甚至绕开类型安全</strong>。这份便利究竟是什么做成的，文档自己就说了。</p>
+
+                    <p>改掉的不只是调用路径。默认回收器换成了保守式：不依赖精确的指针图，而是扫描栈与寄存器，把所有长得像指针的值都当作存活。正因为这个选择，C代码造出来的内存和Go代码造出来的内存才好放进同一个堆里处理。而它的代价，就是下一节那份清单。</p>
+
+                    <h2 id="sec-6">在「完整支持」与「不在兼容目标内」之间</h2>
+
+                    <p>有意思的是，这个项目把兼容性当成<strong>清单</strong>而不是散文来管理。它原样跑标准发行版的编译器测试集，把没通过的条目分进两个文件。一个装还没对齐的，另一个装<strong>本来就不打算对齐的</strong>。</p>
+
+                    <p>还没对齐的那一侧有十一条。其中六条是解析器发出的<strong>错误信息措辞</strong>与标准不同：包声明写坏、名字写坏、字节序标记之类的情形下，诊断文本长得不一样。剩下五条与堆采样剖析有关，其中两条把一个尚未合并的提案编号写成了理由。</p>
+
+                    <p>不打算对齐的那一侧有一百三十六条。这一侧才是真正的边界线。其中一百一十条的理由以同一句话收尾：<strong>支持那种工具链特有的行为不属于兼容目标</strong>。其余的理由更具体：因为用保守式回收器，所以不去对齐精确存活判定与终结时机的，大约十八条；因为不使用写屏障，所以不复现与之相关诊断的，有若干条；还有一些写着<strong>因为用固定大小的原生栈，所以不复现可增长栈的行为</strong>。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>轴</th><th>声明的范围</th><th>实际分岔的地方</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>语言语法</td><td>完整的Go 1.27语法</td><td>解析器诊断措辞有六条不同。不是语法本身，是错误信息</td></tr>
+                            <tr><td>标准库</td><td>在受支持的原生平台上完整支持</td><td>项目自己写明，其他目标上可能缺少部分系统服务或实现特有行为</td></tr>
+                            <tr><td>协程</td><td>能用</td><td>与操作系统线程一对一。数量往上堆时的成本与标准不同</td></tr>
+                            <tr><td>栈</td><td>能用</td><td>固定大小。以可增长栈为前提的行为被归入不兼容目标</td></tr>
+                            <tr><td>垃圾回收</td><td>默认提供</td><td>保守式。精确存活判定与终结时机与标准不同</td></tr>
+                            <tr><td>构建工具</td><td>用法与标准命令相仿</td><td>整套LLVM 22系列加上多个系统库都是前置条件</td></tr>
+                        </tbody>
+                    </table>
+
+                    <ul>
+                        <li><strong>语法兼容与运行时兼容是两个轴。</strong>同一份源码能编译，与同一份源码在同一时刻给出同样的观测，是两回事</li>
+                        <li><strong>依赖终结器与弱引用的代码是第一类风险。</strong>在保守式回收器下，回收时机可能与标准错开</li>
+                        <li><strong>会开出极大量协程的设计是第二类风险。</strong>一对一映射之下，那个数量就是线程数量</li>
+                    </ul>
+
+                    <h2 id="sec-7">改用LLVM之后会变什么</h2>
+
+                    <h3>得到的一侧</h3>
+
+                    <p>换上通用后端，那个后端积累下来的东西就整套跟过来：优化通道集合、链接期优化、各架构的代码生成器，以及架在它上面的调试器与分析工具。目标的扩张也是同样的来路。这个实现之所以能吐出好几种WebAssembly，还能把嵌入式开发板纳入目标，是因为那个后端本来就认识这些架构。</p>
+
+                    <p>直接按C ABI对接这个性质也出自同一处。同一个后端也编译C，于是调用约定与类型表示从一开始就用同一种语言表达出来。不需要包装层的原因就在这里。</p>
+
+                    <h3>付出的一侧</h3>
+
+                    <p>后端大，意味着工具链大。LLVM官方文档把所需磁盘写得很直白：<strong>只构建LLVM大约要1到3GB，把LLVM与Clang一起完整构建大约要15到20GB</strong>。这个实现把LLVM 22系列的编译器、链接器、调试器全部列为前置条件，再往上加保守式回收器库、外部函数接口库、加密库与压缩库。</p>
+
+                    <p>这份清单本身就是<strong>构建可复现性的账单</strong>。标准Go的交叉编译之所以便宜，是因为不需要目标平台的C工具链。边界一开，这个前提就塌了。开发机、持续集成机、部署目标三处的系统库版本号，全都会进入结果。</p>
+
+                    <p>把LLVM换作Go后端的尝试，也不是这个项目才有的。Go官方常见问题里同时提到了接在GCC后端上的前端，以及<strong>使用同一前端的实验性LLVM后端</strong>。用同样方式把TypeScript往下降的尝试，在<a href="perry_typescript_llvm_compiler_2026.html">Perry - 将TypeScript直接编译为LLVM机器码的原生编译器</a>里讲过，而那篇文章里的一个陷阱在这里同样重演：<strong>更好的后端并不自动意味着更快的结果。</strong>语言的语义能不能顺利降到那个后端上，才是先决问题。</p>
+
+                    <h2 id="sec-8">一个自测数字 - WebAssembly的文件体积</h2>
+
+                    <p>这个项目在一个专门的仓库里持续跑体积对比，并把结果公开。条件是随数字一起给出的，所以值得引用。只是<strong>做度量的主体就是项目自己</strong>，这一点必须原样带进阅读里。</p>
+
+                    <p>条件是这样的：执行编号403，生成时刻为2026-09-07的07:11 UTC，持续集成执行机是Linux x64的Ubuntu 24镜像，目标是WebAssembly系统接口。使用Go 1.26.2、LLVM 22、TinyGo 0.41.1，样本是十个应用程序，指标是产物文件的总字节数。构建选项也一并公开：Go一侧加了路径裁剪与符号和调试信息剥离，TinyGo一侧加了体积优先优化与去调试信息，这个实现一侧则把体积优先优化与链接期优化、全局死代码消除组合起来。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>配置</th><th>对标准Go</th><th>对TinyGo</th><th>该怎么读</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>不做链接期优化</td><td>0.66倍</td><td>11.2倍</td><td>默认设置就已经小于标准，可与小型编译器还差着一个数量级</td></tr>
+                            <tr><td>死代码剔除</td><td>0.47倍</td><td>8.0倍</td><td>一个选项又削掉了三成体积</td></tr>
+                            <tr><td>链接期优化，全局消除关</td><td>0.44倍</td><td>7.5倍</td><td>只开链接期优化，与上一行差别不大</td></tr>
+                            <tr><td>链接期优化，全局消除开</td><td>0.34倍</td><td>5.8倍</td><td>最小的配置。即便如此仍是小型编译器的五倍以上</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>这张表里该读出来的不是倍数本身，而是<strong>倍数的方向有两个</strong>这个事实。同一件产物，按一把尺子量是三分之一，按另一把量就接近六倍。看单个案例更清楚：样本里的Base64转换器，标准Go的产物约228万字节，小型编译器的产物约9万7千字节，最小配置的产物约60万字节。<strong>取决于跟哪一边比，同一个数字既能是胜利也能是失败。</strong>只把倍数摘出来的句子之所以危险，原因就在这里。</p>
+
+                    <p>还有，这张表量的是<strong>文件体积</strong>而不是执行速度。体积与速度是两个轴，一个按体积优先调过的构建，在速度轴上未必占优。</p>
+
+                    <h2 id="sec-9">跨越边界时真正会坏掉的东西</h2>
+
+                    <p>这里是本文的中心。无论从哪门语言跨到哪门语言，边界上会坏掉的东西，清单大体一致。要紧的是<strong>每一项会以什么症状出现</strong>。知道症状，才有可能把原因往那个方向去怀疑。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>会坏的东西</th><th>为什么会坏</th><th>出现的症状</th><th>先看哪里</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>内存所有权</td><td>分配的一方与释放的一方遵循不同约定</td><td>长时间运行后常驻内存单调上涨。重启就消失</td><td>每一个跨边界的字符串或缓冲区是否都有配对的释放</td></tr>
+                            <tr><td>回收器看不见的指针</td><td>唯一存活的引用落在回收器不扫描的地方</td><td>只在高负载时崩。栈回溯指向已被回收的对象</td><td>线程局部存储、C堆、交给回调的上下文指针</td></tr>
+                            <tr><td>对象被搬动</td><td>回收器把对象挪走了，而C还握着旧地址</td><td>断续出现错值，堆长大之后才复现</td><td>调用结束后仍存活的指针有没有被固定住</td></tr>
+                            <tr><td>异常与panic</td><td>一边的栈展开约定在另一边并不存在</td><td>不是返回错误而是进程整个终止，日志也留不下</td><td>跨边界的回调里panic会不会漏出去</td></tr>
+                            <tr><td>线程模型</td><td>一边给线程附加了条件</td><td>同一段代码在这个协程上能跑，在另一个协程上就死</td><td>加锁与解锁是不是在同一个线程上配对</td></tr>
+                            <tr><td>错误约定</td><td>用返回值、全局变量还是异常来报告，两边不一致</td><td>失败被读成成功。缺陷要很久之后才显形</td><td>C函数报告错误的方式，以及读取那个值的时机</td></tr>
+                            <tr><td>类型表示</td><td>同名的类型在宽度与布局上不一样</td><td>结构体字段错位。32位与64位结果分岔</td><td>整数宽度、数组作参数与作字段的差别、函数指针</td></tr>
+                            <tr><td>构建可复现性</td><td>系统库与工具的版本号进入了结果</td><td>本机能过，持续集成上过不去</td><td>前置条件清单里有没有把版本号钉死</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>第二行不是抽象的警告，它在这个实现自己的文档里就是一次真实事故。延迟调用链的表头<strong>只以裸指针放在线程局部存储里，保守式回收器看不见它</strong>。在压入一百万次延迟调用的压力测试中，回收器把那些节点回收掉了，结果代码就死在延迟调用里面。诊断写得很干脆：那是<strong>根注册的遗漏，而不是逻辑上的损坏</strong>。修法也跟着诊断走，改成从回收器认得的根上去分配那份状态。</p>
+
+                    <p>第七行同样有具体的文档依据。这个实现的类型对应表<strong>把C函数指针作为参数出现和作为结构体字段出现分开处理</strong>：在参数位置上按Go函数类型接收，在结构体字段里则按普通指针接收。因为C的函数指针只是一个函数的地址，而Go的函数值可能是闭包。数组也一样，在参数位置降级为指针，只有在结构体内部才保持数组形态。对于Windows回调，文档出于同样理由明确写道：<strong>要传直接的函数引用而不是会捕获状态的闭包，状态请用单独的上下文指针传递</strong>。</p>
+
+                    <h2 id="sec-10">调用Python意味着 - 一把锁跟着过来</h2>
+
+                    <p>调用C库和调用Python库难度不一样。后者等于<strong>把一整台叫作解释器的状态机搬进进程里</strong>。那台状态机有自己的约定。</p>
+
+                    <p>Python官方C接口文档里的句子简短而断然：除非是自由线程构建，否则解释器一般不是线程安全的，因此存在全局解释器锁，而且<strong>只有持有这把锁的线程才能操作Python对象或调用Python的C接口。</strong>从外部线程进来时必须成对地获取和释放状态，文档明确写着<strong>每一次获取调用都必须由同一线程上的一次释放调用来配对</strong>。</p>
+
+                    <pre><code class="language-go">// 直接从Go代码里调用Python库
+x := math.Sqrt(py.Float(2))       // 交给Python的math.sqrt
+std.Print(py.Str("sqrt(2) ="), x) // 用Python的print打印
+</code></pre>
+
+                    <p>表面上看是两行函数调用。可这两行要成立，进程里的解释器必须已经初始化，执行这段代码的线程必须持有那把锁，传过去的值必须已经被造成遵循引用计数约定的Python对象。<strong>看不见的前提叠了三层。</strong></p>
+
+                    <p>看这个条件与Go的执行模型如何相遇，就能猜到一对一线程映射这个选择是怎么来的。标准Go里协程并不钉在某个线程上，调度器会把它挪走。协程握着锁却被挪到另一个线程，约定就破了。一个协程固定在一个线程上，这个问题就从结构上消失了。</p>
+
+                    <p>自由线程构建也不是万能药。官方文档写明，即便在那种构建下<strong>把线程状态解绑的手续依然是必要的</strong>，因为解释器需要周期性地暂停所有线程，才能拿到对Python对象的一致视图。文档举的例子就是跑回收器的那段时间。</p>
+
+                    <ul>
+                        <li><strong>并行度的上限由别人决定。</strong>Go这边协程开得再多，触碰Python对象的那段区间都要围着一把锁排队</li>
+                        <li><strong>加锁约定编译器不检查。</strong>获取与释放配对错位，编译照样通过</li>
+                        <li><strong>第三方库要另行安装。</strong>发布物里必须带上解释器和它的那些包，它们的版本号也会进入结果</li>
+                    </ul>
+
+                    <h2 id="sec-11">这个选择在什么时候是对的</h2>
+
+                    <h3>当既有的库事实上是唯一实现时</h3>
+
+                    <p>判断多半能压缩成一个问题：<strong>有没有一个能替代那个库的纯语言实现。</strong>没有的话，边界成本就不是选项而是前提。数值计算里的某个核心算子、打磨了很多年的编解码器、特定硬件的官方驱动、因监管要求而必须使用的密码模块，都属于这一类。此时争论的重点就不再是「用不用」，而是<strong>「把边界放在几个地方」</strong>。</p>
+
+                    <p>缩小边界的办法大体一致：把调用点收拢到一处，在那里粗粒度地跨一次。与其密集调用小函数，不如成批交出去。第三节那道楼梯是每次调用都要附上的结构，所以减少调用次数本身就是在减少成本。</p>
+
+                    <h3>当存在纯语言实现时</h3>
+
+                    <p>有纯语言实现的话，账就换了一种算法。要比的不是性能，而是<strong>运维总成本</strong>。边界一开，系统库会跟进发布物，交叉编译会变难，故障排查会需要两门语言的知识，标准工具链的性能剖析器与竞态检测器只能看见一半。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>情形</th><th>开边界的一侧</th><th>纯语言实现的一侧</th><th>决定胜负的因素</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>根本没有替代实现</td><td>事实上唯一的选择</td><td>不适用</td><td>边界能收拢到几处</td></tr>
+                            <tr><td>有纯语言实现但慢</td><td>只有单次工作量大时才划算</td><td>通常选这一侧</td><td>一次交出去的工作量。太小的话切换成本会吃掉收益</td></tr>
+                            <tr><td>纯语言实现功能不足</td><td>缺的功能正是核心时</td><td>缺的部分可以不用的话</td><td>那个功能位于需求的中心还是边缘</td></tr>
+                            <tr><td>部署目标很多样</td><td>不利</td><td>有利</td><td>能不能为每个目标备齐C工具链</td></tr>
+                            <tr><td>会开出极大量协程</td><td>换运行时的路子不利</td><td>有利</td><td>并发规模换算成线程数之后还扛不扛得住</td></tr>
+                            <tr><td>运维团队只懂一门语言</td><td>故障排查成本会变高</td><td>有利</td><td>凌晨挂掉时有没有人能追出原因</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>最后一行在实务中最常把决定翻过来。开了边界的系统出故障，只靠一门语言的知识很难追到底。Go与另一门语言之间这个判断该怎么立，在<a href="go_to_rust_migration_guide_2026.html">Go迁移到Rust完全指南2026</a>里从另一个角度讲过；把语言选择本身换算成验证成本的那条轴，则在<a href="go_language_ai_coding_fit.html">降低 AI 生成代码验证成本的语言特性</a>里。</p>
+
+                    <h2 id="sec-12">怎么读成熟度 - 别看星标数</h2>
+
+                    <h3>星标数不会告诉你的事</h3>
+
+                    <p>公开仓库的星标数是关注度的指标，不是可信度的指标。这个仓库在查询时点显示星标749、分叉50、未解决议题151。它建于2023年12月，查询当天仍在收到提交。光靠这些数字，引入决策所需要的东西一个也得不到。</p>
+
+                    <p>该看的是另外四样：<strong>发布标签的轨迹</strong>、<strong>未解决议题的种类</strong>、<strong>兼容性声明的形态</strong>、<strong>项目对标准符合范围的自我陈述</strong>。</p>
+
+                    <h3>真正该看的四样</h3>
+
+                    <p>先看发布轨迹。第一个标签是2024年4月，正式版本号1.0.0落在2026年8月24日。在正式版之前的一周多时间里集中放出了五个预发布版，之后又在8月29日和9月6日出了两个维护版。发布总数是四十九个。<strong>走到正式版本号花了两年四个月，而且紧接着就有两次维护</strong>，这个事实比星标数说明得多。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>指标</th><th>查询值</th><th>该从中读出什么</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>抵达正式版本号</td><td>1.0.0在2026-08-24，最新为2026-09-06的1.0.2</td><td>正式版之后两周内出了两个维护版。仍处在早期稳定化区间</td></tr>
+                            <tr><td>距第一个发布的时间</td><td>自2024-04-21起共49个发布</td><td>有稳定的发布节奏。是项目仍在被维护的信号</td></tr>
+                            <tr><td>未解决议题</td><td>151条</td><td>种类比绝对数量重要。这是引入前该拿自己的使用场景去检索的地方</td></tr>
+                            <tr><td>兼容性声明</td><td>未达标11条、不在目标内136条，均附理由并落成文件</td><td>声明不是一句话而是可核对的清单。这是很强的成熟度信号</td></tr>
+                            <tr><td>标准符合范围</td><td>语法与标准库全都要，运行时语义不同</td><td>同一份源码能编译，并不意味着能给出同样的观测</td></tr>
+                            <tr><td>前置条件</td><td>整套LLVM 22系列加上多个系统库</td><td>引入成本里相当一部分花在装工具和钉版本号上</td></tr>
+                            <tr><td>许可证</td><td>Apache-2.0</td><td>带专利条款的宽松型。企业引入时法务审查负担相对轻</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>第四行是这张表里最值钱的一行。多数项目把兼容性写成散文。<strong>「基本兼容」这句话没法验证，而带理由的例外清单可以读、可以追问。</strong>意思是你能直接去核对：自己代码所依赖的行为，有没有落在那份清单里。语言项目被打开究竟改变了什么、又没改变什么，在<a href="mojo_compiler_open_source.html">Mojo 编译器开源</a>里是从治理的轴讲的。这里要看的轴是<strong>兼容性声明的可验证性</strong>。</p>
+
+                    <h2 id="sec-13">引入之前必须答的五个问题</h2>
+
+                    <p>挑工具这件事，多半就是挑问题。下面五个有了答案，决定自然就跟着出来。</p>
+
+                    <ol>
+                        <li><strong>要跨几次边界。</strong>调用次数少、单次交出去的工作量大，那标准<code>cgo</code>就够用。只有当密集调用在结构上无法避免时，换运行时才成为议题</li>
+                        <li><strong>要开多少协程。</strong>一对一映射之下，并发规模就是线程数。以几万个为前提的设计，不适合走这条路</li>
+                        <li><strong>有没有依赖终结器与回收时机的代码。</strong>保守式回收器会让那个时机与标准不同。把资源释放交给终结器的代码，是第一批要检查的对象</li>
+                        <li><strong>部署目标有几种。</strong>能不能为每个目标备齐LLVM系列工具与系统库并把版本号钉死，才是实际引入成本的大头</li>
+                        <li><strong>凌晨挂掉时谁来看。</strong>开了边界的系统出故障，要求两门语言的知识。组织里有没有这个人，比技术判断更靠前</li>
+                    </ol>
+
+                    <p>值得注意的是，这五个问题没有一个在问性能。在开边界这个决定里，性能通常是答案早就定下的那条轴，真正把项目拖垮的是其余四个。给编译型语言加上交互式执行时也会出现同一类取舍，那条轴整理在<a href="interpreter_for_compiled_language.html">给编译型语言加上交互式执行意味着什么</a>里。</p>
+
+                    <h2 id="sec-14">未能确认的部分</h2>
+
+                    <ul>
+                        <li>速度对比未能确认。公开的持续集成度量是<strong>WebAssembly产物文件的字节数</strong>，没有找到以同样形式公开的执行时间对比。第八节的倍数不能挪去当速度读</li>
+                        <li>原生目标的体积表没能打开。结果文件用单独的摘要与表格形式指向原生条目，但那部分内容没有放进本文的依据里</li>
+                        <li>C调用路径实际节省了多少，未能用数字确认。没有栈与调度器切换是设计层面的陈述，没有拿到在同等条件下与标准<code>cgo</code>比较单次调用延迟的公开数值</li>
+                        <li>第三方复现未能确认。第八节的数值全部出自项目自己跑的度量，没有找到独立的度量报告</li>
+                        <li>151条未解决议题的<strong>构成</strong>未能确认。没有把缺陷、功能请求与文档条目的比例分开，所以这个数字不能当质量指标来读</li>
+                        <li>贡献者数量的准确总计未能确认。清单第一页显示19人，但没有把其余页面加总</li>
+                        <li>在Python自由线程构建下这个实现如何表现，未能确认。仓库文档要求的只是3.12以上这个条件，关于无锁构建的单独说明不在查阅范围之内</li>
+                    </ul>
+
+                    <h2 id="sec-15">参考资料</h2>
+
+                    <ul>
+                        <li><a href="https://news.hada.io/topic?id=33302" target="_blank" rel="noopener">GeekNews 话题 33302</a> — 本文的缘起介绍，附有原文地址与摘要</li>
+                        <li><a href="https://github.com/xgo-dev/llgo" target="_blank" rel="noopener">xgo-dev/llgo 仓库</a> — 支持范围的声明、运行时差异、C与Python互操作机制、前置条件清单的出处。查询时刻2026-09-07 11:56 KST</li>
+                        <li><a href="https://go.dev/doc/faq" target="_blank" rel="noopener">Go 官方常见问题</a> — 早期考察过LLVM但判断其太大太慢的表述、构建速度目标，以及静态链接对二进制体积的影响</li>
+                        <li><a href="https://pkg.go.dev/cmd/cgo" target="_blank" rel="noopener">cmd/cgo 官方文档</a> — 指针传递规则、调用之后禁止保留与固定的条件、C字符串的释放责任、用多重赋值接收错误号的约定</li>
+                        <li><a href="https://pkg.go.dev/runtime#Pinner" target="_blank" rel="noopener">runtime.Pinner 文档</a> — 固定保证了什么，以及被固定对象所指向的目标必须单独固定这一条件</li>
+                        <li><a href="https://github.com/golang/go/blob/master/src/runtime/cgocall.go" target="_blank" rel="noopener">Go 运行时 cgocall 源码</a> — 说明系统调用进入标记、切换到g0栈、返回时等待并行上限，以及回调路径反向楼梯的那段注释</li>
+                        <li><a href="https://pkg.go.dev/cmd/compile" target="_blank" rel="noopener">cmd/compile 编译器指令</a> — go:linkname 做什么，以及它可能绕开封装与类型安全的警告</li>
+                        <li><a href="https://docs.python.org/3/c-api/threads.html" target="_blank" rel="noopener">Python C 接口线程文档</a> — 只有持锁线程才能操作Python对象的规则，以及获取与释放须在同一线程配对的条件</li>
+                        <li><a href="https://llvm.org/docs/GettingStarted.html" target="_blank" rel="noopener">LLVM 入门文档</a> — 构建所需的磁盘容量，以及受支持的宿主平台清单</li>
+                        <li><a href="https://tinygo.org/docs/reference/lang-support/" target="_blank" rel="noopener">TinyGo 语言支持文档</a> — 同类替代方案自己写明不支持什么。第八节比较对象的性质</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>分享本文</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">返回列表</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/curl_builder.html">curl命令生成器 2026</a></li>
+      <li><a href="../static/http_status_codes.html">HTTP状态码完全参考 2026</a></li>
+      <li><a href="../static/nginx_generator.html">Nginx 配置生成器</a></li>
+      <li><a href="../static/ssh_config_generator.html">SSH config生成器 2026</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="backup_restore_verification.html">「有备份」与「能恢复」是两个不同的命题 - 成功的备份在哪里说谎，以及恢复验证真正要求什么</a></li>
+      <li><a href="strip_bootstrap_trust_attack.html">把源码读完也看不见的东西 - 一个不做编译的工具如何沿着发行版引导链扩散，以及哪些校验依然有效</a></li>
+      <li><a href="agent_tool_selection_measured.html">说是智能体选的，那主语到底是谁 - 用16,893次执行测量三款编码智能体的第三方选择</a></li>
+      <li><a href="coding_to_agent_orchestration.html">当你不再自己写代码而是交出去 - 什么变便宜了,什么变贵了</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制。粘贴到Threads应用即可分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制。'); });
+    });
+    </script>
+</body>
+</html>

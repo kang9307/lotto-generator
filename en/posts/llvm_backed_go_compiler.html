@@ -1,0 +1,629 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="en">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>What It Costs to Reach for Another Language's Libraries - The Bill an LLVM-Backed Go Compiler Makes Visible</title>
+    <meta name="description" content="Why the standard Go toolchain prices calls into C, what an LLVM-backed compiler removes by swapping the runtime, and the bill that arrives in its place.">
+    <meta name="keywords" content="LLGo, LLVM, Go compiler, cgo, FFI, interoperability, memory ownership, garbage collection, Python GIL, build reproducibility, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/en/posts/llvm_backed_go_compiler.html">
+
+    <meta property="og:title" content="What It Costs to Reach for Another Language's Libraries - The Bill an LLVM-Backed Go Compiler Makes Visible">
+    <meta property="og:description" content="Why a cgo call is not merely a function call, why swapping the runtime erases that cost, and what gets charged in its place.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/en/posts/llvm_backed_go_compiler.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="en_US">
+    <meta property="article:published_time" content="2026-09-07">
+    <meta property="article:section" content="Dev &amp; Infra">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="What It Costs to Reach for Another Language's Libraries">
+    <meta name="twitter:description" content="Crossing a language boundary is never free. Who frees the memory, does the collector see that pointer, whose threading rules apply.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "What It Costs to Reach for Another Language's Libraries - The Bill an LLVM-Backed Go Compiler Makes Visible",
+      "alternativeHeadline": "From why a cgo call is not merely a function call, to the new line items that appear once the runtime is swapped out",
+      "datePublished": "2026-09-07",
+      "dateModified": "2026-09-07",
+      "inLanguage": "en-US",
+      "articleSection": "Dev & Infra",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "LLGo, LLVM, Go compiler, cgo, FFI, interoperability, memory ownership, Python GIL",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/en/posts/llvm_backed_go_compiler.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "Is an LLVM-backed Go compiler a subset of standard Go?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "On the syntax and standard library axes, subset is the wrong word. The repository states that it is compatible with Go 1.20 and later source and supports the complete Go 1.27 language syntax, and that it fully supports the Go standard library on supported native platforms. The axis where it does diverge is runtime semantics. Goroutines map one to one onto operating system threads, stacks are fixed-size native stacks, and the default collector is conservative. So the accurate phrasing is not 「a subset」 but 「all of the syntax, different runtime guarantees」."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "What does it actually mean that cgo calls are expensive in standard Go?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "According to the runtime source commentary, calling a C function first announces entry into a system call, then switches at the assembly layer from the current goroutine stack onto the operating-system-allocated g0 stack before invoking the C function. On the way back it restores the original stack and performs the system call exit, and that exit blocks until this thread can run Go code without violating the parallelism limit. In other words a single call carries two stack switches and two scheduler state changes."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "If swapping the runtime removes the boundary cost, why does not everyone do it?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Because the cost moves rather than disappears. Pinning goroutines one to one onto operating system threads removes the stack switch, but then each goroutine occupies a thread and the stack loses the property of growing on demand. A conservative collector removes the need for precise pointer maps, but exact liveness and finalizer timing then differ from the standard implementation. Most of the entries the project files as out of scope for compatibility trace back to exactly these choices."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "What breaks first when code crosses a language boundary?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Memory ownership, and pointers the collector cannot see. The standard cgo documentation states plainly that the caller is responsible for freeing a C string, and that C code may not keep a copy of a Go pointer after a call returns unless that memory is pinned. The LLVM-backed implementation records the same class of accident in its own documentation. A raw pointer kept only in thread local storage was invisible to the collector, deferred-call nodes were reclaimed underneath it, and the code walking those nodes crashed."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How should the maturity of a project like this be judged?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Not by star count, but by four things. First, whether release tags have reached a stable version number and at what cadence. Second, not the raw number of open issues but what kind they are. Third, whether the compatibility claim exists as a checkable list rather than a sentence. Fourth, how far the project itself documents the scope of standard conformance. This project splits its compatibility exceptions into two list files and attaches a reason to every entry. The existence of that list says far more than the star count does."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/llvm_backed_go_compiler.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/llvm_backed_go_compiler.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/llvm_backed_go_compiler.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/llvm_backed_go_compiler.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/llvm_backed_go_compiler.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "Home",
+      "item": "https://braindetox.kr/en/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "Dev & Infra",
+      "item": "https://braindetox.kr/en/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "What It Costs to Reach for Another Language's Libraries - The Bill an LLVM-Backed Go Compiler Makes Visible",
+      "item": "https://braindetox.kr/en/posts/llvm_backed_go_compiler.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="What It Costs to Reach for Another Language's Libraries - The Bill an LLVM-Backed Go Compiler Makes Visible">
+                <meta itemprop="datePublished" content="2026-09-07">
+                <meta itemprop="dateModified" content="2026-09-07">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="LLGo, LLVM, Go compiler, cgo, FFI, interoperability, memory ownership, Python GIL">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/en/posts/llvm_backed_go_compiler.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">What It Costs to Reach for Another Language's Libraries - The Bill an LLVM-Backed Go Compiler Makes Visible</h1>
+                    <h2 class="post-subtitle">From why a cgo call is not merely a function call, to the new line items that appear once the runtime is swapped out</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-07">2026-09-07</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">Dev &amp; Infra</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>Calling NumPy from a program written in Go, running a PyTorch model, drawing a window through raylib. The sentence sounds appealing, because it promises that an entire foreign ecosystem simply comes along with the code you already have. But what that sentence actually instructs is one thing. <strong>Two different execution models get layered into a single process.</strong></p>
+
+                    <p>Layer them and a boundary appears. A boundary always has a price attached. Who frees the memory, whether the collector can see that pointer, whether one side's exception becomes the other side's panic, whose threading contract applies. Every one of those has to be decided again, on that boundary, by hand. They are exactly the things the compiler and the runtime were quietly guaranteeing for you as long as you stayed inside one language.</p>
+
+                    <p>An implementation that compiles Go through LLVM and calls C and Python libraries directly has now reached a stable version number. What deserves attention here is not how to use that tool. It is <strong>what a decision to use another language's libraries actually takes on</strong>. That implementation happens to be an unusually clear specimen of the resulting bill, because it did not dodge the problem. It met it head on, and it wrote down what meeting it head on cost.</p>
+
+                    <div class="callout">
+                        Everything below that describes standard Go behavior stays inside what the official documentation and the runtime source commentary actually say. Figures and declarations about the implementation come from the repository documentation and from public API queries, and <strong>the query timestamp is 2026-09-07 11:56 KST</strong>. The performance and size numbers come from continuous integration runs the project executes on itself, so they must be read as <strong>self-measurement</strong>. They are not third-party reproductions.
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>What this article covers</h3>
+                        <ol>
+                            <li><a href="#sec-1">The trigger - what the phrase 「Go compiler」 hides</a></li>
+                            <li><a href="#sec-2">Why Go was built this way - the price of a custom backend</a></li>
+                            <li><a href="#sec-3">Why a cgo call is not merely a function call</a></li>
+                            <li><a href="#sec-4">Pointer passing rules - enforced by contract, not by the compiler</a></li>
+                            <li><a href="#sec-5">The choice to swap out the runtime</a></li>
+                            <li><a href="#sec-6">Between 「fully supported」 and 「out of scope」</a></li>
+                            <li><a href="#sec-7">What changes when you build on LLVM</a></li>
+                            <li><a href="#sec-8">One self-measured number - WebAssembly file size</a></li>
+                            <li><a href="#sec-9">What actually breaks at the boundary</a></li>
+                            <li><a href="#sec-10">Calling Python - a lock comes with it</a></li>
+                            <li><a href="#sec-11">When this choice is the right one</a></li>
+                            <li><a href="#sec-12">How to read maturity - not by star count</a></li>
+                            <li><a href="#sec-13">Five questions to answer before adopting</a></li>
+                            <li><a href="#sec-14">What could not be established</a></li>
+                            <li><a href="#sec-15">References</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">The trigger - what the phrase 「Go compiler」 hides</h2>
+
+                    <p>Introductions are usually short. When something is labelled an LLVM-based Go compiler, most readers take it to mean a thing that accepts standard Go unchanged and only emits different machine code. That reading is exactly half right.</p>
+
+                    <p>Here is the scope the repository sets for itself. It is compatible with Go 1.20 and later source, it supports <strong>the complete Go 1.27 language syntax</strong>, and it accepts <code>cgo</code> as well. On supported native platforms it <strong>fully supports the Go standard library</strong>. Read only that far and the word subset is simply wrong.</p>
+
+                    <p>Then the same document says something else one section later. <strong>The runtime differs from the standard toolchain.</strong> Native goroutines map one to one onto operating system threads, stacks are fixed-size native stacks, and the default collector is the conservative Boehm-style collector. Bare-metal targets use a different conservative mark-and-sweep collector instead. All of the syntax is accepted, but <strong>the floor that syntax runs on is a different floor.</strong></p>
+
+                    <p>So a one-line summary of this thing cannot be 「a subset of standard Go」, and it cannot be 「standard Go compatible」 either. The accurate summary is <strong>all of the syntax and the standard library, different runtime guarantees</strong>. Some write-ups list only Linux and macOS as supported platforms, while the repository documentation lists Windows on amd64 and arm64 in two flavours, one for MSVC and one for MinGW, and goes on to name WebAssembly targets and embedded boards. Summaries always lag.</p>
+
+                    <h2 id="sec-2">Why Go was built this way - the price of a custom backend</h2>
+
+                    <p>The Go team considered LLVM early in the project and did not adopt it. The official FAQ preserves the reason in a single sentence. They decided it was <strong>too large and slow to meet their performance goals</strong>. The performance in question is not the speed of the generated code. It is <strong>the speed of the compiler itself</strong>. Elsewhere the same document states the goal outright, that building a large executable on a single computer should take at most <strong>a few seconds</strong>.</p>
+
+                    <p>That single choice went on to shape the character of the language. A custom backend and a custom linker keep the toolchain small. Static linking by default keeps deployment to one file. Two environment variables switch the target operating system and architecture, which makes cross compilation cheap. In exchange, the depth of optimization does not match a general-purpose backend refined over decades, and the breadth of supported architectures does not match it either.</p>
+
+                    <p>The same choice also fixed the character of <code>cgo</code>. In a runtime with its own calling convention, its own stack management and its own scheduler, calling a C function means <strong>stepping briefly into someone else's contract and stepping back</strong>. The procedure for stepping over and returning is the cost.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>What the standard toolchain chose</th><th>What it bought</th><th>What it gave up</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>A custom compiler backend</td><td>Builds measured in seconds even for large executables</td><td>The optimization depth a general-purpose backend has accumulated</td></tr>
+                            <tr><td>A custom linker with static linking by default</td><td>Deployment that ends with a single file</td><td>Small binaries. The runtime and type information are always along for the ride</td></tr>
+                            <tr><td>Target platform chosen by environment variable</td><td>Cross compilation with no C toolchain involved</td><td>The moment a C library enters, that simplicity is gone</td></tr>
+                            <tr><td>Growable goroutine stacks</td><td>Concurrency that survives hundreds of thousands of goroutines</td><td>The ability to run C code directly on those stacks</td></tr>
+                            <tr><td>A collector driven by precise pointer maps</td><td>Exact liveness and predictable finalizer timing</td><td>Memory the collector does not know about needs a contract instead</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>The last two rows foreshadow the rest of this article. The very design that made concurrency and automatic memory management cheap is the design that starts charging the moment code crosses a boundary.</p>
+
+                    <h2 id="sec-3">Why a cgo call is not merely a function call</h2>
+
+                    <p>The top of the <code>cgocall</code> file in the Go runtime source carries a long comment describing the whole call path. That comment is the substance behind the word expensive.</p>
+
+                    <p>When Go code calls a C function, generated code calls the runtime's <code>cgocall</code>. The first thing <code>cgocall</code> does is call <code>entersyscall</code>, so as not to block other goroutines or the collector. The comment spells out the purpose. It is <strong>to tell the scheduler that it should create another thread to run goroutines while this one is off in foreign code</strong>.</p>
+
+                    <p>Next, the assembly-layer <code>asmcgocall</code> <strong>leaves the current goroutine stack and switches onto the <code>g0</code> stack.</strong> The comment states the reason as well. The <code>g0</code> stack is assumed to be an operating-system-allocated stack, which makes it safe to run compiler-generated C code on it. Turn that around and it reads: <strong>C code cannot be run on a goroutine stack as it stands.</strong> A stack that grows on demand is not a place to execute a C function.</p>
+
+                    <p>When the C function finishes, control returns to the original goroutine stack and <code>cgocall</code> calls <code>exitsyscall</code>. The comment describes that function in one clause. It <strong>blocks until this thread can run Go code without violating the parallelism limit</strong>. In other words the return is not immediate. It is <strong>a procedure that waits for the scheduler's permission</strong>.</p>
+
+                    <p>If the C side calls back into Go, the staircase runs in reverse one more time. An adapter converts the C calling convention to the Go one, the stack switches from <code>g0</code> back to the original goroutine stack, and there the code waits on the parallelism limit again. A single callback stacks two layers of round-trip transition.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Stage</th><th>What the runtime does</th><th>Why it is needed</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Entry announcement</td><td>Marks entry into a system call</td><td>So another thread can be arranged to run goroutines while this one is tied up</td></tr>
+                            <tr><td>Stack switch</td><td>Moves from the goroutine stack to the operating system stack</td><td>Because C code cannot run on a growable stack</td></tr>
+                            <tr><td>The actual call</td><td>Unpacks arguments from a frame and invokes the C function</td><td>The two calling conventions differ, so something has to broker between them</td></tr>
+                            <tr><td>Return switch</td><td>Restores the original goroutine stack</td><td>Go code can only continue on its own stack</td></tr>
+                            <tr><td>Exit wait</td><td>Blocks until the parallelism limit permits</td><td>To keep the accounting of concurrently running work intact</td></tr>
+                            <tr><td>If there is a callback</td><td>The same staircase once more, in the other direction</td><td>C calling into Go crosses the same boundary</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>Laid out this way, it becomes clear that expensive is not a story about a constant delay measured in microseconds. <strong>Scheduler accounting and stack ownership change hands on every single call.</strong> That is why handing off one large computation is barely affected, while calling small functions in a tight loop is a structural problem rather than a tuning problem.</p>
+
+                    <h2 id="sec-4">Pointer passing rules - enforced by contract, not by the compiler</h2>
+
+                    <p>More dangerous than the cost are the rules. The <code>cgo</code> documentation nails down the conditions for passing pointers. Go code may pass a Go pointer to C provided <strong>the memory it points to does not contain any Go pointers to memory that is unpinned</strong>. And <strong>C code may not keep a copy of a Go pointer after the call returns</strong>, with the sole exception of memory held down by a pinner.</p>
+
+                    <p>Go pointers passed as arguments are implicitly pinned <strong>only for the duration of the call</strong>. The moment the call returns, so does the guarantee. Strings are simpler still. <code>C.CString</code> makes a copy on the C heap, and the documentation states that <strong>it is the caller's responsibility to arrange for it to be freed</strong>.</p>
+
+                    <pre><code class="language-go">// Standard Go cgo - values crossing the boundary are copied, and freeing stays with the caller
+cs := C.CString(s)                  // makes a copy on the C heap
+defer C.free(unsafe.Pointer(cs))    // without this one line it simply leaks
+n := C.strlen(cs)                   // from here on this is C's memory
+</code></pre>
+
+                    <p>When C has to hold a Go pointer beyond the call, a pinner is the mechanism. The standard library's <code>Pinner</code> holds an object so that <strong>the collector can neither move it nor reclaim it</strong>. If a pinned object points at further Go objects and C follows those too, each of those has to be pinned separately.</p>
+
+                    <pre><code class="language-go">// When C must hold a Go pointer past the end of the call
+var pinner runtime.Pinner
+pinner.Pin(p)            // holds it so the collector can neither move nor reclaim it
+defer pinner.Unpin()     // the C-side reference is valid only until this releases
+</code></pre>
+
+                    <p>What matters here is <strong>who enforces the rules</strong>. None of them is checked by the type checker. Compilation succeeds either way, and violating them does not fail immediately. Symptoms appear only when the collector actually moves or reclaims that memory. It is the class of defect that first surfaces under load, or once the heap has grown.</p>
+
+                    <ul>
+                        <li><strong>What may be passed</strong> — the memory pointed at must contain no unpinned Go pointers. A struct holding a slice or a string falls foul of this condition</li>
+                        <li><strong>What may not be retained</strong> — for C to hold a Go pointer past the call, pinning is required, and the moment pinning is released that reference loses its footing</li>
+                        <li><strong>Where freeing belongs</strong> — what was allocated on the C heap is freed by C's contract. The Go collector does not count that memory, so leaks accumulate silently</li>
+                    </ul>
+
+                    <p>How the same problem can be narrowed at the language level is the axis covered in <a href="rust_extern_filc_safe_c.html">Where Safety Guarantees End at the Rust FFI Boundary</a>. That approach <strong>shrinks the boundary itself</strong>. What is on the table here is the approach that <strong>changes the floor in order to remove the boundary</strong>.</p>
+
+                    <h2 id="sec-5">The choice to swap out the runtime</h2>
+
+                    <p>Every step of the staircase in section three follows from one premise. <strong>The goroutine stack and the scheduler do not belong to C.</strong> Erase the premise and the staircase goes with it. That is precisely the road the LLVM-backed implementation took.</p>
+
+                    <p>The repository documentation puts it concisely. Native goroutines map one to one onto operating system threads with fixed native stacks, so <strong>direct C calls require no Go-to-C stack transition and no scheduler transition</strong>. The binding mechanism skips wrappers as well. A single Go declaration is bound directly to a C ABI symbol.</p>
+
+                    <pre><code class="language-go">import _ "unsafe" // required in order to use the go:linkname directive
+
+//go:linkname Sqrt C.sqrt
+func Sqrt(x float64) float64
+</code></pre>
+
+                    <p>The directive itself exists in the standard compiler too. The official documentation describes its nature this way. It <strong>determines the object-file symbol</strong> used for a Go variable or function declaration, allowing two Go symbols to alias the same object-file symbol, and it is only enabled in files that import <code>unsafe</code>. The same page states that this directive can <strong>subvert the usual encapsulation of unexported declarations, or even type safety</strong>. The documentation itself tells you what the convenience is made of.</p>
+
+                    <p>The call path is not the only thing that changed. The default collector became a conservative one. Without precise pointer maps it scans the stack and registers and treats every pointer-shaped value as live. That choice is what makes it easy to hold memory created by C code and memory created by Go code in one heap. The bill for it is the list in the next section.</p>
+
+                    <h2 id="sec-6">Between 「fully supported」 and 「out of scope」</h2>
+
+                    <p>What is interesting is that this project manages compatibility as <strong>a list</strong> rather than as prose. It runs the compiler test suite from the standard distribution as it stands and files whatever does not pass into two separate files. One holds what has not been matched yet. The other holds <strong>what was never intended to be matched</strong>.</p>
+
+                    <p>The not-yet-matched file holds eleven entries. Six of them concern <strong>the wording of diagnostics the parser emits</strong>. For a malformed package clause, a malformed name, a byte order mark and similar situations, the message differs from the standard one. The remaining five concern sampled heap profiling, and two of those name a pending proposal number as the reason.</p>
+
+                    <p>The never-intended file holds one hundred and thirty-six entries. This is the real boundary line. One hundred and ten of them end with the same clause: <strong>supporting that toolchain-specific behavior is not a compatibility goal</strong>. The rest give more specific reasons. Roughly eighteen say that because the collector is conservative, exact liveness and finalizer timing are not goals. Several say that because there are no garbage collector write barriers, the diagnostics tied to them are not reproduced. And some say that because <strong>stacks are fixed-size native stacks, growable-stack behavior is not reproduced</strong>.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Axis</th><th>Declared scope</th><th>Where it actually diverges</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Language syntax</td><td>The complete Go 1.27 syntax</td><td>Six parser diagnostics differ. Not the syntax itself, the error messages</td></tr>
+                            <tr><td>Standard library</td><td>Fully, on supported native platforms</td><td>Other targets may not provide every operating system service or implementation-specific behavior, as the project itself notes</td></tr>
+                            <tr><td>Goroutines</td><td>They work</td><td>One to one with operating system threads. The cost of scaling them up differs from the standard</td></tr>
+                            <tr><td>Stacks</td><td>They work</td><td>Fixed size. Behavior that presumes a growable stack is filed as out of scope</td></tr>
+                            <tr><td>Garbage collection</td><td>Provided by default</td><td>Conservative. Exact liveness and finalizer timing differ from the standard</td></tr>
+                            <tr><td>Build tooling</td><td>Usage resembles the standard command</td><td>An entire LLVM 22 stack plus several system libraries are prerequisites</td></tr>
+                        </tbody>
+                    </table>
+
+                    <ul>
+                        <li><strong>Syntax compatibility and runtime compatibility are different axes.</strong> That the same source compiles and that the same source produces the same observations at the same moment are separate facts</li>
+                        <li><strong>Code that leans on finalizers and weak references is the first risk group.</strong> Under a conservative collector, reclamation timing can drift away from the standard</li>
+                        <li><strong>Designs that spawn enormous numbers of goroutines are the second risk group.</strong> Under a one-to-one mapping, that count is a thread count</li>
+                    </ul>
+
+                    <h2 id="sec-7">What changes when you build on LLVM</h2>
+
+                    <h3>What you gain</h3>
+
+                    <p>Adopting a general-purpose backend brings along everything that backend has accumulated. The optimization pass pipeline, link-time optimization, per-architecture code generators, and the debuggers and analysis tools built on top of them. Target expansion arrives the same way. This implementation can emit several flavours of WebAssembly and reach embedded boards because the backend already knows those architectures.</p>
+
+                    <p>Binding directly through the C ABI comes from the same place. The same backend compiles C, so calling conventions and type layouts are expressed in the same language from the start. That is why no wrapper layer is required.</p>
+
+                    <h3>What you pay</h3>
+
+                    <p>A large backend means a large toolchain. The official LLVM documentation states the disk requirement plainly. <strong>An LLVM-only build needs roughly one to three gigabytes, and a full build of LLVM and Clang needs around fifteen to twenty gigabytes.</strong> This implementation requires the LLVM 22 compiler, linker and debugger as prerequisites, and adds a conservative collector library, a foreign function interface library, a cryptography library and a compression library on top.</p>
+
+                    <p>That list is the <strong>build reproducibility bill</strong>. Cross compilation in standard Go is cheap precisely because no C toolchain for the target platform is needed. Open the boundary and that premise collapses. The version numbers of system libraries on the developer machine, on the continuous integration machine and on the deployment target all become inputs to the result.</p>
+
+                    <p>Swapping in LLVM as a Go backend is not new to this project either. The official Go FAQ mentions both a front end coupled to the GCC back end and <strong>an experimental LLVM back end using the same front end</strong>. Lowering TypeScript the same way was covered in <a href="perry_typescript_llvm_compiler_2026.html">Perry - The Native TypeScript Compiler That Lowers TS Straight to LLVM Machine Code</a>, and one trap from that article repeats here. <strong>A better backend does not automatically mean a faster result.</strong> Whether the language's semantics lower well onto that backend comes first.</p>
+
+                    <h2 id="sec-8">One self-measured number - WebAssembly file size</h2>
+
+                    <p>The project runs a size comparison continuously in a dedicated repository and publishes the results. The conditions are published alongside them, which makes the numbers quotable. What must still be carried into the reading is that <strong>the party doing the measuring is the project itself</strong>.</p>
+
+                    <p>The conditions are these. Run number 403, created at 07:11 UTC on 2026-09-07, on a continuous integration runner reporting Linux x64 with an Ubuntu 24 image, targeting the WebAssembly system interface. Go 1.26.2, LLVM 22 and TinyGo 0.41.1 were used, the sample is ten applications, and the metric is total bytes of the emitted file. The build options are published too. The Go side used path trimming and stripped symbol and debug information, the TinyGo side used size-first optimization with debug information removed, and this implementation combined size-first optimization with link-time optimization and global dead code elimination.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Configuration</th><th>Against standard Go</th><th>Against TinyGo</th><th>How to read it</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>No link-time optimization</td><td>0.66x</td><td>11.2x</td><td>Smaller than standard out of the box, yet an order of magnitude away from the small-target compiler</td></tr>
+                            <tr><td>Dead code drop</td><td>0.47x</td><td>8.0x</td><td>A single option shaves another thirty percent off the size</td></tr>
+                            <tr><td>Link-time optimization, global elimination off</td><td>0.44x</td><td>7.5x</td><td>Link-time optimization alone barely improves on the previous row</td></tr>
+                            <tr><td>Link-time optimization, global elimination on</td><td>0.34x</td><td>5.8x</td><td>The smallest configuration, and still more than five times the small-target compiler</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>What should be read out of that table is not the multiples themselves but the fact that <strong>the multiples point in both directions</strong>. The same artifact is one third the size by one yardstick and close to six times the size by another. An individual case makes it plainer. For the Base64 converter in the sample, the standard Go artifact is about 2.28 million bytes, the small-target compiler artifact about 97 thousand bytes, and the smallest configuration here about 600 thousand bytes. <strong>Depending on which side you compare against, the same number reads as a victory or a defeat.</strong> That is why a sentence carrying only the multiple is dangerous.</p>
+
+                    <p>Note also that this table measures <strong>file size</strong>, not execution speed. Size and speed are different axes, and a build tuned for size need not be favourable on the speed axis.</p>
+
+                    <h2 id="sec-9">What actually breaks at the boundary</h2>
+
+                    <p>This is the centre of the article. Whichever language crosses into whichever other language, the list of things that break at the boundary is largely the same. What matters is <strong>the symptom each item produces</strong>. You need the symptom in order to suspect the right cause.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>What breaks</th><th>Why it breaks</th><th>The symptom</th><th>Where to look first</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Memory ownership</td><td>The side that allocates and the side that frees follow different contracts</td><td>Resident memory climbs monotonically over long uptime. A restart clears it</td><td>Whether every string or buffer crossing the boundary has a matching free</td></tr>
+                            <tr><td>Pointers the collector cannot see</td><td>The only surviving reference lives somewhere the collector does not scan</td><td>Crashes only under load. Stack traces point at objects already reclaimed</td><td>Thread local storage, the C heap, context pointers handed to callbacks</td></tr>
+                            <tr><td>Object movement</td><td>The collector relocates the object while C still holds the old address</td><td>Intermittently wrong values, reproducible only once the heap has grown</td><td>Whether pointers that outlive the call are actually pinned</td></tr>
+                            <tr><td>Exceptions versus panics</td><td>One side's unwinding contract does not exist on the other side</td><td>The process terminates outright instead of returning an error, leaving no log</td><td>Whether a panic can escape a callback that crosses the boundary</td></tr>
+                            <tr><td>Threading model</td><td>One side attaches conditions to the thread</td><td>The same code works on one goroutine and dies on another</td><td>Whether lock acquire and release are paired on the same thread</td></tr>
+                            <tr><td>Error conventions</td><td>Return value, global variable or exception, they disagree on the channel</td><td>A failure is read as a success. The defect surfaces much later</td><td>How the C function signals errors, and when that value is read</td></tr>
+                            <tr><td>Type representation</td><td>Types with the same name differ in width and layout</td><td>Struct fields shift. Results diverge between 32-bit and 64-bit</td><td>Integer widths, arrays as parameters versus as fields, function pointers</td></tr>
+                            <tr><td>Build reproducibility</td><td>System library and tool versions become inputs to the result</td><td>It works on my machine but not in continuous integration</td><td>Whether the prerequisite list has pinned versions</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>The second row is not an abstract warning. It is recorded in this implementation's own documentation as an actual incident. The head of the deferred-call chain was kept <strong>as a raw pointer in thread local storage only, where the conservative collector could not see it</strong>. In a stress test that queues a million deferred calls, the collector reclaimed those nodes, and the code executing inside the deferred closures died. The diagnosis is stated crisply. It was <strong>a root registration gap, not logical corruption</strong>. The fix matched the diagnosis: allocate that state from a root the collector does know about.</p>
+
+                    <p>The seventh row has concrete documentation behind it as well. The type mapping table for this implementation <strong>treats a C function pointer differently as a parameter than as a struct field</strong>. In parameter position it is received as a Go function type, while inside a struct it is received as a plain pointer. A C function pointer is only the address of one function, whereas a Go function value may be a closure. Arrays behave the same way, decaying to a pointer in parameter position and remaining an array only inside a struct. For Windows callbacks the documentation states the same consequence explicitly: <strong>pass a direct function reference rather than a capturing closure, and carry state through an explicit context pointer</strong>.</p>
+
+                    <h2 id="sec-10">Calling Python - a lock comes with it</h2>
+
+                    <p>Calling a C library and calling a Python library are not the same difficulty. The second one means <strong>bringing an entire stateful interpreter into the process</strong>. That state machine has contracts of its own.</p>
+
+                    <p>The sentence in the official Python C API documentation is short and flat. Unless on a free-threaded build the interpreter is generally not thread-safe, which is why there is a global interpreter lock, and <strong>only a thread that holds it may operate on Python objects or invoke Python's C API</strong>. A thread entering from outside must acquire and release that state in matched pairs, and the documentation states that <strong>every acquire call must be matched by a release call on the same thread</strong>.</p>
+
+                    <pre><code class="language-go">// Calling a Python library straight from Go code
+x := math.Sqrt(py.Float(2))       // hands the value to Python's math.sqrt
+std.Print(py.Str("sqrt(2) ="), x) // prints through Python's print
+</code></pre>
+
+                    <p>On the surface these are two function calls. But for those two lines to hold, the interpreter must already be initialized inside the process, the thread running this code must hold the lock, and the values handed over must have been built into Python objects that follow the reference counting contract. <strong>Three layers of invisible premise.</strong></p>
+
+                    <p>Seeing how that condition meets Go's execution model makes the one-to-one thread mapping easier to understand. In standard Go a goroutine is not nailed to a thread. The scheduler moves it. If a goroutine holding the lock migrates to another thread, the contract is broken. Pin one goroutine to one thread and the problem disappears structurally.</p>
+
+                    <p>Free-threaded builds are not a universal solvent either. The official documentation states that even there <strong>detaching the thread state is still required</strong>, because the interpreter periodically needs to block all threads to get a consistent view of Python objects. Running the collector is given as an example.</p>
+
+                    <ul>
+                        <li><strong>The ceiling on parallelism is set by somebody else.</strong> However many goroutines the Go side spawns, the stretches that touch Python objects queue behind one lock</li>
+                        <li><strong>The locking contract is not checked by the compiler.</strong> Mismatched acquire and release pairs compile perfectly well</li>
+                        <li><strong>Third-party libraries are a separate install.</strong> The interpreter and its packages have to be present in the deployment artifact, and their versions become inputs to the result</li>
+                    </ul>
+
+                    <h2 id="sec-11">When this choice is the right one</h2>
+
+                    <h3>When the existing library is effectively the only implementation</h3>
+
+                    <p>The judgment usually compresses into one question. <strong>Is there a native implementation that could replace that library?</strong> If there is not, the boundary cost is not an option, it is a premise. A particular numerical kernel, a codec refined over decades, a vendor's official driver for specific hardware, a cryptographic module mandated by regulation. In those cases the argument stops being 「should we use it」 and becomes <strong>「how few places should the boundary live in」</strong>.</p>
+
+                    <p>The way to reduce the boundary is generally the same. Gather the call sites into one place and cross coarsely once inside it. Hand over a batch instead of calling small functions in a tight loop. The staircase from section three attaches to every call, so reducing the number of calls is what reduces the cost.</p>
+
+                    <h3>When a native implementation exists</h3>
+
+                    <p>With a native implementation available the arithmetic changes. The comparison is no longer performance but <strong>total cost of operation</strong>. Open the boundary and system libraries ride along in the artifact, cross compilation gets harder, incident investigation requires knowledge of two languages, and the standard profiler and race detector only see half the picture.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Situation</th><th>Opening the boundary</th><th>Native implementation</th><th>What decides it</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>No alternative implementation exists</td><td>Effectively the only option</td><td>Not applicable</td><td>How few places the boundary can be reduced to</td></tr>
+                            <tr><td>A native implementation exists but is slow</td><td>Only when work per call is large</td><td>Usually this side</td><td>Work handed over per crossing. If it is small, transition cost eats the gain</td></tr>
+                            <tr><td>The native implementation lacks features</td><td>When the missing feature is central</td><td>If the missing part can be avoided</td><td>Whether that feature sits at the centre or the edge of the requirements</td></tr>
+                            <tr><td>Deployment targets are varied</td><td>Unfavourable</td><td>Favourable</td><td>Whether a C toolchain can be maintained for every target</td></tr>
+                            <tr><td>Very large numbers of goroutines</td><td>Runtime-swapping designs are unfavourable</td><td>Favourable</td><td>Whether that concurrency survives being converted into thread counts</td></tr>
+                            <tr><td>The operating team knows one language</td><td>Incident investigation gets costly</td><td>Favourable</td><td>Whether anyone can find the cause when it dies at three in the morning</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>That last row overturns decisions most often in practice. An incident in a system with an open boundary is hard to follow to the end with knowledge of only one language. How that judgment is framed between Go and another language is covered from a different angle in <a href="go_to_rust_migration_guide_2026.html">Go to Rust Migration Guide 2026</a>, and the axis that converts language choice itself into verification cost sits in <a href="go_language_ai_coding_fit.html">Language Properties That Lower the Verification Cost of AI-Generated Code</a>.</p>
+
+                    <h2 id="sec-12">How to read maturity - not by star count</h2>
+
+                    <h3>What the star count does not tell you</h3>
+
+                    <p>A public repository's star count is an indicator of attention, not of trust. At the time of the query this repository shows 749 stars, 50 forks and 151 open issues. It was created in December 2023 and was taking commits on the day of the query. None of those numbers yields anything an adoption decision needs.</p>
+
+                    <p>What to look at instead is four things. <strong>The trajectory of release tags</strong>, <strong>the kind of open issues</strong>, <strong>the shape of the compatibility claim</strong>, and <strong>the project's own account of standard conformance</strong>.</p>
+
+                    <h3>The four things actually worth reading</h3>
+
+                    <p>Start with the release trajectory. The first tag is April 2024 and the stable 1.0.0 landed on 24 August 2026. Five pre-releases were pushed out inside little more than a week before the stable one, and maintenance releases followed on 29 August and 6 September. Forty-nine releases in total. <strong>That it took two years and four months to reach a stable version number, and that two maintenance releases followed immediately after</strong>, says far more than the star count does.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Indicator</th><th>Queried value</th><th>What to read from it</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Reaching a stable version</td><td>1.0.0 on 2026-08-24, latest 1.0.2 on 2026-09-06</td><td>Two maintenance releases within two weeks of stable. Still in the early stabilization window</td></tr>
+                            <tr><td>Span since the first release</td><td>49 releases since 2024-04-21</td><td>There is a steady shipping rhythm. A signal that the project is maintained</td></tr>
+                            <tr><td>Open issues</td><td>151</td><td>The kind matters more than the count. This is where you search for your own usage scenario before adopting</td></tr>
+                            <tr><td>Compatibility claim</td><td>11 unmet, 136 out of scope, each with a reason, as files</td><td>The claim is a checkable list rather than a sentence. A strong maturity signal</td></tr>
+                            <tr><td>Standard conformance</td><td>Syntax and standard library fully, runtime semantics different</td><td>That the same source compiles does not mean it produces the same observations</td></tr>
+                            <tr><td>Prerequisites</td><td>An entire LLVM 22 stack plus several system libraries</td><td>A large share of adoption cost sits in installing tools and pinning versions</td></tr>
+                            <tr><td>License</td><td>Apache-2.0</td><td>A permissive license with a patent clause. Comparatively light legal review for internal adoption</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>The fourth row is the most valuable one in that table. Most projects write their compatibility claim as prose. <strong>A sentence saying 「mostly compatible」 cannot be verified, whereas an exception list with attached reasons can be read and argued with.</strong> It means you can check directly whether the behavior your own code leans on appears in that list. What opening a language project actually changes and does not change was covered along the governance axis in <a href="mojo_compiler_open_source.html">Mojo Goes Open Source</a>. The axis here is <strong>the verifiability of a compatibility claim</strong>.</p>
+
+                    <h2 id="sec-13">Five questions to answer before adopting</h2>
+
+                    <p>Choosing a tool is mostly a matter of choosing the questions. Answer these five and the decision follows.</p>
+
+                    <ol>
+                        <li><strong>How many times does the code cross the boundary?</strong> Few calls with a large amount of work per crossing means standard <code>cgo</code> is enough. Only when tight, frequent calls are structurally unavoidable does swapping the runtime become the argument</li>
+                        <li><strong>How many goroutines get spawned?</strong> Under a one-to-one mapping, concurrency scale is thread count. A design that presumes tens of thousands is not a fit for this path</li>
+                        <li><strong>Does any code lean on finalizers and reclamation timing?</strong> A conservative collector shifts that timing away from the standard. Code that delegates resource release to finalizers is the first thing to inspect</li>
+                        <li><strong>How many deployment targets are there?</strong> Whether an LLVM-family toolchain and its system libraries can be provisioned and version-pinned for every target is most of the real adoption cost</li>
+                        <li><strong>Who looks at it when it dies at three in the morning?</strong> An incident in a system with an open boundary demands knowledge of two languages. Whether that person exists in the organization comes before the technical judgment</li>
+                    </ol>
+
+                    <p>Notably, none of the five asks about performance. In a decision to open a boundary, performance is usually the axis whose answer is already settled, and what actually sinks projects is the other four. The same class of trade-off appears when interactive execution is bolted onto a compiled language, and that axis is laid out in <a href="interpreter_for_compiled_language.html">Adding Interactive Execution to a Compiled Language</a>.</p>
+
+                    <h2 id="sec-14">What could not be established</h2>
+
+                    <ul>
+                        <li>A speed comparison could not be established. The published continuous integration measurement is <strong>the byte count of emitted WebAssembly files</strong>, and no execution-time comparison in the same published format was found. The multiples in section eight must not be read across to speed</li>
+                        <li>The native-target size table could not be opened. The result file points at native entries through a separate summary and tabular form, but that content was not brought into this article as evidence</li>
+                        <li>The actual saving on the C call path could not be established numerically. The absence of stack and scheduler transitions is a design-level statement, and no published figure comparing per-call latency against standard <code>cgo</code> under identical conditions was obtained</li>
+                        <li>Third-party reproduction could not be established. Every figure in section eight comes from runs the project executes on itself, and no independent measurement report was found</li>
+                        <li>The <strong>composition</strong> of the 151 open issues could not be established. Defects, feature requests and documentation items were not separated, so that number must not be read as a quality indicator</li>
+                        <li>The exact total number of contributors could not be established. The first page of the list shows 19, but the remaining pages were not summed</li>
+                        <li>How this implementation behaves on a free-threaded Python build could not be established. The repository documentation states only a requirement of 3.12 or later, and no separate account of lock-free builds fell within what was reviewed</li>
+                    </ul>
+
+                    <h2 id="sec-15">References</h2>
+
+                    <ul>
+                        <li><a href="https://news.hada.io/topic?id=33302" target="_blank" rel="noopener">GeekNews topic 33302</a> — the introduction that triggered this article, carrying the source link and a Korean summary</li>
+                        <li><a href="https://github.com/xgo-dev/llgo" target="_blank" rel="noopener">The xgo-dev/llgo repository</a> — source for the declared scope, the runtime differences, the C and Python interop mechanism and the prerequisite list. Queried 2026-09-07 11:56 KST</li>
+                        <li><a href="https://go.dev/doc/faq" target="_blank" rel="noopener">Official Go FAQ</a> — the statement that LLVM was considered early and judged too large and slow, the build speed goal, and the effect of static linking on binary size</li>
+                        <li><a href="https://pkg.go.dev/cmd/cgo" target="_blank" rel="noopener">cmd/cgo documentation</a> — pointer passing rules, the prohibition on retention after a call and the pinning exception, responsibility for freeing C strings, and the convention for reading the error number through multiple assignment</li>
+                        <li><a href="https://pkg.go.dev/runtime#Pinner" target="_blank" rel="noopener">runtime.Pinner documentation</a> — what pinning guarantees, and the requirement that objects reachable from a pinned object be pinned separately</li>
+                        <li><a href="https://github.com/golang/go/blob/master/src/runtime/cgocall.go" target="_blank" rel="noopener">Go runtime cgocall source</a> — the commentary describing the system call announcement, the switch to the g0 stack, the parallelism-limit wait on return, and the reverse staircase for callbacks</li>
+                        <li><a href="https://pkg.go.dev/cmd/compile" target="_blank" rel="noopener">cmd/compile compiler directives</a> — what go:linkname does, and the warning that it can subvert encapsulation and type safety</li>
+                        <li><a href="https://docs.python.org/3/c-api/threads.html" target="_blank" rel="noopener">Python C API thread documentation</a> — the rule that only the lock holder may operate on Python objects, and the requirement that acquire and release be paired on the same thread</li>
+                        <li><a href="https://llvm.org/docs/GettingStarted.html" target="_blank" rel="noopener">LLVM Getting Started</a> — disk space required to build, and the list of supported host platforms</li>
+                        <li><a href="https://tinygo.org/docs/reference/lang-support/" target="_blank" rel="noopener">TinyGo language support</a> — what a same-family alternative states it does not support. Context for the comparison target in section eight</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>Share this post</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X (Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">Copy link</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">Back to list</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Free tools you may find useful</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/curl_builder.html">curl Command Builder 2026</a></li>
+      <li><a href="../static/http_status_codes.html">HTTP Status Codes Reference 2026</a></li>
+      <li><a href="../static/nginx_generator.html">Nginx Config Generator 2026</a></li>
+      <li><a href="../static/ssh_config_generator.html">SSH Config Generator 2026</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">See all tools &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Related Posts</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="backup_restore_verification.html">Having a Backup and Being Able to Restore Are Two Different Claims - Where a Successful Backup Lies, and What Restore Verification Actually Demands</a></li>
+      <li><a href="strip_bootstrap_trust_attack.html">What Source Review Cannot See - A Non-Compiling Utility Rode a Distribution Bootstrap, and Which Verifications Still Hold</a></li>
+      <li><a href="agent_tool_selection_measured.html">When an Agent Picks a Vendor, Which Agent Was It - Measuring Third-Party Choices Across 16,893 Coding Agent Runs</a></li>
+      <li><a href="coding_to_agent_orchestration.html">When You Stop Writing Code and Start Delegating It - What Gets Cheaper and What Gets More Expensive</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('Link copied. Paste it into the Threads app to share.');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('Link copied.'); });
+    });
+    </script>
+</body>
+</html>

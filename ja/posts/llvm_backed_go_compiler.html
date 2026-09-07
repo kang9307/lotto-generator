@@ -1,0 +1,629 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ja">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>他言語のライブラリを使うという決定が背負うもの - LLVM基盤のGoコンパイラが可視化した境界の請求書</title>
+    <meta name="description" content="Go標準ツールチェーンがC呼び出しに値段を付けた理由から、LLVM基盤のコンパイラがランタイムを差し替えてその値段を消す代わりに新たに背負うものまで。境界で壊れる項目を症状ごとに切り分けて整理し、判断基準まで立てる。">
+    <meta name="keywords" content="LLGo, LLVM, Goコンパイラ, cgo, FFI, 相互運用, メモリ所有権, ガベージコレクション, PythonのGIL, ビルド再現性, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/ja/posts/llvm_backed_go_compiler.html">
+
+    <meta property="og:title" content="他言語のライブラリを使うという決定が背負うもの - LLVM基盤のGoコンパイラが可視化した境界の請求書">
+    <meta property="og:description" content="cgoがなぜ単なる関数呼び出しではないのか、ランタイムを替えるとなぜその値段が消えるのか、そして消えた場所に何が新しく請求されるのか。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/ja/posts/llvm_backed_go_compiler.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ja_JP">
+    <meta property="article:published_time" content="2026-09-07">
+    <meta property="article:section" content="開発・インフラ">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="他言語のライブラリを使うという決定が背負うもの">
+    <meta name="twitter:description" content="境界をまたぐ呼び出しはただではない。誰が解放するのか、コレクタはそのポインタを見ているのか、スレッド規約は誰のものか。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "他言語のライブラリを使うという決定が背負うもの - LLVM基盤のGoコンパイラが可視化した境界の請求書",
+      "alternativeHeadline": "cgoが単なる関数呼び出しではない理由から、ランタイムを差し替えた後に新しく生じる請求項目まで",
+      "datePublished": "2026-09-07",
+      "dateModified": "2026-09-07",
+      "inLanguage": "ja-JP",
+      "articleSection": "開発・インフラ",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "LLGo, LLVM, Goコンパイラ, cgo, FFI, 相互運用, メモリ所有権, PythonのGIL",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/ja/posts/llvm_backed_go_compiler.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "LLVM基盤のGoコンパイラは標準Goの部分集合なのか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "文法と標準ライブラリの軸では部分集合という言い方は当たらない。リポジトリはGo 1.20以降のソースと互換であり、Go 1.27の言語文法をすべて支えると記し、対応するネイティブ環境では標準ライブラリを全面的に支えると記している。分かれるのはランタイムの意味論のほうだ。ゴルーチンがOSスレッドに一対一で結び付き、スタックは固定長のネイティブスタックで、既定のコレクタは保守的方式である。したがって正確な言い方は「部分集合」ではなく「文法はすべて、ランタイム保証は別物」となる。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "標準Goでcgo呼び出しが高価だという話は何を指しているのか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "ランタイムのソース注釈によれば、C関数を呼ぶときランタイムはまずシステムコールへの進入を宣言し、アセンブリ層で現在のゴルーチンスタックを離れてOSが用意したg0スタックへ移ってからC関数を呼ぶ。戻るときは元のスタックへ復帰してシステムコールの離脱処理を行うが、この離脱は並列実行の上限を破らずにGoコードを走らせられるようになるまで待たされる。つまり一度の呼び出しがスタック切り替え二回とスケジューラ状態の変更二回を伴う。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "ランタイムを替えれば境界の費用が消えるのに、なぜ皆がそうしないのか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "費用が消えるのではなく場所を移すからだ。ゴルーチンをOSスレッドに一対一で結び付ければスタック切り替えは要らなくなるが、ゴルーチン一つがスレッド一つを占め、スタックは必要に応じて伸びる性質を失う。保守的コレクタを使えばポインタ地図を作る必要はなくなるが、正確な生存判定と終了処理の時点が標準実装と食い違う。互換対象外として分類されている項目の多くが、まさにこの選択から生じている。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "境界をまたぐとき最初に壊れるのは何か",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "メモリの所有権と、コレクタが見られないポインタである。標準のcgo文書はC文字列を作った場合の解放責任が呼び出し側にあると明記し、C側が呼び出し終了後もGoポインタを保持するには固定機構が要ると記す。LLVM基盤の実装側にも同じ種類の事故が文書として残っている。スレッド局所記憶にだけ置いた生ポインタをコレクタが見られず、遅延実行のノードが回収されて、そのノードをたどっていたコードが落ちたという記録だ。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "この種の道具の成熟度は何で判断するのか",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "星の数ではなく四つである。第一にリリースタグが正式な版番号へ到達したかとその間隔、第二に未解決課題の絶対数ではなくその種類、第三に互換性の宣言が文章ではなく検査可能な一覧として存在するか、第四に標準準拠の範囲を自ら書き記しているか。このプロジェクトは互換性の例外を二つの一覧ファイルへ分け、各項目に理由を添えている。その一覧が存在するという事実そのものが、星の数よりはるかに多くを語る。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/llvm_backed_go_compiler.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/llvm_backed_go_compiler.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/llvm_backed_go_compiler.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/llvm_backed_go_compiler.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/llvm_backed_go_compiler.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "ホーム",
+      "item": "https://braindetox.kr/ja/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "開発・インフラ",
+      "item": "https://braindetox.kr/ja/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "他言語のライブラリを使うという決定が背負うもの - LLVM基盤のGoコンパイラが可視化した境界の請求書",
+      "item": "https://braindetox.kr/ja/posts/llvm_backed_go_compiler.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="他言語のライブラリを使うという決定が背負うもの - LLVM基盤のGoコンパイラが可視化した境界の請求書">
+                <meta itemprop="datePublished" content="2026-09-07">
+                <meta itemprop="dateModified" content="2026-09-07">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="LLGo, LLVM, Goコンパイラ, cgo, FFI, 相互運用, メモリ所有権, PythonのGIL">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/ja/posts/llvm_backed_go_compiler.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">他言語のライブラリを使うという決定が背負うもの - LLVM基盤のGoコンパイラが可視化した境界の請求書</h1>
+                    <h2 class="post-subtitle">cgoが単なる関数呼び出しではない理由から、ランタイムを差し替えた後に新しく生じる請求項目まで</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-07">2026-09-07</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">開発・インフラ</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>Goで書いたプログラムからNumPyを呼び、PyTorchを走らせ、raylibで画面を描く。この一文は魅力的に響く。一つの言語で書いてきたコードに、他人の生態系がまるごと付いてくる絵だからだ。しかしこの一文が実際に指示している作業は一つしかない。<strong>互いに異なる実行モデルを二つ、一つのプロセスの中に重ねて置くこと</strong>である。</p>
+
+                    <p>重ねれば必ず境界が生じる。境界には値段が付く。メモリを誰が解放するのか、コレクタがそのポインタを見ているのか、片方の例外がもう片方のパニックへ翻訳されるのか、スレッド規約は誰のものか。そのすべてが、その境界の上で改めて決め直されねばならない。言語一つだけを使っているあいだは、コンパイラとランタイムが代わりに守ってくれていたものだ。</p>
+
+                    <p>LLVMをバックエンドに据えてGoをコンパイルし、CとPythonのライブラリを直接呼べるようにした実装が、正式な版番号を付けて出た。ここで見るべきはその道具の使い方ではない。<strong>他言語のライブラリを使うという決定が何を背負うのか</strong>である。その実装は、その請求書をひときわ鮮明に見せてくれる標本だ。問題を回避せず正面から受け止め、受け止めた代償を文書として残しているからである。</p>
+
+                    <div class="callout">
+                        以下で標準Goの挙動を述べる箇所は、すべて公式文書とランタイムのソース注釈が実際に記している範囲にとどまる。実装側の数値と宣言はリポジトリの文書と公開APIの照会結果であり、<strong>照会時刻は2026-09-07 11:56 KST</strong>だ。性能と大きさの数値はそのプロジェクトが自ら回している継続的インテグレーションの計測なので、<strong>自己計測</strong>として読まねばならない。第三者による再現ではない。
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>この記事で扱うこと</h3>
+                        <ol>
+                            <li><a href="#sec-1">きっかけ - 「Goコンパイラ」という言葉が隠すもの</a></li>
+                            <li><a href="#sec-2">Goはなぜそう作られたのか - 自前バックエンドの代償</a></li>
+                            <li><a href="#sec-3">cgoはなぜ単なる関数呼び出しではないのか</a></li>
+                            <li><a href="#sec-4">ポインタ受け渡しの規則 - 守るのはコンパイラではなく規約だ</a></li>
+                            <li><a href="#sec-5">ランタイムを差し替えるという選択</a></li>
+                            <li><a href="#sec-6">「全面対応」と「互換対象外」のあいだ</a></li>
+                            <li><a href="#sec-7">LLVMに載せると何が変わるのか</a></li>
+                            <li><a href="#sec-8">自己計測の数値を一つ - WebAssemblyのファイル容量</a></li>
+                            <li><a href="#sec-9">境界をまたぐとき実際に壊れるもの</a></li>
+                            <li><a href="#sec-10">Pythonを呼ぶということ - 鍵が付いてくる</a></li>
+                            <li><a href="#sec-11">いつこの選択が正しいのか</a></li>
+                            <li><a href="#sec-12">成熟度の読み方 - 星の数ではなく</a></li>
+                            <li><a href="#sec-13">導入前に答えるべき五つ</a></li>
+                            <li><a href="#sec-14">確認できなかったこと</a></li>
+                            <li><a href="#sec-15">参考資料</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">きっかけ - 「Goコンパイラ」という言葉が隠すもの</h2>
+
+                    <p>紹介文はたいてい短い。「LLVM基盤のGoコンパイラ」と書かれていれば、多くの読者はそれを、標準Goをそのまま受け取って機械語だけ別に吐く代物と読む。そしてその読みは半分だけ当たっている。</p>
+
+                    <p>リポジトリが自ら定めている範囲はこうだ。Go 1.20以降のソースと互換であり、<strong>Go 1.27の言語文法をすべて</strong>支え、<code>cgo</code>も受け取る。対応するネイティブ環境では<strong>標準ライブラリを全面的に支える</strong>と記す。ここまで読めば部分集合という言い方は誤りである。</p>
+
+                    <p>ところが同じ文書がすぐ次の節で別のことを言う。<strong>ランタイムが標準ツールチェーンと異なる。</strong>ネイティブのゴルーチンがOSスレッドへ一対一で結び付き、スタックは固定長のネイティブスタックであり、既定のコレクタは保守的方式のBoehm系である。ベアメタル向けの対象はさらに別の保守的なマーク・スイープ方式を使う。文法はすべて受け取るのに、<strong>その文法が動く床が別物になっている。</strong></p>
+
+                    <p>だからこの代物を一行で要約するとき、「標準Goの部分集合」は不正確であり、「標準Go互換」もまた不正確だ。正確な要約は<strong>文法と標準ライブラリはすべて、ランタイム保証は別物</strong>である。対応環境をLinuxとmacOSだけと書く紹介もあるが、リポジトリの文書はWindowsのamd64とarm64をMSVC向けとMinGW向けの二系統で併記し、WebAssemblyの各対象と組み込みボードまで並べている。要約はいつも遅れて更新される。</p>
+
+                    <h2 id="sec-2">Goはなぜそう作られたのか - 自前バックエンドの代償</h2>
+
+                    <p>Goのチームはプロジェクト初期にLLVMを検討し、採用しなかった。公式のFAQにその理由が一文で残っている。<strong>性能目標を満たすには大きすぎ、遅すぎると判断した</strong>というものだ。ここでいう性能は生成コードの実行速度ではなく、<strong>コンパイラ自身の速度</strong>である。同じ文書は別の箇所で目標を明示する。大きな実行ファイル一つを一台の計算機で<strong>数秒以内に</strong>ビルドすることだ。</p>
+
+                    <p>この選択は連鎖的に言語の性格を決めた。自前のバックエンドと自前のリンカを使うためツールチェーンが小さく、静的リンクが既定なので配布が単純で、対象のOSとアーキテクチャを環境変数二つで切り替えてクロスコンパイルできる。その代わり最適化の深さは数十年積み上げてきた汎用バックエンドに及ばず、対応アーキテクチャの幅もそのバックエンドほど広くはない。</p>
+
+                    <p>そして同じ選択が<code>cgo</code>の性格まで決めた。自前の呼び出し規約と自前のスタック管理、自前のスケジューラを使うランタイムでC関数を呼ぶということは、<strong>他人の規約へ一時的に渡って戻ってくる作業</strong>になる。渡って戻ってくる手続きそのものが費用だ。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>標準ツールチェーンが選んだもの</th><th>その代わりに得たもの</th><th>それゆえ諦めたもの</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>自前のコンパイラバックエンド</td><td>大きな実行ファイルでも数秒規模のビルド</td><td>汎用バックエンドが積み上げてきた最適化の深さ</td></tr>
+                            <tr><td>自前のリンカと静的リンクの既定</td><td>ファイル一つで完結する配布</td><td>小さなバイナリ。ランタイムと型情報が常に載る</td></tr>
+                            <tr><td>環境変数で指定する対象環境</td><td>C用の道具なしで済むクロスコンパイル</td><td>Cライブラリを使った瞬間にその単純さが消える</td></tr>
+                            <tr><td>伸長するゴルーチンスタック</td><td>数十万個を立てても耐える並行性</td><td>Cのコードをそのスタック上でそのまま走らせること</td></tr>
+                            <tr><td>精密なポインタ地図を使うコレクタ</td><td>正確な生存判定と予測できる終了処理の時点</td><td>コレクタが知らないメモリを扱うには規約が要る</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>表の最後の二行がこの記事の残り全部を予告している。並行性と自動メモリ管理を安く仕上げたまさにその設計が、境界をまたぐ瞬間に値段を請求する側へ回るのだ。</p>
+
+                    <h2 id="sec-3">cgoはなぜ単なる関数呼び出しではないのか</h2>
+
+                    <p>Goのランタイムのソースにある<code>cgocall</code>というファイルの冒頭には、呼び出し経路の全体を説明する長い注釈が付いている。この注釈こそが「高価だ」という言葉の中身である。</p>
+
+                    <p>GoのコードがC関数を呼ぶと、生成されたコードがランタイムの<code>cgocall</code>を呼ぶ。<code>cgocall</code>はまず<code>entersyscall</code>を呼ぶ。他のゴルーチンとコレクタを止めないためだ。注釈はこの呼び出しの目的を明示する。<strong>外部コードに入っているあいだ、他のゴルーチンを走らせるスレッドをもう一つ用意すべきだとスケジューラへ知らせること</strong>である。</p>
+
+                    <p>次にアセンブリ層の<code>asmcgocall</code>が、<strong>現在のゴルーチンスタックを離れて<code>g0</code>スタックへ移す。</strong>注釈はその理由まで書いている。<code>g0</code>スタックはOSが確保したスタックなので、Cコンパイラが生成したコードを載せても安全だからだ。裏返せば<strong>ゴルーチンスタックの上ではCのコードをそのまま走らせられない。</strong>必要に応じて伸びるスタックの上でC関数を実行してはならないからである。</p>
+
+                    <p>C関数が終わると元のゴルーチンスタックへ戻り、<code>cgocall</code>が<code>exitsyscall</code>を呼ぶ。注釈はこの関数の性質を一文で記す。<strong>並列実行の上限を破らずにこのスレッドがGoコードを走らせられるようになるまで待たされる</strong>というものだ。つまり復帰は即時ではなく、<strong>スケジューラの許可を待つ手続き</strong>である。</p>
+
+                    <p>C側からGoの関数を呼び戻すと、この階段を逆向きにもう一度下りる。アダプタがCの呼び出し規約をGoの呼び出し規約へ変換し、再び<code>g0</code>スタックから元のゴルーチンスタックへ移し、そこでまた上限を待つ。コールバック一回で往復の切り替えが二重に積み上がるということだ。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>段階</th><th>ランタイムがすること</th><th>なぜ必要か</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>進入の宣言</td><td>システムコールへの進入として印を付ける</td><td>このスレッドが塞がるあいだ、他のゴルーチンを走らせるスレッドを用意するため</td></tr>
+                            <tr><td>スタック切り替え</td><td>ゴルーチンスタックからOSのスタックへ移す</td><td>伸長するスタックの上でCのコードを走らせられないから</td></tr>
+                            <tr><td>実際の呼び出し</td><td>引数をフレームから取り出してC関数を呼ぶ</td><td>呼び出し規約が互いに違うので仲介が要る</td></tr>
+                            <tr><td>復帰の切り替え</td><td>元のゴルーチンスタックへ戻す</td><td>Goのコードは自分のスタックの上でしか続けられない</td></tr>
+                            <tr><td>離脱の待機</td><td>並列上限が許すまで待たされる</td><td>同時実行の数の会計を保つため</td></tr>
+                            <tr><td>コールバックがあれば</td><td>同じ階段を逆方向へもう一度</td><td>CからGoへ入るのも同じ境界だから</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>この表を見れば、「呼び出しが高価だ」がマイクロ秒単位の定数遅延の話ではないと分かる。<strong>スケジューラの会計とスタックの所有権が、呼び出しのたびに行き来する。</strong>だから大きな計算を一度渡す場合はほとんど問題にならず、小さな関数を細かく呼ぶ場合は調整ではなく構造そのものが問題になる。</p>
+
+                    <h2 id="sec-4">ポインタ受け渡しの規則 - 守るのはコンパイラではなく規約だ</h2>
+
+                    <p>費用より危ういのは規則のほうだ。<code>cgo</code>の文書はポインタを渡すときの条件を明確に定めている。GoのポインタをCへ渡すには、<strong>そのポインタが指すメモリが、固定されていない他のGoポインタを含んでいてはならない</strong>。そして<strong>Cのコードは呼び出しが終わった後にGoポインタの写しを保持できない。</strong>例外は固定機構でそのメモリを押さえている場合だけである。</p>
+
+                    <p>引数として渡したGoポインタは、<strong>呼び出しが続いているあいだだけ</strong>暗黙に固定される。呼び出しが終わる瞬間、その保証も終わる。文字列はもっと単純だ。<code>C.CString</code>はCのヒープへ写しを作り、文書は<strong>解放の手配は呼び出し側の責任である</strong>と記す。</p>
+
+                    <pre><code class="language-go">// 標準Goのcgo - 境界をまたぐ値は複製され、解放の責任は呼び出し側に残る
+cs := C.CString(s)                  // Cのヒープへ写しを作る
+defer C.free(unsafe.Pointer(cs))    // この一行がなければそのまま漏れる
+n := C.strlen(cs)                   // ここから先はCのメモリだ
+</code></pre>
+
+                    <p>呼び出しが終わった後もCがGoのメモリを保持せねばならない場合は固定機構を使う。標準ライブラリの<code>Pinner</code>は対象を<strong>コレクタが動かすことも回収することもできないように</strong>押さえておく。固定した対象がさらに別のGoオブジェクトを指し、Cがそこまでたどるのなら、その対象も別途固定せねばならない。</p>
+
+                    <pre><code class="language-go">// Cが呼び出し終了後もGoポインタを保持せねばならないとき
+var pinner runtime.Pinner
+pinner.Pin(p)            // コレクタが動かすことも回収することもできないよう押さえる
+defer pinner.Unpin()     // 解くまでのあいだだけC側の参照が有効だ
+</code></pre>
+
+                    <p>ここで注目すべきは規則の<strong>執行主体</strong>である。これらの規則は型検査器が捕まえてくれない。コンパイルはそのまま通り、破ったときの結果もすぐには現れない。コレクタがそのメモリを実際に動かすか回収する時点になって初めて症状が生じる。負荷が高くなってから、あるいはヒープが育ってから初めて出る種類の欠陥だ。</p>
+
+                    <ul>
+                        <li><strong>渡せるものの条件</strong> — 指すメモリの中に固定されていないGoポインタがあってはならない。構造体の中にスライスや文字列が入っていればこの条件に引っかかる</li>
+                        <li><strong>保持の禁止</strong> — Cが呼び出し後までGoポインタを持つには固定が要り、固定を解いた瞬間その参照は根拠を失う</li>
+                        <li><strong>解放の帰属</strong> — Cのヒープに作ったものはCの規約で解放する。Goのコレクタはそのメモリを数えないので、漏れは静かに積み上がる</li>
+                    </ul>
+
+                    <p>同じ問題を言語の側でどう減らせるかは<a href="rust_extern_filc_safe_c.html">Rust FFI 境界で途切れる安全保証</a>で扱った軸である。そちらは<strong>境界そのものを減らす</strong>接近であり、ここで見るのは<strong>境界をなくすために床を替える</strong>接近だ。</p>
+
+                    <h2 id="sec-5">ランタイムを差し替えるという選択</h2>
+
+                    <p>三節の階段はすべて一つの前提から出ている。<strong>ゴルーチンスタックとスケジューラがCのものではないという前提</strong>だ。その前提を消せば階段も消える。LLVM基盤の実装が選んだ道がまさにそれである。</p>
+
+                    <p>リポジトリの文書の言い回しは簡潔だ。ネイティブのゴルーチンがOSスレッドへ一対一で結び付き、スタックは固定長のネイティブスタックなので、<strong>Cを直接呼ぶときGoからCへのスタック切り替えもスケジューラの切り替えも要らない</strong>という。束縛の仕方もラッパを経ない。Goの宣言一つをC ABIのシンボルへ直に結び付ける。</p>
+
+                    <pre><code class="language-go">import _ "unsafe" // go:linkname 指示子を使うために必要だ
+
+//go:linkname Sqrt C.sqrt
+func Sqrt(x float64) float64
+</code></pre>
+
+                    <p>この指示子そのものは標準のコンパイラにもある。公式文書はその性質をこう記す。Goの変数や関数の宣言が使う<strong>オブジェクトファイルのシンボルを指定</strong>し、二つのGoシンボルが同じものを指すようにするもので、<code>unsafe</code>を取り込んだファイルでのみ有効になる。そして同じ頁が、この指示子は<strong>非公開宣言のカプセル化や、さらには型安全性まで迂回しうる</strong>と明示する。便利さの正体が何なのかを文書自身が語っているわけだ。</p>
+
+                    <p>変わったのは呼び出し経路だけではない。既定のコレクタが保守的方式へ替わった。精密なポインタ地図を持たずにスタックとレジスタを走査し、ポインタらしく見える値をすべて生存しているものとして扱う方式だ。この選択のおかげで、Cのコードが作ったメモリとGoのコードが作ったメモリを一つのヒープで扱うのが容易になる。そしてその代償が次の節の一覧である。</p>
+
+                    <h2 id="sec-6">「全面対応」と「互換対象外」のあいだ</h2>
+
+                    <p>興味深いのは、このプロジェクトが互換性を文章ではなく<strong>一覧</strong>として管理している点だ。標準配布物のコンパイラ試験一式をそのまま回し、通らなかった項目を二つのファイルに分けている。一つはまだ合わせられていないもの、もう一つは<strong>そもそも合わせるつもりのないもの</strong>である。</p>
+
+                    <p>まだ合わせられていない側は十一件だ。そのうち六件は、パーサが出す<strong>エラーメッセージの文言</strong>が標準と違うというもの。壊れたパッケージ宣言、壊れた名前、バイト順序表示といった状況で診断文が別の形で出る。残り五件はヒープ標本プロファイルに関するもので、そのうち二件には未併合の提案番号が理由として記されている。</p>
+
+                    <p>合わせるつもりのない側は百三十六件である。こちらが本当の境界線だ。百十件は理由が同じ文で終わる。<strong>そのツールチェーンに固有の挙動を支えることは互換の目標ではない</strong>というものだ。残りは理由がより具体的である。保守的コレクタを使うので正確な生存判定と終了処理の時点は合わせないという項目が十八件ほど、書き込み障壁を使わないのでそれに関わる診断は再現しないという項目が複数、そして<strong>固定長のネイティブスタックを使うので伸長するスタックの挙動は再現しない</strong>という項目もある。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>軸</th><th>宣言された範囲</th><th>実際に分かれる地点</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>言語文法</td><td>Go 1.27の文法すべて</td><td>パーサの診断文言が六件違う。文法そのものではなくエラーメッセージだ</td></tr>
+                            <tr><td>標準ライブラリ</td><td>対応するネイティブ環境では全面的に</td><td>他の対象では一部のOSサービスや実装固有の挙動がないことがあると自ら記す</td></tr>
+                            <tr><td>ゴルーチン</td><td>動作する</td><td>OSスレッドへ一対一。数を増やすときの費用が標準と異なる</td></tr>
+                            <tr><td>スタック</td><td>動作する</td><td>固定長。伸長するスタックを前提とした挙動は互換対象外に分類される</td></tr>
+                            <tr><td>ガベージコレクション</td><td>既定で提供</td><td>保守的方式。正確な生存判定と終了処理の時点が標準と異なる</td></tr>
+                            <tr><td>ビルドの道具立て</td><td>使い方は標準コマンドに似ている</td><td>LLVM 22系統一式と複数のシステムライブラリが前提条件だ</td></tr>
+                        </tbody>
+                    </table>
+
+                    <ul>
+                        <li><strong>文法互換とランタイム互換は別の軸だ。</strong>同じソースがコンパイルされるという事実と、同じソースが同じ時点で同じ観測を出すという事実は別物である</li>
+                        <li><strong>終了処理や弱参照に頼るコードが第一の危険群だ。</strong>保守的コレクタでは回収の時点が標準からずれうる</li>
+                        <li><strong>ゴルーチンを極端に多く立てる設計が第二の危険群だ。</strong>一対一の対応ではその数がそのままスレッド数になる</li>
+                    </ul>
+
+                    <h2 id="sec-7">LLVMに載せると何が変わるのか</h2>
+
+                    <h3>得る側</h3>
+
+                    <p>汎用バックエンドを使えば、そのバックエンドが積み上げてきたものが全部付いてくる。最適化のパス群、リンク時最適化、アーキテクチャごとのコード生成器、そしてその上に載っているデバッガと解析の道具立てだ。対象の拡大も同じ形でやってくる。この実装がWebAssemblyを複数系統で吐き、組み込みボードまで対象に入れられるのは、そのバックエンドがすでにそれらのアーキテクチャを知っているからである。</p>
+
+                    <p>C ABIで直に結び付くという性質もここから出る。同じバックエンドがCもコンパイルするので、呼び出し規約と型の表現が最初から同じ言語で表される。ラッパ層が要らない理由がこれだ。</p>
+
+                    <h3>払う側</h3>
+
+                    <p>バックエンドが大きいということはツールチェーンが大きいということだ。LLVMの公式文書は所要ディスクをこう記す。<strong>LLVMだけをビルドすればおよそ1から3ギガバイト、LLVMとClangを併せてビルドすればおよそ15から20ギガバイト</strong>である。この実装はLLVM 22系統のコンパイラ・リンカ・デバッガをすべて前提条件として要求し、そこへ保守的コレクタのライブラリ、外部関数インターフェースのライブラリ、暗号のライブラリと圧縮のライブラリを足して要求する。</p>
+
+                    <p>この一覧がそのまま<strong>ビルド再現性の請求書</strong>だ。標準Goのクロスコンパイルが安いのは、対象環境向けのC用の道具が要らないからである。境界を開いた瞬間その前提が崩れる。開発者の機械と継続的インテグレーションの機械と配布対象の、システムライブラリの版番号がすべて結果に入り込む。</p>
+
+                    <p>LLVMをバックエンドへ差し替える試みそのものは、このプロジェクトが初めてではない。Goの公式FAQもGCCバックエンドを使うフロントエンドと、<strong>同じフロントエンドを使う実験的なLLVMバックエンド</strong>の存在を記している。TypeScriptを同じやり方で下ろす試みは<a href="perry_typescript_llvm_compiler_2026.html">Perry - TypeScriptをLLVM機械語へ直接コンパイルするネイティブコンパイラ</a>で扱ったが、その記事で扱った落とし穴の一つがここでも繰り返される。<strong>より良いバックエンドが自動的により速い結果を意味するわけではない。</strong>言語の意味論がそのバックエンドへうまく下りるかどうかが先だ。</p>
+
+                    <h2 id="sec-8">自己計測の数値を一つ - WebAssemblyのファイル容量</h2>
+
+                    <p>このプロジェクトは専用のリポジトリで容量比較を継続的に回し、結果を公開している。条件も併記されているので引用に足る。ただし<strong>計測している主体がプロジェクト自身</strong>である点は、そのまま抱えて読まねばならない。</p>
+
+                    <p>条件はこうだ。実行番号403、生成時刻は2026-09-07の07:11 UTC、継続的インテグレーションの実行機はLinux x64のUbuntu 24イメージ、対象はWebAssemblyのシステムインターフェース。Go 1.26.2、LLVM 22、TinyGo 0.41.1を使い、標本はアプリケーション十本、指標は出力ファイルの総バイト数である。ビルドの選択肢も併せて公開されている。Go側は経路の除去とシンボル・デバッグ情報の除去を掛け、TinyGo側は容量優先の最適化とデバッグ情報の除去を掛け、この実装側は容量優先の最適化にリンク時最適化と全域の不要コード除去を組み合わせた。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>構成</th><th>標準Go比</th><th>TinyGo比</th><th>読み方</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>リンク時最適化なし</td><td>0.66倍</td><td>11.2倍</td><td>既定のままでも標準より小さいが、小型向けコンパイラとは一桁の開きがある</td></tr>
+                            <tr><td>不要コード除去</td><td>0.47倍</td><td>8.0倍</td><td>選択肢一つが容量の三割をさらに削る</td></tr>
+                            <tr><td>リンク時最適化、全域除去は切</td><td>0.44倍</td><td>7.5倍</td><td>リンク時最適化だけでは前の行と大差がない</td></tr>
+                            <tr><td>リンク時最適化、全域除去は入</td><td>0.34倍</td><td>5.8倍</td><td>最小の構成。それでも小型向けコンパイラの五倍を超える</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>この表から読むべきは倍率そのものではなく、<strong>倍率の向きが両方にある</strong>という事実だ。同じ生成物が、片方の物差しでは三分の一であり、もう片方では六倍近い。個別の事例で見ればもっと明白である。標本に入っているBase64変換器の場合、標準Goの生成物がおよそ228万バイト、小型向けコンパイラの生成物がおよそ9万7千バイト、最小構成の生成物がおよそ60万バイトだ。<strong>どちら側と比べるかによって、同じ数字が勝利にも敗北にもなる。</strong>倍率だけを切り取ってきた文が危ういのはこのためである。</p>
+
+                    <p>そしてこの表は実行速度ではなく<strong>ファイル容量</strong>だ。容量と速度は別の軸であり、容量優先の最適化を掛けたビルドが速度の軸で有利とは限らない。</p>
+
+                    <h2 id="sec-9">境界をまたぐとき実際に壊れるもの</h2>
+
+                    <p>ここがこの記事の中心である。どの言語からどの言語へ渡るのであれ、境界で壊れるものの一覧はおおむね同じだ。重要なのは<strong>各項目がどんな症状として現れるか</strong>である。症状を知って初めて、原因をそちらへ疑えるからだ。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>壊れるもの</th><th>なぜ壊れるのか</th><th>現れる症状</th><th>まず見る場所</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>メモリの所有権</td><td>確保する側と解放する側が別の規約を使う</td><td>長時間の稼働で常駐メモリが単調に増える。再起動すれば消える</td><td>境界をまたぐ文字列やバッファごとに解放の相方があるか</td></tr>
+                            <tr><td>コレクタが見られないポインタ</td><td>コレクタが走査しない場所にだけ参照が残る</td><td>負荷が高いときだけ落ちる。スタックの追跡がすでに回収された対象を指す</td><td>スレッド局所記憶、Cのヒープ、コールバックへ渡した文脈ポインタ</td></tr>
+                            <tr><td>対象の移動</td><td>コレクタが対象を動かすのにCは古い番地を持っている</td><td>断続的に誤った値。ヒープが育ってから再現する</td><td>呼び出し終了後も残るポインタに固定が掛かっているか</td></tr>
+                            <tr><td>例外とパニック</td><td>片方の巻き戻し規約がもう片方に存在しない</td><td>エラーの代わりにプロセスが丸ごと終了する。記録が残らない</td><td>境界をまたぐコールバックの中からパニックが漏れ出ないか</td></tr>
+                            <tr><td>スレッドモデル</td><td>片方がスレッドに条件を付ける</td><td>同じコードがあるゴルーチンでは通り、別のゴルーチンでは落ちる</td><td>鍵の取得と解放が同じスレッドで対になっているか</td></tr>
+                            <tr><td>エラーの規約</td><td>戻り値・大域変数・例外のどれで知らせるかが違う</td><td>失敗が成功として読まれる。欠陥がずっと後で表に出る</td><td>C関数のエラー表明の方式と、その値を読む時点</td></tr>
+                            <tr><td>型の表現</td><td>同じ名前の型が幅と配置で異なる</td><td>構造体の欄がずれる。32ビットと64ビットで結果が分かれる</td><td>整数の幅、配列が引数のときと欄のときの違い、関数ポインタ</td></tr>
+                            <tr><td>ビルドの再現性</td><td>システムライブラリと道具の版番号が結果に入り込む</td><td>自分の機械では通るのに継続的インテグレーションで通らない</td><td>前提条件の一覧に版番号の固定があるか</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>二行目は抽象的な警告ではない。この実装の文書に実際の事故の記録として残っている。遅延実行の連鎖の先頭を<strong>スレッド局所記憶にだけ生ポインタとして置いたところ、保守的コレクタがそれを見られなかった</strong>というものだ。百万件の遅延実行を積む負荷試験でコレクタがそのノードを回収し、その結果、遅延実行の中で落ちた。診断は明快である。<strong>論理的な破損ではなく根の登録漏れ</strong>だった。直し方も診断に合わせて、その状態をコレクタが知っている根から確保するよう変えている。</p>
+
+                    <p>七行目にも具体的な文書の根拠がある。この実装の型対応表は<strong>Cの関数ポインタが引数として来るときと構造体の欄として来るときを別に扱う。</strong>引数の位置ではGoの関数型として受け取るが、構造体の欄では素のポインタとして受け取る。Cの関数ポインタは関数一つの番地でしかなく、Goの関数値はクロージャでありうるからだ。配列も同じく、引数の位置ではポインタへ落ち、構造体の中でだけ配列として残る。Windowsのコールバックについても同じ理由で、<strong>状態を捕捉するクロージャの代わりに直接の関数参照を渡し、文脈は別のポインタで伝えよ</strong>と文書が明示している。</p>
+
+                    <h2 id="sec-10">Pythonを呼ぶということ - 鍵が付いてくる</h2>
+
+                    <p>Cのライブラリを呼ぶことと、Pythonのライブラリを呼ぶことは難度が違う。後者は<strong>インタープリタという状態機械を一つ丸ごとプロセスの中へ持ち込む作業</strong>だからだ。その状態機械には自分の規約がある。</p>
+
+                    <p>Python公式のC API文書の一文は短く断定的である。自由スレッドのビルドでない限りインタープリタは一般にスレッド安全ではなく、だから大域インタープリタ鍵があり、<strong>その鍵を握っているスレッドだけがPythonのオブジェクトを扱ったりPythonのC APIを呼んだりできる。</strong>外部のスレッドから入るときは状態の確保と解放を対で合わせねばならず、文書は<strong>すべての確保の呼び出しが同じスレッドでの解放の呼び出しと対にならねばならない</strong>と明示する。</p>
+
+                    <pre><code class="language-go">// Pythonのライブラリをそのままコードから呼ぶ
+x := math.Sqrt(py.Float(2))       // Pythonのmath.sqrtへ渡す
+std.Print(py.Str("sqrt(2) ="), x) // Pythonのprintで表示する
+</code></pre>
+
+                    <p>見た目には関数呼び出しが二行である。ところがこの二行が成り立つには、プロセスの中でインタープリタがすでに初期化されていなければならず、このコードを実行するスレッドが鍵を握っていなければならず、渡した値がPythonのオブジェクトとして作られ参照計数の規約に従わねばならない。<strong>見えない前提が三重</strong>だ。</p>
+
+                    <p>この条件がGoの実行モデルとどう出会うのかを見れば、なぜ一対一のスレッド対応という選択が出てきたのか見当がつく。標準のGoではゴルーチンはスレッドに固定されていない。スケジューラが移す。鍵を握ったままゴルーチンが別のスレッドへ移れば規約が壊れる。ゴルーチン一つがスレッド一つに固定されていれば、この問題は構造的に消える。</p>
+
+                    <p>自由スレッドのビルドも万能ではない。公式文書はそのビルドでも<strong>スレッド状態を切り離す手続きは依然として必要だ</strong>と記す。インタープリタが一貫した視界を得るために、周期的にすべてのスレッドをしばらく止めるからである。例としてコレクタを走らせているあいだが挙げられている。</p>
+
+                    <ul>
+                        <li><strong>並列性の上限が他人のもので決まる。</strong>Go側でゴルーチンをいくら増やしても、Pythonのオブジェクトへ触れる区間は鍵一つを巡って列を作る</li>
+                        <li><strong>鍵の規約はコンパイラが検査しない。</strong>確保と解放の対がずれてもコンパイルは通ってしまう</li>
+                        <li><strong>第三者のライブラリは別途の導入だ。</strong>配布物の中にインタープリタとその一群が必要で、その版番号が結果に入り込む</li>
+                    </ul>
+
+                    <h2 id="sec-11">いつこの選択が正しいのか</h2>
+
+                    <h3>既存のライブラリが事実上唯一の実装であるとき</h3>
+
+                    <p>判断はたいてい一つの問いへ圧縮される。<strong>そのライブラリを代替できる純粋な実装があるか。</strong>なければ境界の費用は選択肢ではなく前提だ。数値計算の特定の中核処理、長年磨かれてきた符号化器、特定のハードウェアの公式ドライバ、規制対応のために特定の実装を使わねばならない暗号モジュールなどがここに当たる。この場合、論点は「使うのか」ではなく<strong>「境界を何箇所に置くのか」</strong>へ移る。</p>
+
+                    <p>境界を減らす方法はおおむね同じだ。呼び出し地点を一箇所へ集め、その中で太く一度だけ渡す。小さな関数を細かく呼ぶ代わりに、まとめて渡すのである。三節で見た階段は呼び出しのたびに付く構造なので、呼び出し回数を減らすことがそのまま費用を減らすことになる。</p>
+
+                    <h3>純粋な実装があるとき</h3>
+
+                    <p>純粋な実装があるなら計算は変わる。比べる対象は性能ではなく<strong>運用の総費用</strong>だ。境界を開けば配布物にシステムライブラリが付いてきて、クロスコンパイルが難しくなり、障害の調査に二つの言語の知識が要るようになり、標準の道具立てのプロファイラと競合検出器が半分しか見られなくなる。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>状況</th><th>境界を開く側</th><th>純粋な実装の側</th><th>決定を分けるもの</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>代替の実装自体がない</td><td>事実上唯一の選択</td><td>該当なし</td><td>境界を何箇所まで減らせるか</td></tr>
+                            <tr><td>純粋な実装はあるが遅い</td><td>一度に渡す仕事量が大きいときだけ</td><td>普通はこちら</td><td>一回に渡す作業量。小さければ切り替えの費用が利益を食う</td></tr>
+                            <tr><td>純粋な実装の機能が足りない</td><td>足りない機能が中核のとき</td><td>足りない部分を使わずに済むなら</td><td>その機能が要件の中心か周辺か</td></tr>
+                            <tr><td>配布対象が多様だ</td><td>不利だ</td><td>有利だ</td><td>対象ごとにC用の道具を揃えられるか</td></tr>
+                            <tr><td>ゴルーチンを極端に多く立てる</td><td>ランタイム差し替え型は不利だ</td><td>有利だ</td><td>並行性の規模がスレッド数へ換算されても耐えるか</td></tr>
+                            <tr><td>運用する組織が一つの言語しか知らない</td><td>障害調査の費用が大きくなる</td><td>有利だ</td><td>未明に落ちたとき原因を追える人がいるか</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>最後の行が実務で最もよく決定を覆す。境界を開いた系の障害は、片方の言語の知識だけでは最後まで追いにくい。Goと別の言語のあいだでこの判断をどう立てるかは<a href="go_to_rust_migration_guide_2026.html">GoからRustへの移行完全ガイド2026</a>で別の角度から扱い、言語選択そのものを検証費用へ換算する軸は<a href="go_language_ai_coding_fit.html">AI生成コードの検証コストを下げる言語特性</a>にある。</p>
+
+                    <h2 id="sec-12">成熟度の読み方 - 星の数ではなく</h2>
+
+                    <h3>星の数が語らないこと</h3>
+
+                    <p>公開リポジトリの星の数は関心の指標であって信頼の指標ではない。このリポジトリは照会時点で星749、フォーク50、未解決の課題151である。2023年12月に作られ、照会当日もコミットが入っていた。これらの数字だけでは、導入の判断に要るものが一つも出てこない。</p>
+
+                    <p>代わりに見るべきは四つだ。<strong>リリースタグの軌跡</strong>、<strong>未解決課題の種類</strong>、<strong>互換性宣言の形</strong>、<strong>標準準拠の範囲についての自己記述</strong>である。</p>
+
+                    <h3>実際に見るべき四つ</h3>
+
+                    <p>リリースの軌跡から見ると、最初のタグが2024年4月、正式な版番号である1.0.0が2026年8月24日だ。事前配布版を五つ、一週間あまりに集中して出した後に正式版を出し、その後8月29日と9月6日に保守版が二度出ている。総リリース数は四十九だ。<strong>正式な版番号まで2年4か月かかり、その直後に二度の保守があった</strong>という事実が、星の数よりはるかに多くを語る。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>指標</th><th>照会値</th><th>この値から読むこと</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>正式な版番号への到達</td><td>1.0.0が2026-08-24、最新は1.0.2で2026-09-06</td><td>正式版の直後二週間で保守版が二度。まだ初期の安定化区間だ</td></tr>
+                            <tr><td>最初のリリースからの期間</td><td>2024-04-21以降でリリース49本</td><td>着実な配布の律動はある。維持されている企画だという合図</td></tr>
+                            <tr><td>未解決の課題</td><td>151件</td><td>絶対数より種類が重要だ。導入前に自分の利用場面で検索すべき場所</td></tr>
+                            <tr><td>互換性の宣言</td><td>未達11件、対象外136件が理由付きでファイルとして</td><td>宣言が文章ではなく検査可能な一覧だ。成熟度の強い合図</td></tr>
+                            <tr><td>標準準拠の範囲</td><td>文法と標準ライブラリは全部、ランタイム意味論は別物</td><td>同じソースがコンパイルされる事実が同じ観測を意味しない</td></tr>
+                            <tr><td>前提条件</td><td>LLVM 22系統一式と多数のシステムライブラリ</td><td>導入費用のかなりの部分が道具の導入と版番号の固定にある</td></tr>
+                            <tr><td>ライセンス</td><td>Apache-2.0</td><td>特許条項のある許容型。社内導入の法務検討の負担は軽いほうだ</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>四行目がこの表で最も値打ちがある。ほとんどの企画は互換性を散文で書く。<strong>「ほぼ互換だ」という文は検証できないが、理由の付いた例外の一覧は読んで問い詰められる。</strong>その一覧に自分のコードが頼っている挙動が入っているかを、直に突き合わせられるということだ。言語の企画が開かれることが実際に何を変え何を変えないのかは<a href="mojo_compiler_open_source.html">Mojoコンパイラのオープンソース公開</a>で統治の軸として扱った。ここで見る軸は<strong>互換性宣言の検証可能性</strong>である。</p>
+
+                    <h2 id="sec-13">導入前に答えるべき五つ</h2>
+
+                    <p>道具を選ぶ作業は、たいてい問いを選ぶ作業だ。下の五つに答えが出れば決定は付いてくる。</p>
+
+                    <ol>
+                        <li><strong>境界を何回またぐのか。</strong>呼び出し回数が少なく一度に渡す仕事量が大きいなら標準の<code>cgo</code>で十分だ。細かい呼び出しが構造的に避けられないときだけ、ランタイムの差し替えが論点になる</li>
+                        <li><strong>ゴルーチンを何個立てるのか。</strong>一対一の対応では並行性の規模がそのままスレッド数だ。数万個を前提とした設計ならこの経路は合わない</li>
+                        <li><strong>終了処理や回収の時点に頼るコードがあるか。</strong>保守的コレクタではその時点が標準と変わる。資源の解放を終了処理に任せたコードが最初の点検対象だ</li>
+                        <li><strong>配布対象は何種類か。</strong>対象ごとにLLVM系統の道具とシステムライブラリを揃え、版番号を固定できるかが実際の導入費用の大半である</li>
+                        <li><strong>未明に落ちたとき誰が見るのか。</strong>境界を開いた系の障害は二つの言語の知識を要求する。その人が組織にいるかが技術的な判断より先だ</li>
+                    </ol>
+
+                    <p>五つの問いのどれも性能を訊いていない点が重要である。境界を開く決定において性能はたいてい既に答えの決まった軸であり、実際に企画を沈めるのは残りの四つだ。コンパイル言語に対話的実行を付けるときにも同じ種類の交換が現れるが、その軸は<a href="interpreter_for_compiled_language.html">コンパイル言語に対話的実行を付けるということ</a>に整理してある。</p>
+
+                    <h2 id="sec-14">確認できなかったこと</h2>
+
+                    <ul>
+                        <li>速度の比較を確認できなかった。公開されている継続的インテグレーションの計測は<strong>WebAssembly出力ファイルのバイト数</strong>であり、実行時間の比較を同じ形式で公開したものは見つからなかった。八節の倍率を速度へ移して読んではならない</li>
+                        <li>ネイティブ対象の容量表は開けなかった。結果ファイルはネイティブの項目を別途の要約と表形式で指しているが、その中身はこの記事の根拠に入れていない</li>
+                        <li>C呼び出し経路の実際の削減幅を数値で確認できなかった。スタックとスケジューラの切り替えがないことは設計上の記述であり、標準の<code>cgo</code>に対する呼び出しあたりの遅延を同じ条件で比べた公開値は得られなかった</li>
+                        <li>第三者による再現を確認できなかった。八節の数値はすべてプロジェクト自身が回したものであり、独立した計測報告は見つからなかった</li>
+                        <li>未解決の課題151件の<strong>構成</strong>を確認できなかった。欠陥と機能要望と文書の項目の比率を分けていないので、この数字を品質の指標として読んではならない</li>
+                        <li>貢献者数の正確な総計を確認できなかった。一覧の最初の頁に19名が出るが、全頁を合算していない</li>
+                        <li>Pythonの自由スレッドのビルドでこの実装がどう動くかを確認できなかった。リポジトリの文書が要求しているのは3.12以上という条件だけで、鍵のないビルドについての別途の記述は確認の範囲になかった</li>
+                    </ul>
+
+                    <h2 id="sec-15">参考資料</h2>
+
+                    <ul>
+                        <li><a href="https://news.hada.io/topic?id=33302" target="_blank" rel="noopener">GeekNews トピック 33302</a> — この記事のきっかけとなった紹介。原文の所在と要約がある場所</li>
+                        <li><a href="https://github.com/xgo-dev/llgo" target="_blank" rel="noopener">xgo-dev/llgo リポジトリ</a> — 対応範囲の宣言、ランタイムの違い、CとPythonの相互運用の仕組み、前提条件一覧の出どころ。照会時刻は2026-09-07 11:56 KST</li>
+                        <li><a href="https://go.dev/doc/faq" target="_blank" rel="noopener">Go 公式 FAQ</a> — 初期にLLVMを検討したが大きく遅いと判断したという記述、ビルド速度の目標、静的リンクがバイナリ容量へ及ぼす影響</li>
+                        <li><a href="https://pkg.go.dev/cmd/cgo" target="_blank" rel="noopener">cmd/cgo 公式文書</a> — ポインタ受け渡しの規則、呼び出し後の保持の禁止と固定の条件、C文字列の解放責任、エラー番号を多重代入で受け取る規約</li>
+                        <li><a href="https://pkg.go.dev/runtime#Pinner" target="_blank" rel="noopener">runtime.Pinner の文書</a> — 固定が何を保証するのかと、固定した対象が指す先は別途固定せねばならないという条件</li>
+                        <li><a href="https://github.com/golang/go/blob/master/src/runtime/cgocall.go" target="_blank" rel="noopener">Go ランタイムの cgocall ソース</a> — システムコール進入の表示、g0スタックへの切り替え、復帰時の並列上限の待機、コールバック経路の逆向きの階段を説明する注釈</li>
+                        <li><a href="https://pkg.go.dev/cmd/compile" target="_blank" rel="noopener">cmd/compile のコンパイラ指示子</a> — go:linkname が何をするのかと、カプセル化や型安全性を迂回しうるという警告</li>
+                        <li><a href="https://docs.python.org/3/c-api/threads.html" target="_blank" rel="noopener">Python C API のスレッド文書</a> — 鍵を握るスレッドだけがPythonのオブジェクトを扱えるという規則と、確保と解放が同じスレッドで対になるという条件</li>
+                        <li><a href="https://llvm.org/docs/GettingStarted.html" target="_blank" rel="noopener">LLVM の入門文書</a> — ビルドに必要なディスク容量と、対応するホスト環境の一覧</li>
+                        <li><a href="https://tinygo.org/docs/reference/lang-support/" target="_blank" rel="noopener">TinyGo の言語対応文書</a> — 同系統の代替が何を支えないと自ら記しているか。八節の比較対象の性格</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>この記事をシェア</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">リンクをコピー</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">一覧に戻る</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">一緒に使うと便利な無料ツール</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/curl_builder.html">curlコマンド生成器 2026</a></li>
+      <li><a href="../static/http_status_codes.html">HTTPステータスコード完全ガイド 2026</a></li>
+      <li><a href="../static/nginx_generator.html">Nginx 設定ジェネレーター</a></li>
+      <li><a href="../static/ssh_config_generator.html">SSH config生成器 2026</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">すべてのツールを見る &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">関連記事</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="backup_restore_verification.html">「バックアップがある」と「復元できる」は別の命題である - 成功したバックアップが嘘をつく場所と、復元検証が実際に要求するもの</a></li>
+      <li><a href="strip_bootstrap_trust_attack.html">ソースを全部読んでも見えないもの - コンパイルしないユーティリティがディストリのブートストラップを渡り歩いた実証と、まだ有効な検証</a></li>
+      <li><a href="agent_tool_selection_measured.html">エージェントが選んだという文の主語は誰か - コーディングエージェント三種の外部サービス選択を16,893回の実行で測った結果</a></li>
+      <li><a href="coding_to_agent_orchestration.html">コードを書かずに任せはじめると - 何が安くなり、何が高くつくのか</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('リンクをコピーしました。Threadsアプリに貼り付けて共有してください。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('リンクをコピーしました。'); });
+    });
+    </script>
+</body>
+</html>
