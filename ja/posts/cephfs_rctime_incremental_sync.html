@@ -1,0 +1,675 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ja">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>変更がなくても全体を走査する - CephFS の rctime で全走査を省く増分同期の設計</title>
+    <meta name="description" content="変更が0件でも全走査は同じコストを払う。CephFS の ceph.dir.rctime という再帰変更時刻を一つ比べて配下を丸ごと飛ばす増分同期の設計を、測定条件と、この方式がむしろ遅かったラウンドまで含めて整理する。">
+    <meta name="keywords" content="CephFS, rctime, ceph.dir.rctime, 増分同期, rsync, 全走査, メタデータ走査, クラスタ間レプリケーション, RPO, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/ja/posts/cephfs_rctime_incremental_sync.html">
+
+    <meta property="og:title" content="変更がなくても全体を走査する - CephFS の rctime で全走査を省く増分同期の設計">
+    <meta property="og:description" content="コストが変更量ではなくデータ総量に比例するなら、名前が増分でも増分ではない。値を一つ比べて配下を飛ばす。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/ja/posts/cephfs_rctime_incremental_sync.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ja_JP">
+    <meta property="article:published_time" content="2026-09-12">
+    <meta property="article:section" content="開発・インフラ">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="変更がなくても全体を走査する - CephFS rctime 増分同期の設計">
+    <meta name="twitter:description" content="変更が0件の日でも全走査は同じコストを払う。再帰変更時刻を一つ比べるだけでそのコストが消える。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "変更がなくても全体を走査する - CephFS の rctime で全走査を省く増分同期の設計",
+      "alternativeHeadline": "比較段階が木全体を走査するなら、名前が増分でもコストは増分ではない",
+      "datePublished": "2026-09-12",
+      "dateModified": "2026-09-12",
+      "inLanguage": "ja-JP",
+      "articleSection": "開発・インフラ",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "CephFS, rctime, ceph.dir.rctime, 増分同期, rsync, 全走査, メタデータ走査, クラスタ間レプリケーション, RPO",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/ja/posts/cephfs_rctime_incremental_sync.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "ceph.dir.rctime とは何で、何を保証するのか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "CephFS がディレクトリに付与する読み取り専用の拡張属性であり、MDS が管理する。配下のツリーでファイルやディレクトリが変わると、その変化が上位へ伝播する。Luminous を含むそれ以降のバージョンで使える。この値を読む操作は呼び出し一回で、配下を走査しない。保証するのは一方向だけである。配下に変更があれば上位の値が上がる、したがって値がそのままなら下を見る必要がない、という向きだけだ。何が、いくつ、どれだけ変わったのかはこの値が答えない。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "全走査の rsync とコストはどう違うのか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "全走査は O(n) である。n は全ファイルとディレクトリの数であり、変更が0件の日でも同じコストがそのままかかる。比較段階がツリー全体を走査するからだ。再帰変更時刻を比べる方式は、無変更なら O(1)、変更があれば O(k) になる。k は値が変わったディレクトリの数で、全体規模とは無関係である。差が出るのは転送ではなく比較のほうだ。転送量はどちらの方式でも実際の変更量と等しい。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "この方式は常に速いのか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "そうではない。試験の8番ラウンドで負けた。100 GB と新規ディレクトリ5万個を一度に追加した条件で、全走査は568秒、この方式は975秒だった。全走査が1.7倍速く、差は407秒である。新しくできたディレクトリごとに同期時刻を記録する必要があり、その一回限りの記録コストが走査で節約した分を超えた。初期シーディングでも利点はない。全部転送しなければならず、飛ばせる区間がそもそも存在しないからだ。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "rsync が失敗したら次回の実行はどうなるのか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "rsync が0以外のコードで終了した場合、ログだけを残してターゲットに値を記録しない。これがこの設計の中心にある安全装置である。失敗したのに記録してしまうと、次回の実行はソースの値とその記録を比べて等しいと判定し、その区間を飛ばす。失敗したデータは送られないまま残り、それを知らせるものが何もなくなる。記録しなければ両者の値は依然として異なるので、同じ区間が次回の対象に戻る。二つの誤りは重さが違うため、片側にだけ外れるように作ってある。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "CephFS 以外のファイルシステムでも使えるのか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "使えない。再帰変更時刻は CephFS が維持する値であり、他の分散ファイルシステムに同じ属性はない。一般的なローカルファイルシステムのディレクトリ変更時刻は、そのディレクトリ自体のエントリが変わったときにだけ上がり、配下の変化を上へ伝播しない。そのため、値が同じなら下を見なくてよいという判断の根拠が立たない。この設計の移植性は、同期ツールではなくファイルシステムが再帰メタデータを維持するかどうかに懸かっている。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/cephfs_rctime_incremental_sync.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/cephfs_rctime_incremental_sync.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/cephfs_rctime_incremental_sync.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/cephfs_rctime_incremental_sync.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/cephfs_rctime_incremental_sync.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "ホーム",
+      "item": "https://braindetox.kr/ja/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "開発・インフラ",
+      "item": "https://braindetox.kr/ja/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "変更がなくても全体を走査する - CephFS の rctime で全走査を省く増分同期の設計",
+      "item": "https://braindetox.kr/ja/posts/cephfs_rctime_incremental_sync.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="変更がなくても全体を走査する - CephFS の rctime で全走査を省く増分同期の設計">
+                <meta itemprop="datePublished" content="2026-09-12">
+                <meta itemprop="dateModified" content="2026-09-12">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="CephFS, rctime, ceph.dir.rctime, 増分同期, rsync, 全走査, メタデータ走査, クラスタ間レプリケーション, RPO">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/ja/posts/cephfs_rctime_incremental_sync.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">変更がなくても全体を走査する - CephFS の rctime で全走査を省く増分同期の設計</h1>
+                    <h2 class="post-subtitle">比較段階が木全体を走査するなら、名前が増分でもコストは増分ではない</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-12">2026-09-12</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">開発・インフラ</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>同期が終わるまでにかかる時間が<strong>変わった量ではなく持っている量</strong>に比例するなら、その同期は名前が何であれ増分ではない。一日に<strong>133件・0.88 MB</strong> が変わるツリーを合わせるのに<strong>16.7時間</strong>かかるなら、その時間の大半は運ぶ作業ではなく<strong>何を運ぶかを決める作業</strong>に使われている。</p>
+
+                    <p>切り替え前の構成は、スナップショット差分で変更ファイルを先に洗い出し、そのあとに rsync を回す形だった。名前には「増分」が付いていたし、変更リスト自体も正確だった。それでも所要時間は減らなかった。理由は一文に縮む。<strong>差分が「どのファイルが変わったか」を教えてくれても、次の段階がディレクトリ単位の比較をすべて実行するなら、総コストは依然としてツリー全体の大きさに比例する。</strong></p>
+
+                    <p>だから軸は「転送をどう速くするか」ではない。転送量はすでに 0.88 MB だった。軸は<strong>変更のない区間を比較の前に切り落とせるか</strong>である。そしてその判断に必要な情報を、ファイルシステムがすでに持っている。CephFS はディレクトリごとに配下ツリーの最終変更時刻を再帰的に上げておく <code>ceph.dir.rctime</code> を維持している。値を一つ読むだけで、その下を走査するかどうかが決まる。</p>
+
+                    <div class="callout">
+                        以下の設計と測定は筆者が作り、運用に適用したものである。外部資料は CephFS の再帰統計と拡張属性に関する Ceph 公式ドキュメントだけを根拠として用い、それ以外の数値はあとの「測定条件」の節に記した試験環境から出た値である。クラスタ・ネームスペース・ホストを特定する名前は使わず、二つのクラスタはソースの Cluster-A とターゲットの Cluster-B とだけ記す。ソースコードやコマンド例も載せず、アルゴリズムは文章と表だけで説明する。
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>この記事で扱うこと</h3>
+                        <ol>
+                            <li><a href="#sec-1">問題 - 所要時間が変更量に比例しない</a></li>
+                            <li><a href="#sec-2">全走査が実際にしていることとコストの出どころ</a></li>
+                            <li><a href="#sec-3">分散ファイルシステムでより痛む理由 - メタデータの往復</a></li>
+                            <li><a href="#sec-4">切り替え前の構成の記録 - 11.25 GB は転送量ではない</a></li>
+                            <li><a href="#sec-5">再帰変更時刻という値 - ceph.dir.rctime</a></li>
+                            <li><a href="#sec-6">その値が保証すること、しないこと</a></li>
+                            <li><a href="#sec-7">判定の構造 - 同じなら飛ばし、違えば降りる</a></li>
+                            <li><a href="#sec-8">四段階の実行と各段階の役割</a></li>
+                            <li><a href="#sec-9">失敗したら記録しない - 片側にだけ外れさせる</a></li>
+                            <li><a href="#sec-10">深さ上限というつまみ</a></li>
+                            <li><a href="#sec-11">コスト構造 - O(n) と O(1) と O(k)</a></li>
+                            <li><a href="#sec-12">測定条件 - 結果より先に立てる</a></li>
+                            <li><a href="#sec-13">ラウンド別の結果 - 何が速くなったのか</a></li>
+                            <li><a href="#sec-14">この方式が負けたラウンド - 新規ディレクトリ5万個</a></li>
+                            <li><a href="#sec-15">規模が大きくなるとき - 測定値と推定を分けて</a></li>
+                            <li><a href="#sec-16">使わないほうがよい三つの場合</a></li>
+                            <li><a href="#sec-17">スナップショットとの相互作用 - データがそのままでも値は変わる</a></li>
+                            <li><a href="#sec-18">まとめ - 五つの文</a></li>
+                            <li><a href="#sec-19">確認できなかったこと</a></li>
+                            <li><a href="#sec-20">参考資料</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">問題 - 所要時間が変更量に比例しない</h2>
+
+                    <p>クラスタ間レプリケーションで一回の同期が終わるまでの時間は、たいてい二つの項の和である。<strong>何が違うかを決める時間</strong>と<strong>違うものを運ぶ時間</strong>だ。後ろの項は変更量に比例する。前の項はそうではない。</p>
+
+                    <p>この非対称が目立たない条件がある。データが小さいときだ。前の項が数秒なら後ろの項が支配的になり、「同期時間は運ぶ量に比例する」という直感が正しいように見える。ツリーが大きくなると順序が逆転する。前の項が時間単位に伸びるあいだ、後ろの項は変更量が少なければ依然として秒単位にとどまる。ある地点を越えると、<strong>同期時間のほぼ全部が「何を運ぶかを決める作業」</strong>になる。</p>
+
+                    <p>ここから実務的に重要な結果が一つ出る。その状態では<strong>同期周期を縮められない。</strong>一つのセッションが終わらなければ次のセッションを掛けられず、セッションの長さは変更量ではなくデータ総量が決める。だから目標復旧時点(RPO)が設計ではなく<strong>結果</strong>になる。セッション一回が8.4時間なら一日に二回が限界であり、その瞬間に RPO は12時間で固定される。誰かが12時間を目標に定めたからそうなったのではない。</p>
+
+                    <p>そこで投げるべき問いの形が変わる。「転送をどう速くするか」ではなく<strong>「比較をそもそもしなくてよい区間をどう突き止めるか」</strong>である。前者にはリンク帯域と並列度という答えがあるが、その答えはすでに 0.88 MB である転送量をこれ以上減らしてくれない。</p>
+
+                    <h2 id="sec-2">全走査が実際にしていることとコストの出どころ</h2>
+
+                    <p>rsync のようなツールが二つのツリーを合わせるときの作業は二段階に分かれる。この区別がこの記事のほぼ全部だと言ってよい。</p>
+
+                    <ul>
+                        <li><strong>比較段階</strong> — 両側の項目を列挙し、各項目のメタデータを読んで突き合わせる。名前・サイズ・変更時刻・権限といったものだ。この段階のコストは<strong>項目数</strong>に比例する。</li>
+                        <li><strong>転送段階</strong> — 突き合わせた結果、違っているものだけを実際に運ぶ。この段階のコストは<strong>違っている量</strong>に比例する。</li>
+                    </ul>
+
+                    <p>二つの段階のコスト関数が別々の変数を使う、という点が肝である。転送段階は変更がなければ0になるが、<strong>比較段階は変更がなくても0にならない。</strong>むしろ変更が少ないほどその時間は純粋な無駄として残る。すべての項目を読み、「全部同じだ」という結論一つを得るためにその時間を使い切るからだ。</p>
+
+                    <p>この構造ゆえに<strong>ツールを取り替えるだけでは解決しない。</strong>どのツールを使っても二つのツリーの差を知るには二つのツリーを見なければならず、「見る」という行為のコストはツリーの大きさが決める。問題はツールの品質ではなく<strong>比較の範囲</strong>にある。rsync の挙動そのものを取り違えて生じる結果の差は性質の違う問題であり、そちらは <a href="rsync_trailing_slash_guide.html">rsync の末尾スラッシュ一つで結果が変わる理由</a>で別に扱った。</p>
+
+                    <p>差分ツールを前に付けてもこの構造は変わらない。差分が変更リストを正確に抜き出しても、それを受け取った側が依然としてディレクトリ単位で両側を突き合わせるなら、比較段階はそのまま残る。<strong>リストを狭めることと比較範囲を狭めることは別の作業である。</strong>前者は転送段階を減らし、後者だけが比較段階を減らす。</p>
+
+                    <h2 id="sec-3">分散ファイルシステムでより痛む理由 - メタデータの往復</h2>
+
+                    <p>ローカルファイルシステムで項目一つのメタデータを読むコストは、たいていメモリアクセスに近い。カーネルが inode とディレクトリエントリをキャッシュに持っているからだ。同じことを CephFS で行うと性質が変わる。メタデータは MDS が管理する資源であり、クライアントはそれをキャッシュするものの、<strong>キャッシュが空ならネットワーク往復</strong>が発生する。</p>
+
+                    <p>そのため全走査のコストは二重に悪くなる。項目数に比例するという性質はそのままなのに、項目一つあたりの単価がローカルより大きく、<strong>キャッシュの状態によって大きく揺れる。</strong>同じツリーを同じやり方で走査しても、キャッシュが温かいときと冷たいときで所要が変わるのはこのためだ。あとの測定でわざとキャッシュを落としたラウンドを別に置いたのも、この理由による。</p>
+
+                    <p>付け加えると、全走査は自分の時間だけを使うのではない。走査が生むメタデータ要求は、同じファイルシステムを使う他のクライアントと同じ資源を取り合う。走査が長引くほどその競合区間も長くなる。この層の一般的な性能特性は <a href="ceph_performance_optimization_guide.html">Ceph パフォーマンス最適化ガイド</a>で整理し、ブロックアクセスとファイルアクセスがそもそも別の経路を通るという話は <a href="ceph_rbd_vs_cephfs_comparison.html">Ceph RBD と CephFS の比較</a>にある。</p>
+
+                    <p>まとめるとこうだ。全走査はどこでも O(n) だが、<strong>分散ファイルシステムではその n に付く定数が大きく、変動も大きい。</strong>同じアルゴリズムがローカルでは耐えられ、ここでは耐えられない理由がそれである。</p>
+
+                    <h2 id="sec-4">切り替え前の構成の記録 - 11.25 GB は転送量ではない</h2>
+
+                    <p>切り替え前の構成の四日分の運用記録を並べると、前の節の構造が数字で見える。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>項目</th><th>値</th><th>何を指すか</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>一日平均の同期所要</td><td>16.7時間</td><td>一日の三分の二が同期に縛られていた</td></tr>
+                            <tr><td>セッションあたりの所要</td><td>約8.4時間</td><td>変更の有無とほぼ無関係に一定だった</td></tr>
+                            <tr><td>一日平均の rsync 処理ボリューム</td><td>11.25 GB</td><td>転送量ではなく、比較の過程で発生したメタデータのボリューム</td></tr>
+                            <tr><td>実際の一日の変更量</td><td>133件・0.88 MB</td><td>同じ期間に実際に変わったもののすべて</td></tr>
+                            <tr><td>一日の同期回数</td><td>2回</td><td>セッション長が8.4時間なのでそれ以上は掛けられない</td></tr>
+                            <tr><td>結果として固まった RPO</td><td>12時間</td><td>目標として定めた値ではなく、セッション長が決めた値</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>三行目と四行目の隔たりがこの表のすべてである。<strong>11.25 GB は運ばれたデータではない。</strong>その期間に実際に違っていたのは 0.88 MB だった。11.25 GB は rsync がツリーを走査しながら発生させた<strong>メタデータ比較ボリューム</strong>である。差分が「どのファイルが変わったか」を教えていたにもかかわらずディレクトリ単位の比較はそのまま実行され、だからコストが変更量ではなくデータ総量を追いかけた。</p>
+
+                    <p>同じ読みを裏づける観測がもう一つある。<strong>四日間この値がほとんど変わらなかった。</strong>ばらつきは ±0.01 GB 程度だった。日ごとに変更量は違ったのに処理ボリュームは固定だったという意味であり、そのボリュームが変更量と無関係な項から出たことの直接の証拠である。変更量に反応する値なら日ごとに揺れなければならない。</p>
+
+                    <p>そしてセッションあたり8.4時間という値が上限を作った。一日24時間に8.4時間のセッションは二つ入り、だから同期は一日2回だった。前の節で述べた「RPO が設計ではなく結果」という文が、ここで数字として確認される。<strong>12時間という RPO は誰かが定めた目標ではなく、セッション長が残した余りだった。</strong></p>
+
+                    <h2 id="sec-5">再帰変更時刻という値 - ceph.dir.rctime</h2>
+
+                    <p>ここで必要なのは、「この配下ツリーに変更があったか」という一つの問いに<strong>配下を走査せずに</strong>答える手段である。CephFS はその手段をすでに持っている。</p>
+
+                    <p><code>ceph.dir.rctime</code> はディレクトリに付く<strong>読み取り専用の拡張属性</strong>である。配下ツリーでファイルやディレクトリが変わると、その変化が<strong>上位へ伝播</strong>する。MDS が管理する値であり、Luminous を含むそれ以降のバージョンで使える。アプリケーションがこの値を更新するのではなくファイルシステムが維持する、という点が重要だ。同期ツールが自前で何かを書いておき、それを信じる構造ではない。</p>
+
+                    <p>コストの観点で見たこの値の性質は単純である。<strong>値を一つ読むのは呼び出し一回であり、その呼び出しは配下を走査しない。</strong>ディレクトリの下に項目が十個だろうと一千万個だろうと、読むコストは同じだ。全走査が O(n) である場所で、この読み取りは O(1) である。</p>
+
+                    <p>再帰メタデータという発想自体、CephFS では珍しいものではない。Ceph 公式ドキュメントはディレクトリの <code>st_size</code> を配下の内容の再帰的なサイズとして報告するマウントオプションを定義しており、POSIX との差異を扱うページも再帰サイズのフィールドを CephFS が維持すると記している。<strong>このファイルシステムはツリーを上がりながら集計された値をすでに持っている。</strong>変更時刻はその系列の一つだ。</p>
+
+                    <p>だから設計の出発点が裏返る。よくある取り組み方は「変更を追跡する台帳を自分たちで作ろう」だが、ここでは<strong>すでに存在する台帳を読むだけでよい。</strong>台帳を自分で作れば、その正確さ・更新時点・復旧方法をすべて自分で引き受けることになるが、ファイルシステムが維持する値ならその責任はファイルシステム側にある。</p>
+
+                    <h2 id="sec-6">その値が保証すること、しないこと</h2>
+
+                    <p>この値で配下を飛ばす判断を立てるには、その判断がどちらの向きにだけ成り立つかを先に釘付けにしておく必要がある。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>区分</th><th>内容</th><th>設計への帰結</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>保証する</td><td>配下ツリーで変更が起きれば上位ディレクトリの値も上がる</td><td>値がそのままなら下を見る必要がない。飛ばす根拠はここに立つ</td></tr>
+                            <tr><td>保証する</td><td>値を一つ読むのに配下への降下が要らない</td><td>判定コストがツリーの大きさと無関係になる</td></tr>
+                            <tr><td>保証しない</td><td>何が変わったのか</td><td>変更リストは依然として rsync が作る。この値は対象範囲を狭めるだけだ</td></tr>
+                            <tr><td>保証しない</td><td>いくつ、どれだけ変わったのか</td><td>値が変わったという事実から転送量を予測できない</td></tr>
+                            <tr><td>保証しない</td><td>値が変われば データも変わったという逆向き</td><td>データ変更なしに値だけが上がる経路がある。スナップショットの節で扱う</td></tr>
+                            <tr><td>保証しない</td><td>伝播がどれだけ速く終わるか</td><td>負荷状態による更新遅延の特性はこの記事の範囲外である</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>表の三行目からがこの設計の性格を決める。この値は<strong>変更追跡ツールではなく枝刈りの信号</strong>である。「ここは見なくてよい」を安く告げるのがすべてであり、「ここはこういうものが変わった」は依然として後段の仕事だ。だからこの方式は rsync を置き換えない。<strong>rsync が働くべき範囲を狭めるだけである。</strong></p>
+
+                    <p>向きの非対称もそのまま受け入れる必要がある。値が同じであることは強い信号であり、値が違うことは弱い信号だ。同じなら確実に飛ばせるが、違うからといって運ぶものがあるという意味にはならない。幸いこの非対称は安全な向きを指している。<strong>弱い信号の側で外れれば無駄働きで済み、強い信号の側で外れればデータを取りこぼす。</strong>この値は強い信号の側が堅い構造になっている。</p>
+
+                    <p>値そのものの表記が実装レベルで扱われてきた値である、という点も記録しておく価値がある。Luminous のリリースノートには、この属性のナノ秒成分の表記が誤っていた不具合の修正項目が残っている。値を文字列として受け取って比較する構造なら、<strong>表記形式そのものが比較の一部</strong>になるという意味だ。</p>
+
+                    <h2 id="sec-7">判定の構造 - 同じなら飛ばし、違えば降りる</h2>
+
+                    <p>比較の一方はソースの現在の値である。もう一方が必要になるが、それは<strong>「最後に成功した同期時点のソースの値」</strong>だ。この値をどこに置くかが設計の二つめの決定である。</p>
+
+                    <p>この設計はそれを<strong>ターゲットディレクトリのカスタム拡張属性</strong>に置く。同期が成功で終わったら、そのときのソースの値をターゲット側に書いておく。次回の実行はソースの現在の値とターゲットに書かれた値を比べる。別のデータベースや状態ファイルを持たないので、<strong>状態がデータと同じ場所に住む。</strong>ターゲットディレクトリが消えればその区間の記録も一緒に消えるので、データがないのに「同期済み」という印だけが残る状態は生じない。状態とデータが食い違う経路が一つ減る形だ。</p>
+
+                    <p>比較の結果は四つの判定のいずれかに落ちる。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>判定</th><th>条件</th><th>動作</th><th>コスト</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>SKIP</td><td>ルートで値が同じ</td><td>rsync をまったく呼び出さない</td><td>0秒。値の読み取り一回で終わる</td></tr>
+                            <tr><td>INCR</td><td>ルートは違い、一部の配下は同じ</td><td>値が違うディレクトリだけを rsync の対象に渡す</td><td>違っているディレクトリ数に比例する</td></tr>
+                            <tr><td>FULL</td><td>初回の一度</td><td>全体を rsync する</td><td>全走査と同じ</td></tr>
+                            <tr><td>FAIL</td><td>rsync が0以外のコードで終了した</td><td>ログだけ残し、値を記録しない</td><td>その回のコストは捨てられ、次回の実行が引き受ける</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>SKIP がこの設計の目的である。残る三つは SKIP が成り立たないときの処理であり、とくに FAIL はあとで節を一つ立てるほど重要だ。注目すべきは SKIP のコストが<strong>ツリーの大きさと無関係</strong>である点である。100 GB のツリーでも 1 TB のツリーでも、「変更なし」を確かめるのにかかる作業は同じだ。</p>
+
+                    <p>INCR の性質も押さえておく。ルートの値が変わったというのはどこかに変更があるという意味にすぎず、ツリー全体が変わったという意味ではない。一段降りて同じ比較を繰り返せば、たいてい<strong>ほとんどの枝がその場で刈り落とされる。</strong>変更が局所的なワークロードほどこの枝刈りがよく効く。</p>
+
+                    <h2 id="sec-8">四段階の実行と各段階の役割</h2>
+
+                    <p>一回の実行は四段階に分かれる。各段階が次の段階の入力を作る構造であり、最初の段階で終わる場合が最も多い経路だ。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>段階</th><th>すること</th><th>産出物</th><th>ここで終わる条件</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>1</td><td>ルートディレクトリのソースの値とターゲットに記録された値を比べる</td><td>同じか違うか</td><td>同じなら SKIP で終わる。2〜4段階を実行しない</td></tr>
+                            <tr><td>2</td><td>値が違うディレクトリを集める。同じディレクトリはその場で刈り落とす</td><td>同期対象ディレクトリの一覧</td><td>一覧が空ならすることがない</td></tr>
+                            <tr><td>3</td><td>集めたディレクトリだけを rsync する。削除の反映を含む</td><td>rsync の終了コード</td><td>0でなければ FAIL に落ちる</td></tr>
+                            <tr><td>4</td><td>成功したディレクトリのターゲットにそのときのソースの値を記録する</td><td>次回の実行の比較基準</td><td>ここまで来て初めて次回が飛ばせる</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>1段階で終わる経路が、この設計の利得が発生する場所である。<strong>変更のない日には2段階以降がまったく実行されない。</strong>全走査方式で「変更がないことを確かめるコスト」がツリー全体を走査するコストと同じだったのと対照的だ。</p>
+
+                    <p>2段階は上から下へ降りながら同じ比較を繰り返す。重要なのは<strong>同じ値に出会った枝はその下を開かない</strong>という点である。したがってこの段階のコストは全ディレクトリ数ではなく<strong>値が違う経路の数</strong>に比例する。変更がツリーの一隅に偏っていれば、残り全部が一回の比較で切り落とされる。</p>
+
+                    <p>3段階で rsync に渡すのは狭められたディレクトリ一覧である。オプションには削除の反映が含まれる。ソースで消えたものがターゲットに残ると二つのツリーが食い違うからだ。ただしこのオプションは対象範囲の狭め方を誤ったときの被害が大きいオプションでもあり、2段階が作る一覧の正確さがそのまま安全性につながる。</p>
+
+                    <p>4段階は記録である。この段階が次回の1段階を可能にする。そして<strong>この段階を条件付きにすること</strong>が次の節の主題だ。</p>
+
+                    <h2 id="sec-9">失敗したら記録しない - 片側にだけ外れさせる</h2>
+
+                    <p>rsync が0以外のコードで終了したら、ログだけを残して<strong>ターゲットに値を記録しない。</strong>一行の規則だが、この設計で最も重要な安全装置である。</p>
+
+                    <p>記録してしまうとどうなるかを追うと理由がはっきりする。失敗した区間に「この時点まで同期済み」という印が残り、次回の実行はソースの値とその印を比べて<strong>同じだと判定する。</strong>そしてその区間を飛ばす。失敗したデータは運ばれないまま残り、以後その区間に新しい変更が生じるまで<strong>誰もその事実を知りようがない。</strong>失敗が一度の遅延で終わらず、恒久的な欠落として固まる。</p>
+
+                    <p>記録しなければ逆になる。次回の実行でソースの値とターゲットの値が依然として違うので、同じ区間がふたたび対象になる。<strong>失敗が次回の実行へ持ち越される。</strong>一時的な原因だったなら次の回で解消し、持続的な原因ならば同じ区間が対象に選ばれ続けてログに繰り返し残る。どちらにせよ<strong>失敗が見える状態で保たれる。</strong></p>
+
+                    <p>二つの誤りの重さが違う、というのが設計の根拠である。整理するとこうなる。</p>
+
+                    <ul>
+                        <li><strong>記録を遅らせて生じる損</strong> — すでに運ばれた区間を次回の実行がもう一度見る。コストはその区間をもう一度比較する時間であり、データは無傷である。</li>
+                        <li><strong>記録を早めて生じる損</strong> — 運ばれていない区間が運ばれたものとして印される。コストはデータの欠落であり、その欠落は自分から姿を現さない。</li>
+                        <li><strong>したがって規則は一つである</strong> — 確信がなければ記録しない。判定が外れうるなら、<strong>無駄働きをする側に</strong>外れるようにする。</li>
+                        <li><strong>部分成功も同じ原則で扱う</strong> — 成功したディレクトリにだけ値を残せば、失敗したディレクトリは次の回の対象へ自動的に戻る。実行単位ではなくディレクトリ単位で記録する理由がこれだ。</li>
+                    </ul>
+
+                    <p>この規則は安い。追加の資源がかからず、別のリトライキューも要らない。<strong>「記録しないこと」自体がリトライキューの役目を果たす。</strong>次回の実行の比較が同じ区間を拾い直すからだ。</p>
+
+                    <h2 id="sec-10">深さ上限というつまみ</h2>
+
+                    <p>2段階の降下には深さ上限がある。上限に達したらそれ以上下へ降りず、<strong>そのディレクトリを丸ごと rsync の対象に渡す。</strong></p>
+
+                    <p>上限が必要な理由は、降下そのものにもコストがあるからだ。一段降りるたびにその層のディレクトリごとに値を読まねばならず、深さ制限なしに降りていけば<strong>結局は全ディレクトリを走査することに収束する。</strong>そうなると、なくそうとした O(n) が形を変えて戻ってくる。</p>
+
+                    <p>だからこの上限は二つのコストのあいだのつまみである。<strong>深く降りるほど rsync に渡す範囲は狭まり、値を読む回数は増える。</strong>浅く切れば逆になる。最適点はツリーの形と変更の分布によって変わる。あとに出てくる測定はすべて上限を10に固定した状態で得た値であり、この値を変えたときの感度は続く第2部で扱う。</p>
+
+                    <h2 id="sec-11">コスト構造 - O(n) と O(1) と O(k)</h2>
+
+                    <p>ここまでの内容をコスト関数に縮めると、二つの方式の違いが一目で入ってくる。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>状況</th><th>全走査</th><th>再帰変更時刻の比較</th><th>差が出る理由</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>変更0件</td><td>O(n)</td><td>O(1)</td><td>前者は全項目を読んで初めて「なし」を知る。後者は値一つで知る</td></tr>
+                            <tr><td>変更が局所的</td><td>O(n)</td><td>O(k)</td><td>k は値が違うディレクトリ数。変更と無関係な枝は開かれない</td></tr>
+                            <tr><td>変更が全面的</td><td>O(n)</td><td>O(k)、kがnに近づく</td><td>刈り落とす枝がなければ二つの方式は同じになる</td></tr>
+                            <tr><td>ディレクトリの大量生成</td><td>O(n)</td><td>O(k) + 記録コスト</td><td>後者にだけ新規ディレクトリごとに値を残す項が付く</td></tr>
+                            <tr><td>初期シーディング</td><td>O(n)</td><td>O(n)</td><td>全部転送しなければならず、飛ばせる区間がない</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>n は全ファイルとディレクトリの数、k は値が違うディレクトリの数である。一行目がこの設計の目的であり、<strong>四行目がこの設計が代価を払う場所</strong>だ。全走査にはなかった項がここに一つ付く。新しくできたディレクトリごとに同期時刻を残さねばならず、その記録はディレクトリ数に比例する。</p>
+
+                    <p>コスト関数をこう分けておくと、「いつ使い、いつ使わないか」が性能試験ではなく<strong>構造から先に</strong>出てくる。変更がまれで局所的なら一行目と二行目の利得が大きく、ディレクトリ生成が頻繁なら四行目の損がそれを削る。あとの測定はこの予測をそのまま確認してくれる。<strong>勝ったときも負けたときも、表が予測した場所でそうなった。</strong></p>
+
+                    <h2 id="sec-12">測定条件 - 結果より先に立てる</h2>
+
+                    <p>数値を見る前に、その数値がどんな条件から出たのかを先に固定する。条件のない比較はどちらの方向へも望む結論を作れてしまう。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>項目</th><th>条件</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>ソースとターゲット</td><td>両側とも CephFS。ソースを Cluster-A、ターゲットを Cluster-B と記す</td></tr>
+                            <tr><td>リンク</td><td>10 Gbps 専用リンク</td></tr>
+                            <tr><td>初期データセット</td><td>約 1 TB、約 90,000 ディレクトリ</td></tr>
+                            <tr><td>ファイルシステムのバージョン</td><td>CephFS Reef 18.x</td></tr>
+                            <tr><td>同期ツール</td><td>rsync 3.2.x</td></tr>
+                            <tr><td>走査の深さ上限</td><td>10</td></tr>
+                            <tr><td>並列度</td><td>1。公正な比較のため逐次に固定した</td></tr>
+                            <tr><td>rsync オプション</td><td>両側とも同一。アーカイブ・ハードリンク保持・削除の反映・強制削除・統計出力</td></tr>
+                            <tr><td>キャッシュ</td><td>一部のラウンドの間にページキャッシュを落としてコールドスタートを作った</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>二つ付け加える。第一に、<strong>両側が同じ rsync オプションを使う。</strong>全走査の側に不利なオプションを与えて比べれば、その差は方式の差ではなくオプションの差になる。第二に、<strong>並列度を1に固定した。</strong>並列化は二つの方式のどちらにも適用できる別の軸なので、混ぜるとどちらの寄与か分けられなくなる。</p>
+
+                    <p>記録しておくことがもう一つある。<strong>3番と6番のラウンドは試験インフラの保守のため飛ばした。</strong>下の表の番号が 1・2・4・5・7・8・9・10 と跳ぶ理由がそれである。二つのラウンドでどんな値が出たかは分からず、その場所を別の値で埋めてもいない。</p>
+
+                    <h2 id="sec-13">ラウンド別の結果 - 何が速くなったのか</h2>
+
+                    <p>同じ条件で二つの方式を交互に回した結果である。シナリオは上から下へ行くほどデータが積み上がる順になっている。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>ラウンド</th><th>シナリオ</th><th>全走査</th><th>この方式</th><th>結果</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>1</td><td>初期の全体同期(約 1 TB)</td><td>5,715秒</td><td>5,381秒</td><td>ほぼ同じ。約6%速い。どちらも全部転送する</td></tr>
+                            <tr><td>2</td><td>無変更、キャッシュが温かい状態</td><td>13秒</td><td>0秒 SKIP</td><td>rsync の呼び出し自体が0回</td></tr>
+                            <tr><td>4</td><td>ファイル1個の追加</td><td>7秒</td><td>2秒</td><td>約3.5倍</td></tr>
+                            <tr><td>5</td><td>コールドキャッシュ、無変更</td><td>14秒</td><td>2秒</td><td>約7倍</td></tr>
+                            <tr><td>7</td><td>コールドキャッシュ、無変更</td><td>15秒</td><td>0秒 SKIP</td><td>I/O 0</td></tr>
+                            <tr><td>8</td><td>100 GB と新規ディレクトリ5万個の追加</td><td>568秒</td><td>975秒</td><td>全走査が1.7倍速い</td></tr>
+                            <tr><td>9</td><td>1.1 TB の状態でファイル1個の追加</td><td>56秒</td><td>9秒</td><td>約6.2倍</td></tr>
+                            <tr><td>10</td><td>1.1 TB の状態で無変更</td><td>24秒</td><td>0秒 SKIP</td><td>即時スキップ</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>1番のラウンドから見る。初期の全体同期で二つの方式の差は事実上ない。5,715秒と5,381秒で約6%の差だが、<strong>この区間では両方とも全部転送するので</strong>差が出る理由がない。この行は利得を見せる行ではなく、<strong>利得がないはずの場所で利得がないことを見せる行</strong>である。ここで大きな差が出ていたら、むしろ測定を疑うべきだ。</p>
+
+                    <p>2・5・7・10番のラウンドがこの設計の狙った場所である。無変更のとき全走査は13秒・14秒・15秒・24秒を使う。これらの値がデータの増加につれて大きくなる点は見ておく価値がある。同じ条件でこの方式は0秒または2秒だ。<strong>0秒は四捨五入ではなく、rsync を呼び出さなかったという意味である。</strong>5番のラウンドの2秒は、コールドキャッシュから値を読んでくるのにかかった時間だ。</p>
+
+                    <p>4番と9番は「実際に少し変わった日」である。4番で7秒対2秒、9番で56秒対9秒だった。二つのラウンドの変更量は同じくファイル1個なのに、<strong>全走査の所要は7秒から56秒へ増え、この方式は2秒から9秒へ増えた。</strong>データが約 1 TB から 1.1 TB へ増えた区間で、前者はデータ総量を追いかけ、後者ははるかに緩やかに動いた。</p>
+
+                    <p>そして8番のラウンドでこの方式が負けた。その行には節を別に立てる。</p>
+
+                    <h2 id="sec-14">この方式が負けたラウンド - 新規ディレクトリ5万個</h2>
+
+                    <p>8番のラウンドの条件は<strong>100 GB と新規ディレクトリ5万個を一度に追加</strong>することだった。結果は全走査568秒、この方式975秒である。<strong>全走査が1.7倍速く、407秒少なく済んだ。</strong></p>
+
+                    <p>原因は前のコスト表の四行目にすでに書かれている。この設計には全走査にない項が一つある。<strong>新しくできたディレクトリごとに同期時刻を記録するコスト</strong>だ。ディレクトリが5万個増えればその記録も5万回起きる。そのラウンドでは、走査を飛ばして節約した時間より<strong>記録に使った時間のほうが大きかった。</strong></p>
+
+                    <p>この結果は設計の欠陥を意味しない。コスト構造が予測したとおりだからである。ただし次の二点は明確にしておく。</p>
+
+                    <ul>
+                        <li><strong>この方式のコストにはディレクトリ生成率に比例する項がある。</strong>全走査にはその項がない。だから生成率が十分に高ければ順序が逆転する。</li>
+                        <li><strong>そのコストは一回限りである。</strong>一度記録しておけばそのディレクトリは以後の回で比較対象になり、変更がないかぎり再び記録しない。8番のラウンドが作った5万個は、9番と10番のラウンドのそれぞれ9秒と0秒という結果に寄与した。</li>
+                        <li><strong>したがって判断の基準は頻度である。</strong>ディレクトリの大量生成が一度きりの出来事なら、その回だけ遅くて終わる。それがワークロードの常時の性質なら損が積み上がり続ける。</li>
+                        <li><strong>回単位で見れば負けるが、区間で見れば違う。</strong>8番で407秒を余計に使い、そのあと9番と10番でそれぞれ47秒と24秒を節約した。同じ条件が繰り返されるほど、この収支の傾きは変わる。</li>
+                    </ul>
+
+                    <p>負けたラウンドを表から消せば、残る表は「無変更なら0秒」だけを繰り返す宣伝物になる。この行があってこそ<strong>利得の大きさと、その利得が成り立つ条件</strong>が一緒に読める。そして実務の判断はたいてい平均ではなく最悪の回で分かれる。8番のラウンドはこの方式の最悪に当たる。</p>
+
+                    <h2 id="sec-15">規模が大きくなるとき - 測定値と推定を分けて</h2>
+
+                    <p>無変更の状態でデータセットの大きさが所要にどう反映されるかを整理すると下のようになる。<strong>測定値と推定を同じ列に混ぜない。</strong></p>
+
+                    <table>
+                        <thead>
+                            <tr><th>データセットの大きさ</th><th>全走査</th><th>この方式</th><th>測定か推定か</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>100 GB</td><td>約3秒</td><td>0秒</td><td>測定値</td></tr>
+                            <tr><td>500 GB</td><td>約10秒</td><td>0秒</td><td>測定値</td></tr>
+                            <tr><td>1 TB</td><td>約24秒</td><td>0秒</td><td>測定値</td></tr>
+                            <tr><td>5 TB</td><td>約120秒</td><td>0秒</td><td><strong>推定</strong>。測定していない</td></tr>
+                            <tr><td>10 TB</td><td>約240秒</td><td>0秒</td><td><strong>推定</strong>。測定していない</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>最後の二行は実際に回して得た値ではない。<strong>5 TB と 10 TB の行は推定である。</strong>前の三行が示す比例関係を延長した値であり、その規模で実際にどうなるかはこの試験が答えない。大きな規模ではメタデータキャッシュのヒット率と MDS の負荷分布が変わるので、比例がそのまま保たれる保証はない。表に列を一つ増やした理由がそれである。</p>
+
+                    <p>左の列の性質はそのまま読んでよい。<strong>全走査の所要はデータセットの大きさに沿って上がる。</strong>無変更という条件はどの行でも同じなのに値は大きくなる。この表の左の列が、この記事の最初の一文を絵にして見せている。</p>
+
+                    <p>右の列は大きさと無関係に0である。これは性能がよいという意味ではなく、<strong>仕事をしなかったという意味</strong>だ。値を一つ比べて同じだという結論が出たので、その次の段階が実行されなかった。ここに誇張の余地はないが、同じ理由で<strong>この列は変更のある日には成り立たない。</strong></p>
+
+                    <h2 id="sec-16">使わないほうがよい三つの場合</h2>
+
+                    <p>この設計が利得にならない、あるいはむしろ損になる条件がある。三つあり、三つとも前のコスト構造からそのまま出てくる。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>状況</th><th>なぜ利得がないのか</th><th>根拠</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>初期シーディング</td><td>全部転送しなければならず、飛ばせる区間がそもそもない</td><td>1番のラウンドで二つの方式の差は約6%にとどまった</td></tr>
+                            <tr><td>ディレクトリを大量に作り続けるワークロード</td><td>値を記録するコストが走査の節約を相殺する</td><td>8番のラウンドで全走査が1.7倍速かった</td></tr>
+                            <tr><td>CephFS 以外のファイルシステム</td><td>この拡張属性は CephFS 専用であり、他の分散ファイルシステムにはない</td><td>判定の根拠になる値そのものが存在しない</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>三つめの項目をもう少し書く。一般的なローカルファイルシステムにもディレクトリの変更時刻はあるが、それは<strong>そのディレクトリ自体のエントリが変わったときにだけ</strong>上がる。配下の深いところのファイルが一つ変わっても上位ディレクトリの値はそのままだ。だから「値が同じなら下を見なくてよい」という判断が成り立たない。この設計の移植性はツールの問題ではなく、<strong>ファイルシステムが再帰メタデータを維持するか</strong>の問題である。</p>
+
+                    <p>二つめの項目には程度の差がある。ディレクトリ生成が断続的な出来事なら、その回だけ遅くて終わる。しかしワークロードが常時ディレクトリを作り出すなら毎回その代価を払う。<strong>判断の基準は総量ではなく、一回あたりの新規ディレクトリ数</strong>である。</p>
+
+                    <h2 id="sec-17">スナップショットとの相互作用 - データがそのままでも値は変わる</h2>
+
+                    <p>知られている相互作用が一つある。<strong>CephFS のスナップショットを削除すると、該当ディレクトリの再帰変更時刻が変わる。</strong>ファイルの中身はそのままなのに値が上がる場合である。</p>
+
+                    <p>この方式は値の変化を変更の信号として読むので、そのディレクトリは INCR と判定される。実害はない。続いて実行される rsync が両側を突き合わせれば運ぶものがなく、だから転送量は0である。ただし<strong>コストはかかる。</strong>その区間を走査する時間と、同期時刻を記録し直す時間だ。前の節で「値が違うことは弱い信号」と記した理由がここにある。</p>
+
+                    <p>運用で扱う方法は二つある。</p>
+
+                    <ul>
+                        <li><strong>スナップショットの整理を閑散な時間帯に置く。</strong>値が揺れる時点と同期が回る時点を重ねないようにすれば、空走査の影響が小さくなる。</li>
+                        <li><strong>予期しない INCR の急増を観測対象にする。</strong>変更量が少ないのに INCR の判定が増えるなら、データ変更ではない原因を先に疑う場所になる。判定の分布そのものが信号になるわけだ。</li>
+                        <li><strong>スナップショット削除が頻繁な区間は期待値を別に取る。</strong>その区間では SKIP の比率が低く出るのが正常なので、全体平均一つで判断すると原因を取り違える。</li>
+                    </ul>
+
+                    <p>この相互作用はこの設計だけに当てはまるものではなく、<strong>再帰変更時刻を信号として使うすべての構造</strong>に当てはまる。値が上がる経路がデータ変更ひとつだけだと仮定すれば、どこでも同じ誤差が生じる。</p>
+
+                    <h2 id="sec-18">まとめ - 五つの文</h2>
+
+                    <p>ここまでを五つの文に縮めるとこうなる。</p>
+
+                    <ul>
+                        <li><strong>比較段階が全体を走査するなら、名前が増分でもコストは増分ではない。</strong>一日の変更が133件・0.88 MB なのに処理ボリュームが 11.25 GB で四日間ずっと固定だった、というのがその証拠である。</li>
+                        <li><strong>CephFS はすでに答えを持っている。</strong><code>ceph.dir.rctime</code> は配下ツリーの変更を上位へ伝播する読み取り専用の属性であり、この値を読むのに配下への降下が要らない。</li>
+                        <li><strong>同じなら飛ばし、違えば降りる。</strong>無変更なら O(1)、変更があれば値が違うディレクトリ数に比例する O(k) である。無変更のラウンドで全走査が13〜24秒を使うあいだ、この方式は0秒で終わった。</li>
+                        <li><strong>失敗したら記録しない。</strong>判定が外れうるなら、データを取りこぼす側ではなく無駄働きをする側に外れるようにする。</li>
+                        <li><strong>常に勝つわけではない。</strong>新規ディレクトリ5万個を一度に作った8番のラウンドでは全走査が1.7倍速く、初期シーディングでは利点がなく、CephFS でなければ使えない。</li>
+                    </ul>
+
+                    <p>運用に移して変わったのは周期だった。セッション長がデータ総量から解放されたことで一日2回が<strong>一日12回</strong>になり、それに伴って RPO が<strong>12時間から1時間</strong>へ下がった。リンクを替えたり機材を増やしたりして得たものではなく、<strong>しなくてよい作業をしないようにして</strong>得た値である。</p>
+
+                    <p>続く第2部では、深さ上限を変えたときの感度、運用で実際に出た失敗モード、そしてこの方式を使わないほうがよい場合を、さらに詳しく扱う。</p>
+
+                    <h2 id="sec-19">確認できなかったこと</h2>
+
+                    <p>下の項目はこの試験の条件の中では答えが出なかった。根拠がそろうまで断定しない。</p>
+
+                    <ul>
+                        <li><strong>他の Ceph バージョンでの伝播特性</strong> — 測定は Reef 18.x の一つのバージョンでのみ行った。他のバージョンで値が上位へ伝播する時点と遅延が同じかどうかは、この試験が答えない。</li>
+                        <li><strong>MDS の負荷が大きい状態での更新遅延</strong> — 試験環境の負荷は同期そのものが生むものだけだった。他のクライアントがメタデータを大きく使っているときに値の更新がどれだけ遅れるのか、その遅れが判定に影響するのかは範囲外である。</li>
+                        <li><strong>別のファイルサイズ分布での結果</strong> — 約 1 TB に約 90,000 ディレクトリという一つの分布でのみ測定した。小さなファイルがはるかに多いツリーや、大きなファイルが少数のツリーで比率がどう変わるかは、この表から読み取れない。</li>
+                        <li><strong>3番と6番のラウンドの値</strong> — 試験インフラの保守のため飛ばした。二つの場所を別の値で埋めておらず、そのシナリオがどちらに有利だったかも推定しない。</li>
+                        <li><strong>5 TB と 10 TB 規模の実際の所要</strong> — 該当の行は前の測定値から延長した推定である。その規模でキャッシュのヒット率とメタデータの分布がどう変わるかは測定の対象ではなかった。</li>
+                        <li><strong>深さ上限を変えたときの最適点</strong> — すべてのラウンドが上限10で行われた。別の値で降下コストと rsync の範囲の均衡がどこに置かれるかは、この条件では答えが出ない。</li>
+                        <li><strong>並列実行での結果</strong> — 公正な比較のため並列度を1に固定した。並列化が二つの方式にそれぞれどれだけ寄与するかは、別の条件が必要である。</li>
+                    </ul>
+
+                    <h2 id="sec-20">参考資料</h2>
+
+                    <ul>
+                        <li><a href="https://docs.ceph.com/en/reef/man/8/mount.ceph/" target="_blank" rel="noopener">Ceph 公式ドキュメント・mount.ceph マニュアル</a> — ディレクトリの <code>st_size</code> を配下の内容の再帰的なサイズとして報告するマウントオプションと、その逆のオプションの定義。CephFS が再帰集計値を維持することの根拠。</li>
+                        <li><a href="https://docs.ceph.com/en/reef/cephfs/posix/" target="_blank" rel="noopener">Ceph 公式ドキュメント・POSIX との差異</a> — 再帰サイズのフィールドを CephFS が維持するという記述。</li>
+                        <li><a href="https://docs.ceph.com/en/latest/releases/luminous/" target="_blank" rel="noopener">Ceph 公式ドキュメント・Luminous リリースノート</a> — <code>ceph.dir.rctime</code> がリリースノートに登場する箇所。この属性値のナノ秒成分の表記の不具合を修正した項目が載っている。</li>
+                        <li>この記事の設計・判定構造・測定結果は筆者が作って運用に適用したものであり、上の三件を除く外部の出典はない。</li>
+                    </ul>
+
+                </div>
+
+                <div class="share-section">
+                    <h3>この記事をシェア</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">リンクをコピー</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">一覧に戻る</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">一緒に使うと便利な無料ツール</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/iptables_generator.html">iptables ファイアウォールルール生成ツール</a></li>
+      <li><a href="../static/code_image.html">コード画像ジェネレーター</a></li>
+      <li><a href="../static/char_counter.html">文字数カウント</a></li>
+      <li><a href="../static/json_formatter.html">JSON フォーマッター</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">すべてのツールを見る &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">関連記事</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="backup_restore_verification.html">「バックアップがある」と「復元できる」は別の命題である - 成功したバックアップが嘘をつく場所と、復元検証が実際に要求するもの</a></li>
+      <li><a href="rsync_trailing_slash_guide.html">rsync の末尾スラッシュ一つで結果が変わる理由 - 消す前に確かめる手順 2026</a></li>
+      <li><a href="postgres_horizontal_scaling_cost.html">Postgresを複数台に分割するという選択 - 水平スケーリングがトランザクション・結合・制約に請求する対価</a></li>
+      <li><a href="oss_ownership_beyond_license.html">コードは開いていても名前は開いていない - オープンソースライセンスが決めない商標・ドメイン・リリース権限</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('リンクをコピーしました。Threads アプリに貼り付けて共有してください。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('リンクをコピーしました。'); });
+    });
+    </script>
+</body>
+</html>

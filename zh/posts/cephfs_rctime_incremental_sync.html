@@ -1,0 +1,675 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>没有变更也要全量扫描 - 用 CephFS rctime 跳过全量扫描的增量同步设计</title>
+    <meta name="description" content="变更为零时，全量扫描依然要付出同样的代价。本文整理的是只比较一个 CephFS 的 ceph.dir.rctime 递归变更时间、就能跳过整棵子树的增量同步设计，并附上完整的测量条件，以及这种方式反而更慢的那一轮和不该使用它的场合。">
+    <meta name="keywords" content="CephFS, rctime, ceph.dir.rctime, 增量同步, rsync, 全量扫描, 元数据扫描, 跨集群复制, RPO, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/cephfs_rctime_incremental_sync.html">
+
+    <meta property="og:title" content="没有变更也要全量扫描 - 用 CephFS rctime 跳过全量扫描的增量同步设计">
+    <meta property="og:description" content="当代价取决于数据总量而不是变更量时，名字叫增量也不是增量。比较一个值就决定要不要打开整棵子树。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/cephfs_rctime_incremental_sync.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-09-12">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="没有变更也要全量扫描 - CephFS rctime 增量同步设计">
+    <meta name="twitter:description" content="在零变更的日子里，全量扫描照样收全价。比较一次递归变更时间就能把这笔账抹掉。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "没有变更也要全量扫描 - 用 CephFS rctime 跳过全量扫描的增量同步设计",
+      "alternativeHeadline": "只要比较阶段把整棵树走一遍，名字叫增量，代价也不是增量",
+      "datePublished": "2026-09-12",
+      "dateModified": "2026-09-12",
+      "inLanguage": "zh-CN",
+      "articleSection": "开发/基础设施",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "CephFS, rctime, ceph.dir.rctime, 增量同步, rsync, 全量扫描, 元数据扫描, 跨集群复制, RPO",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/cephfs_rctime_incremental_sync.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "ceph.dir.rctime 是什么，它保证了什么?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "它是 CephFS 挂在目录上的只读扩展属性，由 MDS 负责维护。子树里的文件或目录发生变化时，该变化会向上级目录传播。从 Luminous 起的版本都可以使用。读取这个值只是一次调用，不会遍历子树。它只在一个方向上给出保证：下面有变更，上面的值就会抬升，因此值没有变就没有必要再往下看。至于变了什么、变了多少个、变了多大，这个值并不回答。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "它和全量扫描的 rsync 在代价上有什么不同?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "全量扫描是 O(n)，n 是文件与目录的总数，即便这一天变更为零，这份代价也要照样付出，因为比较阶段会把整棵树走一遍。比较递归变更时间的方式，在无变更时是 O(1)，有变更时是 O(k)，k 是值发生变化的目录数量，与总体规模无关。差别出在比较而不是传输。两种方式实际传输的字节数是一样的，都等于真实变更量。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "这种方式是不是总是更快?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "不是。它在测试的第8轮输了。在一次性加入 100 GB 与 5 万个新目录的条件下，全量扫描用了 568 秒，这种方式用了 975 秒。全量扫描快约 1.7 倍，差距 407 秒。每个新建目录都需要写入同步时刻，这笔一次性的写入开销超过了跳过扫描所节省的时间。初次播种同样没有好处，因为一切都必须传输，根本没有可跳过的区间。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "如果 rsync 失败了，下一次运行会怎样?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "当 rsync 以非零码结束时，只留下日志，不在目标上写入任何值。这是该设计最核心的安全装置。失败却照写不误的话，下一次运行会把源端的值与那条记录相比并判定为相同，于是跳过该区间。失败的数据就那样留在原地没有送出，而且没有任何东西会暴露这件事。不写入，两边的值就依然不同，同一区间会重新成为下一次的对象。两种错误的分量不同，所以设计成只会往一个方向出错。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "在 CephFS 以外的文件系统上能用吗?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "不能。递归变更时间是 CephFS 维护的值，其他分布式文件系统没有同样的属性。普通本地文件系统的目录时间戳，只有在该目录自身的条目发生变化时才会抬升，不会把子树深处的变化向上传播。于是「值相同就不必往下看」这个判断失去了依据。这套设计的可移植性不取决于同步工具，而取决于文件系统是否维护递归元数据。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/cephfs_rctime_incremental_sync.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/cephfs_rctime_incremental_sync.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/cephfs_rctime_incremental_sync.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/cephfs_rctime_incremental_sync.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/cephfs_rctime_incremental_sync.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "首页",
+      "item": "https://braindetox.kr/zh/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "开发/基础设施",
+      "item": "https://braindetox.kr/zh/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "没有变更也要全量扫描 - 用 CephFS rctime 跳过全量扫描的增量同步设计",
+      "item": "https://braindetox.kr/zh/posts/cephfs_rctime_incremental_sync.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="没有变更也要全量扫描 - 用 CephFS rctime 跳过全量扫描的增量同步设计">
+                <meta itemprop="datePublished" content="2026-09-12">
+                <meta itemprop="dateModified" content="2026-09-12">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="CephFS, rctime, ceph.dir.rctime, 增量同步, rsync, 全量扫描, 元数据扫描, 跨集群复制, RPO">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/cephfs_rctime_incremental_sync.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">没有变更也要全量扫描 - 用 CephFS rctime 跳过全量扫描的增量同步设计</h1>
+                    <h2 class="post-subtitle">只要比较阶段把整棵树走一遍，名字叫增量，代价也不是增量</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-12">2026-09-12</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">开发/基础设施</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>如果一次同步跑完所需的时间取决于<strong>你手里有多少数据，而不是有多少数据变了</strong>，那么这次同步无论叫什么名字都不是增量。一棵每天变动 <strong>133 项、0.88 MB</strong> 的树，要花 <strong>16.7 小时</strong> 才能对齐，那么这些时间的绝大部分并没有花在搬运上，而是花在<strong>决定该搬什么</strong>上。</p>
+
+                    <p>切换之前的那套配置，先用快照差分找出发生变更的文件，然后再跑 rsync。名字里带着「增量」两个字，产出的变更清单本身也确实准确。可是耗时并没有降下来。原因可以压成一句话：<strong>即便差分告诉你哪些文件变了，只要下一个阶段仍然逐目录地做比较，总代价就依然和整棵树的大小成正比。</strong></p>
+
+                    <p>所以这件事的轴心不是「怎么把传输做得更快」。传输量本来就只有 0.88 MB。轴心是<strong>能不能在比较开始之前，就把没有变更的区间切掉</strong>。而做这个判断所需要的信息，文件系统早就握在手里。CephFS 会为每个目录维护 <code>ceph.dir.rctime</code>，把子树的最后变更时间递归地抬到上层。读一个值，就决定了它下面要不要打开。</p>
+
+                    <div class="callout">
+                        下面的设计与测量由笔者自行构建并投入运行。外部资料只用 Ceph 官方文档中关于 CephFS 递归统计与扩展属性的部分作为依据，其余数值都来自后文「测量条件」一节所描述的测试环境。文中不出现任何能够指认集群、命名空间或主机的名称，两个集群只写作源端 Cluster-A 与目标端 Cluster-B。也不附源代码与命令示例，算法只用文字和表格来说明。
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>本文讨论的内容</h3>
+                        <ol>
+                            <li><a href="#sec-1">问题 - 耗时并不随变更量增减</a></li>
+                            <li><a href="#sec-2">全量扫描真正在做的事，以及代价从哪里来</a></li>
+                            <li><a href="#sec-3">为什么在分布式文件系统上更疼 - 元数据往返</a></li>
+                            <li><a href="#sec-4">切换前那套配置的记录 - 11.25 GB 不是传输量</a></li>
+                            <li><a href="#sec-5">递归变更时间这个值 - ceph.dir.rctime</a></li>
+                            <li><a href="#sec-6">这个值保证什么，不保证什么</a></li>
+                            <li><a href="#sec-7">判定结构 - 相同就跳过，不同就下降</a></li>
+                            <li><a href="#sec-8">四个执行阶段各自做什么</a></li>
+                            <li><a href="#sec-9">失败就不写入 - 只让它往一个方向出错</a></li>
+                            <li><a href="#sec-10">深度上限这个旋钮</a></li>
+                            <li><a href="#sec-11">代价结构 - O(n) 与 O(1) 与 O(k)</a></li>
+                            <li><a href="#sec-12">测量条件 - 先立条件再看结果</a></li>
+                            <li><a href="#sec-13">分轮结果 - 到底什么变快了</a></li>
+                            <li><a href="#sec-14">这种方式输掉的那一轮 - 5 万个新目录</a></li>
+                            <li><a href="#sec-15">规模变大之后 - 把测量值和推算分开</a></li>
+                            <li><a href="#sec-16">不用它反而更好的三种情形</a></li>
+                            <li><a href="#sec-17">与快照的相互作用 - 数据没动，值却动了</a></li>
+                            <li><a href="#sec-18">小结 - 五句话</a></li>
+                            <li><a href="#sec-19">没能确认的部分</a></li>
+                            <li><a href="#sec-20">参考资料</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">问题 - 耗时并不随变更量增减</h2>
+
+                    <p>在跨集群复制中，一次同步跑完所需的时间通常是两项之和：<strong>判定哪里不一样所花的时间</strong>，以及<strong>把不一样的东西搬过去所花的时间</strong>。后一项与变更量成正比，前一项并不。</p>
+
+                    <p>有一种条件会让这种不对称隐身，那就是数据量小的时候。前一项只有几秒时，后一项占主导，于是「同步时间与搬运量成正比」这个直觉看起来是对的。树一变大，顺序就翻过来。前一项拉长到小时级，而只要变更量不大，后一项依旧停留在秒级。越过某个点之后，<strong>同步时间几乎全部都是「决定该搬什么」这件事</strong>。</p>
+
+                    <p>由此立刻得到一个实务上很重要的结论：在那种状态下<strong>同步周期无法缩短</strong>。一个会话结束才能挂下一个，而会话的长度由数据总量而不是变更量决定。于是恢复点目标（RPO）不再是设计出来的，而成了<strong>剩下来的结果</strong>。一次会话 8.4 小时，一天就只能跑两次，那一刻 RPO 就被钉死在 12 小时。并不是有人把 12 小时定成了目标。</p>
+
+                    <p>于是该问的问题换了形状。不是「怎么把传输做快」，而是<strong>「怎么找出根本不需要比较的区间」</strong>。前一个问题的答案是链路带宽和并行度，而这些答案并不能把已经只有 0.88 MB 的传输量再压下去。</p>
+
+                    <h2 id="sec-2">全量扫描真正在做的事，以及代价从哪里来</h2>
+
+                    <p>rsync 这类工具在对齐两棵树时，工作分成两个阶段。这个区分几乎就是本文的全部。</p>
+
+                    <ul>
+                        <li><strong>比较阶段</strong> — 列举两边的条目，读取每个条目的元数据来做比对，包括名称、大小、修改时间、权限等等。这一阶段的代价与<strong>条目数量</strong>成正比。</li>
+                        <li><strong>传输阶段</strong> — 只搬运比对之后确实不同的那些。这一阶段的代价与<strong>不同的数据量</strong>成正比。</li>
+                    </ul>
+
+                    <p>关键在于两个阶段的代价函数用的是不同的变量。传输阶段在没有变更时会降到零，<strong>但比较阶段在没有变更时并不会降到零</strong>。变更越少，那段时间反而越纯粹地成为浪费，因为它把全部预算都用在读完每一个条目，只为换来「全都一样」这一个结论。</p>
+
+                    <p>正因为这个结构，<strong>换工具解决不了问题</strong>。用哪种工具，想知道两棵树的差异都得把两棵树看一遍，而「看」这个动作的代价由树的大小决定。问题不在工具的品质，而在<strong>比较的范围</strong>。因为误解 rsync 自身行为而产生的结果差异属于另一类问题，那一侧在<a href="rsync_trailing_slash_guide.html">rsync 末尾一个斜杠为何让结果完全不同</a>里单独讲过。</p>
+
+                    <p>在前面接上差分工具也改变不了这个结构。差分即便准确地抽出了变更清单，只要接收清单的一方仍然逐目录地比对两边，比较阶段就原封不动地留着。<strong>收窄清单和收窄比较范围是两回事。</strong>前者减少的是传输阶段，只有后者才减少比较阶段。</p>
+
+                    <h2 id="sec-3">为什么在分布式文件系统上更疼 - 元数据往返</h2>
+
+                    <p>在本地文件系统上读取一个条目的元数据，代价大体接近一次内存访问，因为内核把 inode 和目录项都放在缓存里。同一件事放到 CephFS 上，性质就变了。元数据是由 MDS 管理的资源，客户端虽然会缓存它，但<strong>缓存一空就会产生网络往返</strong>。</p>
+
+                    <p>于是全量扫描的代价在两个方向上同时变差。与条目数成正比这个性质没变，但每个条目的单价比本地高，而且<strong>会随缓存状态大幅波动</strong>。同一棵树用同一种方式走一遍，缓存热和缓存冷时耗时不同，原因就在这里。后面的测量特意安排了把缓存清空的轮次，也是出于这个理由。</p>
+
+                    <p>还要补一句：全量扫描花掉的不只是自己的时间。它产生的元数据请求，会和同一文件系统上的其他客户端争抢同样的资源。扫描拖得越久，争抢的窗口就开得越久。这一层的一般性能特征整理在 <a href="ceph_performance_optimization_guide.html">Ceph 性能优化完全指南</a>里，而块访问与文件访问从一开始就走不同路径这件事，则在 <a href="ceph_rbd_vs_cephfs_comparison.html">Ceph RBD 与 CephFS 对比</a>中。</p>
+
+                    <p>归结起来是这样：全量扫描在哪里都是 O(n)，但<strong>在分布式文件系统上，挂在这个 n 上的常数既大又不稳</strong>。同一个算法在本地还撑得住，到这里就撑不住，原因正在于此。</p>
+
+                    <h2 id="sec-4">切换前那套配置的记录 - 11.25 GB 不是传输量</h2>
+
+                    <p>把切换之前那套配置的四天运行记录并排摆开，上一节的结构就以数字呈现出来。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>项目</th><th>数值</th><th>指的是什么</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>日均同步耗时</td><td>16.7 小时</td><td>一天里有三分之二被同步占住</td></tr>
+                            <tr><td>单次会话耗时</td><td>约 8.4 小时</td><td>无论有没有变更几乎都一样</td></tr>
+                            <tr><td>日均 rsync 处理体量</td><td>11.25 GB</td><td>不是传输字节，而是比较过程中产生的元数据体量</td></tr>
+                            <tr><td>实际日变更量</td><td>133 项、0.88 MB</td><td>同一时期真正发生变化的全部内容</td></tr>
+                            <tr><td>每日同步次数</td><td>2 次</td><td>会话 8.4 小时，再多就挂不下了</td></tr>
+                            <tr><td>因此定型的 RPO</td><td>12 小时</td><td>不是选定的目标，而是会话长度决定的数字</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>第三行和第四行之间的落差就是这张表的全部。<strong>11.25 GB 并不是被搬走的数据。</strong>那段时间里真正不同的只有 0.88 MB。11.25 GB 是 rsync 在走树的过程中激起的<strong>元数据比较体量</strong>。尽管差分已经报出了哪些文件发生变更，目录级的比较照样执行，于是代价追的是数据总量而不是变更量。</p>
+
+                    <p>还有一项观测支持同样的读法：<strong>四天里这个数字几乎没有动过</strong>，浮动只在正负 0.01 GB 的量级。每天的变更量各不相同，处理体量却固定不变，这直接证明了那份体量来自一个与变更无关的项。真正对变更量有反应的数字，应该每天都在晃。</p>
+
+                    <p>而单次会话 8.4 小时这个值造出了上限。一天 24 小时里塞得下两个 8.4 小时的会话，所以同步每天跑两次。上一节说的「RPO 不是设计而是结果」，在这里得到了数字上的确认。<strong>12 小时这个 RPO 不是谁定下的目标，而是会话长度剩下来的余数。</strong></p>
+
+                    <h2 id="sec-5">递归变更时间这个值 - ceph.dir.rctime</h2>
+
+                    <p>这里需要的，是一种能在<strong>不遍历子树</strong>的前提下回答「这棵子树有没有变过」这一个问题的手段。CephFS 早就带着这件工具。</p>
+
+                    <p><code>ceph.dir.rctime</code> 是挂在目录上的<strong>只读扩展属性</strong>。子树里的文件或目录一旦变化，该变化就会<strong>向上传播</strong>。这个值由 MDS 维护，从 Luminous 起的版本都可以使用。要紧的是它由文件系统维护，而不是由应用去更新。这不是「同步工具自己记一本账，再回头相信自己写下的东西」那种结构。</p>
+
+                    <p>从代价的角度看，这个值的性质很简单：<strong>读一个值就是一次调用，而这次调用不会遍历子树</strong>。目录下面挂着十个条目还是一千万个条目，读取的代价都一样。全量扫描是 O(n) 的地方，这次读取是 O(1)。</p>
+
+                    <p>递归元数据这个想法在 CephFS 里并不稀奇。Ceph 官方文档定义了一个挂载选项，把目录的 <code>st_size</code> 报成其内容的递归大小；讲述与 POSIX 差异的页面也写明递归大小字段由 CephFS 维护。<strong>这个文件系统本来就握着沿树向上汇总出来的值。</strong>变更时间只是这一族里的一个成员。</p>
+
+                    <p>于是设计的起点被翻了过来。常见的做法是「我们自己造一本记录变更的账」，而在这里<strong>账本已经存在，只要读就行</strong>。自己造账本，就得自己承担它的准确性、更新时机和恢复办法；而文件系统维护的值，这份责任在文件系统那边。</p>
+
+                    <h2 id="sec-6">这个值保证什么，不保证什么</h2>
+
+                    <p>要用这个值立起跳过子树的判断，就得先把这个判断只在哪个方向上成立钉死。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>类别</th><th>内容</th><th>对设计的影响</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>保证</td><td>子树里发生变更，上级目录的值也会跟着抬升</td><td>值没变就没必要往下看。跳过的依据立在这里</td></tr>
+                            <tr><td>保证</td><td>读一个值不需要向子树下降</td><td>判定代价与树的大小脱钩</td></tr>
+                            <tr><td>不保证</td><td>究竟什么变了</td><td>变更清单仍由 rsync 生成，这个值只收窄对象范围</td></tr>
+                            <tr><td>不保证</td><td>变了多少个、变了多大</td><td>值变了这件事无法用来预测传输量</td></tr>
+                            <tr><td>不保证</td><td>反方向，即值变了就意味着数据也变了</td><td>存在数据没变而值抬升的通路，快照那一节会讲</td></tr>
+                            <tr><td>不保证</td><td>传播要多快才完成</td><td>负载状态下的更新延迟特征不在本文范围内</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>从表的第三行往下，决定了这套设计的性格。这个值是<strong>剪枝信号而不是变更追踪器</strong>。它的全部本事就是廉价地告诉你「这里不用看」，而「这里变了些什么」依然是后一阶段的活儿。所以这种方式并不取代 rsync，<strong>它只是收窄 rsync 必须工作的范围</strong>。</p>
+
+                    <p>方向上的不对称也得照单接受。值相同是强信号，值不同是弱信号。相同就可以放心跳过，不同却不等于有东西要搬。所幸这种不对称指向安全的一侧：<strong>在弱信号一侧判错，代价是白干一场；在强信号一侧判错，代价是丢数据。</strong>而这个值恰恰在强信号那一侧是结实的。</p>
+
+                    <p>还有一点值得记下来：这个值的文本形式在实现层面是被处理过的。Luminous 的发行说明里留着一条修复记录，修的是该属性纳秒部分表示有误的缺陷。如果设计是把值当作字符串来比较，那么<strong>表示形式本身就构成比较的一部分</strong>。</p>
+
+                    <h2 id="sec-7">判定结构 - 相同就跳过，不同就下降</h2>
+
+                    <p>比较的一边是源端当前的值。另一边也得有，那就是<strong>「最后一次成功同步时刻的源端值」</strong>。把这个值放在哪里，是设计上的第二个决定。</p>
+
+                    <p>这套设计把它放进<strong>目标目录的自定义扩展属性</strong>里。同步成功结束后，就把当时的源端值写到目标一侧。下一次运行拿源端的当前值与目标上写着的值作比较。因为不另设数据库或状态文件，<strong>状态就住在数据所在的同一个地方</strong>。目标目录一旦消失，那一段记录也随之消失，于是不会出现数据已经没了、却只剩一枚「已同步」记号的状态。状态与数据走岔的通路少了一条。</p>
+
+                    <p>比较的结果会落到四种判定中的一种。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>判定</th><th>条件</th><th>动作</th><th>代价</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>SKIP</td><td>根目录上两个值相同</td><td>根本不调用 rsync</td><td>0 秒。读一次值就结束了</td></tr>
+                            <tr><td>INCR</td><td>根不同，而部分子目录相同</td><td>只把值不同的目录交给 rsync</td><td>与值不同的目录数量成正比</td></tr>
+                            <tr><td>FULL</td><td>初次的那一回</td><td>整棵树都走 rsync</td><td>与全量扫描相同</td></tr>
+                            <tr><td>FAIL</td><td>rsync 以非零码结束</td><td>只留日志，不写入值</td><td>这一轮的开销被丢弃，由下一次运行接手</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>SKIP 就是这套设计的目的。其余三种是 SKIP 不成立时的处理，其中 FAIL 重要到后面要单开一节。值得注意的是 SKIP 的代价<strong>与树的大小无关</strong>。确认「没有变更」这件事，在 100 GB 的树和 1 TB 的树上花的功夫是一样的。</p>
+
+                    <p>INCR 的性质也值得点明。根的值变了，只说明某处有变更，并不说明整棵树都变了。往下走一级重复同样的比较，通常<strong>大部分枝条就在那里被剪掉了</strong>。变更越是局部的工作负载，这种剪枝越管用。</p>
+
+                    <h2 id="sec-8">四个执行阶段各自做什么</h2>
+
+                    <p>一次运行分成四个阶段，每个阶段为下一个阶段生成输入，而在第一个阶段就结束是最常见的路径。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>阶段</th><th>做什么</th><th>产出</th><th>在此结束的条件</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>1</td><td>把根目录的源端值与目标上记录的值作比较</td><td>相同或不同</td><td>相同则以 SKIP 结束，第 2 至 4 阶段不执行</td></tr>
+                            <tr><td>2</td><td>收集值不同的目录，相同的当场剪掉</td><td>待同步目录清单</td><td>清单为空就没有可做的事</td></tr>
+                            <tr><td>3</td><td>只对收集到的目录跑 rsync，包含删除的同步</td><td>rsync 的退出码</td><td>非零就掉进 FAIL</td></tr>
+                            <tr><td>4</td><td>在成功目录的目标上写入当时的源端值</td><td>下一次运行的比较基准</td><td>走到这里，下一次才跳得掉</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>在第 1 阶段结束的这条路径，就是这套设计产生收益的地方。<strong>没有变更的日子里，第 2 阶段之后根本不会执行。</strong>这与全量扫描方式形成对照：在那边，「确认没有变更」的代价等于把整棵树走一遍的代价。</p>
+
+                    <p>第 2 阶段自上而下地重复同样的比较。要紧的是<strong>遇到值相同的枝条就不再打开它下面</strong>。因此这一阶段的代价并不与目录总数成正比，而与<strong>值不同的路径数量</strong>成正比。变更若集中在树的一角，其余全部都会被一次比较切掉。</p>
+
+                    <p>第 3 阶段交给 rsync 的是收窄后的目录清单。选项里包含删除的同步，因为源端删掉的东西如果留在目标端，两棵树就会对不上。不过这个选项也正是对象范围收错时伤害最大的选项，所以第 2 阶段生成的清单有多准确，就直接换算成多少安全性。</p>
+
+                    <p>第 4 阶段是写入。这一阶段让下一次运行的第 1 阶段成为可能。而<strong>把这一阶段变成有条件的</strong>，正是下一节的主题。</p>
+
+                    <h2 id="sec-9">失败就不写入 - 只让它往一个方向出错</h2>
+
+                    <p>rsync 以非零码结束时，只留下日志，<strong>不在目标上写入值</strong>。这是一行规则，却是这套设计里最重要的安全装置。</p>
+
+                    <p>顺着「照写不误会怎样」走一遍，理由就清楚了。失败的区间上留下了一枚「已同步至此刻」的记号，下一次运行拿源端的值与那枚记号相比，<strong>判定为相同</strong>，于是跳过该区间。失败的数据没被搬走就那样留着，而在此后那个区间产生新变更之前，<strong>没有任何人能知道这件事</strong>。一次失败没有以一次延迟收场，而是固化成了永久的缺口。</p>
+
+                    <p>不写入则正好相反。下一次运行时源端的值和目标的值依旧不同，于是同一区间重新成为对象。<strong>失败被结转到下一次运行。</strong>若是临时原因，下一轮就化解了；若是持续性原因，同一区间会不断被选中并反复出现在日志里。无论哪一种，<strong>失败都被保持在可见的状态</strong>。</p>
+
+                    <p>设计的依据在于两种错误的分量不同。整理一下就是：</p>
+
+                    <ul>
+                        <li><strong>晚写入带来的损失</strong> — 下一次运行会把已经搬完的区间再看一遍。代价是重新比较那段区间的时间，数据是完好的。</li>
+                        <li><strong>早写入带来的损失</strong> — 一个根本没搬走的区间被标记为已搬走。代价是数据缺失，而这种缺失不会自己现身。</li>
+                        <li><strong>所以规则只有一条</strong> — 没有把握就不写入。判定既然可能出错，就让它<strong>往白干一场的方向</strong>出错。</li>
+                        <li><strong>部分成功也按同一原则处理</strong> — 只在成功的目录上留下值，失败的目录就会自动回到下一轮的对象里。记录以目录为单位而不是以运行为单位，原因就在这儿。</li>
+                    </ul>
+
+                    <p>这条规则很便宜。不占额外资源，也不需要另设重试队列。<strong>「不写入」本身就扮演了重试队列的角色</strong>，因为下一次运行的比较会把同一区间重新捡起来。</p>
+
+                    <h2 id="sec-10">深度上限这个旋钮</h2>
+
+                    <p>第 2 阶段的下降带有深度上限。碰到上限就不再往下走，而是<strong>把那个目录整个交给 rsync</strong>。</p>
+
+                    <p>上限之所以必要，是因为下降本身也有代价。每往下一级，就得为那一层的每个目录读一次值，不设深度限制地一路下去，<strong>最终会收敛成把全部目录走一遍</strong>。那样一来，本想消除的 O(n) 就换个形状回来了。</p>
+
+                    <p>所以这个上限是两种代价之间的旋钮。<strong>降得越深，交给 rsync 的范围越窄，而读值的次数越多。</strong>切得浅则反过来。最优点随树的形状和变更的分布而变。后面出现的测量全部是在上限固定为 10 的状态下取得的，而改动这个值之后的敏感度，留到接下来的第二篇再讲。</p>
+
+                    <h2 id="sec-11">代价结构 - O(n) 与 O(1) 与 O(k)</h2>
+
+                    <p>把前面的内容压成代价函数，两种方式的区别一眼就能看进去。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>情形</th><th>全量扫描</th><th>比较递归变更时间</th><th>差别为何产生</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>零变更</td><td>O(n)</td><td>O(1)</td><td>前者要读完所有条目才知道「没有」，后者靠一个值就知道</td></tr>
+                            <tr><td>变更是局部的</td><td>O(n)</td><td>O(k)</td><td>k 是值不同的目录数。与变更无关的枝条根本不会打开</td></tr>
+                            <tr><td>变更遍布全树</td><td>O(n)</td><td>O(k)，k 趋近 n</td><td>没有枝条可剪时，两种方式就一样了</td></tr>
+                            <tr><td>大量创建目录</td><td>O(n)</td><td>O(k) 加上写入代价</td><td>只有后者多出一项：为每个新目录写入值</td></tr>
+                            <tr><td>初次播种</td><td>O(n)</td><td>O(n)</td><td>一切都必须传输，没有可跳过的区间</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>n 是文件与目录的总数，k 是值不同的目录数。第一行是这套设计的目标，而<strong>第四行是这套设计付出代价的地方</strong>。这里多挂了一项全量扫描所没有的成本：每个新建目录都得留下同步时刻，而这份写入与目录数成正比。</p>
+
+                    <p>把代价函数这样拆开，「何时该用、何时不该用」就不是靠性能测试，而是<strong>先从结构里</strong>得出来的。变更稀少且局部时，第一行和第二行的收益很大；目录创建频繁时，第四行的损失就把收益啃掉。后面的测量原样确认了这个预测。<strong>赢的时候和输的时候，都恰好发生在表所预言的位置上。</strong></p>
+
+                    <h2 id="sec-12">测量条件 - 先立条件再看结果</h2>
+
+                    <p>在看数字之前，先把这些数字出自何种条件固定下来。没有条件的比较，往哪个方向都能造出想要的结论。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>项目</th><th>条件</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>源端与目标端</td><td>两侧都是 CephFS。源端写作 Cluster-A，目标端写作 Cluster-B</td></tr>
+                            <tr><td>链路</td><td>10 Gbps 专用链路</td></tr>
+                            <tr><td>初始数据集</td><td>约 1 TB，约 90,000 个目录</td></tr>
+                            <tr><td>文件系统版本</td><td>CephFS Reef 18.x</td></tr>
+                            <tr><td>同步工具</td><td>rsync 3.2.x</td></tr>
+                            <tr><td>扫描深度上限</td><td>10</td></tr>
+                            <tr><td>并行度</td><td>1。为求比较公平而固定为顺序执行</td></tr>
+                            <tr><td>rsync 选项</td><td>两侧完全一致：归档模式、保留硬链接、同步删除、强制删除、输出统计</td></tr>
+                            <tr><td>缓存</td><td>在部分轮次之间清空页缓存，制造冷启动</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>补充两点。第一，<strong>两侧使用相同的 rsync 选项</strong>。若给全量扫描那一侧配上不利的选项再来比，差距就成了选项的差距而不是方式的差距。第二，<strong>并行度固定为 1</strong>。并行化是两种方式都能套用的另一条轴，混进来就分不清是哪一边的贡献。</p>
+
+                    <p>还有一件事要记下来：<strong>第 3 轮和第 6 轮因测试基础设施维护而跳过。</strong>下表编号之所以跳成 1、2、4、5、7、8、9、10，原因就在这里。这两轮会得出什么数值无从知晓，也没有拿别的数字去填补那两个位置。</p>
+
+                    <h2 id="sec-13">分轮结果 - 到底什么变快了</h2>
+
+                    <p>下面是在相同条件下交替运行两种方式的结果。场景自上而下按数据不断累积的顺序排列。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>轮次</th><th>场景</th><th>全量扫描</th><th>本方式</th><th>结果</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>1</td><td>初次全量同步（约 1 TB）</td><td>5,715 秒</td><td>5,381 秒</td><td>几乎相同，快约 6%。两边都在全部传输</td></tr>
+                            <tr><td>2</td><td>无变更，缓存处于热状态</td><td>13 秒</td><td>0 秒 SKIP</td><td>rsync 调用次数为 0</td></tr>
+                            <tr><td>4</td><td>新增 1 个文件</td><td>7 秒</td><td>2 秒</td><td>约 3.5 倍</td></tr>
+                            <tr><td>5</td><td>冷缓存，无变更</td><td>14 秒</td><td>2 秒</td><td>约 7 倍</td></tr>
+                            <tr><td>7</td><td>冷缓存，无变更</td><td>15 秒</td><td>0 秒 SKIP</td><td>I/O 为 0</td></tr>
+                            <tr><td>8</td><td>新增 100 GB 与 5 万个新目录</td><td>568 秒</td><td>975 秒</td><td>全量扫描快 1.7 倍</td></tr>
+                            <tr><td>9</td><td>在 1.1 TB 状态下新增 1 个文件</td><td>56 秒</td><td>9 秒</td><td>约 6.2 倍</td></tr>
+                            <tr><td>10</td><td>在 1.1 TB 状态下无变更</td><td>24 秒</td><td>0 秒 SKIP</td><td>立即跳过</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>先看第 1 轮。初次全量同步中，两种方式的差别实际上没有。5,715 秒对 5,381 秒，差约 6%，可是<strong>这一段两边都在全部传输</strong>，本来就没有产生差距的理由。这一行不是用来展示收益的，而是用来展示<strong>在不该有收益的地方确实没有收益</strong>。这里若出现大差距，反倒该怀疑测量。</p>
+
+                    <p>第 2、5、7、10 轮才是这套设计瞄准的位置。无变更时全量扫描花掉 13 秒、14 秒、15 秒、24 秒。这些数字随着数据增长而变大，值得留意。同样条件下，本方式是 0 秒或 2 秒。<strong>0 秒不是四舍五入，而是根本没有调用 rsync。</strong>第 5 轮的 2 秒，是从冷缓存里把值读回来所花的时间。</p>
+
+                    <p>第 4 轮和第 9 轮是「确实变了一点点的日子」。第 4 轮是 7 秒对 2 秒，第 9 轮是 56 秒对 9 秒。两轮的变更量同样都是 1 个文件，可是<strong>全量扫描的耗时从 7 秒涨到 56 秒，本方式从 2 秒涨到 9 秒</strong>。在数据从约 1 TB 长到 1.1 TB 的这一段里，前者追着数据总量走，后者的动作则平缓得多。</p>
+
+                    <p>而在第 8 轮，这种方式输了。那一行要单开一节。</p>
+
+                    <h2 id="sec-14">这种方式输掉的那一轮 - 5 万个新目录</h2>
+
+                    <p>第 8 轮的条件是<strong>一次性加入 100 GB 与 5 万个新目录</strong>。结果是全量扫描 568 秒，本方式 975 秒。<strong>全量扫描快 1.7 倍，少用了 407 秒。</strong></p>
+
+                    <p>原因在前面那张代价表的第四行里早就写着了。这套设计比全量扫描多出一项：<strong>为每个新建目录写入同步时刻的代价</strong>。目录多出 5 万个，这份写入就发生 5 万次。在那一轮里，<strong>写入所花的时间超过了跳过扫描省下的时间</strong>。</p>
+
+                    <p>这个结果并不意味着设计有缺陷，因为它恰恰就是代价结构所预测的样子。不过下面两点还是要讲清楚。</p>
+
+                    <ul>
+                        <li><strong>本方式的代价里有一项与目录创建速率成正比。</strong>全量扫描没有这一项。所以当创建速率足够高时，顺序就会翻转。</li>
+                        <li><strong>这笔代价是一次性的。</strong>写过一次之后，那个目录在往后的轮次里就成为比较对象，只要没有变更就不会再写。第 8 轮造出的 5 万个目录，为第 9 轮和第 10 轮的 9 秒与 0 秒做出了贡献。</li>
+                        <li><strong>因此判断的标准是频度。</strong>大量创建目录若是一次性事件，那就只有那一轮慢，然后就结束了；若这是工作负载的常态性质，损失就会不断累积。</li>
+                        <li><strong>按单轮看是输了，按区间看则不同。</strong>第 8 轮多花了 407 秒，随后第 9 轮和第 10 轮分别省下 47 秒和 24 秒。同样的条件重复得越多，这本账的斜率就越不一样。</li>
+                    </ul>
+
+                    <p>把输掉的那一轮从表里抹掉，剩下的表就成了只会反复念「无变更就是 0 秒」的宣传品。有了这一行，<strong>收益的大小和这份收益成立的条件</strong>才能被一起读出来。而且实务上的判断往往不取决于平均值，而取决于最坏的那一轮。第 8 轮正是这种方式的最坏情形。</p>
+
+                    <h2 id="sec-15">规模变大之后 - 把测量值和推算分开</h2>
+
+                    <p>把无变更状态下数据集大小如何反映到耗时上整理如下。<strong>测量值和推算不放进同一列。</strong></p>
+
+                    <table>
+                        <thead>
+                            <tr><th>数据集大小</th><th>全量扫描</th><th>本方式</th><th>测量还是推算</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>100 GB</td><td>约 3 秒</td><td>0 秒</td><td>测量值</td></tr>
+                            <tr><td>500 GB</td><td>约 10 秒</td><td>0 秒</td><td>测量值</td></tr>
+                            <tr><td>1 TB</td><td>约 24 秒</td><td>0 秒</td><td>测量值</td></tr>
+                            <tr><td>5 TB</td><td>约 120 秒</td><td>0 秒</td><td><strong>推算</strong>，未经测量</td></tr>
+                            <tr><td>10 TB</td><td>约 240 秒</td><td>0 秒</td><td><strong>推算</strong>，未经测量</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>最后两行不是真跑出来的数字。<strong>5 TB 与 10 TB 两行是推算</strong>，由前三行呈现的比例关系外推而来，而那种规模下实际会怎样，这次测试并不作答。规模更大时，元数据缓存的命中率和 MDS 上的负载分布都会变，所以没法保证比例关系照旧成立。表里多加一列，原因就在这里。</p>
+
+                    <p>左边一列的性质可以照字面读。<strong>全量扫描的耗时随数据集大小一路往上。</strong>每一行的条件同样都是无变更，数字却还是在变大。这张表的左列，就是本文第一句话画成的图。</p>
+
+                    <p>右边一列不论规模都是 0。这并不表示性能好，而是表示<strong>什么都没做</strong>。比较了一个值，得出相同的结论，于是后续阶段没有执行。这里没有夸大的余地，但出于同样的理由，<strong>这一列在有变更的日子里并不成立</strong>。</p>
+
+                    <h2 id="sec-16">不用它反而更好的三种情形</h2>
+
+                    <p>有些条件下这套设计得不到收益，甚至反而吃亏。一共三种，三种都直接从前面的代价结构里掉出来。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>情形</th><th>为何没有收益</th><th>依据</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>初次播种</td><td>一切都必须传输，根本没有可跳过的区间</td><td>第 1 轮中两种方式只差约 6%</td></tr>
+                            <tr><td>持续大量创建目录的工作负载</td><td>写入值的代价把跳过扫描省下的时间抵消掉</td><td>第 8 轮中全量扫描快 1.7 倍</td></tr>
+                            <tr><td>CephFS 以外的文件系统</td><td>这个扩展属性是 CephFS 专有的，其他分布式文件系统没有</td><td>作为判定依据的那个值根本不存在</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>第三项再多写几句。普通本地文件系统也有目录的变更时间，但它<strong>只在该目录自身的条目发生变化时</strong>才抬升。子树深处的某个文件变了，上级目录的值仍然不动。于是「值相同就不必往下看」这个判断无从成立。这套设计的可移植性不是工具的问题，而是<strong>文件系统是否维护递归元数据</strong>的问题。</p>
+
+                    <p>第二项则有程度之分。目录创建若是间歇性事件，那就只有那一轮慢，然后结束；可要是工作负载常态性地造目录，每一轮都要付这笔钱。<strong>判断的标准不是总量，而是每一轮的新增目录数。</strong></p>
+
+                    <h2 id="sec-17">与快照的相互作用 - 数据没动，值却动了</h2>
+
+                    <p>有一项已知的相互作用：<strong>删除 CephFS 快照会改变相应目录的递归变更时间。</strong>文件内容原封未动，值却抬升了。</p>
+
+                    <p>由于本方式把值的变化读作变更的信号，那个目录会被判为 INCR。实际上没有危害。随后执行的 rsync 把两边一比，没有可搬的东西，于是传输量为 0。不过<strong>代价是真实存在的</strong>：扫描那段区间的时间，以及重新写入同步时刻的时间。前面那节之所以把值不同记为弱信号，道理就在这里。</p>
+
+                    <p>运行上有两种处理办法。</p>
+
+                    <ul>
+                        <li><strong>把快照清理安排在闲时。</strong>让值发生抖动的时刻与同步运行的时刻错开，空扫描的影响就会变小。</li>
+                        <li><strong>把意料之外的 INCR 激增当作观测对象。</strong>变更量不大而 INCR 判定却增多时，这就是优先怀疑非数据变更原因的地方。判定的分布本身就成了一种信号。</li>
+                        <li><strong>对快照删除频繁的区间单独设定期望值。</strong>那种区间里 SKIP 比例偏低才是正常，用一个整体平均值去判断就会把原因认错。</li>
+                    </ul>
+
+                    <p>这项相互作用并不是这套设计独有的，而是适用于<strong>所有把递归变更时间当作信号的结构</strong>。只要假定抬升该值的通路只有数据变更这一条，同样的误差在哪里都会出现。</p>
+
+                    <h2 id="sec-18">小结 - 五句话</h2>
+
+                    <p>把以上内容压成五句话就是这样。</p>
+
+                    <ul>
+                        <li><strong>只要比较阶段把整棵树走一遍，名字叫增量，代价也不是增量。</strong>证据是每天变更 133 项、0.88 MB，处理体量却是 11.25 GB 且四天里固定不动。</li>
+                        <li><strong>CephFS 早就握着答案。</strong><code>ceph.dir.rctime</code> 是把子树变更向上传播的只读属性，读它不需要向下遍历。</li>
+                        <li><strong>相同就跳过，不同就下降。</strong>无变更时是 O(1)，有变更时是与值不同的目录数成正比的 O(k)。在无变更的轮次里，全量扫描花掉 13 至 24 秒，本方式则以 0 秒结束。</li>
+                        <li><strong>失败就不写入。</strong>判定既然可能出错，就让它往白干一场的方向错，而不是往丢数据的方向错。</li>
+                        <li><strong>它并不总是赢。</strong>在一次性造出 5 万个新目录的第 8 轮里，全量扫描快 1.7 倍；初次播种没有好处；不是 CephFS 就根本用不了。</li>
+                    </ul>
+
+                    <p>投入运行之后发生变化的是周期。会话长度从数据总量中解放出来，于是每天 2 次变成了<strong>每天 12 次</strong>，RPO 也随之从<strong>12 小时降到 1 小时</strong>。这个数字不是换链路或加设备换来的，而是靠<strong>不再去做本来就不必做的事</strong>换来的。</p>
+
+                    <p>接下来的第二篇会更细地讲深度上限改动后的敏感度、运行中实际出现的失败模式，以及哪些场合不用这种方式反而更好。</p>
+
+                    <h2 id="sec-19">没能确认的部分</h2>
+
+                    <p>下列项目在这次测试的条件内没有得出答案。在依据齐备之前不下定论。</p>
+
+                    <ul>
+                        <li><strong>其他 Ceph 版本上的传播特征</strong> — 测量只在 Reef 18.x 这一个版本上进行。其他版本上该值向上传播的时点与延迟是否相同，这次测试并不作答。</li>
+                        <li><strong>MDS 负载很重时的更新延迟</strong> — 测试环境里的负载只有同步自身产生的那一份。其他客户端大量使用元数据时，值的更新会滞后多久、这份滞后是否影响判定，都在范围之外。</li>
+                        <li><strong>不同文件大小分布下的结果</strong> — 只在约 1 TB、约 90,000 个目录这一种分布上做了测量。小文件多得多的树，或者大文件寥寥数个的树，比例会怎么变，从这张表里读不出来。</li>
+                        <li><strong>第 3 轮与第 6 轮的数值</strong> — 因测试基础设施维护而跳过。那两个位置没有拿别的数字填补，也不去推测那些场景会对哪一方有利。</li>
+                        <li><strong>5 TB 与 10 TB 规模的实际耗时</strong> — 相应的行是从前面的测量值外推出来的推算。那种规模下缓存命中率与元数据分布如何变化，并不在测量对象之内。</li>
+                        <li><strong>改动深度上限后的最优点</strong> — 所有轮次都在上限 10 上进行。换成别的值时，下降代价与 rsync 范围之间的平衡落在哪里，在这个条件下得不出答案。</li>
+                        <li><strong>并行执行下的结果</strong> — 为求比较公平而把并行度固定为 1。并行化对两种方式各自的贡献有多大，需要另设条件才能回答。</li>
+                    </ul>
+
+                    <h2 id="sec-20">参考资料</h2>
+
+                    <ul>
+                        <li><a href="https://docs.ceph.com/en/reef/man/8/mount.ceph/" target="_blank" rel="noopener">Ceph 官方文档，mount.ceph 手册页</a> — 把目录的 <code>st_size</code> 报成其内容递归大小的挂载选项，以及其反向选项的定义。这是 CephFS 维护递归汇总值的依据。</li>
+                        <li><a href="https://docs.ceph.com/en/reef/cephfs/posix/" target="_blank" rel="noopener">Ceph 官方文档，与 POSIX 的差异</a> — 递归大小字段由 CephFS 维护的表述。</li>
+                        <li><a href="https://docs.ceph.com/en/latest/releases/luminous/" target="_blank" rel="noopener">Ceph 官方文档，Luminous 发行说明</a> — <code>ceph.dir.rctime</code> 在发行说明中出现的位置，即修复该属性值纳秒部分表示有误这一缺陷的条目。</li>
+                        <li>本文的设计、判定结构与测量结果由笔者自行构建并投入运行，除上述三项之外没有外部出处。</li>
+                    </ul>
+
+                </div>
+
+                <div class="share-section">
+                    <h3>分享本文</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">返回列表</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/iptables_generator.html">iptables 防火墙规则生成器</a></li>
+      <li><a href="../static/code_image.html">代码图片生成器</a></li>
+      <li><a href="../static/char_counter.html">字数统计</a></li>
+      <li><a href="../static/json_formatter.html">JSON 格式化工具</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="backup_restore_verification.html">「有备份」与「能恢复」是两个不同的命题 - 成功的备份在哪里说谎，以及恢复验证真正要求什么</a></li>
+      <li><a href="rsync_trailing_slash_guide.html">rsync 末尾一个斜杠为何让结果完全不同 - 删除前的确认方法 2026</a></li>
+      <li><a href="postgres_horizontal_scaling_cost.html">把Postgres拆分至多台机器的选择 - 水平扩展向事务、连接与约束收取的代价</a></li>
+      <li><a href="oss_ownership_beyond_license.html">代码是开放的，名字不是 - 开源许可证不决定的商标、域名与发布权限</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制。粘贴到 Threads 应用即可分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制。'); });
+    });
+    </script>
+</body>
+</html>

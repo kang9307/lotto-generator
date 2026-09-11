@@ -1,0 +1,675 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="en">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nothing Changed, Yet It Scanned Everything - Incremental CephFS Replication That Skips Subtrees with ceph.dir.rctime</title>
+    <meta name="description" content="A full tree scan costs the same when nothing changed. Incremental CephFS replication that compares one ceph.dir.rctime value and skips whole subtrees.">
+    <meta name="keywords" content="CephFS, rctime, ceph.dir.rctime, recursive change time, incremental rsync, subtree skip, full tree scan, metadata scan, cross-cluster replication, RPO, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/en/posts/cephfs_rctime_incremental_sync.html">
+
+    <meta property="og:title" content="Nothing Changed, Yet It Scanned Everything - Incremental CephFS Replication That Skips Subtrees with ceph.dir.rctime">
+    <meta property="og:description" content="When cost scales with total data instead of changed data, the job is not incremental no matter what it is called. One value decides whether a subtree is opened.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/en/posts/cephfs_rctime_incremental_sync.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="en_US">
+    <meta property="article:published_time" content="2026-09-12">
+    <meta property="article:section" content="Dev &amp; Infra">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Nothing Changed, Yet It Scanned Everything - CephFS rctime Incremental Sync">
+    <meta name="twitter:description" content="On a day with zero changes a full tree scan still bills the full price. One recursive change time comparison removes that bill.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "Nothing Changed, Yet It Scanned Everything - Incremental CephFS Replication That Skips Subtrees with ceph.dir.rctime",
+      "alternativeHeadline": "When the comparison stage walks the whole tree, the cost is not incremental no matter what the job is called",
+      "datePublished": "2026-09-12",
+      "dateModified": "2026-09-12",
+      "inLanguage": "en-US",
+      "articleSection": "Dev & Infra",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "CephFS, rctime, ceph.dir.rctime, recursive change time, incremental rsync, subtree skip, full tree scan, metadata scan, cross-cluster replication, RPO",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/en/posts/cephfs_rctime_incremental_sync.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "What is ceph.dir.rctime and what does it guarantee?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "It is a read-only extended attribute that CephFS attaches to directories, and the MDS maintains it. When a file or a directory changes anywhere in a subtree, that change propagates upward to the parent directories. It is available in Luminous and later releases. Reading the value is a single call and it does not walk the subtree. The guarantee runs in one direction only. If something below changed, the value above went up, so an unchanged value means there is no reason to look further down. What changed, how many items changed, and how much data changed are not answered by this value."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How does the cost differ from a full tree scan with rsync?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "A full tree scan is O(n), where n is the total number of files and directories, and that cost is paid in full on a day with zero changes because the comparison stage walks the entire tree. Comparing recursive change times is O(1) when nothing changed and O(k) when something did, where k is the number of directories whose value differs and is independent of total size. The difference sits in the comparison stage, not in the transfer stage. Both approaches transfer exactly the bytes that actually changed."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Is this approach always faster?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "No. It lost round 8 of the benchmark. With 100 GB and 50,000 new directories added at once, the full tree scan finished in 568 seconds and this approach took 975 seconds. The full tree scan was about 1.7 times faster, a gap of 407 seconds. Every newly created directory needs its sync timestamp written, and that one-time write cost exceeded what the skipped scanning saved. Initial seeding gains nothing either, because everything has to be transferred and there is no subtree left to skip."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "What happens on the next run if rsync fails?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "When rsync exits with a non-zero code, the run logs the failure and writes no value to the target. That is the central safety property of the design. Writing the value after a failure would make the next run compare the source value against that record, find them equal, and skip the range, so the failed data would sit unshipped with nothing to reveal it. Leaving the value unwritten keeps the two sides different, so the same range is picked up again on the next run. The two possible mistakes carry different weights, so the design is built to fail in only one of the two directions."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Does this work on file systems other than CephFS?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "It does not. The recursive change time is a value CephFS maintains, and other distributed file systems do not carry an equivalent attribute. On an ordinary local file system a directory timestamp moves only when an entry in that directory itself changes, and it does not propagate a change deep in the subtree upward. That removes the basis for deciding that an unchanged value means an unchanged subtree. The portability of this design depends on whether the file system maintains recursive metadata, not on the sync tool."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/cephfs_rctime_incremental_sync.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/cephfs_rctime_incremental_sync.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/cephfs_rctime_incremental_sync.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/cephfs_rctime_incremental_sync.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/cephfs_rctime_incremental_sync.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "Home",
+      "item": "https://braindetox.kr/en/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "Dev & Infra",
+      "item": "https://braindetox.kr/en/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "Nothing Changed, Yet It Scanned Everything - Incremental CephFS Replication That Skips Subtrees with ceph.dir.rctime",
+      "item": "https://braindetox.kr/en/posts/cephfs_rctime_incremental_sync.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="Nothing Changed, Yet It Scanned Everything - Incremental CephFS Replication That Skips Subtrees with ceph.dir.rctime">
+                <meta itemprop="datePublished" content="2026-09-12">
+                <meta itemprop="dateModified" content="2026-09-12">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="CephFS, rctime, ceph.dir.rctime, recursive change time, incremental rsync, subtree skip, full tree scan, metadata scan, cross-cluster replication, RPO">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/en/posts/cephfs_rctime_incremental_sync.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">Nothing Changed, Yet It Scanned Everything - Incremental CephFS Replication That Skips Subtrees with ceph.dir.rctime</h1>
+                    <h2 class="post-subtitle">When the comparison stage walks the whole tree, the cost is not incremental no matter what the job is called</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-12">2026-09-12</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">Dev &amp; Infra</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>If the time a synchronization run takes scales with <strong>how much data you hold rather than how much of it changed</strong>, that run is not incremental, whatever its name says. When a tree in which <strong>133 items and 0.88 MB</strong> change per day takes <strong>16.7 hours</strong> a day to reconcile, almost all of those hours were not spent moving anything. They were spent <strong>deciding what to move</strong>.</p>
+
+                    <p>The configuration in place before the switch computed a snapshot diff first, worked out which files had changed, and then ran rsync over the result. The word incremental was in its name, and the change list it produced was genuinely accurate. The elapsed time still did not fall. The reason compresses into one sentence. <strong>Even when a diff tells you exactly which files changed, if the next stage still performs a directory-by-directory comparison, the total cost remains proportional to the size of the whole tree.</strong></p>
+
+                    <p>So the axis of this problem is not how to make transfers faster. The transfer was already 0.88 MB. The axis is <strong>whether the ranges with no changes can be cut away before the comparison begins</strong>. And the information needed for that decision is already held by the file system. CephFS maintains <code>ceph.dir.rctime</code> on every directory, a recursive change time that carries the last modification in a subtree upward. Reading one value decides whether everything beneath it gets opened at all.</p>
+
+                    <div class="callout">
+                        The design and the measurements below were built and put into production by the author. The only external references used are the Ceph official documentation covering recursive statistics and extended attributes in CephFS; every other number comes from the test environment described in the measurement conditions section. No names that identify a cluster, a namespace, or a host appear here, and the two clusters are written only as Cluster-A for the source and Cluster-B for the target. No source code and no command examples are included either, and the algorithm is described in prose and tables only.
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>What this article covers</h3>
+                        <ol>
+                            <li><a href="#sec-1">The problem - elapsed time does not scale with the amount changed</a></li>
+                            <li><a href="#sec-2">What a full tree scan actually does and where its cost comes from</a></li>
+                            <li><a href="#sec-3">Why it hurts more on a distributed file system - metadata round trips</a></li>
+                            <li><a href="#sec-4">The record from the previous configuration - 11.25 GB is not transferred data</a></li>
+                            <li><a href="#sec-5">Recursive change time as a value - ceph.dir.rctime</a></li>
+                            <li><a href="#sec-6">What that value guarantees and what it does not</a></li>
+                            <li><a href="#sec-7">The decision structure - equal means skip, different means descend</a></li>
+                            <li><a href="#sec-8">Four execution stages and what each one does</a></li>
+                            <li><a href="#sec-9">On failure, write nothing - failing in only one direction</a></li>
+                            <li><a href="#sec-10">The depth limit as a dial</a></li>
+                            <li><a href="#sec-11">Cost structure - O(n), O(1) and O(k)</a></li>
+                            <li><a href="#sec-12">Measurement conditions - stated before the results</a></li>
+                            <li><a href="#sec-13">Results by round - what actually got faster</a></li>
+                            <li><a href="#sec-14">The round this approach lost - 50,000 new directories</a></li>
+                            <li><a href="#sec-15">Scaling up - measured values kept apart from estimates</a></li>
+                            <li><a href="#sec-16">Three cases where not using this is better</a></li>
+                            <li><a href="#sec-17">Interaction with snapshots - the value moves when the data did not</a></li>
+                            <li><a href="#sec-18">Summary in five sentences</a></li>
+                            <li><a href="#sec-19">What could not be established</a></li>
+                            <li><a href="#sec-20">References</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">The problem - elapsed time does not scale with the amount changed</h2>
+
+                    <p>In cross-cluster replication, the time one synchronization run takes is usually the sum of two terms: <strong>the time spent determining what differs</strong> and <strong>the time spent moving what differs</strong>. The second term scales with the amount of change. The first one does not.</p>
+
+                    <p>There is a condition under which this asymmetry stays invisible, and that condition is a small dataset. When the first term is a few seconds, the second term dominates, and the intuition that synchronization time scales with the volume being moved looks correct. As the tree grows, the order flips. The first term stretches into hours while the second term stays in the seconds range as long as the change volume is small. Past a certain point, <strong>practically all of the synchronization time is the work of deciding what to move</strong>.</p>
+
+                    <p>A practical consequence follows immediately. In that state <strong>the synchronization interval cannot be shortened</strong>. One session has to finish before the next can start, and the length of a session is set by the total data volume rather than by the change volume. The recovery point objective (RPO) therefore stops being a design decision and becomes a <strong>residue</strong>. If a single session runs 8.4 hours, two sessions a day is the ceiling, and at that moment the RPO is nailed to 12 hours. Nobody chose 12 hours as a target.</p>
+
+                    <p>That changes the shape of the question worth asking. It is not how to make the transfer faster but <strong>how to find out which ranges do not need to be compared at all</strong>. The first question has answers in link bandwidth and parallelism, and none of those answers shrink a transfer that is already 0.88 MB.</p>
+
+                    <h2 id="sec-2">What a full tree scan actually does and where its cost comes from</h2>
+
+                    <p>When a tool like rsync reconciles two trees, the work splits into two stages. That split is very nearly the whole of this article.</p>
+
+                    <ul>
+                        <li><strong>The comparison stage</strong> enumerates entries on both sides and reads the metadata of each entry to compare them: name, size, modification time, permissions, and so on. The cost of this stage is proportional to the <strong>number of entries</strong>.</li>
+                        <li><strong>The transfer stage</strong> moves only the entries that the comparison found to differ. The cost of this stage is proportional to the <strong>amount that differs</strong>.</li>
+                    </ul>
+
+                    <p>The crucial point is that the two cost functions take different variables. The transfer stage falls to zero when nothing changed, but <strong>the comparison stage does not fall to zero when nothing changed</strong>. If anything, the less that changed, the more purely that time becomes waste, because the entire budget goes into reading every entry only to arrive at the single conclusion that everything is identical.</p>
+
+                    <p>Because of this structure, <strong>swapping the tool does not fix it</strong>. Whatever tool you use, learning the difference between two trees requires looking at two trees, and the cost of looking is set by the size of the trees. The problem is not the quality of the tool but the <strong>scope of the comparison</strong>. Differences in outcome that come from misreading how rsync itself behaves are a separate class of problem, and that side is covered in <a href="rsync_trailing_slash_guide.html">why one trailing slash changes everything in rsync</a>.</p>
+
+                    <p>Bolting a diff tool onto the front does not change the structure either. Even when the diff extracts an exact change list, if the consumer of that list still compares both sides directory by directory, the comparison stage survives intact. <strong>Narrowing the list and narrowing the comparison scope are two different things.</strong> The former shrinks the transfer stage; only the latter shrinks the comparison stage.</p>
+
+                    <h2 id="sec-3">Why it hurts more on a distributed file system - metadata round trips</h2>
+
+                    <p>On a local file system, reading the metadata of one entry costs roughly what a memory access costs, because the kernel holds inodes and directory entries in cache. The same operation on CephFS has a different character. Metadata is a resource managed by the MDS, and while clients cache it, <strong>an empty cache means a network round trip</strong>.</p>
+
+                    <p>That makes the cost of a full tree scan worse along two axes at once. The property of scaling with entry count is unchanged, but the unit price per entry is higher than on a local file system and it <strong>swings widely with cache state</strong>. This is why the same tree walked the same way takes a different amount of time with a warm cache than with a cold one. It is also why the measurements later on include rounds where the cache was deliberately dropped.</p>
+
+                    <p>A full tree scan does not only spend its own time, either. The metadata requests it generates contend for the same resources as every other client on the same file system, and the longer the scan runs, the longer that contention window stays open. The general performance characteristics of this layer are collected in the <a href="ceph_performance_optimization_guide.html">complete guide to Ceph performance optimization</a>, and the fact that block access and file access travel different paths from the start is covered in <a href="ceph_rbd_vs_cephfs_comparison.html">Ceph RBD versus CephFS</a>.</p>
+
+                    <p>To put it plainly, a full tree scan is O(n) anywhere, but <strong>on a distributed file system the constant attached to that n is large and unstable</strong>. That is why the same algorithm is tolerable locally and intolerable here.</p>
+
+                    <h2 id="sec-4">The record from the previous configuration - 11.25 GB is not transferred data</h2>
+
+                    <p>Laying out four days of operational records from the configuration used before the switch turns the structure of the previous section into numbers.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Item</th><th>Value</th><th>What it points at</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Daily average synchronization time</td><td>16.7 hours</td><td>Two thirds of every day was tied up in synchronization</td></tr>
+                            <tr><td>Time per session</td><td>About 8.4 hours</td><td>Nearly constant whether or not anything had changed</td></tr>
+                            <tr><td>Daily average rsync processing volume</td><td>11.25 GB</td><td>Not transferred bytes but metadata volume raised by the comparison</td></tr>
+                            <tr><td>Actual daily change volume</td><td>133 items and 0.88 MB</td><td>Everything that genuinely differed over the same period</td></tr>
+                            <tr><td>Synchronization runs per day</td><td>2</td><td>An 8.4 hour session leaves no room for more</td></tr>
+                            <tr><td>RPO that resulted</td><td>12 hours</td><td>Not a chosen target but a number the session length set</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>The gap between the third row and the fourth row is the whole of this table. <strong>The 11.25 GB is not data that moved.</strong> What actually differed over that period was 0.88 MB. The 11.25 GB is the <strong>metadata comparison volume</strong> rsync raised while walking the tree. Even though the diff had already reported which files changed, the directory-level comparison ran anyway, so the cost tracked total data volume instead of change volume.</p>
+
+                    <p>One more observation supports the same reading. <strong>Over four days that figure barely moved</strong>, with a spread on the order of plus or minus 0.01 GB. Change volume differed from day to day while processing volume stayed fixed, which is direct evidence that the volume came from a term unrelated to change. A figure that responded to change volume would have wobbled daily.</p>
+
+                    <p>And the 8.4 hours per session created a ceiling. Two sessions of 8.4 hours fit inside a 24 hour day, so synchronization ran twice a day. The claim from the previous section, that the RPO was a residue rather than a design, is confirmed here in numbers. <strong>The 12 hour RPO was not a target anyone set; it was what the session length left over.</strong></p>
+
+                    <h2 id="sec-5">Recursive change time as a value - ceph.dir.rctime</h2>
+
+                    <p>What is needed here is a way to answer one question, whether this subtree changed, <strong>without walking the subtree</strong>. CephFS already carries that instrument.</p>
+
+                    <p><code>ceph.dir.rctime</code> is a <strong>read-only extended attribute</strong> on a directory. When a file or a directory anywhere in the subtree changes, that change <strong>propagates upward</strong>. The value is maintained by the MDS and is available in Luminous and later releases. What matters is that the file system maintains it rather than the application updating it. This is not a structure in which a sync tool writes its own bookkeeping and then trusts what it wrote.</p>
+
+                    <p>From a cost standpoint the property of this value is simple. <strong>Reading one value is one call, and that call does not walk the subtree.</strong> Whether ten entries or ten million sit beneath the directory, the read costs the same. Where a full tree scan is O(n), this read is O(1).</p>
+
+                    <p>The idea of recursive metadata is not exotic in CephFS. The Ceph official documentation defines a mount option that reports a directory <code>st_size</code> as the recursive size of its contents, and the page on differences from POSIX notes that the recursive size field is maintained by CephFS. <strong>This file system already holds values aggregated on the way up the tree.</strong> The change time is one member of that family.</p>
+
+                    <p>That inverts the starting point of the design. The common approach is to build a ledger of changes yourself, whereas here <strong>the ledger already exists and only has to be read</strong>. A ledger you build yourself makes you responsible for its accuracy, its update timing, and its recovery path, while a value the file system maintains puts that responsibility on the file system.</p>
+
+                    <h2 id="sec-6">What that value guarantees and what it does not</h2>
+
+                    <p>To build a subtree skip decision on this value, the direction in which the decision holds has to be nailed down first.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Class</th><th>Statement</th><th>Consequence for the design</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Guaranteed</td><td>A change anywhere in the subtree raises the value on the parent directory</td><td>An unchanged value means there is no reason to look below. The skip rests here</td></tr>
+                            <tr><td>Guaranteed</td><td>Reading one value requires no descent into the subtree</td><td>The decision cost becomes independent of tree size</td></tr>
+                            <tr><td>Not guaranteed</td><td>What changed</td><td>rsync still builds the change list. This value only narrows the scope</td></tr>
+                            <tr><td>Not guaranteed</td><td>How many items and how much data changed</td><td>A changed value predicts nothing about transfer volume</td></tr>
+                            <tr><td>Not guaranteed</td><td>The reverse direction, that a changed value means changed data</td><td>There are paths that raise the value without changing data. The snapshot section covers one</td></tr>
+                            <tr><td>Not guaranteed</td><td>How quickly the propagation completes</td><td>Update latency under load is outside the scope of this article</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>From the third row down, the table defines the character of the design. This value is <strong>a pruning signal rather than a change tracker</strong>. Telling you cheaply that there is no need to look here is the whole of its job, and telling you what changed here remains the job of the next stage. So this approach does not replace rsync. <strong>It only narrows the range in which rsync has to work.</strong></p>
+
+                    <p>The asymmetry of direction has to be accepted as it is. An equal value is a strong signal and a differing value is a weak one. Equality permits a confident skip, but a difference does not imply that anything needs to move. Fortunately the asymmetry points the safe way. <strong>Being wrong on the weak signal costs wasted work, and being wrong on the strong signal costs lost data.</strong> This value is solid exactly on the strong-signal side.</p>
+
+                    <p>It is also worth recording that the textual form of the value has been handled at the implementation level. The Luminous release notes carry a fix for a defect in which the nanosecond component of this attribute was rendered incorrectly. If a design compares the value as a string, then <strong>the formatting itself is part of the comparison</strong>.</p>
+
+                    <h2 id="sec-7">The decision structure - equal means skip, different means descend</h2>
+
+                    <p>One side of the comparison is the current value on the source. The other side has to be <strong>the source value as of the last successful synchronization</strong>, and where that record lives is the second decision in the design.</p>
+
+                    <p>This design puts it in a <strong>custom extended attribute on the target directory</strong>. When a synchronization finishes successfully, the source value at that moment is written on the target side. The next run compares the current source value against the value recorded on the target. Because no separate database or state file exists, <strong>the state lives in the same place as the data</strong>. If a target directory disappears, the bookkeeping for that range disappears with it, so there is no state in which the data is gone while a marker saying it was synchronized remains behind. One path for state and data to drift apart is removed.</p>
+
+                    <p>The comparison lands on one of four verdicts.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Verdict</th><th>Condition</th><th>Action</th><th>Cost</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>SKIP</td><td>The values match at the root</td><td>rsync is not invoked at all</td><td>Zero seconds. One value read and the run is over</td></tr>
+                            <tr><td>INCR</td><td>The root differs while some subtrees match</td><td>Only the directories whose values differ are handed to rsync</td><td>Proportional to the number of differing directories</td></tr>
+                            <tr><td>FULL</td><td>The initial run</td><td>The whole tree goes through rsync</td><td>The same as a full tree scan</td></tr>
+                            <tr><td>FAIL</td><td>rsync exited with a non-zero code</td><td>Only a log entry is written; no value is recorded</td><td>That run is discarded and the next run takes the range again</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>SKIP is the purpose of the design. The other three are what happens when SKIP does not hold, and FAIL in particular earns a section of its own later. What deserves attention is that the cost of SKIP is <strong>independent of tree size</strong>. Confirming that nothing changed takes the same work on a 100 GB tree as on a 1 TB tree.</p>
+
+                    <p>INCR has a property worth naming too. A differing root value means only that something changed somewhere, not that the whole tree changed. Descending one level and repeating the same comparison usually <strong>cuts most of the branches away right there</strong>. The more localized the change pattern of a workload, the better this pruning works.</p>
+
+                    <h2 id="sec-8">Four execution stages and what each one does</h2>
+
+                    <p>A single run splits into four stages, each producing the input for the next, and the most common path is the one that ends at the first stage.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Stage</th><th>What it does</th><th>Output</th><th>Condition for stopping here</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>1</td><td>Compares the source value at the root against the value recorded on the target</td><td>Equal or different</td><td>Equal ends the run as SKIP. Stages 2 through 4 never execute</td></tr>
+                            <tr><td>2</td><td>Collects directories whose values differ and prunes the matching ones on the spot</td><td>A list of directories to synchronize</td><td>An empty list means there is nothing to do</td></tr>
+                            <tr><td>3</td><td>Runs rsync over only the collected directories, with deletion propagation included</td><td>The rsync exit code</td><td>A non-zero code drops the run into FAIL</td></tr>
+                            <tr><td>4</td><td>Writes the source value of that moment onto the target of each successful directory</td><td>The comparison baseline for the next run</td><td>Only reaching here lets the next run skip</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>The path that ends at stage 1 is where the benefit of this design appears. <strong>On a day with no changes, stages 2 through 4 never run at all.</strong> Contrast that with the full tree scan, where the cost of confirming that nothing changed equals the cost of walking the entire tree.</p>
+
+                    <p>Stage 2 repeats the same comparison on the way down. What matters is that <strong>a branch whose value matches is never opened</strong>. The cost of this stage is therefore proportional to the <strong>number of paths whose values differ</strong> rather than to the total directory count. When change is concentrated in one corner of the tree, everything else is cut away by a single comparison.</p>
+
+                    <p>Stage 3 hands rsync the narrowed directory list. Deletion propagation is part of the option set, because anything removed on the source and left on the target puts the two trees out of step. That option is also the one that does the most damage when the target scope was narrowed incorrectly, so the accuracy of the list stage 2 produces translates directly into safety.</p>
+
+                    <p>Stage 4 is the write. This stage is what makes stage 1 of the next run possible. And <strong>making this stage conditional</strong> is the subject of the next section.</p>
+
+                    <h2 id="sec-9">On failure, write nothing - failing in only one direction</h2>
+
+                    <p>When rsync exits with a non-zero code, the run writes a log entry and <strong>records no value on the target</strong>. It is a one-line rule and it is the most important safety property in the design.</p>
+
+                    <p>Following what happens if the value is written anyway makes the reason plain. The failed range carries a mark saying it was synchronized as of that moment, and the next run compares the source value against that mark and <strong>finds them equal</strong>. So it skips the range. The failed data stays unshipped, and until new changes land in that range afterwards, <strong>nothing reveals the fact</strong>. A failure that should have been a single delayed run hardens into a permanent gap.</p>
+
+                    <p>Writing nothing produces the opposite. On the next run the source value and the target value still differ, so the same range becomes a target again. <strong>The failure carries forward into the next run.</strong> If the cause was transient it clears on the following cycle, and if the cause is persistent the same range keeps being selected and keeps appearing in the log. Either way, <strong>the failure stays visible</strong>.</p>
+
+                    <p>The design rests on the two possible mistakes having different weights. Set out plainly:</p>
+
+                    <ul>
+                        <li><strong>The loss from writing too late</strong> is that the next run looks once more at a range already shipped. The price is the time to compare that range again, and the data is intact.</li>
+                        <li><strong>The loss from writing too early</strong> is that a range which was never shipped is marked as shipped. The price is missing data, and that gap does not announce itself.</li>
+                        <li><strong>So the rule is single.</strong> Write nothing without certainty. If the verdict can be wrong, make it wrong <strong>in the direction of wasted work</strong>.</li>
+                        <li><strong>Partial success follows the same principle.</strong> Writing values only on the directories that succeeded returns the failed ones to the next cycle automatically. That is why the record is kept per directory rather than per run.</li>
+                    </ul>
+
+                    <p>The rule is cheap. It consumes no extra resources and it needs no retry queue. <strong>Not writing is itself the retry queue</strong>, because the comparison on the next run picks the same range back up.</p>
+
+                    <h2 id="sec-10">The depth limit as a dial</h2>
+
+                    <p>The descent in stage 2 has a depth limit. When the limit is reached, the walk stops going deeper and <strong>hands that directory to rsync whole</strong>.</p>
+
+                    <p>The limit exists because descending has a cost of its own. Each level down means reading a value for every directory on that level, and descending without a limit <strong>converges on walking every directory in the tree</strong>. At that point the O(n) the design set out to remove comes back wearing a different shape.</p>
+
+                    <p>So the limit is a dial between two costs. <strong>The deeper the descent, the narrower the range handed to rsync and the more value reads it takes.</strong> Cutting shallow reverses both. The optimum depends on the shape of the tree and on the distribution of change within it. Every measurement below was taken with the limit fixed at 10, and the sensitivity to that number is covered in the second part that follows this article.</p>
+
+                    <h2 id="sec-11">Cost structure - O(n), O(1) and O(k)</h2>
+
+                    <p>Reducing everything so far to cost functions makes the difference between the two approaches visible at a glance.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Situation</th><th>Full tree scan</th><th>Recursive change time comparison</th><th>Why they differ</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Zero changes</td><td>O(n)</td><td>O(1)</td><td>The former reads every entry to learn there is nothing. The latter learns it from one value</td></tr>
+                            <tr><td>Localized change</td><td>O(n)</td><td>O(k)</td><td>k is the number of directories whose values differ. Branches unrelated to the change are never opened</td></tr>
+                            <tr><td>Change everywhere</td><td>O(n)</td><td>O(k) with k approaching n</td><td>With no branches left to prune, the two approaches converge</td></tr>
+                            <tr><td>Mass directory creation</td><td>O(n)</td><td>O(k) plus a write cost</td><td>Only the latter carries a term for writing a value on every new directory</td></tr>
+                            <tr><td>Initial seeding</td><td>O(n)</td><td>O(n)</td><td>Everything has to be transferred, so no range can be skipped</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>Here n is the total number of files and directories and k is the number of directories whose values differ. The first row is the goal of the design, and <strong>the fourth row is where the design pays</strong>. A term that does not exist in the full tree scan is attached here: every newly created directory needs its sync timestamp written, and that write scales with directory count.</p>
+
+                    <p>Splitting the cost function this way means the answer to when to use this and when not to comes out of the <strong>structure first</strong> rather than out of a performance test. Where change is rare and localized, the gains in the first two rows are large; where directory creation is frequent, the loss in the fourth row eats into them. The measurements that follow confirm the prediction exactly. <strong>Both the wins and the loss land precisely where the table said they would.</strong></p>
+
+                    <h2 id="sec-12">Measurement conditions - stated before the results</h2>
+
+                    <p>Before any figures appear, the conditions that produced them are fixed. A comparison without stated conditions can be steered to whichever conclusion is wanted.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Item</th><th>Condition</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Source and target</td><td>CephFS on both sides. The source is written as Cluster-A and the target as Cluster-B</td></tr>
+                            <tr><td>Link</td><td>A dedicated 10 Gbps link</td></tr>
+                            <tr><td>Initial dataset</td><td>About 1 TB across about 90,000 directories</td></tr>
+                            <tr><td>File system version</td><td>CephFS Reef 18.x</td></tr>
+                            <tr><td>Synchronization tool</td><td>rsync 3.2.x</td></tr>
+                            <tr><td>Scan depth limit</td><td>10</td></tr>
+                            <tr><td>Parallelism</td><td>1, fixed sequential for a fair comparison</td></tr>
+                            <tr><td>rsync options</td><td>Identical on both sides: archive mode, hard link preservation, deletion propagation, forced deletion, statistics output</td></tr>
+                            <tr><td>Cache</td><td>The page cache was dropped between some rounds to create cold starts</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>Two points deserve emphasis. First, <strong>both sides use the same rsync options</strong>. Handing the full tree scan a disadvantageous option set would turn the gap into a difference of options rather than a difference of approaches. Second, <strong>parallelism was fixed at 1</strong>. Parallelization is a separate axis that applies to both approaches, and mixing it in makes the contribution of each impossible to separate.</p>
+
+                    <p>One more thing belongs on the record. <strong>Rounds 3 and 6 were skipped because of maintenance on the test infrastructure.</strong> That is why the numbering in the table below jumps as 1, 2, 4, 5, 7, 8, 9, 10. What those two rounds would have produced is unknown, and their places were not filled with substitute values.</p>
+
+                    <h2 id="sec-13">Results by round - what actually got faster</h2>
+
+                    <p>The two approaches were run alternately under identical conditions. The scenarios accumulate data as the table goes down.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Round</th><th>Scenario</th><th>Full tree scan</th><th>This approach</th><th>Outcome</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>1</td><td>Initial full synchronization of about 1 TB</td><td>5,715 s</td><td>5,381 s</td><td>Nearly identical, about 6 percent faster. Both transfer everything</td></tr>
+                            <tr><td>2</td><td>No changes, warm cache</td><td>13 s</td><td>0 s SKIP</td><td>rsync was never invoked</td></tr>
+                            <tr><td>4</td><td>One file added</td><td>7 s</td><td>2 s</td><td>About 3.5 times</td></tr>
+                            <tr><td>5</td><td>Cold cache, no changes</td><td>14 s</td><td>2 s</td><td>About 7 times</td></tr>
+                            <tr><td>7</td><td>Cold cache, no changes</td><td>15 s</td><td>0 s SKIP</td><td>Zero I/O</td></tr>
+                            <tr><td>8</td><td>100 GB and 50,000 new directories added</td><td>568 s</td><td>975 s</td><td>The full tree scan was 1.7 times faster</td></tr>
+                            <tr><td>9</td><td>One file added at 1.1 TB</td><td>56 s</td><td>9 s</td><td>About 6.2 times</td></tr>
+                            <tr><td>10</td><td>No changes at 1.1 TB</td><td>24 s</td><td>0 s SKIP</td><td>Immediate skip</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>Start with round 1. In the initial full synchronization the two approaches are effectively the same: 5,715 seconds against 5,381 seconds, a gap of about 6 percent. There is no reason for a gap, <strong>because both sides transfer everything in this range</strong>. This row does not demonstrate a gain; it demonstrates <strong>the absence of a gain where there should not be one</strong>. A large difference here would be a reason to doubt the measurement.</p>
+
+                    <p>Rounds 2, 5, 7 and 10 are the target the design aims at. With no changes, the full tree scan spends 13, 14, 15 and 24 seconds. Those numbers growing as the dataset grows is worth noticing. Under the same conditions this approach spends 0 or 2 seconds. <strong>Zero here is not a rounding artifact; it means rsync was not invoked.</strong> The 2 seconds in round 5 is the time to fetch the values from a cold cache.</p>
+
+                    <p>Rounds 4 and 9 are the days when something really did change a little. Round 4 was 7 seconds against 2, and round 9 was 56 seconds against 9. The change volume in both rounds was identically one file, yet <strong>the full tree scan went from 7 seconds to 56 while this approach went from 2 seconds to 9</strong>. Across a stretch where the dataset grew from about 1 TB to 1.1 TB, the former tracked total data volume and the latter moved far more gently.</p>
+
+                    <p>And in round 8 this approach lost. That row gets its own section.</p>
+
+                    <h2 id="sec-14">The round this approach lost - 50,000 new directories</h2>
+
+                    <p>The condition in round 8 was <strong>100 GB and 50,000 new directories added at once</strong>. The result was 568 seconds for the full tree scan and 975 seconds for this approach. <strong>The full tree scan was 1.7 times faster and finished 407 seconds sooner.</strong></p>
+
+                    <p>The cause is already written in the fourth row of the cost table. This design carries a term the full tree scan does not: <strong>the cost of writing a sync timestamp on every newly created directory</strong>. Fifty thousand new directories means fifty thousand writes. In that round, <strong>the time spent writing exceeded the time saved by skipping the scan</strong>.</p>
+
+                    <p>The result does not indicate a defect in the design, because it is exactly what the cost structure predicted. Two things are worth stating clearly all the same.</p>
+
+                    <ul>
+                        <li><strong>This approach has a cost term proportional to the directory creation rate.</strong> The full tree scan has no such term. So when the creation rate is high enough, the ordering flips.</li>
+                        <li><strong>That cost is one-time.</strong> Once written, a directory becomes a comparison target on subsequent runs and is not written again while it stays unchanged. The 50,000 directories created in round 8 fed into the 9 second and 0 second results of rounds 9 and 10.</li>
+                        <li><strong>So the criterion is frequency.</strong> If mass directory creation is a single event, only that run is slow and it ends there. If it is a standing property of the workload, the loss accumulates.</li>
+                        <li><strong>Per run it loses, but over a stretch the arithmetic differs.</strong> Round 8 cost 407 extra seconds, and rounds 9 and 10 then saved 47 and 24 seconds. The slope of that balance changes as the same pattern repeats.</li>
+                    </ul>
+
+                    <p>Delete the losing round from the table and what remains is a promotional sheet repeating zero seconds when nothing changed. This row is what lets the size of the gain be read together with <strong>the conditions under which the gain holds</strong>. And operational decisions are usually settled by the worst run rather than by the average. Round 8 is the worst case of this approach.</p>
+
+                    <h2 id="sec-15">Scaling up - measured values kept apart from estimates</h2>
+
+                    <p>Laid out below is how dataset size shows up in elapsed time while nothing has changed. <strong>Measured values and estimates do not share a column.</strong></p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Dataset size</th><th>Full tree scan</th><th>This approach</th><th>Measured or estimated</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>100 GB</td><td>About 3 s</td><td>0 s</td><td>Measured</td></tr>
+                            <tr><td>500 GB</td><td>About 10 s</td><td>0 s</td><td>Measured</td></tr>
+                            <tr><td>1 TB</td><td>About 24 s</td><td>0 s</td><td>Measured</td></tr>
+                            <tr><td>5 TB</td><td>About 120 s</td><td>0 s</td><td><strong>Estimated</strong>, not measured</td></tr>
+                            <tr><td>10 TB</td><td>About 240 s</td><td>0 s</td><td><strong>Estimated</strong>, not measured</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>The last two rows were not obtained by running anything. <strong>The 5 TB and 10 TB rows are estimates</strong>, extrapolated from the proportional relationship the first three rows show, and what actually happens at that scale is not something this test answers. At larger scales the hit rate of the metadata cache and the load distribution across the MDS change, so the proportionality cannot be assumed to hold. That is why the table carries an extra column.</p>
+
+                    <p>The property of the left column can be read as it stands. <strong>The elapsed time of a full tree scan climbs with dataset size.</strong> The condition of no changes is identical on every row, and the value still grows. The left column of this table is a picture of the first sentence of this article.</p>
+
+                    <p>The right column is zero regardless of size. That does not mean the performance is good; it means <strong>no work was done</strong>. One value was compared, the conclusion was that they matched, and the following stages never executed. There is no room to overstate that, and by the same token <strong>this column does not hold on a day when something changed</strong>.</p>
+
+                    <h2 id="sec-16">Three cases where not using this is better</h2>
+
+                    <p>There are conditions under which this design gains nothing or actively costs. There are three, and all three fall straight out of the cost structure above.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Situation</th><th>Why there is no gain</th><th>Evidence</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Initial seeding</td><td>Everything has to be transferred, so no range can be skipped in the first place</td><td>Round 1 showed a gap of only about 6 percent</td></tr>
+                            <tr><td>Workloads that keep creating directories in bulk</td><td>The cost of writing values offsets what the skipped scanning saves</td><td>In round 8 the full tree scan was 1.7 times faster</td></tr>
+                            <tr><td>File systems other than CephFS</td><td>This extended attribute is specific to CephFS and other distributed file systems do not have it</td><td>The value the decision rests on does not exist</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>The third item deserves a little more. Ordinary local file systems do carry a directory timestamp, but it moves <strong>only when an entry in that directory itself changes</strong>. A single file changing deep in the subtree leaves the parent value untouched. So the judgment that an unchanged value means no need to look below does not hold. The portability of this design is not a question about the tool but about <strong>whether the file system maintains recursive metadata</strong>.</p>
+
+                    <p>The second item admits degrees. If directory creation is an intermittent event, only that run is slow and it ends there, whereas a workload that produces directories continuously pays the cost on every run. <strong>The criterion is new directories per run rather than total directory count.</strong></p>
+
+                    <h2 id="sec-17">Interaction with snapshots - the value moves when the data did not</h2>
+
+                    <p>There is one known interaction. <strong>Deleting a CephFS snapshot changes the recursive change time on the directory concerned.</strong> The file contents are untouched and the value goes up anyway.</p>
+
+                    <p>Since this approach reads a moving value as a signal of change, that directory is judged INCR. No actual harm follows. The rsync that runs next compares both sides, finds nothing to move, and transfers zero bytes. <strong>The cost is real, though</strong>: the time to scan that range and the time to write the sync timestamp again. This is exactly why the earlier section recorded a differing value as a weak signal.</p>
+
+                    <p>Two ways of handling it in operation:</p>
+
+                    <ul>
+                        <li><strong>Place snapshot cleanup in a quiet window.</strong> Keeping the moments when values shift apart from the moments when synchronization runs reduces the impact of the wasted scanning.</li>
+                        <li><strong>Treat an unexpected surge in INCR as something to observe.</strong> When change volume is small yet INCR verdicts increase, that is the place to suspect a cause other than data change first. The distribution of verdicts becomes a signal in its own right.</li>
+                        <li><strong>Set separate expectations for ranges where snapshot deletion is frequent.</strong> A low SKIP ratio is normal in those ranges, so judging by a single overall average leads to misreading the cause.</li>
+                    </ul>
+
+                    <p>This interaction is not particular to this design. It applies to <strong>every structure that uses recursive change time as a signal</strong>. Assume that data change is the only path that raises the value and the same error appears anywhere.</p>
+
+                    <h2 id="sec-18">Summary in five sentences</h2>
+
+                    <p>Everything above reduces to five sentences.</p>
+
+                    <ul>
+                        <li><strong>When the comparison stage walks the whole tree, the cost is not incremental no matter what the job is called.</strong> The evidence is a daily change of 133 items and 0.88 MB against a processing volume of 11.25 GB that stayed fixed across four days.</li>
+                        <li><strong>CephFS already holds the answer.</strong> <code>ceph.dir.rctime</code> is a read-only attribute that propagates subtree changes upward, and reading it requires no descent.</li>
+                        <li><strong>Equal means skip and different means descend.</strong> The cost is O(1) with no changes and O(k) with changes, proportional to the number of directories whose values differ. In the unchanged rounds the full tree scan spent 13 to 24 seconds while this approach finished in 0.</li>
+                        <li><strong>On failure, write nothing.</strong> If the verdict can be wrong, make it wrong in the direction of wasted work rather than in the direction of lost data.</li>
+                        <li><strong>It does not always win.</strong> In round 8, with 50,000 new directories created at once, the full tree scan was 1.7 times faster; initial seeding gains nothing; and outside CephFS this cannot be used at all.</li>
+                    </ul>
+
+                    <p>What changed once this went into production was the interval. Freeing session length from total data volume turned 2 runs a day into <strong>12 runs a day</strong>, and the RPO came down from <strong>12 hours to 1 hour</strong>. That figure did not come from changing the link or adding hardware. It came from <strong>no longer doing work that did not need doing</strong>.</p>
+
+                    <p>The second part that follows covers the sensitivity to the depth limit, the failure modes that showed up in production, and the cases where not using this approach is the better call, in more detail.</p>
+
+                    <h2 id="sec-19">What could not be established</h2>
+
+                    <p>The items below did not get an answer within the conditions of this test. Nothing is asserted about them until there is a basis for it.</p>
+
+                    <ul>
+                        <li><strong>Propagation behavior on other Ceph releases.</strong> The measurements were taken on Reef 18.x alone. Whether the timing and latency of upward propagation are the same on other releases is not something this test answers.</li>
+                        <li><strong>Update latency while the MDS is heavily loaded.</strong> The only load in the test environment was what the synchronization itself generated. How far value updates lag while other clients are exercising metadata heavily, and whether that lag affects the verdict, is outside the scope.</li>
+                        <li><strong>Results under a different file size distribution.</strong> Measurements come from one distribution only, about 1 TB across about 90,000 directories. How the ratios shift on a tree with far more small files, or one with a few very large files, cannot be read from this table.</li>
+                        <li><strong>The values from rounds 3 and 6.</strong> They were skipped for maintenance on the test infrastructure. Those two slots were not filled with substitute numbers, and no guess is offered about which approach those scenarios would have favored.</li>
+                        <li><strong>Actual elapsed time at 5 TB and 10 TB.</strong> Those rows are extrapolations from the measured values above. How cache hit rates and metadata distribution behave at that scale was not a subject of measurement.</li>
+                        <li><strong>The optimum for the depth limit.</strong> Every round ran at a limit of 10. Where the balance between descent cost and rsync scope settles at other values does not have an answer under these conditions.</li>
+                        <li><strong>Results under parallel execution.</strong> Parallelism was fixed at 1 for a fair comparison. How much parallelization contributes to each approach requires a separate set of conditions.</li>
+                    </ul>
+
+                    <h2 id="sec-20">References</h2>
+
+                    <ul>
+                        <li><a href="https://docs.ceph.com/en/reef/man/8/mount.ceph/" target="_blank" rel="noopener">Ceph documentation, mount.ceph manual page</a> — the definition of the mount option that reports a directory <code>st_size</code> as the recursive size of its contents, and of its inverse. The basis for CephFS maintaining recursively aggregated values.</li>
+                        <li><a href="https://docs.ceph.com/en/reef/cephfs/posix/" target="_blank" rel="noopener">Ceph documentation, differences from POSIX</a> — the statement that the recursive size field is maintained by CephFS.</li>
+                        <li><a href="https://docs.ceph.com/en/latest/releases/luminous/" target="_blank" rel="noopener">Ceph documentation, Luminous release notes</a> — where <code>ceph.dir.rctime</code> appears in the release notes, in the entry fixing a defect in how the nanosecond component of the attribute value was rendered.</li>
+                        <li>The design, the decision structure and the measurements in this article were built and put into production by the author, and there is no external source beyond the three entries above.</li>
+                    </ul>
+
+                </div>
+
+                <div class="share-section">
+                    <h3>Share this post</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X (Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">Copy link</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">Back to list</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Free tools you may find useful</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/iptables_generator.html">iptables Generator 2026</a></li>
+      <li><a href="../static/code_image.html">Code Image Generator</a></li>
+      <li><a href="../static/char_counter.html">Character Counter</a></li>
+      <li><a href="../static/json_formatter.html">JSON Formatter</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">See all tools &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Related Posts</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="backup_restore_verification.html">Having a Backup and Being Able to Restore Are Two Different Claims - Where a Successful Backup Lies, and What Restore Verification Actually Demands</a></li>
+      <li><a href="rsync_trailing_slash_guide.html">Why One Trailing Slash Changes Everything in rsync - Checking Before You Delete 2026</a></li>
+      <li><a href="postgres_horizontal_scaling_cost.html">Choosing to Split Postgres Across Multiple Nodes - The Cost Horizontal Scaling Levies on Transactions, Joins, and Constraints</a></li>
+      <li><a href="oss_ownership_beyond_license.html">The Code Is Open, the Name Is Not - Trademarks, Domains and Release Access an Open Source License Never Grants</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('Link copied. Paste it into the Threads app to share.');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('Link copied.'); });
+    });
+    </script>
+</body>
+</html>

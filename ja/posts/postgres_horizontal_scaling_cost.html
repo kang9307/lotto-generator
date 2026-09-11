@@ -1,0 +1,724 @@
+<!DOCTYPE html>
+<!--
+ * 技術 ブログ ポスト テンプレート
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ja">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Postgresを複数台に分割するという選択 - 水平スケーリングがトランザクション・結合・制約に請求する対価</title>
+    <meta name="description" content="Postgresを水平分割すると、単一ノードのトランザクション、結合、一意制約、シーケンスが損なわれ、分散ネットワークの対価を払うことになります。シャーディングキー選定の重みや運用管理の増加、水平分割前に試すべき最適化の順序を整理します。">
+    <meta name="keywords" content="PostgreSQL, 水平スケーリング, シャーディング, 分散トランザクション, 2PC, PREPARE TRANSACTION, シャーディングキー, 再シャーディング, パーティショニング, Multigres, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/ja/posts/postgres_horizontal_scaling_cost.html">
+
+    <meta property="og:title" content="Postgresを複数台に分割するという選択 - 水平スケーリングがトランザクション・結合・制約に請求する対価">
+    <meta property="og:description" content="単一ノードで自明だった関係モデルの機能が複数サーバーに分散する際に払うコストと、シャーディング前の点検順序。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/ja/posts/postgres_horizontal_scaling_cost.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ja_JP">
+    <meta property="article:published_time" content="2026-09-12">
+    <meta property="article:section" content="開発・インフラ">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Postgresを複数台に分割するという選択 - 水平スケーリングがトランザクション・結合・制約に請求する対価">
+    <meta name="twitter:description" content="単一ノードで自明だった関係モデルの機能が複数サーバーに分散する際に払うコストと、シャーディング前の点検順序。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "Postgresを複数台に分割するという選択 - 水平スケーリングがトランザクション・結合・制約に請求する対価",
+      "alternativeHeadline": "単一ノードで自明だった関係モデルの機能が複数サーバーに分散する際に払うコストと、シャーディング前の点検順序",
+      "datePublished": "2026-09-12",
+      "dateModified": "2026-09-12",
+      "inLanguage": "ja-JP",
+      "articleSection": "開発・インフラ",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "PostgreSQL, 水平スケーリング, シャーディング, 分散トランザクション, 2PC, PREPARE TRANSACTION, シャーディングキー, 再シャーディング, パーティショニング, Multigres",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/ja/posts/postgres_horizontal_scaling_cost.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "PostgreSQLを複数台に水平分割すると、なぜトランザクションが困難になるのか？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "単一インスタンスでは内部のWALとMVCCがメモリおよびローカルディスク上で即座に原子性を保証するが、複数ノードに跨がると2相コミット（2PC）が不可避となる。2PCはコーディネーターと全参加シャードがPREPARE段階を経るためネットワーク往復遅延が累積し、各シャードがロックを保持したまま待機することになる。さらにPostgreSQL公式文書が警告するように、残留したPREPAREトランザクションはVACUUMを阻害し、トランザクションID周回による緊急停止のリスクを招く。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "シャーディング環境においてテーブル結合（JOIN）はどのようなコストを要求するのか？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "2つのテーブルが同一のシャーディングキーで結ばれ同一インスタンスに物理配置されている場合（コロケーション）、結合クエリ全体を個別のシャードへそのままプッシュダウンしてローカル速度で処理できる。しかし異なるシャードへデータが分散している場合、ゲートウェイが全シャードへ部分クエリをばら撒いて結果をネットワーク経由で回収（スキャッター・ギャザー）し、ゲートウェイ側のメモリ上で再結合しなければならず、ネットワーク帯域の枯渇やメモリ圧迫、遅延増大を招く。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "シャーディング環境で従来のSERIALやBIGSERIAL主キーが使えない理由は何か？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "SERIALは単一PostgreSQLインスタンスの内部シーケンスカウンタに依存する構造であるため、複数ノードが各自でシーケンスを発行すれば必ずID番号の衝突が発生する。したがって分散環境では時系列ソート可能なUUIDv7やSnowflake等の分散一意ID生成器を採用せざるを得ず、シャーディングキーを含まないカラムに対する大域的一意制約（UNIQUE）は外部インデックスなしにデータベース単体で強制することができない。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "最初に不適切なシャーディングキーを選定するとどのような破綻が起きるのか？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "カーディナリティが低いキーやタイムスタンプのような単調増加キーを選定すると、特定の単一シャードへ書き込みトラフィックが集中するホットスポットが発生する。シャーディングキーは行の物理的な格納先を決定づけるため、これを変更するにはクラスタ全体のデータを再分配（再シャーディング）しなければならず、リアルタイムストリーミングや二重書き込み、切り替え検証といった膨大なダウンタイムリスクと開発工数が要求される。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "データベースを分割する前に試すべき代替手段の順序は何か？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "第1にpg_stat_statementsを用いたスロークエリやインデックスのチューニング、第2に読み取りレプリカへの参照トラフィックのオフロード、第3に単一ノード内の宣言的パーティショニング（Declarative Partitioning）による管理単位の分割、第4に古い履歴データを外部へ切り離すアーカイブである。最後に数百GBのRAMと高速NVMeを備えた上位サーバーへの垂直増設（スケールアップ）を検討すべきであり、この手順を飛ばしてシャーディングを導入すれば分散システムの複雑さだけを抱え込むことになる。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/postgres_horizontal_scaling_cost.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/postgres_horizontal_scaling_cost.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/postgres_horizontal_scaling_cost.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/postgres_horizontal_scaling_cost.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/postgres_horizontal_scaling_cost.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "ホーム",
+      "item": "https://braindetox.kr/ja/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "開発・インフラ",
+      "item": "https://braindetox.kr/ja/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "Postgresを複数台に分割するという選択 - 水平スケーリングがトランザクション・結合・制約に請求する対価",
+      "item": "https://braindetox.kr/ja/posts/postgres_horizontal_scaling_cost.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="Postgresを複数台に分割するという選択 - 水平スケーリングがトランザクション・結合・制約に請求する対価">
+                <meta itemprop="datePublished" content="2026-09-12">
+                <meta itemprop="dateModified" content="2026-09-12">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="PostgreSQL, 水平スケーリング, シャーディング, 分散トランザクション, 2PC, PREPARE TRANSACTION, シャーディングキー, 再シャーディング, パーティショニング, Multigres">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/ja/posts/postgres_horizontal_scaling_cost.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">Postgresを複数台に分割するという選択 - 水平スケーリングがトランザクション・結合・制約に請求する対価</h1>
+                    <h2 class="post-subtitle">単一ノードで自明だった関係モデルの機能が複数サーバーに分散する際に払うコストと、シャーディング前の点検順序</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-12">2026-09-12</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">開発・インフラ</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>リレーショナルデータベースを運用する組織において、トラフィックとデータ量が膨張した際、エンジニアが最初に思い浮かべる言葉は水平スケーリングである。Webサーバーやアプリケーションコンテナを増設するように、データベースも複数台のノードに分割すれば書き込み処理量とストレージ容量が線形に伸びると期待しがちだ。実際、NoSQLや分散キーバリューストアはそのような設計思想でスケールする。しかし、PostgreSQLは本質的に単一ノードの強固な関係モデルとして磨き上げられてきたエンジンである。</p>
+
+                    <p>単一インスタンスで完璧に動作していたデータベースを複数の物理マシンに切り分けた瞬間、これまで当たり前に享受してきた数々の機能が静かに損なわれ、あるいは巨額のアーキテクチャ的請求書となって跳ね返ってくる。単一メモリ空間で即座に検証されていた不可分なトランザクションはネットワーク通信を経由する分散合意へと変貌し、超高速なハッシュ結合は帯域を食いつぶすデータ転送処理へと成り下がる。テーブル単位で一意性を保っていたインデックスや自動採番シーケンスは、大域的な衝突の火種へと変わる。</p>
+
+                    <p>この記事は特定の分散ツールや製品を賞賛あるいは非難するために書かれたものではない。1台のマシンで完結していた処理がネットワーク境界を跨ぐ瞬間、<strong>構造的に何が壊れ、何を諦める必要があり、どのような代替手段を組まねばならないのか</strong>を冷静に解剖する。その上で、シャーディングという極めて危険で後戻りのできない河を渡る前に、単一インスタンス内で必ず試し切るべき最適化手順を整理する。</p>
+
+                    <div class="callout">
+                        本稿で扱う分散トランザクションの限界、2相コミット（2PC）の制約、テーブルパーティショニングの仕様はPostgreSQL 17の公式マニュアルの記述に基づく。また契機として触れるMultigresのアーキテクチャや制約事項は、同プロジェクトの公式リポジトリREADMEおよび技術文書が自ら明かしている内容に限定し、原文にない性能数値やスループットは一切記載しない。
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>この記事で扱うこと</h3>
+                        <ol>
+                            <li><a href="#sec-1">発端 - Postgresの水平スケーリングを掲げたオープンソースの登場</a></li>
+                            <li><a href="#sec-2">垂直スケーリングが最初に突き当たる物理的限界</a></li>
+                            <li><a href="#sec-3">垂直スケーリングと水平スケーリングの構造的比較</a></li>
+                            <li><a href="#sec-4">分割した瞬間に変わるもの - 単一ノードで自明だった仕組みの崩壊</a></li>
+                            <li><a href="#sec-5">トランザクション境界 - シャードを跨ぐ2相コミットと原子性の代償</a></li>
+                            <li><a href="#sec-6">結合演算 - データ配置とネットワーク往復のボトルネック</a></li>
+                            <li><a href="#sec-7">一意制約とシーケンス - グローバル一意性が消失する場所</a></li>
+                            <li><a href="#sec-8">外部キーと分散集約 - 放棄するか代替すべきもの</a></li>
+                            <li><a href="#sec-9">シャーディングキーの変更は極めて困難 - ホットスポットと再シャーディングの重み</a></li>
+                            <li><a href="#sec-10">運用で爆発する作業 - リカバリ・DDL伝播・可観測性</a></li>
+                            <li><a href="#sec-11">水平分割に踏み切る前に必ず経るべき5つの段階</a></li>
+                            <li><a href="#sec-12">まとめ - 4つの文</a></li>
+                            <li><a href="#sec-13">確認できなかったこと</a></li>
+                            <li><a href="#sec-14">参考資料</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">発端 - Postgresの水平スケーリングを掲げたオープンソースの登場</h2>
+
+                    <p>2026年9月初旬、技術コミュニティにおいてMultigresというプロジェクトが発表された。MySQLエコシステムにおいて大規模水平分割のデファクトスタンダードとして知られるVitessのアーキテクチャを、PostgreSQLへと持ち込もうとするオープンソースの試みである。このプロジェクトの骨子は、PostgreSQL本体のコードを改変して独自の派生データベースを作るのではなく、標準のPostgreSQLインスタンス群の前段にプロキシ、コネクションプーラー、オーケストレーターを階層配置して水平拡張を実現しようとする点にある。</p>
+
+                    <p>公開リポジトリおよび公式ドキュメントから確認できる客観的事実は次の4点に要約される。</p>
+
+                    <ul>
+                        <li><strong>何を行う構造か</strong> — アプリケーションとデータベースの間に多層プロキシを配置する。上位層のMultigatewayはPostgreSQLサーバーとして振る舞い、クエリを適切なノードへルーティングし分散結合を調停する計算層である。下位層のMultipoolerは各PostgreSQLインスタンスに1対1で常駐し、セッション状態の保持と接続プーリングを担う。Multiorchはレプリケーション監視、自動フェイルオーバー、WALのクォーラム同期を統括する。</li>
+                        <li><strong>何を要求するのか</strong> — 関連するテーブルと行を同一シャード内に物理的に集約する関係モデル型のシャーディング設計を前提とする。これにより分散結合や分散トランザクションを最小化するためである。複数シャードに跨がるトランザクションが避けられない場合は、PostgreSQL標準の2相コミット（2PC）プロトコルを利用する設計となっている。</li>
+                        <li><strong>文書自らが明かす現在の限界</strong> — 2026年6月に最初のアルファ版が公開された初期段階にある。現在の公開リリースには接続プーリング、自動フェイルオーバー、バックアップ、Kubernetes Operatorのみが含まれており、<strong>核心であるシャーディング機能そのものは未だ公式リリースに含まれておらず開発計画の段階</strong>である。またプーラー層を経由する際、CREATE DATABASEや外部データラッパ（FDW）、一部の動的SQLが制限されると明記されている。</li>
+                        <li><strong>本番稼働に対する原文の見解</strong> — プロジェクトの公式文書は現在のフェーズをテストおよび実験目的のアルファ版と位置づけており、本番環境での利用を推奨しないと明確に述べている。</li>
+                    </ul>
+
+                    <p>この取り組みは、技術者に根本的な問いを投げかける。大掛かりな調停レイヤーを設けてまでPostgreSQLを複数台に分割すべきタイミングとはいつであり、その選択によってシステムが支払う真の代償とは何か、という点である。</p>
+
+                    <h2 id="sec-2">垂直スケーリングが最初に突き当たる物理的限界</h2>
+
+                    <p>データベースの負荷が増大した際、最も安全で確実な選択肢は垂直スケーリング（スケールアップ）である。単一のマシンに対してより多くのCPUコア、数百ギガバイトのメモリ、そして数万IOPSを誇るエンタープライズNVMeストレージを投入する手法である。垂直スケーリングであればアプリケーションのコードやSQLを変更する必要は一切なく、リレーショナルエンジンが提供する完全なACID保証、インデックス、制約を保ち続けることができる。</p>
+
+                    <p>実のところ、現代における大半のサービスは垂直スケーリングだけで十分に運用を維持できる。最新のクラウドインスタンスは単一ノードで数百規模のvCPUとテラバイト単位のメモリを提供する。適切なインデックス設計と参照用レプリカ（Read Replica）の活用を組み合わせれば、毎秒数万件のトランザクションを安定して処理可能である。しかし、それでも垂直スケーリングが物理的に壁に突き当たる瞬間が存在する。</p>
+
+                    <ul>
+                        <li><strong>単一プライマリの書き込み限界</strong> — 参照トラフィックはレプリカを増設して分散できるが、データの挿入・更新・削除は必ず単一のプライマリノードを通過しなければならない。書き込みはWAL（先行書き込みログ）の同期書き込み、共有バッファのダーティページ排出、行ロックの競合を伴うため、単一マシンのストレージ帯域と同期処理の限界に達した時点でスケールアップは停止する。</li>
+                        <li><strong>メンテナンス窓とVACUUM負荷の爆発</strong> — 単一ノード内のデータが数十テラバイトに達すると、内部メンテナンスが深刻なリスクへと転じる。PostgreSQLの追記型MVCCは不要行を回収するためにVACUUMを必要とするが、テーブルが巨大化するとautovacuumがディスクI/Oを占有し、サービスの応答速度を著しく低下させる。巨大なB-treeインデックスの再構築（REINDEX）も極めて長時間を要する。</li>
+                        <li><strong>単一障害点（SPOF）と復旧時間（RTO）の増大</strong> — 単一ノードの規模が大きくなるほど、ハードウェア障害発生時のクラッシュリカバリとWAL再生にかかる時間は跳ね上がる。フェイルオーバーを実施しても、膨大なバッファプールが冷え切った状態（コールドキャッシュ）から直ちにピークトラフィックを捌き切ることは極めて難しい。</li>
+                        <li><strong>ハードウェア費用の指数関数的急騰</strong> — サーバーのスペックは一定の閾値を超えた途端、価格曲線が跳ね上がる。上位スペックほどコストは仕様に比例せず、より急峻に上がる。具体的な倍率はベンダーと時期によって異なるため、実際の見積もりで確認する必要がある。</li>
+                    </ul>
+
+                    <p>このように、書き込み飽和、メンテナンス限界、リカバリ遅延が同時に臨界点へ達した時、アーキテクトは初めてデータベースを複数台に分割する水平スケーリングの検討へ追い込まれる。</p>
+
+                    <h2 id="sec-3">垂直スケーリングと水平スケーリングの構造的比較</h2>
+
+                    <p>垂直スケーリングと水平スケーリングの違いは単なるサーバー台数の増減ではない。システムの動作原理と前提条件を根本から交換する選択である。両者の構造的な相違点は次の通りである。</p>
+
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>比較項目</th>
+                                <th>垂直スケーリング（Scale-up）</th>
+                                <th>水平スケーリング（Sharding / Scale-out）</th>
+                                <th>実務的な意味合い</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><strong>拡張の軸とリソース</strong></td>
+                                <td>単一ノードのCPU・RAM・NVMeスペック増設</td>
+                                <td>独立した複数ノードへのデータ分散配置</td>
+                                <td>水平スケーリングは内部通信媒体として物理ネットワークを導入する。</td>
+                            </tr>
+                            <tr>
+                                <td><strong>SQL互換性と機能</strong></td>
+                                <td>100%完全なPostgreSQL機能をそのまま利用</td>
+                                <td>結合・トランザクション・DDLに部分的な制約が発生</td>
+                                <td>水平スケーリングはアプリケーション側のクエリ書き換えを強制する。</td>
+                            </tr>
+                            <tr>
+                                <td><strong>トランザクション保証</strong></td>
+                                <td>エンジン内部のローカルACID（WALおよびMVCC）</td>
+                                <td>シャードを跨ぐ2相コミット（2PC）または結果整合性</td>
+                                <td>分散トランザクションは通信遅延とロック保持時間を劇的に増大させる。</td>
+                            </tr>
+                            <tr>
+                                <td><strong>運用の複雑性</strong></td>
+                                <td>単一インスタンスの監視とシンプルなバックアップ</td>
+                                <td>ゲートウェイ、プーラー、ノード別オーケストレーション</td>
+                                <td>管理すべきプロセスと潜在的な障害点が倍数で増殖する。</td>
+                            </tr>
+                            <tr>
+                                <td><strong>書き込み限界の突破</strong></td>
+                                <td>単一マシンのハードウェア上限に縛られる</td>
+                                <td>シャーディングキーに基づいて書き込みを複数台へ分散</td>
+                                <td>超巨大な書き込みトランザクションを捌くための唯一の突破口となる。</td>
+                            </tr>
+                            <tr>
+                                <td><strong>障害の影響範囲</strong></td>
+                                <td>プライマリ障害がドメイン全体へ波及</td>
+                                <td>理論上は特定シャードの障害を局所化可能</td>
+                                <td>部分障害がクラスタ全体の連鎖停止を引き起こさない設計が求められる。</td>
+                            </tr>
+                        </tbody>
+                    </table>
+
+                    <p>上記が示すように、水平スケーリングは書き込みの限界を打破できる強力な選択肢である一方、単一ノードが提供してきた関係モデルの統一された抽象化を解体する。</p>
+
+                    <h2 id="sec-4">分割した瞬間に変わるもの - 単一ノードで自明だった仕組みの崩壊</h2>
+
+                    <p>エンジニアがPostgreSQLを選ぶ最大の理由は、その信頼性と表現力豊かな関係モデルにある。外部キーによって親子レコードの整合性が保証され、複雑な変更処理は単一トランザクション内で例外時に巻き戻される。数行のJOIN句を書くだけで複数テーブルがミリ秒で結合され、SERIAL型が重複のない一連番号を滞りなく払い出す。</p>
+
+                    <p>しかし、データベースを複数台に分断した瞬間、これらの前提は一斉に崩壊する。分散された環境では、異なる物理マシンに存在するテーブル間のメモリポインタを直結することはできず、異なるディスクのWALへ単一のアトミック操作で書き込むこともできない。<strong>1台のコンピュータ内部でCPUキャッシュとメモリバスを通じて行われていた通信が、スイッチとネットワークケーブルを通過するTCPパケットへと置き換わるからである。</strong></p>
+
+                    <p>マイクロ秒単位で完了していたロック獲得やインデックス探索は、ネットワークの往復遅延（RTT）が介入することでミリ秒単位へと千倍近く遅延する。速度が千倍遅い環境において、単一マシン前提の直列化やロック機構をそのまま維持することは不可能だ。水平スケーリングとは、関係モデルの基盤的機能を一つずつ手放すか、分散システム用の代替部品と交換する厳しい取引に他ならない。</p>
+
+                    <h2 id="sec-5">トランザクション境界 - シャードを跨ぐ2相コミットと原子性の代償</h2>
+
+                    <p>水平分割によって最も深刻な打撃を受けるのがトランザクションの原子性（Atomicity）である。処理対象のデータが同一シャード内に完結している限り、そのノードのローカルエンジンが以前と変わらずACIDを担保する。問題は、<strong>1つの論理的ビジネス処理が異なるシャードに点在する複数のデータを同時に更新しなければならない場合</strong>に生じる。</p>
+
+                    <p>この課題に対する古典的な解法が2相コミット（2PC, Two-Phase Commit）である。外部コーディネーターが関与する全シャードに対してコミットの準備が整ったかを問い合わせる準備（Prepare）フェーズを経て、全ノードから承認を得た後に確定（Commit）フェーズを実行する。PostgreSQLはエンジン標準の構文として<code>PREPARE TRANSACTION</code>および<code>COMMIT PREPARED</code>を提供している。</p>
+
+                    <pre><code class="language-sql">-- 分散トランザクション環境におけるPostgreSQLの2相コミット（2PC）実行フロー
+-- [フェーズ1: ローカルでトランザクションを開始し変更を実行]
+BEGIN;
+UPDATE user_balance SET balance = balance - 10000 WHERE user_id = 42;
+
+-- [フェーズ2: コミット準備 - セッションから切り離し状態をディスクへ永続化]
+PREPARE TRANSACTION 'tx_shard1_user42_20260912';
+
+-- 外部コーディネーターが他シャードの準備完了を確認した後にコミットを指示
+-- [フェーズ3: 大域的コミットの確定実行]
+COMMIT PREPARED 'tx_shard1_user42_20260912';
+
+-- いずれかのシャードで障害が発生した場合は大域的にロールバック
+-- ROLLBACK PREPARED 'tx_shard1_user42_20260912';</code></pre>
+
+                    <p>この2PCプロトコルは論理的には整合性を保てるが、運用環境においては極めて重大な性能低下と可用性の危機を招く。PostgreSQL 17の公式マニュアルは、PREPARE TRANSACTIONに関して以下の痛烈な警告を記している。</p>
+
+                    <ul>
+                        <li><strong>max_prepared_transactionsの有効化義務</strong> — デフォルト設定値は0（無効）である。外部トランザクションマネージャーが厳密に管理しない限り、誤って残存したトランザクションがシステムを破壊するのを防ぐため、0のままにしておくことが強く推奨されている。</li>
+                        <li><strong>ロック（Lock）の無期限保持</strong> — トランザクションがPREPARE状態に入ると、クライアント接続が切断されても、そのトランザクションが取得した行ロックやテーブルロックは解除されずディスクに残り続ける。コーディネーターの障害やネットワーク分断で確定指示が届かなければ、他のすべてのセッションがそのデータへアクセスできず永久にブロックされる。</li>
+                        <li><strong>VACUUMによる不要行回収の完全停止</strong> — 準備されたトランザクションは、それが生成された時点のトランザクションID（XID）を固定してしまう。結果としてVACUUMプロセスが古い不要タプルを掃除できなくなり、テーブルが異常に肥大化（Bloat）する。</li>
+                        <li><strong>XID周回（Wraparound）に伴う強制シャットダウン</strong> — 準備状態のトランザクションが放置されたまま通常のトランザクションが進むと、XIDの枯渇が進み、データベースはデータ消失を防ぐために最終的に強制停止（緊急シャットダウン）に至る。</li>
+                    </ul>
+
+                    <p>この物理的オーバーヘッドゆえに、Multigresのような最新の水平分割ツールであっても「最適なシャーディング設計によって2PCを極力回避せよ」と繰り返し説いている。実務においては、複数シャードに跨がる分散ACIDトランザクションは事実上のアンチパターンであり、非同期なSagaパターンによる結果整合性を受け入れるか、単一シャード内へ更新を閉じ込める設計が求められる。</p>
+
+                    <h2 id="sec-6">結合演算 - データ配置とネットワーク往復のボトルネック</h2>
+
+                    <p>単一のPostgreSQL環境におけるテーブル結合は、オプティマイザがネステッドループ結合、ハッシュ結合、マージ結合から最適な実行計画を選定し、ローカルメモリ内で極めて高速に完結する。</p>
+
+                    <p>しかし、データが10台のシャードに分散された環境で<code>orders</code>テーブルと<code>users</code>テーブルを結合する場合、その挙動はデータの配置構造によって決定づけられる。</p>
+
+                    <ul>
+                        <li><strong>コロケーション結合（Collocation Join）</strong> — <code>orders</code>と<code>users</code>が同一のキー（例: <code>user_id</code>）でシャーディングされ、同一ユーザーのレコードが同一のPostgreSQLノードに同居している場合である。ゲートウェイは結合クエリ全体を個別のシャードへそのままプッシュダウンし、各シャードがローカルのデータだけで結合を終えて結果を返すため、ネットワーク転送コストは発生しない。</li>
+                        <li><strong>ブロードキャスト結合（Broadcast Join）</strong> — 都道府県マスターや商品分類コードのように、容量が小さく更新頻度が極めて低いテーブルを結合する際に用いられる。参照テーブルの完全なコピーを全シャードに事前に複製配置しておくことでローカル結合を可能にするが、マスターデータの更新時に全ノードへ書き込み負荷が波及する。</li>
+                        <li><strong>スキャッター・ギャザー結合（Scatter-Gather Cross-shard Join）</strong> — 最も避けるべきケースである。結合対象のテーブル同士が異なるキーで分割されている場合、プッシュダウンは不可能となる。ゲートウェイは関係する全シャードへクエリをばら撒き（Scatter）、膨大な中間データをネットワーク越しに回収（Gather）して、ゲートウェイ自身のメモリ上でハッシュテーブルを構築して結合しなければならない。</li>
+                    </ul>
+
+                    <p>スキャッター・ギャザー結合が発生した瞬間、ネットワーク帯域は逼迫し、プロキシノードのメモリ消費は跳ね上がり、OOM（メモリ不足）による障害リスクが跳ね上がる。水平分割環境では、これまで自由自在に駆使していた複雑なSQL結合を封印し、データを非正規化して冗長保持するか、アプリケーション層で個別取得して組み立て直す苦肉の策が必要となる。</p>
+
+                    <h2 id="sec-7">一意制約とシーケンス - グローバル一意性が消失する場所</h2>
+
+                    <p>単一インスタンスにおいて<code>id SERIAL PRIMARY KEY</code>や<code>email VARCHAR(255) UNIQUE</code>を宣言することは日常的な開発手法である。ローカルのB-treeインデックスが重複データを瞬時に検知し、データの一貫性を保ってくれるからである。</p>
+
+                    <p>しかし、複数の独立したノードに分かれた環境では、この大域的な一意性が根底から崩れ去る。</p>
+
+                    <ul>
+                        <li><strong>単一シーケンスの衝突</strong> — PostgreSQLのシーケンスは単一インスタンス内のメモリ管理下にある。シャード1とシャード2がそれぞれ独立して1から番号を採番すれば、生成された主キーは必然的に重複する。分散環境ではSERIALを廃止し、128ビットのUUIDv7（時間順ソート可能）やSnowflake型（タイムスタンプ＋マシンID＋連番）の分散ID生成機構を導入せざるを得ず、インデックスサイズとストレージを余計に浪費する。</li>
+                        <li><strong>シャーディングキーを含まない一意制約の不可能性</strong> — これは単一ノード内の宣言的パーティショニングでも水平シャーディングでも共通する根本的な制約である。PostgreSQL 17の公式文書はこう明記している。「パーティションテーブルに一意制約または主キー制約を作成するには、制約のカラムにすべてのパーティションキーを含めなければならない。なぜなら、個別のインデックスは自分自身のパーティション内の一意性しか直接強制できないからである」。</li>
+                        <li><strong>大域的一意性の検証コスト</strong> — ユーザーを<code>user_id</code>で分割した状態で<code>email</code>カラムに一意制約をかけたい場合、データベースエンジン単体ではこれを防ぐ手段が存在しない。シャード2で新しいメールアドレスをINSERTする際、シャード2はシャード1のローカルインデックスを覗き見ることができないためである。これを防ぐには専用のグローバル参照インデックスを設けて事前検証するか、Redis等の外部分散ロックに依存しなければならない。</li>
+                        <li><strong>書き込みスループットの相殺</strong> — すべてのINSERT操作のたびに大域的一意性を確認するための追加通信が発生するならば、水平スケーリングによって獲得しようとした書き込み性能向上は完全に帳消しになる。</li>
+                    </ul>
+
+                    <h2 id="sec-8">外部キーと分散集約 - 放棄するか代替すべきもの</h2>
+
+                    <p>リレーショナルエンジンのもう一つの象徴である外部キー（Foreign Key）や集約処理（Aggregation）も、水平スケーリングによって過酷な制約を受ける。以下の比較表は、1台で自明だった主要機能がシャーディング時にどのように崩壊し、現場でどのように代替・妥協されているかを整理したものである。</p>
+
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>関係モデルの標準機能</th>
+                                <th>単一ノード（Single Node）の動作</th>
+                                <th>水平分割（Sharding）時の現実</th>
+                                <th>現場における代替策・妥協点</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><strong>原子的なトランザクション（ACID）</strong></td>
+                                <td>単一エンジンのローカルWALとMVCCにより即座に保証</td>
+                                <td>複数シャードに跨がる更新で2PCが必須となり、遅延とロックが激化</td>
+                                <td>同一シャード内の更新に限定するか、Saga等の結果整合性を受け入れる</td>
+                            </tr>
+                            <tr>
+                                <td><strong>テーブル間結合（JOIN）</strong></td>
+                                <td>ローカルメモリ内のハッシュ／マージ結合によりミリ秒で完了</td>
+                                <td>シャードを跨ぐデータ転送によりネットワーク帯域とプロキシメモリを圧迫</td>
+                                <td>同一キーでのコロケーション配置を徹底するか、非正規化して保持する</td>
+                            </tr>
+                            <tr>
+                                <td><strong>大域的一意制約（UNIQUE）</strong></td>
+                                <td>ローカルB-treeインデックスで重複行の挿入を瞬時に遮断</td>
+                                <td>シャーディングキーを含まないカラムは別ノードの重複を検知不能</td>
+                                <td>シャーディングキーを一意キーへ合成するか、外部ロックで事前確認する</td>
+                            </tr>
+                            <tr>
+                                <td><strong>自動採番主キー（SERIAL）</strong></td>
+                                <td>単一の内部カウンタにより重複のない単調増加連番を自動発行</td>
+                                <td>各ノードが独自に採番するため、同一のID番号が必然的に衝突する</td>
+                                <td>UUIDv7やSnowflake等の分散ID生成器、ノード別採番範囲の割り当て</td>
+                            </tr>
+                            <tr>
+                                <td><strong>外部キー制約（FOREIGN KEY）</strong></td>
+                                <td>参照整合性およびCASCADE削除をデータベースエンジンが強制</td>
+                                <td>親レコードと子レコードが異なるノードにある場合、参照検証が物理的に不可能</td>
+                                <td>DB層の外部キーを全廃し、アプリケーションロジック側で整合性を管理する</td>
+                            </tr>
+                            <tr>
+                                <td><strong>集約とページネーション（GROUP BY / LIMIT）</strong></td>
+                                <td>インデックス走査とインラインソートにより即座に結果を抽出</td>
+                                <td>全シャードから大量データを集約してプロキシで再ソート、深層OFFSETで爆発</td>
+                                <td>カーソルベースのページネーション（Keyset Pagination）や事前集約テーブルの活用</td>
+                            </tr>
+                        </tbody>
+                    </table>
+
+                    <p>特に<code>ORDER BY created_at LIMIT 20 OFFSET 10000</code>のような深層ページネーションは分散環境において致命的である。ゲートウェイは10台のシャードすべてに対して先頭10,020件の取得を要求し、合計10万件以上の行をネットワーク経由で吸い上げてメモリ上でソートし直す羽目になる。データベースが提供していた利便性は消滅し、すべてのツケがアプリケーションコードへと回される。</p>
+
+                    <h2 id="sec-9">シャーディングキーの変更は極めて困難 - ホットスポットと再シャーディングの重み</h2>
+
+                    <p>水平スケーリングを決断した際、最初に立ちはだかる最大の設計判断がシャーディングキー（パーティションキー）の決定である。シャーディングキーは、各レコードがどの物理シャードへ格納されるかを決定づける番地情報である。選定基準とそれぞれの危険性は以下の通りである。</p>
+
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>選定における観点</th>
+                                <th>考慮すべき技術的背景</th>
+                                <th>推奨されるパターン</th>
+                                <th>不適切なパターン（アンチパターン）</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><strong>カーディナリティ（値の多様さ）</strong></td>
+                                <td>値の種類が十分に多くなければ均等にノードへ分散されない</td>
+                                <td>数百万以上の重複しない識別子（user_id, account_id）</td>
+                                <td>ステータス値、性別、国コード等の限定されたカテゴリ値（特定の偏り）</td>
+                            </tr>
+                            <tr>
+                                <td><strong>書き込みトラフィックの均等性</strong></td>
+                                <td>特定時点において特定の単一ノードへ書き込みが偏らないこと</td>
+                                <td>ハッシュ分割、ランダム性の高い業務エンティティ識別子</td>
+                                <td>日付タイムスタンプ、単調増加ID（最新日付のシャード1台だけが高負荷）</td>
+                            </tr>
+                            <tr>
+                                <td><strong>クエリのアクセスパターン</strong></td>
+                                <td>大半の検索WHERE条件にシャーディングキーが含まれていること</td>
+                                <td>業務の起点となる主キー（テナントID、顧客番号）</td>
+                                <td>検索条件にほとんど指定されない内部UUID（毎回全シャード走査）</td>
+                            </tr>
+                            <tr>
+                                <td><strong>データ容量の増加傾向</strong></td>
+                                <td>特定キーに紐づくデータボリュームが極端に巨大化しないこと</td>
+                                <td>均一な規模の一般ユーザー、中小型のテナント識別子</td>
+                                <td>超巨大企業が含まれるB2BのテナントID（特定シャードのディスクが枯渇）</td>
+                            </tr>
+                            <tr>
+                                <td><strong>キーの不変性（Immutability）</strong></td>
+                                <td>キーの値が変更されると、行を別の物理サーバーへ移管しなければならない</td>
+                                <td>レコード生成後に二度と変更されない不変のサロゲートキー</td>
+                                <td>メールアドレス、所属部署コード、変更可能なユーザー名</td>
+                            </tr>
+                        </tbody>
+                    </table>
+
+                    <p>シャーディングキーの選定が恐ろしい理由は、<strong>一度決定して本番稼働を始めたら、後から変更することが極めて困難だからである。</strong>日付単位で分割した結果として最新ノードだけにアクセスが集中するホットスポットが発生したり、テナントIDで分割した結果として1社の大企業顧客がシャードのディスクを埋め尽くす偏りが生じた場合、どう対処すべきか。</p>
+
+                    <p>取り得る手段は、クラスタ全体のデータを新たなルールに基づいて再配置する再シャーディング（Resharding）のみである。再シャーディングは単なる設定変更ではない。稼働中のテーブルからターゲットシャードへ数十テラバイトのデータをリアルタイムでレプリケーションし、同期差分を追いつかせた上でトラフィックを切り替え（カットオーバー）、万一に備えて逆方向のレプリケーションを敷くという極めて高度なインフラ手術である。Multigresのドキュメントが再シャーディングのワークフローと障害復旧に多くの記述を割いているのもそのためだ。誤った選定は数ヶ月にわたる開発チームの疲弊とサービス障害に直結する。</p>
+
+                    <h2 id="sec-10">運用で爆発する作業 - リカバリ・DDL伝播・可観測性</h2>
+
+                    <p>データベースノードが1台から10台へ増えたとき、運用の手間は単に10倍になるのではなく、乗数的に跳ね上がる。単一ノード運用では想定もしなかった新たな課題が次々と噴出する。</p>
+
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>運用管理の項目</th>
+                                <th>単一インスタンス（または基本レプリカ構成）</th>
+                                <th>分散シャーディングクラスタ（水平分割）</th>
+                                <th>運用の複雑化を招く主な要因</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><strong>バックアップと時点復元（PITR）</strong></td>
+                                <td>単一のWALアーカイブを順次再生して指定時刻へ復元完了</td>
+                                <td>各シャードで独立したWALのタイムスタンプが微妙に乖離</td>
+                                <td>分散トランザクション整合性を保ちながらクラスタ全体を同一瞬間に巻き戻すのが極難</td>
+                            </tr>
+                            <tr>
+                                <td><strong>スキーマ変更（DDLマイグレーション）</strong></td>
+                                <td>単一トランザクション内でDDLを実行、失敗時は即座にロールバック</td>
+                                <td>多数のシャードへDDLを順次または並列適用、バージョン混在期が発生</td>
+                                <td>一部ノードだけマイグレーションが完了した移行期間を許容するアプリケーションコードが必須</td>
+                            </tr>
+                            <tr>
+                                <td><strong>コネクションプーリング管理</strong></td>
+                                <td>pgBouncerを1〜2台置くだけで数千のクライアント接続を保護</td>
+                                <td>ゲートウェイプロキシ＋ノード別Multipoolerによる多層構造</td>
+                                <td>プロキシとプーラーの間でセッション状態の追従オーバーヘッドとメモリ消費が増大</td>
+                            </tr>
+                            <tr>
+                                <td><strong>障害検出とフェイルオーバー</strong></td>
+                                <td>Patroni等により単一マスターを自動選出しスタンバイを昇格</td>
+                                <td>全シャードが各自のプライマリ・レプリカ構成を持ち、個別合意を形成</td>
+                                <td>ネットワーク分断時に特定シャードがスプリットブレインを起こさないようクォーラム管理が必要</td>
+                            </tr>
+                            <tr>
+                                <td><strong>可観測性と性能分析</strong></td>
+                                <td>単一ホストのpg_stat_statementsと基本メトリクスで原因特定</td>
+                                <td>分散トレーシング（Distributed Tracing）と全ノードのログ統合</td>
+                                <td>クエリ遅延がゲートウェイの負荷か、特定シャードの行ロックか、ネットワーク遅延かの判別が困難</td>
+                            </tr>
+                        </tbody>
+                    </table>
+
+                    <p>とりわけ過酷なのが災害復旧（DR）である。単一のPostgreSQLであれば「昨日の14時15分00秒時点に戻してほしい」という要求は容易に実現できる。単一のWALストリームに確実なタイムスタンプが刻まれているからだ。しかし10台のシャードに分かれた環境では、サーバー間の微小なクロックスキュー（時刻ズレ）や通信ラグが存在するため、完全な一貫性を保った同一スナップショットに全台を巻き戻すことは極めて難易度が高い。分散トランザクションの処理途中の瞬間に復元してしまえば、シャード間のデータ不整合は永久に残る。</p>
+
+                    <h2 id="sec-11">水平分割に踏み切る前に必ず経るべき5つの段階</h2>
+
+                    <p>水平スケーリングがもたらす巨大な複雑性と運用上の負債を直視すれば、熟練したエンジニアリング組織がとるべき姿勢は明白である。<strong>「シャーディングは誇るべき成果ではなく、あらゆる手段を尽くした後の最終防衛線である。」</strong>可能な限り単一ノード内の最適化を極限まで押し進め、シャーディングという選択を遠ざけなければならない。</p>
+
+                    <p>データベースを複数台に切り分ける前に、以下の5段階を順番にやり切ったかを自問すべきである。</p>
+
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>段階</th>
+                                <th>重点的に取り組むべき最適化作業</th>
+                                <th>期待される改善効果</th>
+                                <th>この段階を飛ばした際のリスク</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><strong>第1段階: クエリとインデックスの徹底整備</strong></td>
+                                <td>pg_stat_statementsによる遅延分析、不要インデックス削除、欠落インデックス追加、N+1撲滅</td>
+                                <td>不要なディスクI/Oの完全排除、CPU使用率の大幅低減</td>
+                                <td>フルスキャンを伴う非効率なクエリをクラスタ全体にばら撒き、問題を何倍にも悪化させる</td>
+                            </tr>
+                            <tr>
+                                <td><strong>第2段階: 読み取り専用レプリカの分離</strong></td>
+                                <td>参照用トラフィック、分析バッチ、管理画面クエリをリードレプリカへオフロード</td>
+                                <td>プライマリノードの計算資源とI/Oを純粋な書き込み処理専用として確保</td>
+                                <td>単なる参照トラフィックの競合を書き込みの限界と錯覚し、不要な分割に走ってしまう</td>
+                            </tr>
+                            <tr>
+                                <td><strong>第3段階: 単一ノード内での宣言的パーティショニング</strong></td>
+                                <td>PostgreSQL標準の宣言的パーティショニング（Range/List）で肥大テーブルを物理ファイル分割</td>
+                                <td>パーティションプルーニングによる高速化、VACUUM範囲の局所化、瞬時のDETACH/DROP</td>
+                                <td>分散ネットワークの複雑さを背負うことなく手に入るエンジン内部の分割効果を見落とす</td>
+                            </tr>
+                            <tr>
+                                <td><strong>第4段階: コールドデータの外部アーカイブ</strong></td>
+                                <td>1年以上経過した古い履歴データを別ストレージ（S3等）や分析用DWHへ退避</td>
+                                <td>アクティブなワーキングセットをRAM内に常駐させ、キャッシュヒット率を極大化</td>
+                                <td>ほとんど読まれない過去の巨大データを抱えたままシャーディングし、インフラ費を爆発させる</td>
+                            </tr>
+                            <tr>
+                                <td><strong>第5段階: ハードウェアの垂直増設（スケールアップ）</strong></td>
+                                <td>最新世代の高性能CPU、512GB〜数TBのRAM、超高速ローカルNVMeストレージの導入</td>
+                                <td>完全なACIDと関係モデルの機能を維持したまま、単一ノードの処理限界を数倍に引き延ばす</td>
+                                <td>コード変更なしにインフラ投資だけで安全に解決できる最も安価な機会を放棄してしまう</td>
+                            </tr>
+                        </tbody>
+                    </table>
+
+                    <p>特に第3段階のPostgreSQL宣言的パーティショニング（Declarative Partitioning）は、シャーディングが持つ利点の多くをネットワーク通信の介在なしに享受できる。以下に示すのは、日付範囲をキーとした標準的なパーティション定義である。</p>
+
+                    <pre><code class="language-sql">-- 単一インスタンス内での宣言的範囲パーティショニング構成例
+CREATE TABLE measurement (
+    city_id         int not null,
+    logdate         date not null,
+    peaktemp        int,
+    unitsales       int
+) PARTITION BY RANGE (logdate);
+
+-- 各月ごとのパーティションテーブルを定義（物理的にストレージが分離される）
+CREATE TABLE measurement_y2026m08 PARTITION OF measurement
+    FOR VALUES FROM ('2026-08-01') TO ('2026-09-01');
+
+CREATE TABLE measurement_y2026m09 PARTITION OF measurement
+    FOR VALUES FROM ('2026-09-01') TO ('2026-10-01');
+
+-- パーティションキーを含むインデックスを作成
+CREATE INDEX ON measurement (logdate);
+
+-- クエリ実行時、enable_partition_pruningにより該当月のテーブルのみが走査される</code></pre>
+
+                    <p>この仕組みを用いれば、数億件のデータが蓄積されても不要になった過去の月を<code>ALTER TABLE measurement DETACH PARTITION ...</code>というコマンド1つで瞬時に切り離すことができ、autovacuumの負荷もパーティションごとに分散される。この手順を飛ばしてシャーディングに手を出すのは、階段を使わずにいきなり窓から飛び降りるようなものである。</p>
+
+                    <h2 id="sec-12">まとめ - 4つの文</h2>
+
+                    <p>本稿で展開してきた議論を、現場のエンジニアが心に留めるべき4つの文で総括する。</p>
+
+                    <ul>
+                        <li>PostgreSQLを複数台に分断する選択は魔法の銀の弾丸ではなく、<strong>関係モデルの堅牢な保証をネットワーク遅延と運用負債に引き換える高額な取引</strong>である。</li>
+                        <li>シャードの境界を跨いだ瞬間、<strong>ACIDトランザクション、結合演算、一意制約、自動採番は機能しなくなり</strong>、整合性を担保する重責はすべてアプリケーションコードへと押し付けられる。</li>
+                        <li>シャーディングキーはデータの物理的配置を決定する後戻り不能な選択であり、<strong>判断を誤った際に生じるホットスポットと再シャーディングはシステムを揺るがす災難</strong>となる。</li>
+                        <li>クエリ最適化、リードレプリカ、宣言的パーティショニング、データアーカイブ、垂直増設の<strong>すべてを試し切るまでは、決してデータベースの水平分割を始めてはならない。</strong></li>
+                    </ul>
+
+                    <h2 id="sec-13">確認できなかったこと</h2>
+
+                    <p>今回の調査および公式資料の精査において、確認が取れず判断を保留した項目は以下の通りである。</p>
+
+                    <ul>
+                        <li><strong>Multigresにおける分散結合の内部メモリ制御の詳細</strong> — 公式ドキュメントは将来的にプッシュダウン結合やスキャッター結合をサポートすると述べているが、大規模なデータ転送時にゲートウェイノードで発生するメモリ枯渇を防ぐためのディスク退避（Disk Spill）の具体的実装については未公開である。</li>
+                        <li><strong>PostgreSQL 2PCにおける遅延増大の定量的基準値</strong> — 公式マニュアルはPREPARE TRANSACTIONの動作原理、ロック保持、XID周回リスクを詳細に解説しているものの、ネットワーク構成や参加ノード数によって変動が激しいため、性能劣化の具体的なパーセンテージ等は記述されていない。</li>
+                        <li><strong>アルファ版以降における拡張機能（Extension）の網羅的動作性</strong> — Multigresは標準テストスイートによる高互換性を掲げているが、PostGISやpgvectorといった特殊なデータ型やインデックス構造を伴う拡張が分散層でどこまで十全に動作するかは現行の資料から検証できなかった。</li>
+                    </ul>
+
+                    <h2 id="sec-14">参考資料</h2>
+
+                    <p>本稿の執筆にあたり参照・検証した公式ドキュメントおよび情報源の正確なURLは以下の通りである。</p>
+
+                    <ul>
+                        <li>GeekNews 33505: <a href="https://news.hada.io/topic?id=33505" target="_blank" rel="noopener noreferrer">Multigres - Postgres の水平スケーリングのためのオープンソース</a></li>
+                        <li>Multigres GitHubリポジトリ: <a href="https://github.com/multigres/multigres" target="_blank" rel="noopener noreferrer">GitHub - multigres/multigres: Vitess for Postgres</a></li>
+                        <li>Multigres公式ドキュメント: <a href="https://multigres.com/docs" target="_blank" rel="noopener noreferrer">Multigres Upcoming features | Multigres Docs</a></li>
+                        <li>PostgreSQL 17公式ドキュメント（テーブルパーティショニング）: <a href="https://www.postgresql.org/docs/17/ddl-partitioning.html" target="_blank" rel="noopener noreferrer">PostgreSQL: Documentation: 17: 5.12. Table Partitioning</a></li>
+                        <li>PostgreSQL 17公式ドキュメント（2相トランザクション）: <a href="https://www.postgresql.org/docs/17/sql-prepare-transaction.html" target="_blank" rel="noopener noreferrer">PostgreSQL: Documentation: 17: PREPARE TRANSACTION</a></li>
+                    </ul>
+
+                </div>
+
+                <div class="share-section">
+                    <h3>この記事を共有する</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">リンクをコピー</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">一覧へ戻る</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">一緒に使うと便利な無料ツール</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/iptables_generator.html">iptables ファイアウォールルール生成ツール</a></li>
+      <li><a href="../static/code_image.html">コード画像ジェネレーター</a></li>
+      <li><a href="../static/char_counter.html">文字数カウント</a></li>
+      <li><a href="../static/json_formatter.html">JSON フォーマッター</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">すべてのツールを見る &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">関連記事</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="mongodb_to_postgres_sync.html">一度移すことと合わせ続けることは別の問題だ - MongoDB コレクションを PostgreSQL へ送るとき強制される選択</a></li>
+      <li><a href="game_server_scaling_limits.html">同時接続1,000人は何を測った数字か - ゲームサーバーが先に壊れる場所 2026</a></li>
+      <li><a href="sql_not_in_null_empty_result.html">NOT IN のリストに NULL が一つ混ざると結果が丸ごと空になる - エラーなしで0行になる SQL 三値論理 2026</a></li>
+      <li><a href="postgres_startup_survival_2026.html">スタートアップのPostgres生存ガイド - コネクション枯渇からパーティショニングまで 2026</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('リンクがコピーされました。Threadsアプリに貼り付けて共有してください。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('リンクがコピーされました。'); });
+    });
+    </script>
+</body>
+</html>
