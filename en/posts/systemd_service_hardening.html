@@ -1,0 +1,735 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿 (English)
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="en">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>systemd Service Hardening and Sandboxing - What Directives Actually Block in Practice</title>
+    <meta name="description" content="What systemd sandboxing directives block and what they miss: ProtectSystem and PrivateTmp values, the breakages they cause, and a staged drop-in rollout.">
+    <meta name="keywords" content="systemd, service hardening, sandboxing, ProtectSystem, PrivateTmp, Seccomp, NoNewPrivileges, Linux server security, drop-in override, process isolation">
+
+    <link rel="canonical" href="https://braindetox.kr/en/posts/systemd_service_hardening.html">
+
+    <meta property="og:title" content="systemd Service Hardening and Sandboxing - What Directives Actually Block in Practice">
+    <meta property="og:description" content="A comprehensive analysis of systemd sandboxing directives, practical defense boundaries, common operational failure points, and phased drop-in deployment strategies.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/en/posts/systemd_service_hardening.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="en_US">
+    <meta property="article:published_time" content="2026-09-12">
+    <meta property="article:section" content="Dev &amp; Infra">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="systemd Service Hardening and Sandboxing - What Directives Actually Block in Practice">
+    <meta name="twitter:description" content="A comprehensive analysis of systemd sandboxing directives, practical defense boundaries, common operational failure points, and phased drop-in deployment strategies.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "systemd Service Hardening and Sandboxing - What Directives Actually Block in Practice",
+      "alternativeHeadline": "An In-Depth Analysis of Process Isolation, Filesystem Lockdown, System Call Filtering, and Operational Recovery",
+      "datePublished": "2026-09-12",
+      "dateModified": "2026-09-12",
+      "inLanguage": "en-US",
+      "articleSection": "Dev & Infra",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "systemd, service hardening, sandboxing, ProtectSystem, PrivateTmp, Seccomp, NoNewPrivileges, Linux server security, drop-in override, process isolation",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/en/posts/systemd_service_hardening.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "Does systemd service sandboxing prevent remote code execution vulnerabilities in application code?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "No, it does not. The primary objective of sandboxing is not to eliminate application-level flaws like SQL injection or deserialization bugs, but rather to contain the blast radius after a compromise occurs, preventing lateral movement, root privilege escalation, and persistent backdoor installations."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "What is the concrete difference between ProtectSystem values yes, full, and strict?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "The value yes mounts /usr and bootloader directories (/boot, /efi) read-only while leaving /etc writable. The value full additionally mounts /etc read-only to prevent configuration tampering. The value strict mounts the entire filesystem hierarchy read-only except for API filesystems like /dev, /proc, and /sys, requiring explicit write allowances via ReadWritePaths."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Why does enabling PrivateTmp=yes cause certain multi-process services to fail connecting to sockets?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "PrivateTmp sets up a dedicated mount namespace with an isolated /tmp directory for the service process. Any legacy application relying on UNIX domain sockets created inside /tmp to communicate across distinct service boundaries will find that the processes look at completely separate physical directories, causing connection failures."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Why does MemoryDenyWriteExecute=yes crash runtimes like Node.js or Java Virtual Machines?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Engines like V8 in Node.js and the JVM rely on Just-In-Time (JIT) compilation, allocating writable memory pages and subsequently executing code directly from them. MemoryDenyWriteExecute enforces strict W^X memory protection, blocking mmap and mprotect calls that violate this boundary and terminating or aborting the runtime."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Why should system administrators use drop-in override files instead of directly editing vendor unit files?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Vendor unit files located in /usr/lib/systemd/system/ are managed by operating system package managers (such as apt or dnf) and are completely overwritten during software updates. Utilizing drop-in files under /etc/systemd/system/<service>.d/override.conf ensures custom hardening directives persist cleanly across package updates."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/systemd_service_hardening.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/systemd_service_hardening.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/systemd_service_hardening.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/systemd_service_hardening.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/systemd_service_hardening.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "Home",
+      "item": "https://braindetox.kr/en/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "Dev & Infra",
+      "item": "https://braindetox.kr/en/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "systemd Service Hardening and Sandboxing - What Directives Actually Block in Practice",
+      "item": "https://braindetox.kr/en/posts/systemd_service_hardening.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="systemd Service Hardening and Sandboxing - What Directives Actually Block in Practice">
+                <meta itemprop="datePublished" content="2026-09-12">
+                <meta itemprop="dateModified" content="2026-09-12">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="systemd, service hardening, sandboxing, ProtectSystem, PrivateTmp, Seccomp, NoNewPrivileges, Linux server security, drop-in override, process isolation">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/en/posts/systemd_service_hardening.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">systemd Service Hardening and Sandboxing - What Directives Actually Block in Practice</h1>
+                    <h2 class="post-subtitle">An In-Depth Analysis of Process Isolation, Filesystem Lockdown, System Call Filtering, and Operational Recovery</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-12">Sep 12, 2026</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">Dev &amp; Infra</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+                    <div class="post-toc">
+                        <h3>Table of Contents</h3>
+                        <ol>
+                            <li><a href="#sec-1">1. The Essence of Sandboxing: Limiting Lateral Movement After Compromise</a></li>
+                            <li><a href="#sec-2">2. Filesystem Isolation: What Is Hidden and What Is Made Read-Only</a></li>
+                            <li><a href="#sec-3">3. Kernel and System State Protection: Blocking Runtime Modifications</a></li>
+                            <li><a href="#sec-4">4. Privilege Reduction and Process Identity: Eliminating Root and Privilege Escalation</a></li>
+                            <li><a href="#sec-5">5. System Call and Architecture Filtering: Shrinking the Attack Surface with Seccomp</a></li>
+                            <li><a href="#sec-6">6. Network Interface and Socket Family Constraints</a></li>
+                            <li><a href="#sec-7">7. Directive Defense Coverage, Common Failure Modes, and Multi-Value Comparison</a></li>
+                            <li><a href="#sec-8">8. Phased Rollout Strategy: Drop-in Overrides and Step-by-Step Deployment</a></li>
+                            <li><a href="#sec-9">9. What Could Not Be Confirmed</a></li>
+                            <li><a href="#sec-10">10. References</a></li>
+                        </ol>
+                    </div>
+
+                    <h2 id="sec-1">1. The Essence of Sandboxing: Limiting Lateral Movement After Compromise</h2>
+
+                    <p>When engineering Linux server security configurations, the very first boundary that systems architects and infrastructure engineers must clearly delineate is the fundamental operational limit of process sandboxing. A persistent and dangerous misconception across development teams is the belief that injecting aggressive systemd sandboxing directives into service unit definitions can magically neutralize core application-layer vulnerabilities. In reality, the execution environment isolation mechanisms exposed by systemd cannot intercept or repair flawed input parsing routines, unvalidated SQL construction, logic flaws in custom authentication middleware, or vulnerable deserialization routines executing inside userland runtimes. If an application contains an exploitable code execution vulnerability, an external adversary will successfully trigger that flaw regardless of the underlying unit settings.</p>
+
+                    <p>The true technical objective of systemd service sandboxing is post-compromise containment, specifically designed to curtail the blast radius once an adversary has successfully established remote code execution within the process boundary. In an unhardened environment, a compromised web service process running under a privileged identity or with unfettered system access immediately grants the attacker the ability to inspect the entire host storage tree, harvest cached authentication credentials, survey internal loopback services, modify dynamic linker configurations, and alter kernel parameters to establish permanent rootkits. By implementing comprehensive execution containment, the operating system traps the compromised process inside an airtight compartment where lateral traversal, privilege escalation, and persistence establishment become physically unattainable under standard kernel enforcement rules.</p>
+
+                    <p>The hardening architecture documented throughout the official systemd.exec reference pages is organized around four synergistic isolation pillars: strict filesystem namespace restructuring, complete process privilege degradation, kernel runtime surface reduction, and low-level system call filtering. When these pillars are deployed in concert, the defensive posture shifts dramatically. Even if an adversary achieves arbitrary shellcode execution within a daemon, the operating system ensures that the intrusion remains strictly confined to an ephemeral and powerless sandbox, safeguarding the integrity and confidentiality of the host operating system and adjacent workloads.</p>
+
+                    <ul>
+                        <li>Sandboxing is not an application-layer barrier against initial exploits, but an operating system containment perimeter engineered to arrest lateral traversal post-intrusion.</li>
+                        <li>Even after full process takeover, robust sandboxing physically precludes persistence mechanisms such as rootkit installation, cron manipulation, and privilege escalation.</li>
+                        <li>Every security directive imposes operational trade-offs and resource restrictions that directly interact with software runtimes, mandating careful architectural evaluation.</li>
+                    </ul>
+
+                    <h2 id="sec-2">2. Filesystem Isolation: What Is Hidden and What Is Made Read-Only</h2>
+
+                    <p>Immediately following the initial execution of arbitrary commands, an intruder routinely explores local storage volumes to harvest private keys, inspect environment configuration variables, locate world-writable staging directories, and drop compiled binary implants. To neutralize these reconnaissance and staging activities, systemd leverages Linux mount namespaces and VFS bind mounts to provide granular, per-service filesystem restructuring capabilities.</p>
+
+                    <h3 id="sec-2-1">Hierarchical Protection with ProtectSystem and ProtectHome</h3>
+
+                    <p>The ProtectSystem directive governs the protection of core operating system binaries, shared runtime libraries, and administrative configuration files. When assigned the value yes, the system manager mounts the entire /usr directory tree alongside the active bootloader directories (/boot and /efi) in a strictly read-only state inside the private mount namespace of the spawned process. Escalating this configuration to full expands this immutable boundary to encompass the /etc directory, effectively thwarting malicious attempts to modify authentication configuration files, pam modules, or local system definitions. The most stringent setting, strict, flips the default access model entirely: the complete host filesystem hierarchy is mounted read-only, leaving only virtual API filesystems such as /dev, /proc, and /sys to be addressed by specialized directives. Under strict mode, any directory requiring persistent state modification—such as log outputs, dynamic caches, or database directories—must be explicitly declared using ReadWritePaths, StateDirectory, or LogsDirectory; otherwise, all write attempts trigger immediate EROFS errors.</p>
+
+                    <p>Complementing system-wide protection, the ProtectHome directive isolates private user storage where sensitive cryptographic credentials, SSH authorized keys, shell histories, and userland configuration files reside. Configuring ProtectHome=yes renders /home, /root, and /run/user entirely inaccessible and invisible to the service, replacing them with inaccessible empty mounts with zero permissions. The read-only variant permits the service to inspect user files while prohibiting file modifications or malicious staging. Meanwhile, the tmpfs configuration mounts transient memory-backed temporary filesystems over the home directories, presenting empty paths that accept volatile writes without ever touching or exposing genuine host data volumes.</p>
+
+                    <h3 id="sec-2-2">File Access Isolation via PrivateTmp and UMask</h3>
+
+                    <p>The PrivateTmp directive directly addresses one of the most prevalent historical attack surfaces in shared multi-user environments: symlink races, predictable temporary filename attacks, and unauthorized data eavesdropping in shared /tmp and /var/tmp directories. When PrivateTmp=yes is declared, systemd allocates an isolated mount namespace for the executed process and mounts private, dedicated /tmp and /var/tmp directories backed by isolated subtrees located under /tmp/systemd-private-UUID-service-hash/ on the host. Processes executing outside this specific unit namespace cannot observe, manipulate, or link against files generated within the private temporary space, cleanly preventing file interception and race condition exploits.</p>
+
+                    <p>Fine-grained path access control is further augmented by ReadOnlyPaths, ReadWritePaths, and InaccessiblePaths. These directives take space-separated lists of absolute paths, enabling administrators to carve out explicit read-only, read-write, or entirely blocked subtrees. Prefacing a path with a hyphen (-) instructs the manager to silently ignore non-existent paths on disk, ensuring portability across diverse server installations. In parallel, the UMask directive defines the default file creation permission mask for the service process. While standard Linux environments often default to 0022 (permitting global read access), establishing an aggressive mask such as 0027 or 0077 ensures that generated diagnostic logs, temporary operational buffers, and cached records are generated without global or group read permissions, preventing accidental credential leaks across collocated system accounts.</p>
+
+                    <ul>
+                        <li>ProtectSystem enforces tiered filesystem immutability, progressing from yes (/usr protected) to full (/etc locked) and strict (entire VFS read-only).</li>
+                        <li>ProtectHome eliminates visibility into administrative and user home paths, offering complete blocking (yes), read-only review, or isolated tmpfs overlays.</li>
+                        <li>PrivateTmp establishes isolated temporary directory namespaces, neutralizing shared /tmp symlink race conditions and file tampering vectors.</li>
+                        <li>Configuring UMask to 0077 guarantees that newly minted files and directories are strictly locked to the service user, precluding local data leaks.</li>
+                    </ul>
+
+                    <h2 id="sec-3">3. Kernel and System State Protection: Blocking Runtime Modifications</h2>
+
+                    <p>An attacker who achieves an initial foothold often seeks to compromise the underlying Linux kernel itself or modify hypervisor-level operational knobs to bypass userspace security barriers. systemd provides dedicated containment directives designed specifically to restrict interactions with kernel control interfaces and resource tracking structures.</p>
+
+                    <h3 id="sec-3-1">Defending Kernel Tunables and Dynamic Module Loading</h3>
+
+                    <p>The ProtectKernelTunables directive defends runtime kernel parameters against unauthorized alteration. When enabled, systemd mounts the virtual interfaces exposed under /proc/sys, /sys, /proc/sysrq-trigger, /proc/latency_stats, /proc/acpi, and /proc/fs strictly read-only within the process execution context. This prevents a compromised service from tampering with sysctl networking attributes, disabling kernel address randomization, manipulating core dump patterns, or disabling memory protection features during an active compromise attempt.</p>
+
+                    <p>ProtectKernelModules strictly prohibits the dynamic insertion, loading, and unloading of Linux kernel modules. By explicitly removing the CAP_SYS_MODULE capability from the bounding set and denying access to module storage hierarchies such as /usr/lib/modules, systemd ensures that an attacker cannot drop a malicious rootkit kernel object into the running operating system to hide processes or capture raw network traffic. Unless a daemon specifically functions as an infrastructure hardware orchestrator or dynamic VPN tunnel manager, enterprise application services should universally operate with module loading disabled.</p>
+
+                    <h3 id="sec-3-2">Restricting Control Groups and procfs Visibility</h3>
+
+                    <p>The ProtectControlGroups directive mounts the unified control group hierarchy accessible at /sys/fs/cgroup in a read-only state. This blocks malicious code from reconfiguring cgroup v2 resource limits, manipulating CPU or memory ceilings, or interfering with neighboring service slices to induce noisy-neighbor Denial of Service conditions. Unless a service acts as a container orchestrator possessing explicitly delegated cgroup subtrees, granting write access to the control group tree represents an unnecessary security exposure.</p>
+
+                    <p>The ProtectProc directive controls the visibility of process information exposed through the procfs (/proc) virtual filesystem, mapping directly to kernel hidepid mount semantics. Under the default setting, a service process can inspect metadata, command-line invocation arguments, and runtime statuses for processes owned by other system users. Transitioning ProtectProc to noaccess denies access to other users process directories, while the invisible setting entirely hides foreign processes from /proc, preventing tools like ps or top from displaying neighboring system processes. The ptraceable mode selectively permits visibility only over processes that the service possesses legal authorization to inspect via ptrace. This completely eliminates information harvesting where an attacker reads sensitive command-line secrets and tokens from collocated daemon processes.</p>
+
+                    <ul>
+                        <li>ProtectKernelTunables renders /proc/sys and /sys read-only, preventing runtime sysctl manipulation and kernel parameter corruption.</li>
+                        <li>ProtectKernelModules revokes module loading privileges, blocking the dynamic installation of rootkits and unverified kernel drivers.</li>
+                        <li>ProtectControlGroups enforces read-only cgroup hierarchy mounts, preventing unauthorized resource limit tampering across service slices.</li>
+                        <li>ProtectProc=invisible conceals external processes from the /proc tree, blinding attackers during internal system reconnaissance activities.</li>
+                    </ul>
+
+                    <h2 id="sec-4">4. Privilege Reduction and Process Identity: Eliminating Root and Privilege Escalation</h2>
+
+                    <p>Historically, system daemons were launched as root to perform low-port network binding or open privileged log files, relying on internal application logic to drop privileges later. This legacy model frequently broke down when software bugs occurred prior to privilege shedding. Modern systemd directives enforce privilege reduction externally before application code ever receives execution cycles.</p>
+
+                    <h3 id="sec-4-1">Disabling Privilege Elevation with NoNewPrivileges and RestrictSUIDSGID</h3>
+
+                    <p>The NoNewPrivileges=yes directive represents one of the most critical foundational settings in modern Linux systems security. Internally executing the kernel prctl(PR_SET_NO_NEW_PRIVILEGES, 1, ...) system call, this setting guarantees that the service process and every subsequently spawned child process can never acquire elevated operational rights via execve. Even if an attacker identifies a vulnerable Set-UID (SUID) or Set-GID (SGID) binary on disk or attempts to execute a file endowed with extended file capabilities, the operating system ignores these privilege bits completely. This decisively invalidates entire classes of local privilege escalation exploits that rely on executing auxiliary system binaries to obtain a root shell.</p>
+
+                    <p>Working in conjunction with execution barriers, RestrictSUIDSGID=yes prevents the creation of new privilege-granting files on storage volumes. Any attempt by the service process to invoke chmod, fchmodat, or related system calls to attach SUID or SGID permissions to a file or directory is instantly trapped and denied by the kernel. This stops attackers who have obtained write access to an application upload folder or staging directory from planting an SUID root binary designed to serve as an enduring backdoor for future access.</p>
+
+                    <h3 id="sec-4-2">Bounding Linux Capabilities and Adopting DynamicUser</h3>
+
+                    <p>Linux capabilities partition the monolithic authority of the superuser into distinct, granular privileges. The CapabilityBoundingSet directive defines an explicit whitelist representing the absolute maximum ceiling of capabilities a service process and its descendants may ever possess. If CapabilityBoundingSet is declared with an empty assignment, all capabilities are permanently dropped, reducing the process to a purely unprivileged execution state. When specific elevated operations are mandatory—such as binding a web server to privileged ports below 1024—the administrator can combine an unprivileged user identity with AmbientCapabilities=CAP_NET_BIND_SERVICE, enabling the service to securely acquire the required network binding right without running as the root user.</p>
+
+                    <p>The DynamicUser=yes directive modernizes identity management by completely bypassing the requirement to manually provision static system accounts in /etc/passwd and /etc/group. Upon service startup, systemd dynamically allocates a transient, unique UID and GID from the allocated range between 61184 and 65519, recycling the identity back to the system pool upon service termination. Crucially, declaring DynamicUser=yes automatically implies and activates an array of high-grade hardening directives, including ProtectSystem=strict, ProtectHome=yes, NoNewPrivileges=yes, PrivateTmp=yes, and RestrictNamespaces=yes, instantly elevating the target service into a hardened isolation container.</p>
+
+                    <ul>
+                        <li>NoNewPrivileges enforces the PR_SET_NO_NEW_PRIVILEGES flag, ensuring that child executions can never elevate credentials through SUID binaries.</li>
+                        <li>RestrictSUIDSGID rejects attempts to apply SUID or SGID permission bits to files on disk, blocking the creation of persistent local backdoors.</li>
+                        <li>CapabilityBoundingSet establishes a strict ceiling on available Linux capabilities, eliminating unneeded administrative powers like CAP_SYS_ADMIN.</li>
+                        <li>DynamicUser allocates transient non-root execution identities while automatically applying comprehensive filesystem sandboxing defaults.</li>
+                    </ul>
+
+                    <h2 id="sec-5">5. System Call and Architecture Filtering: Shrinking the Attack Surface with Seccomp</h2>
+
+                    <p>The system call table is the core gateway between userspace software and privileged kernel execution routines. Filtering this boundary using Seccomp BPF (Berkeley Packet Filter) represents the most potent mechanism for shrinking the kernel attack surface exposed to a compromised daemon.</p>
+
+                    <h3 id="sec-5-1">SystemCallFilter and SystemCallArchitectures</h3>
+
+                    <p>The SystemCallFilter directive enforces kernel-level seccomp system call filtering. Rather than forcing administrators to enumerate hundreds of low-level architecture-specific system calls manually, systemd provides structured, pre-compiled system call sets denoted by the at (@) symbol. Declaring SystemCallFilter=@system-service permits the execution of standard system services—encompassing essential file I/O, networking sockets, signal processing, and process management—while systematically denying dangerous or irrelevant system calls.</p>
+
+                    <p>When an unauthorized system call is invoked by default, the Linux kernel terminates the offending process immediately with a SIGSYS signal (often reflected as exit code 159). To facilitate graceful auditing and prevent unexpected production outages during initial rollout, engineers can specify SystemCallErrorNumber=EPERM. This instructs the kernel to return an immediate EPERM error to the caller rather than terminating the process, allowing administrators to inspect diagnostic logs and identify missing operational calls. Furthermore, SystemCallArchitectures=native locks the system call dispatching layer exclusively to the native hardware ABI (such as x86-64), blocking legacy 32-bit compatibility execution layers that attackers frequently exploit to bypass 64-bit seccomp rules.</p>
+
+                    <h3 id="sec-5-2">MemoryDenyWriteExecute and Namespace Restrictions</h3>
+
+                    <p>The MemoryDenyWriteExecute=yes directive implements strict W^X (Write XOR Execute) memory integrity enforcement. The Linux kernel actively rejects any mmap invocation specifying both PROT_WRITE and PROT_EXEC permissions simultaneously, and similarly prevents mprotect from transitioning existing writable memory pages into an executable state. This mechanism provides robust mitigation against memory corruption exploits, specifically preventing injected shellcode from executing within dynamically allocated heap or stack pages. However, software environments relying on Just-In-Time (JIT) compilation runtimes—such as Node.js (V8), Java (JVM), and .NET Core—frequently allocate writable buffers and subsequently execute code from them, making this directive incompatible with these runtimes unless specialized dual-mapping architectures are supported.</p>
+
+                    <p>LockPersonality=yes locks the process personality execution domain via the personality system call, blocking attempts to alter memory layout semantics or disable Address Space Layout Randomization (ASLR). Meanwhile, RestrictNamespaces restricts access to Linux namespace creation via clone, unshare, or setns. While modern container engines require namespace manipulation, general server daemons have no justification for creating independent network, mount, or user namespaces. Restricting user namespace creation is particularly crucial, as unprivileged user namespaces have historically served as a prime conduit for exploiting subtle vulnerabilities within the Linux kernel.</p>
+
+                    <ul>
+                        <li>SystemCallFilter restricts process execution to safe syscall subsets like @system-service, reducing kernel exploit exposure.</li>
+                        <li>SystemCallArchitectures=native shuts down legacy 32-bit ABI compatibility interfaces, neutralizing seccomp filter bypass techniques.</li>
+                        <li>MemoryDenyWriteExecute enforces W^X memory discipline, preventing attackers from executing shellcode injected into writable memory buffers.</li>
+                        <li>RestrictNamespaces disables the instantiation of arbitrary namespaces, preventing privilege escalation exploits rooted in user namespaces.</li>
+                    </ul>
+
+                    <h2 id="sec-6">6. Network Interface and Socket Family Constraints</h2>
+
+                    <p>Restricting low-level networking primitives prevents compromised daemons from participating in local network sniffing, crafting spoofed protocol packets, or pivoting into internal management interfaces. systemd embeds socket controls and eBPF packet filtering directly into the service lifecycle.</p>
+
+                    <h3 id="sec-6-1">Controlling Socket Communications via RestrictAddressFamilies</h3>
+
+                    <p>The RestrictAddressFamilies directive establishes an explicit whitelist of network address families that a service process is permitted to initialize using the socket system call. Standard modern web applications, caching daemons, and microservices typically require only AF_UNIX (local inter-process communication), AF_INET (IPv4 networking), and AF_INET6 (IPv6 networking). Configuring RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 actively denies the creation of raw packet sockets (AF_PACKET), routing configuration interfaces (AF_NETLINK), and peripheral protocol stacks such as AF_BLUETOOTH or AF_APPLETALK. This denies an attacker the ability to inject custom Layer 2 packets, capture promiscuous network traffic, or alter host routing configurations from within the service process.</p>
+
+                    <h3 id="sec-6-2">eBPF-Based IPAddressDeny and IPAddressAllow</h3>
+
+                    <p>Documented extensively within the systemd.resource-control manual, the IPAddressDeny and IPAddressAllow directives implement ingress and egress network packet filtering at the cgroup v2 boundary using integrated eBPF (Extended Berkeley Packet Filter) socket programs. This provides an independent, service-specific network firewall layer completely detached from host-level iptables or nftables chains.</p>
+
+                    <p>For background computational tasks, scheduled batch scripts, or isolated data sanitization services that possess zero operational need for network access, setting IPAddressDeny=any drops all incoming and outgoing IP network traffic instantly at the socket layer. If a service must communicate strictly with a collocated database or local cache, declaring IPAddressAllow=localhost while retaining IPAddressDeny=any cleanly isolates the workload from foreign networks. Administrators must exercise caution when applying blanket IP restrictions, ensuring that outbound DNS queries to port 53 or essential internal metrics endpoints are explicitly accounted for in the allowlist.</p>
+
+                    <ul>
+                        <li>RestrictAddressFamilies limits socket creation strictly to required domains, blocking dangerous interfaces like AF_PACKET and AF_NETLINK.</li>
+                        <li>IPAddressDeny=any leverages cgroup eBPF hooks to enforce total IP communication blackouts on dedicated backend workers.</li>
+                        <li>IPAddressAllow establishes precise ingress and egress CIDR whitelists, confining network reach strictly to approved local or private subnets.</li>
+                    </ul>
+
+                    <h2 id="sec-7">7. Directive Defense Coverage, Common Failure Modes, and Multi-Value Comparison</h2>
+
+                    <p>The central obstacle in executing an effective infrastructure hardening campaign is that security constraints inevitably collide with existing software assumptions. Enabling directives without a comprehensive understanding of their operational failure modes inevitably causes unexpected application downtime. The following matrix outlines the primary defensive coverage, common breakage scenarios, and recovery procedures for each core systemd hardening directive.</p>
+
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Directive</th>
+                                <th>Primary Threat Blocked</th>
+                                <th>Common Operational Failure Mode</th>
+                                <th>Troubleshooting and Recovery</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>NoNewPrivileges</td>
+                                <td>Prevents acquiring new privileges across execve via SUID/SGID bits or file capabilities</td>
+                                <td>Internal execution of auxiliary binaries relying on SUID (sudo, ping, passwd) fails with permission denied</td>
+                                <td>Remove SUID helper dependencies, grant specific capabilities via ambient sets, or refactor logic</td>
+                            </tr>
+                            <tr>
+                                <td>PrivateTmp</td>
+                                <td>Stops symlink races, temp file hijacking, and information disclosure across shared /tmp paths</td>
+                                <td>Inter-process communication using UNIX sockets placed in /tmp (such as mysql.sock) breaks completely</td>
+                                <td>Relocate shared IPC sockets to standardized runtime paths like /run or /var/run</td>
+                            </tr>
+                            <tr>
+                                <td>PrivateDevices</td>
+                                <td>Prevents raw access to physical storage devices, raw memory (/dev/mem), and physical hardware</td>
+                                <td>Workloads requiring direct hardware interfaces (GPU compute, audio devices, serial ports) fail to launch</td>
+                                <td>Disable PrivateDevices for specialized hardware daemons or configure explicit DeviceAllow rules</td>
+                            </tr>
+                            <tr>
+                                <td>ProtectSystem</td>
+                                <td>Protects core operating system binaries (/usr) and configuration directories (/etc) against tampering</td>
+                                <td>Daemons attempting to dynamically rewrite configuration files in /etc or create runtimes fail with EROFS</td>
+                                <td>Downgrade full to yes for dynamic config daemons, or define explicit ReadWritePaths exclusions</td>
+                            </tr>
+                            <tr>
+                                <td>ProtectHome</td>
+                                <td>Prevents reading, exfiltrating, or modifying sensitive credentials stored in user home directories</td>
+                                <td>Services expecting to read configs from ~/.config or write operational data in /home crash on startup</td>
+                                <td>Relocate service data to /var/lib, adopt read-only mode, or grant specific ReadWritePaths permissions</td>
+                            </tr>
+                            <tr>
+                                <td>ProtectKernelTunables</td>
+                                <td>Blocks modification of kernel variables, memory knobs, and sysctl interfaces under /proc and /sys</td>
+                                <td>Configuration utilities or network managers designed to adjust sysctl parameters fail during execution</td>
+                                <td>Pre-configure kernel parameters via /etc/sysctl.d/ at system boot time rather than inside services</td>
+                            </tr>
+                            <tr>
+                                <td>ProtectKernelModules</td>
+                                <td>Denies CAP_SYS_MODULE to block dynamic insertion of unverified kernel modules and rootkits</td>
+                                <td>Firewall helpers, VPN daemons, or file drivers attempting to load modules on demand fail to initialize</td>
+                                <td>Pre-load necessary kernel modules at boot using /etc/modules-load.d/ configuration snippets</td>
+                            </tr>
+                            <tr>
+                                <td>ProtectControlGroups</td>
+                                <td>Prevents modifying cgroup hierarchies, enforcing CPU, memory, and task limits against tampering</td>
+                                <td>Container engines or hypervisors attempting to allocate sub-cgroups without delegation fail immediately</td>
+                                <td>Disable ProtectControlGroups for container managers and configure explicit Delegate=yes options</td>
+                            </tr>
+                            <tr>
+                                <td>ProtectProc</td>
+                                <td>Restricts /proc visibility, preventing process enumeration, command-line sniffing, and snooping</td>
+                                <td>System monitoring tools (Prometheus node_exporter, htop) cannot inspect external system processes</td>
+                                <td>Maintain ProtectProc=default for monitoring daemons while applying invisible to backend apps</td>
+                            </tr>
+                            <tr>
+                                <td>RestrictAddressFamilies</td>
+                                <td>Blocks unauthorized socket domains, preventing packet sniffing (AF_PACKET) and routing tampering</td>
+                                <td>Local socket operations fail due to missing AF_UNIX, or outbound DNS fails due to missing AF_INET</td>
+                                <td>Carefully declare all necessary socket families, typically AF_INET AF_INET6 AF_UNIX for web services</td>
+                            </tr>
+                            <tr>
+                                <td>RestrictNamespaces</td>
+                                <td>Restricts unshare and clone namespace creation, blocking kernel privilege escalation vectors</td>
+                                <td>Applications embedding internal sandboxing runtimes (bwrap, Chromium sandbox) crash on execution</td>
+                                <td>Selectively allow specific required namespace types or disable RestrictNamespaces for sandbox engines</td>
+                            </tr>
+                            <tr>
+                                <td>RestrictSUIDSGID</td>
+                                <td>Prevents applying SUID or SGID bits to storage files, blocking persistent backdoor establishment</td>
+                                <td>Packaging utilities, build pipelines, or deployment synchronization scripts fail during file creation</td>
+                                <td>Apply RestrictSUIDSGID strictly to long-running runtime daemons, excluding package deployment tools</td>
+                            </tr>
+                            <tr>
+                                <td>RestrictRealtime</td>
+                                <td>Prevents processes from acquiring real-time scheduling priority, mitigating CPU starvation attacks</td>
+                                <td>Low-latency media servers, real-time audio mixers, or high-frequency trading workers experience jitter</td>
+                                <td>Retain default scheduling permissions only for specialized low-latency tasks requiring SCHED_FIFO</td>
+                            </tr>
+                            <tr>
+                                <td>SystemCallFilter</td>
+                                <td>Limits system calls to designated subsets, blocking obsolete or dangerous kernel interactions</td>
+                                <td>The process invokes an unlisted system call and is abruptly terminated with a SIGSYS signal (exit 159)</td>
+                                <td>Deploy SystemCallErrorNumber=EPERM to audit missing calls, review logs, and add required syscalls</td>
+                            </tr>
+                            <tr>
+                                <td>SystemCallArchitectures</td>
+                                <td>Blocks execution of legacy 32-bit ABIs on 64-bit platforms, closing seccomp filter bypass holes</td>
+                                <td>Legacy 32-bit binaries, multi-arch packages, or legacy runtime wrappers fail to execute</td>
+                                <td>Migrate and recompile all runtime dependencies to native 64-bit architectures before enabling</td>
+                            </tr>
+                            <tr>
+                                <td>CapabilityBoundingSet</td>
+                                <td>Restricts the maximum set of Linux capabilities that the service process can ever acquire</td>
+                                <td>Administrative operations (file ownership chown, setuid transitions, port binding) are denied</td>
+                                <td>Profile required capabilities via system audit logs and explicitly whitelist only necessary entries</td>
+                            </tr>
+                            <tr>
+                                <td>MemoryDenyWriteExecute</td>
+                                <td>Enforces W^X memory discipline, preventing execution of injected buffer overflow payloads</td>
+                                <td>JIT compilers (Node.js V8, JVM, .NET) attempting to write and execute memory pages crash instantly</td>
+                                <td>Disable MemoryDenyWriteExecute for JIT runtimes or configure runtimes to use dual-mapped memory pages</td>
+                            </tr>
+                            <tr>
+                                <td>LockPersonality</td>
+                                <td>Locks execution personality via personality(2), preventing emulation modes and ASLR evasion</td>
+                                <td>Legacy execution wrappers or emulation layers (such as older BSD compatibility shims) fail</td>
+                                <td>Standard Linux enterprise software functions seamlessly; apply universally to modern daemons</td>
+                            </tr>
+                            <tr>
+                                <td>ReadOnlyPaths</td>
+                                <td>Forces designated storage directories to mount read-only, preventing unwanted filesystem mutations</td>
+                                <td>Applications attempting to create temporary locks, state files, or logs in those paths throw EROFS</td>
+                                <td>Carve out explicit write exceptions using ReadWritePaths for specific operational subdirectories</td>
+                            </tr>
+                            <tr>
+                                <td>User / Group</td>
+                                <td>Enforces process execution under a dedicated non-root identity to honor least-privilege principles</td>
+                                <td>Services fail to read root-owned configuration files or cannot bind to privileged ports below 1024</td>
+                                <td>Adjust filesystem permissions to match service ownership and grant AmbientCapabilities for port access</td>
+                            </tr>
+                            <tr>
+                                <td>UMask</td>
+                                <td>Enforces restrictive default permissions on all newly created files and directories</td>
+                                <td>Shared files cannot be read by web servers, log forwarders, or group members expecting 0644 access</td>
+                                <td>Calibrate umask settings, utilizing 0027 to permit group read access while blocking public access</td>
+                            </tr>
+                            <tr>
+                                <td>IPAddressDeny</td>
+                                <td>Enforces eBPF-driven socket packet drops at the cgroup boundary for unauthorized IP addresses</td>
+                                <td>Outbound DNS resolution, external API queries, or centralized telemetry pipelines are dropped</td>
+                                <td>Combine IPAddressDeny=any with explicit IPAddressAllow entries for local subnets and DNS endpoints</td>
+                            </tr>
+                        </tbody>
+                    </table>
+
+                    <p>Several advanced systemd directives support multi-tiered non-boolean arguments. Each configuration setting imposes distinctly different filesystem and visibility models under the hood, as outlined in the comparative breakdown below.</p>
+
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Directive</th>
+                                <th>Assigned Value</th>
+                                <th>Underlying Filesystem and Isolation Semantics</th>
+                                <th>Target Operational Workload</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td rowspan="4">ProtectSystem</td>
+                                <td>no</td>
+                                <td>Maintains standard host mount visibility without applying read-only protections</td>
+                                <td>System package managers, OS update agents, and filesystem repair utilities</td>
+                            </tr>
+                            <tr>
+                                <td>yes</td>
+                                <td>Mounts /usr and bootloader paths (/boot, /efi) read-only; leaves /etc fully writable</td>
+                                <td>Services that dynamically rewrite local configuration files within /etc</td>
+                            </tr>
+                            <tr>
+                                <td>full</td>
+                                <td>Mounts /usr, /boot, /efi, and the /etc configuration tree strictly read-only</td>
+                                <td>Standard enterprise production services (Nginx, PostgreSQL, Redis, APIs)</td>
+                            </tr>
+                            <tr>
+                                <td>strict</td>
+                                <td>Mounts the entire VFS tree read-only, excluding virtual APIs (/dev, /proc, /sys)</td>
+                                <td>Completely stateless microservices and hardened workers with isolated storage</td>
+                            </tr>
+                            <tr>
+                                <td rowspan="4">ProtectHome</td>
+                                <td>no</td>
+                                <td>Preserves full normal read and write visibility over all user home directories</td>
+                                <td>Desktop user session helpers, backup engines, and personal home automation tools</td>
+                            </tr>
+                            <tr>
+                                <td>read-only</td>
+                                <td>Mounts /home, /root, and /run/user read-only, preventing local file modifications</td>
+                                <td>Analysis utilities and daemons needing to parse user configs without editing</td>
+                            </tr>
+                            <tr>
+                                <td>tmpfs</td>
+                                <td>Overlays empty, memory-backed temporary filesystems over home directories</td>
+                                <td>Isolated build pipelines requiring temporary local home paths without real data</td>
+                            </tr>
+                            <tr>
+                                <td>yes</td>
+                                <td>Renders /home, /root, and /run/user entirely inaccessible with zero permissions</td>
+                                <td>Standard system daemons and backend infrastructure detached from user storage</td>
+                            </tr>
+                            <tr>
+                                <td rowspan="4">ProtectProc</td>
+                                <td>default</td>
+                                <td>Preserves default procfs visibility, bound only by standard DAC user permissions</td>
+                                <td>Host performance monitors, process supervisors, and systems tracing agents</td>
+                            </tr>
+                            <tr>
+                                <td>noaccess</td>
+                                <td>Restricts access to metadata and status attributes for processes owned by other users</td>
+                                <td>General application servers requiring baseline process metadata protection</td>
+                            </tr>
+                            <tr>
+                                <td>invisible</td>
+                                <td>Completely hides other users processes from /proc, preventing process table enumeration</td>
+                                <td>Multi-tenant web backends, shared application hosts, and API microservices</td>
+                            </tr>
+                            <tr>
+                                <td>ptraceable</td>
+                                <td>Exposes only processes over which the executing service holds legal ptrace authority</td>
+                                <td>Application debuggers, internal crash reporters, and specialized worker supervisors</td>
+                            </tr>
+                        </tbody>
+                    </table>
+
+                    <h2 id="sec-8">8. Phased Rollout Strategy: Drop-in Overrides and Step-by-Step Deployment</h2>
+
+                    <p>The most common operational failure in system hardening is the indiscriminate application of all available isolation switches simultaneously. When a service subsequently fails to start, operators struggle to isolate the root cause and frequently abandon security measures entirely. A structured, phased hardening methodology using drop-in configurations ensures controlled, verifiable progress.</p>
+
+                    <h3 id="sec-8-1">The Necessity of Drop-in Override Structures</h3>
+
+                    <p>Packaged software distributions deploy unit files into /usr/lib/systemd/system/ or /lib/systemd/system/. Directly modifying these vendor-supplied files is an operational anti-pattern; subsequent package updates executed via apt or dnf will unconditionally overwrite local changes, obliterating custom hardening directives. Conversely, copying entire unit files into /etc/systemd/system/ introduces technical debt, as upstream updates to unit definitions, dependencies, and environment variables will be completely masked by the stale copy.</p>
+
+                    <p>The standard systemd solution is the drop-in override architecture. By establishing a dedicated configuration directory under /etc/systemd/system/service-name.service.d/ and authoring an override.conf file within it, administrators declare only the specific security directives they wish to enforce. The service manager dynamically merges these directives with the base unit at runtime.</p>
+
+                    <pre><code># Create the dedicated drop-in directory and author the override configuration
+sudo mkdir -p /etc/systemd/system/myapp.service.d
+sudo nano /etc/systemd/system/myapp.service.d/override.conf</code></pre>
+
+                    <h3 id="sec-8-2">Four-Stage Hardening Workflow and Illustrative Configuration</h3>
+
+                    <p>Security hardening should advance through four controlled phases: baseline filesystem protection, kernel state lockdown, system call and memory integrity enforcement, and network protocol filtering. The configuration snippet below illustrates this progressive strategy. This example must be rigorously tested in a non-production staging environment prior to production rollout.</p>
+
+                    <pre><code># [NOTICE: The following configuration is an illustrative example for testing.
+# Verify all operational dependencies in staging before applying to production.]
+
+[Service]
+# Phase 1: Baseline Identity Reduction and Filesystem Sandboxing (Risk: Low)
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+UMask=0027
+
+# Phase 2: Kernel Integrity and Process Table Concealment (Risk: Moderate)
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+
+# Phase 3: System Call Filtering and Memory Integrity (Risk: Moderate-High)
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+
+# Phase 4: Network Surface and Socket Protocol Filtering (Risk: High)
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# IPAddressDeny=any
+# IPAddressAllow=localhost 10.0.0.0/8</code></pre>
+
+                    <p>Following configuration authoring, the systemd manager daemon must reload its unit database, and the target service must be restarted. Infrastructure engineers can then execute systemd-analyze security to evaluate the resulting exposure score.</p>
+
+                    <pre><code># Reload unit configurations, restart the daemon, and inspect the security posture
+sudo systemctl daemon-reload
+sudo systemctl restart myapp.service
+systemd-analyze security myapp.service</code></pre>
+
+                    <ul>
+                        <li>Phase 1 establishes core containment via NoNewPrivileges, ProtectSystem=full, ProtectHome=yes, and PrivateTmp=yes.</li>
+                        <li>Phase 2 locks kernel tunables, prevents module loading, isolates cgroups, and conceals foreign processes in /proc.</li>
+                        <li>Phase 3 enforces seccomp filtering and W^X memory discipline, validating compatibility with JIT compilation engines.</li>
+                        <li>Phase 4 restricts socket families and evaluates eBPF IP packet filtering to eliminate unauthorized network communication paths.</li>
+                    </ul>
+
+                    <h2 id="sec-9">9. What Could Not Be Confirmed</h2>
+
+                    <p>During technical analysis of the official systemd documentation, the following specific implementation details could not be verified from primary sources and are not asserted as definitive facts.</p>
+
+                    <ul>
+                        <li>The specific compile-time build flags, macro defaults, and distribution-specific default sandboxing policies across major Linux distributions (Ubuntu, Debian, RHEL, Arch Linux) could not be confirmed; upstream man pages do not document downstream distribution defaults.</li>
+                        <li>The precise architecture-specific system call mappings included within the @system-service grouping across diverse CPU architectures (x86-64, aarch64, riscv64) and differing Linux kernel releases could not be confirmed.</li>
+                        <li>The exact mathematical weighting formula, additive penalty algorithm, and score categorization thresholds utilized internally by systemd-analyze security to calculate composite exposure scores (0.0 to 10.0) could not be confirmed from the man page text.</li>
+                        <li>The precise behavioral differences and silent deactivation rules for specific sandboxing directives when systemd is executed as PID 1 inside unprivileged, rootless containers (Docker, Podman) could not be confirmed from official reference documentation.</li>
+                    </ul>
+
+                    <h2 id="sec-10">10. References</h2>
+
+                    <p>The technical analysis and directive specifications presented in this guide are derived strictly from official freedesktop.org systemd documentation.</p>
+
+                    <ul>
+                        <li><a href="https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html" target="_blank" rel="noopener">systemd.exec(5) — Execution Environment Configuration Official Manual</a>: Specifications for process isolation, filesystem namespaces, privilege dropping, and Seccomp system call filtering.</li>
+                        <li><a href="https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html" target="_blank" rel="noopener">systemd.resource-control(5) — Resource Control Unit Settings Official Manual</a>: Specifications for cgroup v2 resource accounting, hierarchy management, and eBPF-based socket filtering.</li>
+                        <li><a href="https://www.freedesktop.org/software/systemd/man/latest/systemd-analyze.html" target="_blank" rel="noopener">systemd-analyze(1) — System Analysis and Debugging Official Manual</a>: Operational documentation for systemd-analyze security inspections and exposure rating audits.</li>
+                        <li><a href="https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html" target="_blank" rel="noopener">systemd.service(5) — Service Unit Configuration Official Manual</a>: Service process lifecycle management models and execution configuration directives.</li>
+                        <li><a href="linux_server_guide_10_security.html">Linux Server Administration Complete Guide Part 10</a>: Foundational coverage of operating system hardening, firewalls, and defense-in-depth architecture.</li>
+                    </ul>
+                </div>
+
+                <div class="share-section">
+                    <h3>Share this post</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">Copy Link</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">Back to list</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Free tools you may find useful</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/iptables_generator.html">iptables Generator 2026</a></li>
+      <li><a href="../static/code_image.html">Code Image Generator</a></li>
+      <li><a href="../static/char_counter.html">Character Counter</a></li>
+      <li><a href="../static/json_formatter.html">JSON Formatter</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">See all tools &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Related Posts</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="linux_server_guide_03_packages.html">Linux Server Administration Complete Guide Part 3</a></li>
+      <li><a href="cephfs_rctime_operational_limits.html">The Gain Lives Between Depth 5 and 10 - Operational Limits and Failure Modes of ceph.dir.rctime Incremental Sync</a></li>
+      <li><a href="rust_tier1_microsoft_msvc.html">Rust Becomes a Tier-1 Language at Microsoft - What Sharing the MSVC Backend Really Changes</a></li>
+      <li><a href="app_install_ad_bot_detection.html">Installs Surged But Users Vanished - How 60% of Google App Campaign Installs Were Bots and Detection Signals 2026</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('Link copied. Paste into Threads to share!');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('Link copied to clipboard!'); });
+    });
+    </script>
+</body>
+</html>

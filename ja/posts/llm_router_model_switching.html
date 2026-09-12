@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<!--
+ * 技術ブログ投稿テンプレート
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ja">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>すべての呼出しを旗艦モデルに任せない - APIをそのままにモデルを動的切替するLLMルーターとSwitchyard</title>
+    <meta name="description" content="すべての呼出しを高価な旗艦モデルに送る必要はない。OpenAIとAnthropic API規格を保ったままツール実行履歴でモデルを切り替えるNVIDIA NeMo Switchyardの構造、Stage Routerの原理、ルータ導入の代償を整理する。">
+    <meta name="keywords" content="LLMルーター, Switchyard, NVIDIA NeMo, モデルルーティング, Stage Router, OpenAI API, Anthropic Messages API, LiteLLM, NeMo Relay, AIエージェント費用最適化">
+
+    <link rel="canonical" href="https://braindetox.kr/ja/posts/llm_router_model_switching.html">
+
+    <meta property="og:title" content="すべての呼出しを旗艦モデルに任せない - APIをそのままにモデルを動的切替するLLMルーターとSwitchyard">
+    <meta property="og:description" content="プロンプト単体の難易度予測を超え、ツールの実行失敗履歴からモデルを昇格させる階層設計とプロンプトキャッシュ・遅延時間の構造的代償。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/ja/posts/llm_router_model_switching.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ja_JP">
+    <meta property="article:published_time" content="2026-09-12">
+    <meta property="article:section" content="開発・インフラ">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="すべての呼出しを旗艦モデルに任せない - LLMルーターとSwitchyard">
+    <meta name="twitter:description" content="API規格をそのままに失敗履歴とツール信号でモデルを動的に切り替えるLLMルーターのアーキテクチャ分析。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "すべての呼出しを旗艦モデルに任せない - APIをそのままにモデルを動的切替するLLMルーターとSwitchyard",
+      "alternativeHeadline": "プロンプト単体の難易度予測を超え、ツールの実行失敗履歴からモデルを昇格させる階層設計とプロンプトキャッシュ・遅延時間の構造的代償",
+      "datePublished": "2026-09-12",
+      "dateModified": "2026-09-12",
+      "inLanguage": "ja-JP",
+      "articleSection": "開発・インフラ",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "LLMルーター, Switchyard, NVIDIA NeMo, モデルルーティング, Stage Router, OpenAI API, Anthropic Messages API, LiteLLM, NeMo Relay, AIエージェント費用最適化",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/ja/posts/llm_router_model_switching.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "LLMルーターとは何であり、従来のAPIゲートウェイと何が違うのですか？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "単純な負荷分散やAPIキー管理を担う従来のゲートウェイとは異なり、LLMルーターはプロンプトの意味、タスクの複雑度、エージェントのツール実行履歴を解析し、各リクエストを処理可能な最も経済的なモデルへ動的に振り分けるインフラ層です。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "NVIDIA NeMo Switchyardを導入する際、既存コードの改修は必要ですか？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "アプリケーションコードの修正は不要です。SwitchyardはOpenAI Chat Completions/Responses規格およびAnthropic Messages規格に準拠したプロキシを提供するため、クライアントの接続先エンドポイント（base_url）を変更するだけで動作します。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Stage Routerはどのような基準で上位モデルへの昇格を判断しますか？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "単一のプロンプトから難易度を推測するのではなく、会話履歴内のツール実行結果を精査します。トレースバック、アサーションエラー、コマンド再試行などの障害パターンを検知した場合に上位モデルへ切り替え、テスト通過時には効率的なモデルを維持します。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "LLMルーターの導入に伴って発生する技術的代償には何がありますか？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "プロキシ経由によるネットワーク遅延の増加、単一障害点（SPOF）のリスク、そしてターンごとに異なるモデルへ切り替えることでクラウド側のプロンプトキャッシュが無効化され、期待したコスト削減効果が損なわれるリスクが挙げられます。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "モデルルーティングの効果を客観的に検証するには何を測定すべきですか？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "単純なトークン単価の比較にとどまらず、タスクの達成成功率を一定に固定した状態での総費用、モデル階層ごとの呼出し比率、不要なエスカレーションの頻度、およびプロキシ処理による遅延オーバーヘッドを総合的に計測する必要があります。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/llm_router_model_switching.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/llm_router_model_switching.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/llm_router_model_switching.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/llm_router_model_switching.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/llm_router_model_switching.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "ホーム",
+      "item": "https://braindetox.kr/ja/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "開発・インフラ",
+      "item": "https://braindetox.kr/ja/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "すべての呼出しを旗艦モデルに任せない - APIをそのままにモデルを動的切替するLLMルーターとSwitchyard",
+      "item": "https://braindetox.kr/ja/posts/llm_router_model_switching.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="すべての呼出しを旗艦モデルに任せない - APIをそのままにモデルを動的切替するLLMルーターとSwitchyard">
+                <meta itemprop="datePublished" content="2026-09-12">
+                <meta itemprop="dateModified" content="2026-09-12">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="LLMルーター, Switchyard, NVIDIA NeMo, モデルルーティング, Stage Router, OpenAI API, Anthropic Messages API, LiteLLM, NeMo Relay, AIエージェント費用最適化">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/ja/posts/llm_router_model_switching.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">すべての呼出しを旗艦モデルに任せない - APIをそのままにモデルを動的切替するLLMルーターとSwitchyard</h1>
+                    <h2 class="post-subtitle">プロンプト単体の難易度予測を超え、ツールの実行失敗履歴からモデルを昇格させる階層設計とプロンプトキャッシュ・遅延時間の構造的代償</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-12">2026-09-12</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">開発・インフラ</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>大規模言語モデルをソフトウェア製品や自律型コーディングエージェントの実行ループに組み込むエンジニアリング環境において、開発チームが直面するジレンマは極めて明確です。すべてのユーザーリクエストや内部ツールの実行ターンを最高性能の旗艦モデルに委ねれば、タスクの完了率や推論精度は最高水準を維持できます。しかし、1日に数千件ものセッションが積み重なると、クラウドの推論費用請求額は制御不能な勢いで急増します。一方で、運用コストを抑えるために一律で軽量モデルを採用すると、複雑なコードリファクタリングや多重デバッグの場面で致命的な論理破綻や幻覚が発生してしまいます。</p>
+
+                    <p>この溝を埋めるため、従来の多くのシステムではアプリケーションコードの各所に条件分岐を書き、特定のキーワードやタスク種別に応じて異なるモデルを呼び出す手法が取られてきました。しかし、コード内にモデル選定ロジックを直接埋め込む方式は、プロバイダのAPI仕様変更や新しい高効率モデルが登場するたびに、アプリケーション全体を再ビルドしてデプロイし直さなければならないという巨大な技術的負債を生み出します。こうした問題をインフラストラクチャ層で根本的に分離するために生まれたのが、<strong>LLMルーター（LLM Router）</strong>という設計層です。</p>
+
+                    <p>NVIDIA NeMoエコシステムの一環として公開されたオープンソースプロジェクト<strong>Switchyard</strong>は、このアーキテクチャの転換点を象徴しています。Switchyardの設計目標は、エージェント側のコードを1行も書き換えることなく、各LLM呼び出しを「そのタスクを遂行可能な最も低コストなモデル」へと動的に振り分けることです。本稿では単なるツール紹介にとどまらず、なぜソフトウェアシステムがモデル選定を担う独立したルーティング層を必要とするのか、ツールの実行失敗履歴をもとに上位モデルへと昇格させるStage Routerの発想が何を変えるのか、そしてルーターを介在させることで生じる遅延やキャッシュ無効化という現実の代償を深く解剖します。</p>
+
+                    <nav class="post-toc">
+                        <h3>目次</h3>
+                        <ol>
+                            <li><a href="#sec-1">モデル固定コードが残す技術的負債とルーティング層の登場</a></li>
+                            <li><a href="#sec-2">クライアントを変更しないプロトコル互換プロキシ設計</a></li>
+                            <li><a href="#sec-3">Switchyardの構造とアーキテクチャ — libsyからswitchyard-serverまで</a></li>
+                            <li><a href="#sec-4">Stage Routerのメカニズム — 失敗履歴とツール実行信号によるモデル昇格</a></li>
+                            <li><a href="#sec-5">ルーター導入に伴う構造的代償 — 遅延、キャッシュ損失、単一障害点</a></li>
+                            <li><a href="#sec-6">モデル間の挙動差異と再現性 — ツール呼出しと出力フォーマットの分断</a></li>
+                            <li><a href="#sec-7">ルーティング効果を客観的に計測・検証するための指標</a></li>
+                            <li><a href="#sec-8">静的価格比較から動的分散へ — 単価ハブとの連携</a></li>
+                            <li><a href="#sec-9">確認できなかったこと</a></li>
+                            <li><a href="#sec-10">参考資料</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">モデル固定コードが残す技術的負債とルーティング層の登場</h2>
+
+                    <p>生成AI統合の初期フェーズでは、コードベース深くにモデル名をリテラル文字列として直接記述する設計が一般的でした。クライアントSDKを初期化する際に <code>model="gpt-4o"</code> や <code>model="claude-3-5-sonnet"</code> と静的に指定する方式です。しかし、プロダクトが成長し運用が長期化するにつれて、この静的結合は深刻な構造的限界を露呈します。</p>
+
+                    <ul>
+                        <li><strong>モデル変更がデプロイライフサイクルに完全従属する課題</strong>: クラウドプロバイダは数か月単位で価格引き下げや高性能な新世代モデルの投入を行います。コード内にモデル名が直接埋め込まれていると、より安価で優れた最新モデルを採用するためだけに、ソースコードを修正し、テストスイート全体を実行してステージングから本番へのデプロイパイプラインを通さなければなりません。</li>
+                        <li><strong>タスクの難易度とモデル費用の極端な不均衡</strong>: 単一のエージェントセッション内であっても、挨拶の返答、ファイル一覧の取得、grep検索の実行、マークダウンの整形といった低負荷作業と、並行処理バグの特定やアーキテクチャ再編といった高難度作業が混在します。固定モデル構造では、これらすべての些細な操作に対しても旗艦モデルのプレミアム単価が課金され続けます。</li>
+                        <li><strong>プロバイダ障害やクォータ枯渇に対する回復力の欠如</strong>: 特定のモデルプロバイダでレートリミット（HTTP 429）やサーバーダウン（500系エラー）が発生した場合、個別のアプリケーション層にフォールバック処理が実装されていなければ、システム全体が即座に停止してしまいます。</li>
+                    </ul>
+
+                    <p>従来のマイクロサービスがデータベース接続や外部決済連携においてプロキシ層を設けて上位のビジネスロジックを保護したのと同様に、AIインフラにおいてもモデルの特定と呼び出しの責務をアプリケーションの外部へ切り出す<strong>独立ルーティング層</strong>の構築は不可避の帰結です。クライアントは具体的なモデル名を呼び出すのではなく、抽象化されたルーティングポリシー（例：標準コーディング、最高水準デバッグ）を要求し、背後の物理モデルの選定はルーターが動的に担うことになります。</p>
+
+                    <h2 id="sec-2">クライアントを変更しないプロトコル互換プロキシ設計</h2>
+
+                    <p>新たなインフラ層を導入するにあたり、エンジニアリング組織にとって最大の障壁となるのは既存クライアントコードの書き換え工数です。開発現場がすでに構築してきた膨大なプロンプト資産、Claude CodeやCodex CLIなどのサードパーティCLIツール、あるいは確立されたエージェントフレームワークを専用SDKへと移行しなければならないとすれば、導入のハードルは極めて高くなります。</p>
+
+                    <p>したがって、実運用に耐えうるLLMルーターの必須要件は、<strong>業界標準APIプロトコルとの完全なワイヤレベル互換性</strong>を保持することです。Switchyardはこの要件を満たすため、業界で最も広く普及している3つの主要通信規格を完全にサポートしています。</p>
+
+                    <ul>
+                        <li><strong>OpenAI Chat Completions形式</strong>: 標準の <code>/v1/chat/completions</code> エンドポイントを提供し、OpenAI公式SDK、LangChain、LlamaIndexなどのライブラリと無修正で接続可能です。</li>
+                        <li><strong>OpenAI Responses形式</strong>: 構造化出力や次世代の対話型レスポンス仕様を透過的に扱います。</li>
+                        <li><strong>Anthropic Messages形式</strong>: <code>/v1/messages</code> エンドポイントを提供し、Claude専用のツールや開発者クライアントが環境変数 <code>ANTHROPIC_BASE_URL</code> をプロキシに向けるだけでルーティングの恩恵を受けられます。</li>
+                    </ul>
+
+                    <p>プロトコル互換プロキシとして振る舞うことにより、クライアントは背後に単一のモデルが存在するのか、それともインテリジェントなルーティング層が介在しているのかを意識する必要が一切ありません。クライアントは通常のネイティブAPI呼び出しを送信し、ルーターがそのリクエストを中間傍受してセッション履歴やエラーシグナルを評価し、最適なアップストリームへとディスパッチします。</p>
+
+                    <h2 id="sec-3">Switchyardの構造とアーキテクチャ — libsyからswitchyard-serverまで</h2>
+
+                    <p>NVIDIA NeMoのSwitchyardは、単一の完成品バイナリとしてのみ提供されているのではなく、システムの統合深度に応じて選べる多層構造のRustクレートモジュールとして設計されています。Apache-2.0ライセンスで公開されているSwitchyardリポジトリの主要コンポーネントとそれぞれの成熟度は、以下のように定義されています。</p>
+
+                    <table>
+                        <caption>Switchyardコンポーネント構成と安定性ステージ</caption>
+                        <thead>
+                            <tr>
+                                <th>コンポーネント名</th>
+                                <th>安定性ステージ</th>
+                                <th>主要な機能と用途</th>
+                                <th>運用上のガイドライン</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><code>switchyard-libsy</code></td>
+                                <td>Beta</td>
+                                <td>独自のゲートウェイやエージェント制御ループに内蔵するコアルーティングエンジン</td>
+                                <td>統合検証に推奨。v1.0正式リリースまでに内部API変更の可能性あり</td>
+                            </tr>
+                            <tr>
+                                <td><code>switchyard-llm-client</code></td>
+                                <td>Alpha</td>
+                                <td>HTTPモデル呼び出しとプロバイダ間のプロトコル相互変換を担当</td>
+                                <td>実験的プロジェクトおよび検証用。本番の直接公開は非推奨</td>
+                            </tr>
+                            <tr>
+                                <td><code>switchyard-runner</code></td>
+                                <td>Alpha</td>
+                                <td>NeMo Relayなどの外部ランタイム環境内で設定済みルートを実行</td>
+                                <td>ランタイム統合および監視環境下でのパイロット運用向け</td>
+                            </tr>
+                            <tr>
+                                <td><code>switchyard-server</code></td>
+                                <td>Demo</td>
+                                <td>OpenAIおよびAnthropic規格に対応した独立稼働型プロキシサーバー</td>
+                                <td>技術評価およびPoC専用。高可用性が求められる本番運用には非推奨</td>
+                            </tr>
+                        </tbody>
+                    </table>
+
+                    <h3 id="sec-3-1">ライブラリ内蔵方式と独立プロキシ方式の2つの選択肢</h3>
+
+                    <p>エンジニアリングチームがSwitchyardを導入する際、アーキテクチャに応じて2つの統合アプローチを選択できます。第1の手法は<strong>ライブラリ内蔵方式</strong>です。Python環境では <code>pip install nemo-switchyard</code>、Rust環境では <code>switchyard-libsy</code> を直接依存関係に追加し、既存のAPIゲートウェイやエージェント内部にロジックを組み込みます。この方式の大きな利点は、実際のHTTP通信、リトライ制御、認証情報管理の責任を既存のアプリケーションが保持し続ける点です。Switchyardは純粋な決定関数として機能し、どのモデルを選ぶべきかのみを返すため、トランスポート層の信頼性を既存のまま維持できます。</p>
+
+                    <p>第2の手法は<strong>独立プロキシサーバー方式</strong>です。<code>switchyard-server</code> を起動し、TOML設定ファイルによってアップストリームクライアントとルーティング規則を一括定義します。既存のゲートウェイが存在しない場合や、Claude Codeなどの外部ツールから即座にモデル分散を試したい場合に、ポート4000などでプロキシを立ち上げて接続先URLを差し替えるだけで稼働します。</p>
+
+                    <pre><code class="language-toml"># Switchyardプロキシ設定ファイル例 (routes.toml)
+schema_version = 1
+
+[llm_clients.upstream_openai]
+format = "openai_chat"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+
+[targets.flagship_model]
+id = "gpt-4o"
+llm_client = "upstream_openai"
+
+[targets.efficient_model]
+id = "gpt-4o-mini"
+llm_client = "upstream_openai"
+
+[routes.stage_coding]
+id = "switchyard/stage"
+type = "stage_router"
+capable_target = "flagship_model"
+efficient_target = "efficient_model"
+picker = "efficient_first"
+confidence_threshold = 0.5
+
+</code></pre>
+
+                    <h3 id="sec-3-2">コンポーネント成熟度と1.0以前の制約</h3>
+
+                    <p>リポジトリのワークスペース設定に記載されている通り、現在のSwitchyardのバージョンは<strong>0.2.0</strong>であり、明確に1.0未満の初期開発段階に位置づけられています。コアライブラリである <code>switchyard-libsy</code> はベータ段階に達しているものの、HTTP送受信を担うモジュール群はアルファ段階にとどまります。</p>
+
+                    <p>とりわけ独立プロキシの <code>switchyard-server</code> は、公式ドキュメントにおいて<strong>Demo</strong>（実証・デモ用）と位置づけられています。これは社内の機能評価や開発環境でのテストには最適である一方、無停止稼働や膨大なトラフィックを捌くエンタープライズ本番環境での単独運用はまだ想定されていないことを示します。本番環境で大規模に運用する場合は、すでに実績のあるLiteLLMやNeMo Relayの公式プラグインとしてSwitchyardのアルゴリズムを統合するか、ライブラリ形式で組み込むのが最も堅牢な選択となります。</p>
+
+                    <h2 id="sec-4">Stage Routerのメカニズム — 失敗履歴とツール実行信号によるモデル昇格</h2>
+
+                    <p>従来の初歩的なLLMルーターの多くは、<strong>プロンプトに基づく単一分類器（Single-prompt Classifier）</strong>の形態をとっていました。ユーザーが送信した最初のプロンプトを小型モデルやエンベディングモデルに渡し、その文面から難易度やカテゴリを推測してモデルを振り分ける手法です。しかし、自律型コーディングエージェントの現場において、この手法は根本的な破綻を迎えます。</p>
+
+                    <p>実際のソフトウェア開発現場では、開発者が深刻な並行処理バグを依頼する際にも「このエラーを直して」と数文字のプロンプトしか入力しないことが日常茶飯事であり、逆に単純な変数名変更に対して詳細な背景仕様を何十行も書き連ねることもあります。つまり、<strong>ユーザーが最初に入力したテキスト表現だけでは、その後のデバッグ作業の真の複雑さを事前に予見することは不可能です。</strong>タスクの真の難易度は、エージェントがコードを編集し、コマンドを実行し、テストスイートを走らせる実行時（ランタイム）において初めて明らかになります。</p>
+
+                    <p>Switchyardの<strong>Stage Router</strong>は、まさにこの現実を踏まえて発想を根本から転換させました。静的なテキスト予測を捨て去り、<strong>「エージェントがこれまでのステップで何をどのように失敗してきたか」</strong>というツールの実行履歴そのものを信号として捉え、上位モデルへの昇格（Escalation）を動的に判断します。</p>
+
+                    <h3 id="sec-4-1">ツール信号抽出器が検知するエラーパターンと深刻度</h3>
+
+                    <p>Switchyard内部の <code>tool_signals.rs</code> モジュールは、対話履歴内のすべてのツール呼び出しとその結果出力を走査し、正規化されたテキストパターンマッチングを実行します。ネットワーク通信を行わず純粋なメモリ処理で高速動作するこの抽出器は、障害シグナルを3段階の深刻度定数に分類します。</p>
+
+                    <ul>
+                        <li><strong>CRITICAL（重み 1.0）</strong>: メモリ不足エラー（<code>out of memory</code>, <code>memoryerror</code>）や接続拒否（<code>connection refused</code>, <code>econnrefused</code>）など、作業環境そのものが致命的な膠着状態に陥ったことを示すシステム障害。</li>
+                        <li><strong>HARD（重み 0.7）</strong>: Pythonの例外トレースバック（<code>traceback (most recent call last)</code>）、モジュール読込失敗（<code>modulenotfounderror:</code>）、未定義コマンド（<code>command not found</code>）、アサーション失敗（<code>assertionerror</code>）、構文エラー（<code>syntaxerror:</code>）、タイムアウト（<code>timed out</code>, <code>deadline exceeded</code>）、ファイル不在（<code>filenotfounderror:</code>, <code>file does not exist</code>）。</li>
+                        <li><strong>SOFT（重み 0.3）</strong>: 詳細なトレースバックは伴わないものの、終了コードが非ゼロであった場合（<code>exit code 1</code>, <code>exit status 1</code>, <code>returned non-zero</code>）。</li>
+                    </ul>
+
+                    <p>さらにシグナル抽出器は、エージェントの行動をファイル編集（<code>edit</code>）、新規作成（<code>write</code>）、調査読込（<code>read</code>）、計画立案（<code>plan</code>）に分類して集計します。また、テスト実行の出力から成功フレーズ（<code>" passed"</code>, <code>"all tests passed"</code>, <code>"test result: ok"</code>）を検知すると安全な状態と見なし、失敗リテラル（<code>"✗ "</code>, <code>"fatal:"</code>, <code>"error:"</code>）を検知すると即座に失敗と評価します。</p>
+
+                    <h3 id="sec-4-2">信頼度不足時の判断棄権とフォールバック機能</h3>
+
+                    <p>Stage Routerは標準設定において <code>picker = "efficient_first"</code> の戦略を採用します。セッション開始直後の探索段階やファイル閲覧ターンでは、最も安価な効率モデル（例：GPT-4o-mini相当）が優先的に割り当てられます。しかし、コードを書き換えたにもかかわらずテストでアサーションエラーが連続したり、構文エラーによる失敗が反復されたりして障害スコアが累積すると、内部の信頼度閾値（<code>confidence_threshold</code>、標準0.5）を超えた瞬間に、次ターンの処理が高性能な旗艦モデルへと一気に昇格されます。</p>
+
+                    <p>もしツール実行履歴のシグナルが曖昧で確証が持てない場合、ルーターは無理に推測することなく判断を棄権（Abstain）し、下位の <code>LlmTaskClassifier</code>（小型判別モデルによる再判定）へ処理を渡すか、設定済みのデフォルト階層へと安全にフォールバックします。「失敗の明確な証拠がある場合にのみ高価なモデルを投入する」というこの仕組みが、無駄な上位呼出しを最小限に抑え込みます。</p>
+
+                    <h2 id="sec-5">ルーター導入に伴う構造的代償 — 遅延、キャッシュ損失、単一障害点</h2>
+
+                    <p>いかなるアーキテクチャの導入にも必ず代償が伴います。LLMルーターが掲げるトークン費用削減のメリットの裏側には、システムが引き受けなければならない技術的トレードオフが存在します。これらを正確に計算せずに導入すれば、削減できたトークン代以上の運用被害を被ることになります。</p>
+
+                    <h3 id="sec-5-1">プロンプトキャッシュ無効化による費用の逆転現象</h3>
+
+                    <p>現在のクラウドLLMインフラにおいて、最大のコスト削減武器となっているのがプロバイダ側による<strong>プロンプト接頭辞キャッシング（Prompt Prefix Caching）</strong>です。AnthropicやOpenAIのキャッシュ機能は、長大なシステムプロンプトやリポジトリ構成、過去の会話履歴が一致していれば、入力トークン費用を50%から最大90%近く割り引いて提供します。</p>
+
+                    <p>しかし、<strong>ターンごとに動的にモデルを切り替えるルーティング設計は、このプロンプトキャッシュの恩恵を直接的に破壊します。</strong>例えば、エージェントが3万トークンのコード文脈を蓄積しながら4ターン目までモデルAと対話していたとします。5ターン目でStage Routerがテスト失敗を検知しモデルBへ昇格させるとどうなるでしょうか。モデルBのサーバー側キャッシュには当該セッションのコンテキストが一切存在しないため、3万トークンの全履歴が<strong>キャッシュ未適用の正規単価</strong>で新規課金されます。もしモデルAのキャッシュ適用入力単価が安く、モデルBの非キャッシュ単価が高価であった場合、たった1回のモデル切り替えによってそれまでの節約分が一瞬で相殺されてしまいます。動的ルーティングが真に利益をもたらすには、モデル変更によって得られる出力トークンの削減価値が、プロンプトキャッシュ無効化に伴う損失を確実に上回っていなければなりません。</p>
+
+                    <h3 id="sec-5-2">ネットワークホップの追加と運用観測性の複雑化</h3>
+
+                    <p>ルーターを独立したプロキシとして配置する場合、すべてのHTTPリクエストはクライアントとプロバイダの間で最低1回の<strong>追加ネットワークホップ</strong>を経由します。JSONペイロードのシリアライズ・デシリアライズ時間、正規表現によるシグナル解析、さらに補助的な分類モデルを呼び出す場合の推論遅延（数百ミリ秒）が積み重なり、ユーザーが体感する応答開始時間（TTFT）は確実に悪化します。</p>
+
+                    <p>加えて、ルーター自体が<strong>単一障害点（SPOF）</strong>となるリスクも無視できません。クラウドプロバイダが生きていても、中間プロキシが過負荷やメモリ枯渇でクラッシュすれば、組織内のすべてのエージェントが動作を停止します。これに対処するため、READMEは独立プロキシに二つの観測面を記載しています。どのターゲットが何を処理したかを返す <code>/v1/stats</code> と、リクエスト・エラー・レイテンシ・トークン・ルーティングのオーバーヘッドをPrometheusカウンタとして公開する <code>/metrics</code> です。</p>
+
+                    <h2 id="sec-6">モデル間の挙動差異と再現性 — ツール呼出しと出力フォーマットの分断</h2>
+
+                    <p>複数モデルを動的に併用する際、インフラエンジニアが見落としがちな盲点が、<strong>プロバイダ間におけるモデルの振る舞いの非互換性</strong>です。OpenAIとAnthropicのモデルはいずれもツール利用（Function Calling）をサポートしていますが、その細かな解釈と挙動は大きく異なります。</p>
+
+                    <ul>
+                        <li><strong>ツール引数スキーマの解釈と型厳格性の差</strong>: あるモデルはスキーマ定義の軽微な不整合（数値の文字列渡しなど）を寛容に解釈して自己修正しますが、別のモデルは厳格にバリデーションエラーを返して停止します。</li>
+                        <li><strong>推論思考タグとシステムプロンプトの順守傾向</strong>: 内部思考プロセスを出力する推論特化型モデルと一般的な指示追従モデルとでは、文脈解釈の癖が異なるため、対話の途中でモデルを切り替えるとエージェントの前提行動規範が崩れる危険性があります。</li>
+                        <li><strong>JSON出力のマークダウン包装フォーマット</strong>: コードブロック内へのJSON埋め込み方やコメント挿入の有無といった細かな出力形式の違いが、後続の決定論的パーサーを破壊する要因になります。</li>
+                    </ul>
+
+                    <p>Switchyardはモデルごとに専用の <code>system_prompt</code> を動的に前置したり、固有の拡張パラメータ（<code>extra_body</code>）を注入することでこの差異を緩和する手段を提供しています。しかし、異なる学習データを持つモデル群が同一の文脈を完璧に引き継ぐことは原理的に難しいため、候補モデルの組み合わせ選定には綿密な回帰テストが不可欠です。</p>
+
+                    <h2 id="sec-7">ルーティング効果を客観的に計測・検証するための指標</h2>
+
+                    <p>ルーター導入後の効果測定において最も陥りやすい誤りは、「トークン費用が前月比で40%削減された」といった表面的な請求書金額だけを成果として報告することです。もしモデルを安価なものに変えた結果、エージェントのタスク完了率が激減していたとすれば、それは最適化ではなくシステムの品質崩壊に過ぎません。</p>
+
+                    <h3 id="sec-7-1">タスク成功率を固定した条件下での純費用測定</h3>
+
+                    <p>モデルルーティングの正当性を証明するための絶対原則は、<strong>タスク成功率（Task Success Rate）を一定水準に固定した状態で総費用を比較すること</strong>です。Terminal-Bench 2.1やSWE-benchのような標準化された自律プログラミングベンチマークを用い、同一の課題セットに対して最終テストを通過した割合（Pass Rate）が単一旗艦モデルと同等以上であることを確認しなければなりません。</p>
+
+                    <p>実際、Switchyard公式リポジトリが公表しているTerminal-Bench 2.1の検証データでは、単一固定モデルによる精度は56%未満にとどまりました。これに対し、Switchyardの段階的（staged）・エスカレーション（escalation）・分類器（classifier）ルーティングは、旗艦モデル基準点であるOpus 4.8と比較して<strong>13%〜30%低い総費用で71%〜76%の正確度</strong>を達成しました。このように成功率の維持・向上が担保されて初めて、コスト削減の主張は技術的な正当性を持ち得ます。</p>
+
+                    <h3 id="sec-7-2">階層遷移頻度とシグナル誤検知率の継続監査</h3>
+
+                    <p>本番運用中には、以下のテレメトリ指標を常時トラッキングする必要があります。</p>
+
+                    <ul>
+                        <li><strong>モデル階層ごとのトラフィック分岐比率</strong>: エージェントの全実行ターンのうち、効率モデルが処理した割合と上位モデルへと昇格された割合の推移。</li>
+                        <li><strong>不要なエスカレーションの発生率</strong>: 単なる警告メッセージや正常な再試行の過程でエラーシグナルが誤検知され、無駄に高価なモデルが起動された比率。</li>
+                        <li><strong>セッションごとの消費トークン量とプロキシ付加遅延</strong>: ルーター導入前後におけるP95・P99遅延の推移と、プロンプトキャッシュ適中率の変動データ。</li>
+                    </ul>
+
+                    <table>
+                        <caption>LLM割当アーキテクチャごとの主要特性とトレードオフ比較</caption>
+                        <thead>
+                            <tr>
+                                <th>割当アーキテクチャ</th>
+                                <th>判断基準シグナル</th>
+                                <th>追加遅延オーバーヘッド</th>
+                                <th>プロンプトキャッシュへの影響</th>
+                                <th>最適な運用ユースケース</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>単一固定モデル</td>
+                                <td>静的コード設定</td>
+                                <td>0 ms（プロキシ介在なし）</td>
+                                <td>最大維持（単一プロバイダのキャッシュを100%活用）</td>
+                                <td>タスク難易度が均一で超低遅延が必須の業務</td>
+                            </tr>
+                            <tr>
+                                <td>プロンプト分類器</td>
+                                <td>ユーザー入力の初回文面</td>
+                                <td>分類モデルの推論時間（数十〜数百 ms）</td>
+                                <td>セッション全体で維持可能</td>
+                                <td>1問1答形式で完結する一般的なチャットボット</td>
+                            </tr>
+                            <tr>
+                                <td>実行履歴Stage Router</td>
+                                <td>ツールの実行失敗シグナル</td>
+                                <td>ルール解析オーバーヘッド（&lt; 5 ms、純CPU処理）</td>
+                                <td>モデル切り替えターンでキャッシュ未適用が発生</td>
+                                <td>自己修正とテスト検証を繰り返す自律コーディングエージェント</td>
+                            </tr>
+                        </tbody>
+                    </table>
+
+                    <p>以下は、READMEが記載している二つの観測エンドポイントをそのまま呼び出す流れです。</p>
+
+                    <pre><code class="language-bash"># どのターゲットが何を処理したか — プロキシが返す集計
+curl -s http://localhost:4000/v1/stats | jq .
+
+# Prometheus カウンタ — リクエスト・エラー・レイテンシ・トークン・ルーティングのオーバーヘッド
+curl -s http://localhost:4000/metrics | head -20</code></pre>
+
+                    <h2 id="sec-8">静的価格比較から動的分散へ — 単価ハブとの連携</h2>
+
+                    <p>効果的なLLMルーティング基盤を構築するための大前提となるのは、各プロバイダが提供するモデル群の正確なコスト構造を把握しておくことです。入力トークン単価、出力トークン単価、そしてキャッシュ適用時と非適用時の価格差を把握していなければ、どのモデルを <code>efficient_target</code> に据え、どのモデルを <code>capable_target</code> に指定すべきかの設計指針を立てることはできません。</p>
+
+                    <p>当ブログの価格分析ハブである <a href="ai_model_comparison_2026.html">Claude・GPT・Gemini・Grok・DeepSeek・GLMの価格、コンテキスト、地域アベイラビリティ、廃止予定比較 2026</a> では、主要な基盤モデルの最新単価と課金体系を一元的に整理しています。当該記事が<strong>「各モデルが物理的にいくらなのか」</strong>という静的な費用の軸を扱っているのに対し、本稿で検証したSwitchyardとLLMルーターは<strong>「実行時の要求ごとにどれを選ぶべきか」</strong>という動的なインフラ制御の軸を扱っています。</p>
+
+                    <p>静的な単価分析に基づいて高効率な軽量モデルを基礎層に配置し、実績ある旗艦モデルを上位層に接続したうえで、ランタイムのエラーシグナルに応じて柔軟に行き来させる設計こそが、持続可能なAIインフラ運用の標準形となります。</p>
+
+                    <h2 id="sec-9">確認できなかったこと</h2>
+
+                    <p>公開リポジトリのソースコードおよびドキュメントの開示範囲に基づき、今回の技術検証において独自に確認できなかった事項は以下の通りです。</p>
+
+                    <ul>
+                        <li><strong>毎秒数千リクエスト（QPS）を超える高負荷環境下におけるswitchyard-serverの正確なP99遅延特性</strong>: 基本的なプロキシ機能とTerminal-Benchにおける正解率は開示されているものの、大規模エンタープライズ環境で持続的な並行負荷をかけた際の厳密な遅延パーセンタイル分布は確認できませんでした。</li>
+                        <li><strong>合成ベンチマーク以外の多様な企業実務ワークフローにおける長期累積コスト削減実績</strong>: READMEにはTerminal-Bench 2.1に基づく削減率（13%〜30%）が示されていますが、カスタマーサポートやドキュメント要約といった非コーディング領域における長期的な実運用データは確認できませんでした。</li>
+                        <li><strong>v1.0.0正式安定版（GA）の具体的なリリース時期とロードマップ</strong>: パッケージバージョンが0.2.0であり、libsyがベータ、サーバーがデモという成熟度ステータスは確認できましたが、下位互換性を保証する正式版の登場時期は明記されていません。</li>
+                        <li><strong>異種プロバイダ間におけるプロンプトキャッシュ状態の同期・共有機構の有無</strong>: OpenAIとAnthropicのように異なるクラウド事業者の間でセッションが切り替わった際に、プロバイダ側のKVキャッシュ消失をインフラ側で補填・共有する独自の仕組みが実装されているかは確認できませんでした。</li>
+                    </ul>
+
+                    <h2 id="sec-10">参考資料</h2>
+
+                    <ul>
+                        <li><a href="https://github.com/NVIDIA-NeMo/Switchyard" target="_blank" rel="noopener">NVIDIA-NeMo/Switchyard 公式GitHubリポジトリ</a> — NVIDIA NeMoチームが公開したオープンソースLLMルーター。Apache-2.0ライセンス、Rust製コアライブラリ（libsy）、独立プロキシ（switchyard-server）、Stage Router実装およびTerminal-Bench 2.1ベンチマーク結果。</li>
+                        <li><a href="https://docs.anthropic.com/en/api/messages" target="_blank" rel="noopener">Messages - Claude API Reference</a> — Anthropic公式APIリファレンス。<code>/v1/messages</code> エンドポイント仕様、システムプロンプト設定およびツール呼出し規約。</li>
+                        <li><a href="https://github.com/BerriAI/litellm" target="_blank" rel="noopener">LiteLLM 公式GitHubリポジトリ</a> — 100種類以上のLLM APIをOpenAI形式に統合するプロキシゲートウェイ。Switchyardルーティングプラグインの公式連携先。</li>
+                        <li><a href="https://news.hada.io/topic?id=33566" target="_blank" rel="noopener">GeekNews - Switchyard: OpenAI/Anthropic APIをそのままにモデルを切り替えるLLMルーター</a> — 国内外の技術コミュニティにおけるプロジェクト紹介と機能概要（掲載日: 2026-09-12）。</li>
+                        <li><a href="ai_model_comparison_2026.html">AIモデル価格比較ハブ 2026 - Claude・GPT・Gemini・DeepSeek単価とキャッシュ料金一覧</a> — 主要AIモデルのトークン単価およびキャッシュ割引構造の包括的比較分析。</li>
+                        <li><a href="ai_agent_error_tracking_2026.html">AIエージェントのエラートラッキングと障害分析 2026</a> — ツール実行失敗の検知手法と自己修復型エージェントループの設計指針。</li>
+                    </ul>
+
+                </div>
+
+                <div class="share-section">
+                    <h3>この記事をシェアする</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">リンクをコピー</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">一覧へ戻る</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">一緒に使うと便利な無料ツール</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/yaml_json_converter.html">YAML JSON変換器 2026</a></li>
+      <li><a href="../static/curl_builder.html">curlコマンド生成器 2026</a></li>
+      <li><a href="../static/http_status_codes.html">HTTPステータスコード完全ガイド 2026</a></li>
+      <li><a href="../static/nginx_generator.html">Nginx 設定ジェネレーター</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">すべてのツールを見る &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">関連記事</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="ai_coding_cost_management_guide.html">AIコーディング費用を組織単位で統制する方法 - 予算・ルーティング・キャッシュ・ゲートウェイ 2026</a></li>
+      <li><a href="llm_size_estimation.html">外からモデルのサイズを測るという試み - 何が読み取れて何がぼやけるのか</a></li>
+      <li><a href="omniroute_ai_gateway_2026.html">OmniRoute徹底分析 - 271のプロバイダーを束ねる無料AIゲートウェイの実効性と限界 2026</a></li>
+      <li><a href="weave_router_llm_2026.html">Weave Router 分析 - プロンプトごとにモデルを自動選択するルーティングが必要な理由 2026</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('リンクがコピーされました。Threadsに貼り付けて共有してください！');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('リンクがコピーされました！'); });
+    });
+    </script>
+</body>
+</html>

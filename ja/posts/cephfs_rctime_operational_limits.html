@@ -1,0 +1,672 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ja">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>深さ5から10を外れると利得が消える - CephFS rctime 増分同期の運用限界と失敗モード</title>
+    <meta name="description" content="深さ3で6秒、5と8と10で4秒、15で6秒、20で8秒。CephFS rctime 増分同期のスキャン深さ感度と導入前後の比較、1.97時間を費やして転送0だった外れ値1件、そして運用で実際に踏んだ失敗モード5種を整理する。">
+    <meta name="keywords" content="CephFS, rctime, ceph.dir.rctime, スキャン深さ, 再帰変更時刻, 増分同期, 失敗モード, TOCTOU, RPO, クラスタ間レプリケーション, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/ja/posts/cephfs_rctime_operational_limits.html">
+
+    <meta property="og:title" content="深さ5から10を外れると利得が消える - CephFS rctime 増分同期の運用限界と失敗モード">
+    <meta property="og:description" content="深さはタダのつまみではない。深く降りるほど rsync の範囲は狭まり、スキャンと記録は高くつく。その交換の最適区間と、その外側の損を測定で書く。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/ja/posts/cephfs_rctime_operational_limits.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ja_JP">
+    <meta property="article:published_time" content="2026-09-12">
+    <meta property="article:section" content="開発・インフラ">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="深さ5から10を外れると利得が消える - CephFS rctime 増分同期の運用限界">
+    <meta name="twitter:description" content="いちばん深く降りた設定がいちばん遅かった。深さ感度6点と、運用で踏んだ失敗モード5種を書く。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "深さ5から10を外れると利得が消える - CephFS rctime 増分同期の運用限界と失敗モード",
+      "alternativeHeadline": "いちばん深く降りた設定がいちばん遅かった",
+      "datePublished": "2026-09-12",
+      "dateModified": "2026-09-12",
+      "inLanguage": "ja-JP",
+      "articleSection": "開発・インフラ",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "CephFS, rctime, ceph.dir.rctime, スキャン深さ, 増分同期, 失敗モード, TOCTOU, RPO, クラスタ間レプリケーション",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/ja/posts/cephfs_rctime_operational_limits.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "スキャン深さを深くするほど速くなるのか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "ならない。約1 TB・約90,000ディレクトリでファイル1個だけを変更した条件で測ると、深さ3が6秒、5が4秒、8が4秒、10が4秒、15が6秒、20が8秒だった。いちばん深く降りた設定がいちばん遅い。深さを上げると rsync に渡す範囲は狭まるが、値を読むスキャンと値を残す記録が同時に高くつく。二つの曲線が逆向きに動くので合計はU字を描き、この木では底が5から10のあいだにあった。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "SKIP が半分というのはどういう意味か?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "4日間で95セッションを回し、そのうち47セッションが SKIP、48セッションが INCR だった。FULL と FAIL は0で、成功率は100%である。SKIP はルートで値が一致し、rsync を一度も呼ばなかった回だ。つまり半分の回は何もしていない。従来方式では同じ条件の回がセッションあたり8.4時間を使っていた。何もしない回を安く済ませることがこの設計の目的なので、SKIP 比率は無駄の指標ではなく成果の指標である。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "スナップショットを削除したら同期に2時間かかった。障害か?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "障害ではなく既知の相互作用だ。CephFS のスナップショットを削除すると当該ディレクトリの再帰変更時刻が変わり、この設計は値の変化を変更の信号として読むので、その区間が INCR と判定される。実測1件では7,074秒、つまり1.97時間かかり、実際の転送は0だった。データ被害はなく、消えるのは時間だけである。対策はコードではなくスケジュールだ。スナップショット整理を同期が暇な時間帯に移す。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "なぜソースが空のときに止めなければならないのか?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "同期オプションに削除反映が入っているからだ。CephFS のマウントが外れるとマウントポイントは消えず、空の通常ディレクトリに戻る。その状態で走らせるとソースに何もないという意味になり、削除反映がその事実をそのままターゲットへ運んで丸ごと消す。だから判定はソースとターゲットを非対称に扱う。ソースのベースが空なら実行を拒否し、ターゲットのベースが空なら警告だけにする。初回シーディングではターゲットが空であることが正常だからだ。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "この方式を使わないほうがよい条件は?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "四つある。第一に初回シーディングは全部転送するので飛ばす区間がない。第二にディレクトリを常時大量に作るワークロードは、マーカーを残す費用がスキャン節約を相殺する。第三に変更が全ディレクトリへ均等に散らばるワークロードは切る枝がなく、全走査と同じになる。第四にスナップショットを頻繁に作って消す環境は、データ変更がなくても値が上がって無駄スキャンが繰り返される。そして CephFS でなければ判定の根拠となる値そのものが存在しない。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/cephfs_rctime_operational_limits.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/cephfs_rctime_operational_limits.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/cephfs_rctime_operational_limits.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/cephfs_rctime_operational_limits.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/cephfs_rctime_operational_limits.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "ホーム",
+      "item": "https://braindetox.kr/ja/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "開発・インフラ",
+      "item": "https://braindetox.kr/ja/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "深さ5から10を外れると利得が消える - CephFS rctime 増分同期の運用限界と失敗モード",
+      "item": "https://braindetox.kr/ja/posts/cephfs_rctime_operational_limits.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="深さ5から10を外れると利得が消える - CephFS rctime 増分同期の運用限界と失敗モード">
+                <meta itemprop="datePublished" content="2026-09-12">
+                <meta itemprop="dateModified" content="2026-09-12">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="CephFS, rctime, ceph.dir.rctime, スキャン深さ, 増分同期, 失敗モード, TOCTOU, RPO, クラスタ間レプリケーション">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/ja/posts/cephfs_rctime_operational_limits.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">深さ5から10を外れると利得が消える - CephFS rctime 増分同期の運用限界と失敗モード</h1>
+                    <h2 class="post-subtitle">値ひとつで飛ばす設計がどこまで効き、どこから使うべきでないのか</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-12">2026-09-12</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">開発・インフラ</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>深さを20まで降りるように設定すると、同期はいちばん精密になる代わりに<strong>いちばん遅くなる</strong>。同じ木で同じ変更を置いたまま深さだけを変えて測ると、<strong>深さ3で6秒、5で4秒、8で4秒、10で4秒、15で6秒、20で8秒</strong>という値が出る。曲線は単調ではない。底は真ん中にあり、両端はそれぞれ別の理由で上がる。</p>
+
+                    <p>この記事は<a href="cephfs_rctime_incremental_sync.html">CephFS の rctime で全走査を省く増分同期の設計</a>の後編だ。前編が<strong>なぜ効くのか</strong>を扱ったのに対し、ここでは<strong>どこまで効き、いつ使うべきでないか</strong>を扱う。取り上げるのは四つ。深さを変えたときの感度、導入前後の4日ずつを並べた運用比較、1.97時間を費やして何も転送しなかった外れ値1件、そしてコードに実際に仕込んである失敗モード5種である。</p>
+
+                    <p>前編の結論を一行に縮めるとこうなる。<strong>比較段階が木全体を走査するなら、名前が増分でもコストは増分ではない。</strong> <code>ceph.dir.rctime</code> は配下の変更を上位へ伝播させる読み取り専用の拡張属性であり、この値を読むのに配下をたどる必要はない。同じなら飛ばし、違えば一段降りる。その降下をどこで打ち切るかが<strong>深さ</strong>であり、この記事の最初の主題だ。</p>
+
+                    <div class="callout">
+                        以下の設計と測定は筆者が作って運用に適用したものである。外部資料は CephFS の再帰統計と拡張属性に関する Ceph 公式ドキュメントのみを根拠に使う。クラスタ・ネームスペース・ホストを特定する名前は使わず、二つのクラスタはソースの Cluster-A とターゲットの Cluster-B としてのみ記す。同期対象のディレクトリも名前ではなく役割と規模で指す。ソースコードやコマンド例も載せず、アルゴリズムと失敗モードは文章と表だけで説明する。
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>この記事で扱うこと</h3>
+                        <ol>
+                            <li><a href="#sec-1">深さはタダのつまみではない</a></li>
+                            <li><a href="#sec-2">深さ感度 - 6・4・4・4・6・8</a></li>
+                            <li><a href="#sec-3">曲線がU字になる理由 - 両端の損が違う</a></li>
+                            <li><a href="#sec-4">深さの決め方 - 三つの項の大きさを比べる</a></li>
+                            <li><a href="#sec-5">導入前後 - 16.7時間が15秒になった</a></li>
+                            <li><a href="#sec-6">何がその差を作ったか - 周期が解けた</a></li>
+                            <li><a href="#sec-7">セッションモード分布 - 半分は何もしなかった</a></li>
+                            <li><a href="#sec-8">「しないこと」が成果になる構造</a></li>
+                            <li><a href="#sec-9">外れ値1件 - 1.97時間を費やして転送0</a></li>
+                            <li><a href="#sec-10">外れ値を含めて数える理由</a></li>
+                            <li><a href="#sec-11">運用で踏んだ失敗モード5種</a></li>
+                            <li><a href="#sec-12">マウント喪失 - ソースが空ならターゲットが消える</a></li>
+                            <li><a href="#sec-13">比較と記録のあいだの窓 - マーカーを保留する</a></li>
+                            <li><a href="#sec-14">残り三つ - 壊れたリンク、名前の長さ、ロックの記述子</a></li>
+                            <li><a href="#sec-15">使うべきでない場合</a></li>
+                            <li><a href="#sec-16">まとめ - 五つの文</a></li>
+                            <li><a href="#sec-17">確認できなかったこと</a></li>
+                            <li><a href="#sec-18">参考資料</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">深さはタダのつまみではない</h2>
+
+                    <p>この設計の降下は上から下へ降りながら同じ比較を繰り返す。値が同じ枝はその場で切られ、違う枝だけがもう一段開かれる。深さの上限に達したらそれ以上降りず、<strong>そのディレクトリを丸ごと rsync に渡す</strong>。</p>
+
+                    <p>ここで上限が三つの項の大きさを同時に変える。一つずつ見ると向きが互いに逆だ。</p>
+
+                    <ul>
+                        <li><strong>スキャン</strong> — 値を読む仕事だ。深さが増えれば階層が増え、階層ごとに兄弟ディレクトリを確認しなければならないので<strong>読み取り回数が増える</strong>。</li>
+                        <li><strong>rsync</strong> — 渡された範囲を照合して運ぶ仕事だ。深さが増えるほど渡す範囲がリーフに近づくので<strong>減る</strong>。</li>
+                        <li><strong>記録</strong> — 同期時刻をターゲットに残す仕事だ。深さが増えればマーカーを置くディレクトリが増えるので<strong>増える</strong>。</li>
+                    </ul>
+
+                    <p>二つが増えて一つが減る構造である。だから合計は深さに対して単調にならない。「精密なほどよい」という直感がここで崩れる。深さを上げて得るものは<strong>rsync 範囲の縮小ひとつだけ</strong>で、その代わりに二つの項を払う。浅い側も同じだ。深さを下げてスキャンと記録を節約すれば、<strong>rsync が広いサブツリーを丸ごと受け取る</strong>。</p>
+
+                    <p>そうなると「どちらの損が大きいか」が条件で分かれる。前編のすべての測定は上限を10に固定した状態で得た値であり、この値を動かすと何が変わるかがここからだ。</p>
+
+                    <h2 id="sec-2">深さ感度 - 6・4・4・4・6・8</h2>
+
+                    <p>測定条件は前編と同じである。約1 TB に約90,000ディレクトリ、<strong>ファイル1個だけを変更したうえで</strong>深さだけを変えながら同じ同期を回した。変更量が一つに固定されているので、差はすべて深さから出る。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>深さ</th><th>スキャン</th><th>rsync</th><th>記録</th><th>合計</th><th>rsync が受け取る範囲</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>3</td><td>0秒</td><td>5秒</td><td>1秒</td><td><strong>6秒</strong></td><td>広い。大きなサブツリーを丸ごと渡す</td></tr>
+                            <tr><td>5</td><td>0秒</td><td>3秒</td><td>1秒</td><td><strong>4秒</strong></td><td>狭まり始める</td></tr>
+                            <tr><td>8</td><td>1秒</td><td>2秒</td><td>1秒</td><td><strong>4秒</strong></td><td>ほぼリーフに届く</td></tr>
+                            <tr><td>10</td><td>1秒</td><td>2秒</td><td>1秒</td><td><strong>4秒</strong></td><td>狭い。変更のあるディレクトリだけ</td></tr>
+                            <tr><td>15</td><td>2秒</td><td>2秒</td><td>2秒</td><td><strong>6秒</strong></td><td>これ以上狭まらない</td></tr>
+                            <tr><td>20</td><td>3秒</td><td>2秒</td><td>3秒</td><td><strong>8秒</strong></td><td>これ以上狭まらない</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>合計だけを見れば<strong>6 → 4 → 4 → 4 → 6 → 8</strong> である。最小が一点ではなく区間として出て、その両側が上がる。ところが合計より重要なのは<strong>真ん中の三列</strong>だ。その列がなぜU字なのかを説明する。</p>
+
+                    <p>rsync 列を縦に読むと<strong>5秒 → 3秒 → 2秒 → 2秒 → 2秒 → 2秒</strong>だ。深さ8を越えるとそれ以上は下がらない。この木では<strong>深さ8あたりですでにリーフに届いている</strong>からで、その下には狭める範囲が残っていない。逆にスキャンと記録の列は<strong>0・1から始まって3・3まで上がり続ける</strong>。片方は底を打ったのに、もう片方は止まらない。</p>
+
+                    <p>だから深さ10以降の増加は「効果が減る」ではなく、<strong>「効果は終わってコストだけ残った」</strong>に近い。深さ20の8秒のうち rsync は2秒だけで、残りの6秒はすべて値を読み書きするのに使われた。<strong>働いていない時間が働いている時間の三倍</strong>になったわけだ。</p>
+
+                    <h2 id="sec-3">曲線がU字になる理由 - 両端の損が違う</h2>
+
+                    <p>同じ6秒でも、深さ3の6秒と深さ15の6秒は性質がまったく違う。この区別が実務で方向を決める。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>区間</th><th>支配する項</th><th>何が起きるか</th><th>何が無駄になるか</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>浅すぎる (3)</td><td>rsync 5秒</td><td>変更地点を特定する前に降下を打ち切り、広いサブツリーを丸ごと渡す</td><td>変更と無関係な項目を rsync が改めて照合する</td></tr>
+                            <tr><td>最適区間 (5〜10)</td><td>均等に分散</td><td>降下がリーフ近くで終わり、rsync 範囲が実際の変更地点に収束する</td><td>ほとんどない</td></tr>
+                            <tr><td>深すぎる (15〜20)</td><td>スキャン + 記録 6秒</td><td>rsync 範囲はもう縮まないのに、階層ごとに兄弟を確認しマーカーを残す</td><td>終わった探索を続け、書く必要のないマーカーを書く</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>浅い側の損は<strong>前編が消そうとしたそのコストが部分的に戻ってくること</strong>だ。渡されたサブツリーの中で rsync は結局、項目数に比例する比較をする。範囲が小さくなっただけで性質は全走査と同じである。降下を早く打ち切りすぎると<strong>O(n) の縮小版</strong>を毎回回すことになる。</p>
+
+                    <p>深い側の損は性質が違う。ここでは無駄に比較するのではなく<strong>無駄に値を読み書きする</strong>。そしてこの二つは同じ資源を使わない。rsync の照合はファイルメタデータへのアクセスで、スキャンと記録は拡張属性へのアクセスだ。どちらも結局メタデータサーバへの要求になるが、深い側の要求は<strong>ターゲット側に書き込みまで起こす</strong>。マーカーを残す仕事は読み取りではなく書き込みだからである。</p>
+
+                    <p>だから深さを過剰に取るのは自分のセッションが遅くなって終わる話ではない。同じファイルシステムを使う他のクライアントとメタデータ資源を奪い合う時間が延びる。この層の一般的な性能特性は<a href="ceph_performance_optimization_guide.html">Ceph 性能最適化ガイド</a>にまとめてある。</p>
+
+                    <p>一つ付け加えることがある。<strong>深さが作る最適点は木の形が決める。</strong> 上の表の底が5〜10なのはこの木でそうだという意味であって、普遍定数ではない。ディレクトリあたりのファイルが多い平坦な木はより浅い側が有利で、階層が多くリーフごとのファイルが少ない深い木はより深い側が有利だ。だから次節は数字ではなく<strong>判定ルール</strong>を扱う。</p>
+
+                    <h2 id="sec-4">深さの決め方 - 三つの項の大きさを比べる</h2>
+
+                    <p>深さは「推奨値を書き写す値」ではなく<strong>自分の木で測って決める値</strong>だ。幸い測り方は単純である。一回の実行が残す記録から三つの項の時間が別々に出るので、その三つの大小関係だけを見ればよい。</p>
+
+                    <ul>
+                        <li><strong>スキャン + 記録 &gt; rsync</strong> — 深さが高い。探索とマーキングに使う時間が実際の整合に使う時間を超えたという意味なので<strong>下げる</strong>。上の表の深さ15と20がまさにこの状態だ。</li>
+                        <li><strong>rsync が圧倒的に大きい</strong> — 深さが低い。広い範囲を丸ごと渡している可能性が高いので<strong>上げてみる</strong>。ただし変更量そのものが大きいせいかもしれないので、転送量と合わせて見る。</li>
+                        <li><strong>三つが均等に小さい</strong> — そこが最適区間だ。この状態では深さをさらにいじっても得るものはない。</li>
+                        <li><strong>出発点は10にする。</strong> 測定で底の区間の右端であり、より浅い側へ下げる余地を残した値だ。</li>
+                        <li><strong>深さは運用中に変えてよい。</strong> 再起動は不要で、値を変えた直後の初回で新しい深さ範囲にマーカーが自動的に埋まる。</li>
+                    </ul>
+
+                    <p>ただし<strong>深さを上げた直後の初回は遅い</strong>。新しく含まれた階層にはマーカーがないのでその階層のディレクトリが全部不一致として捕まり、全部が記録対象になる。これは欠陥ではなく構造が予測するとおりで、転送なしに比較と記録だけが起こる。逆方向、つまり深さを下げる変更にはこの費用がない。範囲外になった階層のマーカーは照会されないだけでそのまま残る。</p>
+
+                    <p>ここで明確にしておくことが一つある。<strong>深さは性能のつまみであって安全のつまみではない。</strong> どの深さで打ち切ろうと最後に回るのは削除反映を含む rsync であり、二つの木を同じにする責任はそこにある。深さを誤れば遅くなるが、ずれることはない。データがずれる経路は深さではなく<strong>後に出てくる失敗モードの側</strong>にある。</p>
+
+                    <h2 id="sec-5">導入前後 - 16.7時間が15秒になった</h2>
+
+                    <p>ここからは試験環境ではなく実際に回っているレプリケーションだ。従来方式で4日、転換後の方式で4日を同じ対象について記録し、並べて置いた。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>指標</th><th>転換前</th><th>転換後</th><th>何が変わったか</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>日平均同期所要</td><td>16.7時間</td><td><strong>15秒</strong></td><td>一日の三分の二が空いた状態で戻ってきた</td></tr>
+                            <tr><td>セッションあたり所要</td><td>約8.4時間</td><td>正常回で1秒前後</td><td>セッション長がデータ総量から解けた</td></tr>
+                            <tr><td>日あたり同期回数</td><td>2回</td><td><strong>12回</strong></td><td>セッションが短くなった結果であって原因ではない</td></tr>
+                            <tr><td>RPO</td><td>12時間</td><td><strong>1時間</strong></td><td>周期が短くなった分そのままついてきた</td></tr>
+                            <tr><td>日平均処理ボリューム</td><td>11.25 GB</td><td>0.88 MB</td><td>前者は転送量ではなく比較ボリュームだ</td></tr>
+                            <tr><td>実際の日変更量</td><td colspan="2">133件・0.88 MB(同じ対象、同じワークロード)</td><td>両方で変わらない値である</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>最後の二行を一緒に読まないと表が正しく読めない。<strong>同じ対象の実際の変更量は両方で同じだ。</strong> 一日133件、0.88 MB である。転換前の11.25 GB はその0.88 MB を探すために木を走査して発生した<strong>メタデータ比較ボリューム</strong>で、転換後の0.88 MB は実際に運んだ量だ。同じ列に入っているが性質が違う値である。</p>
+
+                    <p>転換前の側が<strong>4日間ずっと揺れなかった</strong>ことも同じ話をしている。日ごとの処理ボリュームの偏差が1.3%程度だった。日ごとに変更量は違ったのに処理ボリュームは固定だった。変更量に反応する値なら日ごとに揺れるはずだ。<strong>揺れなかったという事実そのものが、その値が変更量と無関係な項から出たという証拠</strong>である。</p>
+
+                    <p>セッションあたり8.4時間も同じく固定だった。この値がそのまま上限を作った。一日24時間に8.4時間のセッションは二つ入るので、同期は一日2回だった。その結果が RPO 12時間である。<strong>誰かが12時間を目標に決めたのではなく、セッション長が残した余りだった。</strong></p>
+
+                    <h2 id="sec-6">何がその差を作ったか - 周期が解けた</h2>
+
+                    <p>16.7時間が15秒になったことを「速くなった」と要約すると半分しか当たっていない。より正確には<strong>一セッションの長さがデータ総量から分離され、そのおかげで周期を設計できるようになった</strong>ということだ。実務で値打ちがあるのは二つ目のほうである。</p>
+
+                    <p>転換前は周期が選択肢ではなかった。セッションが8.4時間なら次のセッションを12時間間隔より詰めて掛けられない。掛けても前のセッションが終わらず重なる。セッション長はデータ総量が決め、データ総量は減らせない値だ。だから<strong>RPO が設計対象ではなく結果</strong>だった。</p>
+
+                    <p>転換後は順序が逆になる。正常回が秒単位で終わるので<strong>周期を先に決めてそれに合わせて掛ければよい</strong>。毎正時にすれば一日12回になり、RPO はその間隔に従って1時間になる。リンクを変えたり機材を増やしたりして得た値ではない。<strong>しなくていい仕事をしないようにして生まれた余裕</strong>を周期に使ったのだ。</p>
+
+                    <p>この区別がなぜ重要かというと、<strong>改善の大きさを倍率だけで言うと何が変わったのかが消えるから</strong>だ。倍率は条件が変われば一緒に変わる。一方「コスト関数がデータ総量から変更量へ移った」という構造的な記述は条件が変わっても残る。そしてその記述が<strong>次の問いに答えを与える</strong>。データが二倍に増えたらどうなるか。転換前の方式はセッションが二倍になり RPO も一緒に延びる。転換後の方式は変更量がそのままならそのままだ。</p>
+
+                    <h2 id="sec-7">セッションモード分布 - 半分は何もしなかった</h2>
+
+                    <p>4日間のすべての回を判定別に数えるとこうなる。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>判定</th><th>セッション数</th><th>比率</th><th>その回に起きたこと</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>SKIP</td><td>47</td><td><strong>49.5%</strong></td><td>ルートで値が同じで rsync を呼ばなかった</td></tr>
+                            <tr><td>INCR</td><td>48</td><td><strong>50.5%</strong></td><td>値が違うディレクトリだけ絞って rsync した</td></tr>
+                            <tr><td>FULL</td><td>0</td><td>0%</td><td>全体同期は一度も起きなかった</td></tr>
+                            <tr><td>FAIL</td><td>0</td><td>0%</td><td>成功率100%</td></tr>
+                            <tr><td colspan="2"><strong>合計95セッション</strong></td><td colspan="2">4日間・総所要1.98時間(外れ値1件を含む)</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>正常運用日だけを別に見ると一日24セッションで<strong>SKIP 13・INCR 11</strong> が繰り返され、一日の総所要がそれぞれ14秒・16秒・15秒だった。転送ファイルは126・142・130件、転送量は750 KB・1.09 MB・842 KB である。<strong>同じパターンが三日続けて繰り返された</strong>という点がこの表の静かな部分だ。日ごとに揺れなかったということは、判定が偶然ではなくワークロードの性質をそのまま反映しているという意味である。</p>
+
+                    <p>INCR の回が何に引っかかったかも性質が一定だった。ほとんどがログローテーションや設定ローテーションのように<strong>時刻に合わせて規則的にファイルを作って消す動作</strong>だった。夜間は SKIP が続き、ローテーションが回る時刻に INCR が立ち、業務時間には小規模な変更が断続的に混ざる。この分布そのものがその対象の活動プロファイルだ。</p>
+
+                    <p>FULL が0であることも読む価値がある。全体同期は転換時点に一度回ればそれ以降は必要なかった。マーカーが一度落ち着いたあとは毎回が SKIP か INCR にしか落ちない。<strong>初期費用が一回きりだという前編の記述が運用記録でそのまま確認された</strong>わけである。</p>
+
+                    <h2 id="sec-8">「しないこと」が成果になる構造</h2>
+
+                    <p>SKIP が半分だという事実は最初に見ると無駄のように読める。「半分の回が空回りした」と読まれやすい。その読みがひっくり返る地点がこの設計の核心だ。</p>
+
+                    <p>転換前も<strong>変更がない回の比率は同じだった</strong>。ワークロードが同じなので当然である。違ったのはその回の値だ。変更がない回に転換前の方式は<strong>8.4時間</strong>を使った。すべての項目を読んで「全部同じ」という結論一つを得るのにその時間を全部使ったのだ。同じ回に転換後の方式は<strong>0秒</strong>を使う。</p>
+
+                    <p>つまり SKIP 比率は無駄の指標ではなく<strong>節約が発生した回の比率</strong>である。そしてこの比率が高いほどこの設計がよく合うワークロードだという意味になる。変更が稀なほど利得が大きくなる構造だからだ。逆に SKIP が0に近いワークロードなら、この設計を使っても全走査と似たものになる。</p>
+
+                    <p>ここで観測の方向が一つ生まれる。<strong>SKIP 比率そのものを指標として追う。</strong> この対象では40〜55%が正常範囲だった。この値が急に落ちたら二つのうち一つだ。</p>
+
+                    <ul>
+                        <li><strong>実際に変更が増えた</strong> — 転送ファイル数と転送量が一緒に上がる。ワークロードが変わったのであって設計の問題ではない。</li>
+                        <li><strong>値だけ上がって運ぶものはない</strong> — 転送量はそのままなのに INCR だけ増える。データ変更ではない原因を疑う場所だ。次節がその場合である。</li>
+                    </ul>
+
+                    <p>二つの場合を分けるのは<strong>判定分布と転送量を一緒に見る仕事</strong>だ。どちらか一方だけ見ても区別できない。INCR が増えたという事実だけでは何が起きたか分からず、転送量が0だという事実だけではその回が高くついたか分からない。</p>
+
+                    <h2 id="sec-9">外れ値1件 - 1.97時間を費やして転送0</h2>
+
+                    <p>4日のうちある一日に、この設計が<strong>大きく負けた回</strong>が一つあった。隠せば上の表はずっときれいになるが、この記事でもっとも情報量の多い一行でもある。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>項目</th><th>内容</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>所要</td><td><strong>7,074秒 = 1.97時間</strong>(その回ひとつ)</td></tr>
+                            <tr><td>判定</td><td>INCR — 値が違ったので変更があると読んだ</td></tr>
+                            <tr><td>原因</td><td>CephFS スナップショット削除で再帰変更時刻が変わった(false INCR)</td></tr>
+                            <tr><td>影響範囲</td><td>もっとも大きな二つのディレクトリ。数千万ファイル規模</td></tr>
+                            <tr><td>実際の転送</td><td><strong>0ファイル。</strong> 行き来したのはメタデータ1,748バイトだけ</td></tr>
+                            <tr><td>解消</td><td>rsync がその範囲を全部照合したあと0件転送で終わり、次の回から正常</td></tr>
+                            <tr><td>その日の残り</td><td>同じ日の23セッションのうち SKIP 8・INCR 15。残りは普段どおり</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>何が起きたかは前編で書いた性質一つで全部説明できる。<strong>値が上がる経路はデータ変更ひとつだけではない。</strong> CephFS のスナップショットを削除すると当該ディレクトリの再帰変更時刻が変わる。ファイルの内容はそのままなのに値だけ上がる。この設計は値の変化を変更の信号として読むので、その区間を INCR と判定する。</p>
+
+                    <p>その次が実際にコストが発生した場所だ。判定された区間が<strong>よりによってもっとも大きな二つのディレクトリ</strong>だった。絞って渡したとはいえその範囲の中の項目数が数千万規模なので、rsync はそのすべてを照合しなければならなかった。照合した結果、運ぶものがないという結論が出たので転送は0だった。<strong>1.97時間のほとんどすべてが「運ぶものがないことを確認するのに」使われた。</strong> 前編の最初の一文が狙っていたまさにその無駄が、別の入口から一度入ってきたのである。</p>
+
+                    <p>データは安全だった。ずれたものも、消えたものもない。損は時間ひとつだ。それでもこの1件が重要な理由は、<strong>この設計の判定が間違う方向を実物で見せるから</strong>である。前編で「値が同じというのは強い信号で、値が違うというのは弱い信号だ」と書いた。この回がその弱い側で間違った事例だ。そして弱い側で間違えば<strong>無駄骨を折るだけでデータを取りこぼさない</strong>。その非対称性を意図的にその方向に作っておいた結果がこの表である。</p>
+
+                    <p>対策はコードではなくスケジュールだ。三つを一緒に使う。</p>
+
+                    <ul>
+                        <li><strong>スナップショット整理を暇な時間帯へ移す。</strong> 値が揺れる時点と同期が回る時点を重ねないようにする。無駄スキャン自体はなくせないが、影響を時間帯の外へ押し出す。</li>
+                        <li><strong>予想外の INCR 急増を観測対象にする。</strong> 転送量はそのままなのに INCR だけ増えたら、データ変更ではない原因を先に見る。</li>
+                        <li><strong>スナップショット削除が多い区間は期待値を別に取る。</strong> その区間で SKIP 比率が低く出るのは正常なので、全体平均ひとつで判断すると原因を取り違える。</li>
+                    </ul>
+
+                    <p>そしてこの相互作用はこの実装だけの話ではない。<strong>再帰変更時刻を信号として使うすべての構造が同じ誤差を持つ。</strong> 値が上がる経路がデータ変更ひとつだけだと仮定した瞬間、どこであれ同じ場所で間違う。</p>
+
+                    <h2 id="sec-10">外れ値を含めて数える理由</h2>
+
+                    <p>この1件を「既知の例外」として抜けば4日の合計は<strong>45秒</strong>になる。抜かなければ<strong>1.98時間</strong>だ。同じ4日の転換前の合計が<strong>66.93時間</strong>なので、二つの数値はこう分かれる。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>数え方</th><th>転換後の4日合計</th><th>転換前比</th><th>この数値が語るもの</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>正常回のみ(外れ値を除く)</td><td>45秒</td><td>約5,300倍</td><td>ワークロードが予想どおり動くときの値</td></tr>
+                            <tr><td><strong>外れ値を含む</strong></td><td><strong>1.98時間</strong></td><td><strong>33.8倍</strong></td><td>スナップショット整理が重なった日まで含めた値</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>どちらを代表値として出すかは趣味の問題ではない。<strong>運用で使う判断は平均ではなく最悪の回で分かれる。</strong> その回一つが1.97時間なら、その日の RPO は1時間ではなく二時間台に広がる。平均だけ見て「RPO 1時間」と書けばその二時間を説明できない。</p>
+
+                    <p>そして外れ値を含めても<strong>33.8倍</strong>だ。この数字がこの節の要点である。もっとも悪い日をそのまま入れても一桁の倍率ではなく二桁の倍率が残るなら、<strong>外れ値を抜いて数値を大きくする理由がない</strong>。抜いて得るものは5,300倍というより大きな数字ひとつだけで、失うものは「この方式がどんな条件で悪くなるか」という情報すべてだ。</p>
+
+                    <p>正直に数えるほうが実務に役立つというのは道徳的な勧告ではない。<strong>抜いた数値は次の対象に適用したとき再現しない。</strong> スナップショット整理のポリシーが違うところへそのまま持っていけば5,300倍は出ず、33.8倍のほうが出る。すると「予想より及ばない」という診断が出て、原因を見当違いのところに探しに行くことになる。</p>
+
+                    <h2 id="sec-11">運用で踏んだ失敗モード5種</h2>
+
+                    <p>ここまでは速いか遅いかの話だった。ここからは<strong>ずれるかずれないか</strong>の話だ。運用に載せたあと実際に踏んでコードに仕込んだものが五つある。性質が互いに違うのでまず表で分けておく。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>失敗モード</th><th>症状</th><th>なぜ危険か</th><th>どう防いだか</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><strong>マウント喪失</strong></td><td>ソースが空に見える</td><td>削除反映がその事実をターゲットへ運んで<strong>ターゲットを消す</strong></td><td>ソースのベースが空なら実行そのものを拒否する</td></tr>
+                            <tr><td><strong>比較と記録のあいだの窓</strong></td><td>見た目は正常。症状がない</td><td>今回運ばなかった変更が<strong>同期済みと表示される</strong></td><td>rsync 開始時刻より後の値ならマーカーを保留する</td></tr>
+                            <tr><td><strong>壊れたシンボリックリンク</strong></td><td>同じ場所で繰り返し失敗</td><td>防ごうとした状況が<strong>防いだつもりのまま残る</strong></td><td>リンクをたどらない検査を併用する</td></tr>
+                            <tr><td><strong>名前の長さ制限</strong></td><td>証跡ファイルが静かに消える</td><td>整理失敗のあとのフォールバックが<strong>元を消す</strong></td><td>パスではなく名前の末尾だけを使い衝突防止の接頭辞を付ける</td></tr>
+                            <tr><td><strong>ロック記述子の継承</strong></td><td>次の回が延々と見送る</td><td>親が死んでも<strong>ロックが解けない</strong></td><td>ワーカーの起動時に継承した記述子を閉じる</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>五つのうち上の二つは<strong>データがずれうるもの</strong>で、下の三つは<strong>資源と証跡が漏れるもの</strong>だ。だから前の二つには節を別に与える。共通点を一つ挙げておく価値がある。<strong>五つのうち症状として先に現れたのは三つだけ</strong>で、残る二つには症状がない。症状がないほうが危険である。</p>
+
+                    <h2 id="sec-12">マウント喪失 - ソースが空ならターゲットが消える</h2>
+
+                    <p>この設計は最後に削除反映を入れた rsync を回す。ソースで消えたものがターゲットに残れば二つの木がずれるからだ。そのオプションが正常動作でする仕事と、ソースが消えたときにする仕事が<strong>区別されない</strong>というのがこの失敗モードのすべてである。</p>
+
+                    <p>まず事実を一つ押さえる必要がある。<strong>CephFS のマウントが外れてもマウントポイントは消えない。</strong> そこにあったローカルディレクトリが再び見えるようになり、たいていそれは<strong>空の通常ディレクトリ</strong>だ。パスはそのまま存在し、アクセスもでき、読み取りも成功する。ただ中に何もない。</p>
+
+                    <p>その状態で同期が回ると rsync が受け取る入力は「ソースに何もない」だ。これは<strong>「ソースで全部消された」と文法的に同じ入力</strong>である。削除反映が入っているので rsync は自分の仕事を正確に遂行する。ターゲットをソースと同じにする。すなわち<strong>ターゲットを空にする</strong>。</p>
+
+                    <p>ここで危険の正体を正確に言う必要がある。「ソースが空なら同期が止まる」ことが危険なのではない。止まることは何の被害も与えない。危険なのは<strong>「ソースが空なら同期が成功する」</strong>ほうだ。rsync はエラーを出さない。終了コードは0で、統計には削除件数が正常に刻まれ、判定は成功として記録される。<strong>そしてマーカーまで更新される。</strong> 次の回は二つの木が同じだと見て飛ばす。事故が起きたという信号がどこにも残らない。</p>
+
+                    <p>だから判定が rsync の前に出なければならない。実行を作る前に<strong>マウントのベースが空かどうか</strong>から見る。そしてこの判定はソースとターゲットを<strong>非対称に</strong>扱う。危険が非対称だからだ。</p>
+
+                    <ul>
+                        <li><strong>ソースのベースが空なら実行を拒否する。</strong> 正常に空である理由がなく、誤って進めたときの代償がターゲット全体だからだ。</li>
+                        <li><strong>ターゲットのベースが空なら警告だけにする。</strong> 初回シーディングではターゲットが空であることが正常だ。ここで止めれば初回が永遠に回らない。</li>
+                        <li><strong>個別の同期ディレクトリではなくベースを見る。</strong> 初回のターゲット配下ディレクトリは空であることが正常なので、それだけを見ると誤判定する。マウント喪失はベースで現れる。</li>
+                        <li><strong>検査コストは事実上0だ。</strong> ディレクトリ一つが空かを見る仕事で、回あたり一度である。この程度の値で買える安全なら買うほうが正しい。</li>
+                    </ul>
+
+                    <p>この失敗モードが与える教訓はオプション一つにとどまらない。<strong>「入力が空だ」と「入力が読めなかった」を区別しないコードは、失敗を正常として処理する。</strong> 削除反映が入った同期は、その混同の代償がもっとも高い場所の一つにすぎない。同系統の罠を rsync の引数の形で扱った話は<a href="rsync_trailing_slash_guide.html">rsync の末尾スラッシュ一つで結果が変わる理由</a>に別に書いてある。</p>
+
+                    <h2 id="sec-13">比較と記録のあいだの窓 - マーカーを保留する</h2>
+
+                    <p>前編でこの設計の安全装置として「失敗したら記録しない」を書いた。それでは塞がらない窓がもう一つある。<strong>成功したのに記録してはいけない場合</strong>だ。</p>
+
+                    <p>順序をたどると見えてくる。一回は値を比較し、絞られた範囲を rsync し、最後にそのときのソースの値をターゲットに記録する。ところが<strong>rsync が回っているあいだもソースは生きている</strong>。そのあいだにファイル一つが変われば、その変更は今回のコピーに入っていないのにソースの再帰変更時刻はすでに上がる。記録段階が読む値は<strong>変更後の値</strong>だ。</p>
+
+                    <p>その値をそのまま刻むとマーカーが嘘をつく。マーカーの意味は「この時刻基準でターゲットがソースと同じ」なのに、実際にはその時刻の直前の状態までしか同じではない。次の回はソースの現在値とそのマーカーを比較して<strong>同じと判定し飛ばす</strong>。その変更は<strong>次の全体同期が回るまで永久に欠落</strong>する。症状がない。エラーも、警告も、失敗判定もない。</p>
+
+                    <p>防ぐ方法は<strong>記録を条件付きでもう一段作ること</strong>だ。読んだ値が今回の rsync 開始時刻より後なら、その値は「今回のコピーが収めきれなかった変更」を含んでいるという意味なので<strong>マーカーを残さない</strong>。コストは次の回の再スキャン一度だ。得るものは欠落が生じないという保証である。前編の原則がここでもそのまま適用される。<strong>間違いうるなら無駄骨を折るほうへ間違わせる。</strong></p>
+
+                    <p>ただしこの保留には必ず付かなければならない条件が三つある。三つとも落とすと、直したものが新しい問題を作る。</p>
+
+                    <ul>
+                        <li><strong>保留はそのディレクトリ自身のマーカーにだけ適用し、子は記録を続ける。</strong> 再帰変更時刻は<strong>配下全体の最大値</strong>なので、生きている木ではどこかでファイル一つ変わるだけでルートの値が rsync 開始時刻を越える。ルートで保留して引き返すと<strong>ターゲット全体にマーカーが一つも残らず</strong>、次の回が全量降下する。すると毎回が全体再スキャンで固定される。</li>
+                        <li><strong>子を記録してよい根拠がある。</strong> この段階はその範囲の rsync が全部成功したときにだけ実行される。そして子の値が rsync 開始時刻以下なら、値が再帰最大値なのでそのサブツリーには rsync 開始以降の変更がなかったという意味だ。二つを合わせるとその子のターゲットは最新である。</li>
+                        <li><strong>時計が二つあることを計算に入れる。</strong> 値はメタデータサーバの時計から出て、rsync 開始時刻は実行ホストの時計から出る。二つの時計がずれて値が未来に見えると保留が永遠に解けない。だから現在時刻より一定幅以上先の値は<strong>スキューとみなして保留しない</strong>。この幅は設定として外に出す。</li>
+                    </ul>
+
+                    <p>そしてこの装置には<strong>正常動作として残る性質</strong>が一つある。変更が多いディレクトリは毎回ルートの値が上がるので<strong>ルートのマーカーが毎回保留</strong>される。したがってその対象は SKIP ではなく INCR として報告され続ける。配下のマーカーは正常に刻まれるのでスキャンは変更分で止まり、全量降下と比べればコストははるかに小さい。それでも<strong>忙しい対象で SKIP を期待してはいけない。</strong> 期待すると正常動作を異常と誤診する。</p>
+
+                    <h2 id="sec-14">残り三つ - 壊れたリンク、名前の長さ、ロックの記述子</h2>
+
+                    <p>残る三つはデータを直接ずらしはしない。代わりに<strong>仕込んだ装置が働かないようにするか、原因を探す材料をなくす</strong>。三つとも「直したと書いてあるのに実際には捕まえていない」形で現れたという共通点がある。</p>
+
+                    <h3>壊れたシンボリックリンクが検査を通る</h3>
+
+                    <p>ソースでディレクトリだった名前がファイルになったり、その逆になったりすると、ターゲットには以前の型のものがそのまま残って衝突する。だから整合の前に<strong>ターゲット側の残骸があるか</strong>を確認して脇へどける段階がある。問題はその確認が<strong>対象が存在するかを問う形</strong>だったという点だ。</p>
+
+                    <p>その形の検査は<strong>シンボリックリンクをたどる</strong>。リンクが掛かっているのに対象がないと、リンク自体は健在なのに検査は「なし」と答える。すると片づける段階を飛ばし、その次にディレクトリを作ろうとする試みが<strong>すでに存在する</strong>という理由で失敗する。防ごうとした状況が<strong>防いだと思ったまま</strong>残るのだ。直す方法はリンクをたどらない検査を併用することだけである。</p>
+
+                    <h3>証跡ファイルの名前が制限を越える</h3>
+
+                    <p>片づけた残骸は消さずに<strong>保管庫へ移す</strong>。何がなぜ片づけられたかが後で原因を探す材料になるからだ。ところがそのファイル名を元のパス全体をつないで作ると、深い深さで<strong>ファイル名の制限である255バイトを越える</strong>。</p>
+
+                    <p>越えれば移動が失敗する。それ自体も悪いが本当の問題はその次だ。失敗したときのフォールバックが<strong>そのまま消すこと</strong>だった。つまり原因を探そうと残そうとしたファイルが、残せないほどパスが長いという理由で<strong>消された</strong>。深いパスほど消えるという点で偏りまである。直した形はパスを名前に入れないことだ。最後の名前要素だけを使い、長ければ末尾だけを残し、時刻とプロセス識別子を付けて衝突を防ぎ、<strong>パス全体はログにだけ書く</strong>。</p>
+
+                    <p>保管庫のほうにも同系統の穴がもう一つあった。古い項目を消す整理が<strong>通常ファイルだけ</strong>を対象にしていたため、ディレクトリごと移しておいた項目と移されたリンクが<strong>永遠に残った</strong>。保管庫が無限に大きくなる。整理対象を保管庫の直下の項目すべてに変え、パス変数が空のときは即座に中断するようにした。再帰削除を回すコードでパス変数が空なら何が消えるかは説明する必要もないだろう。</p>
+
+                    <h3>ワーカーがロックの記述子を握っている</h3>
+
+                    <p>重複実行を防ぐため起動時にロックファイルを取る。前の回がまだ回っていれば今回は即座に引き下がる。正常動作でありログにもそう残る。</p>
+
+                    <p>問題はそのロックを取った<strong>ファイル記述子が子プロセスへ継承される</strong>という点だ。この設計は複数の対象を並列に処理するのでワーカーが複数立ち、ワーカーが呼ぶ下位コマンドもその記述子を受け継ぐ。すると<strong>親が死んでもロックが解けない</strong>。生き残った子のうち一つがその記述子を握っているかぎり、ロックは掛かったままだ。</p>
+
+                    <p>結果は静かである。次の回が「前のセッションがまだ実行中」という理由で引き下がり、その次の回も引き下がる。<strong>そのログは正常動作のときと一文字も違わない。</strong> だからこの状態はエラーに見えず「今日はやけにロック待ちが多いな」に見える。そのあいだ RPO は静かに延びる。防ぐ方法はワーカーが起動した直後に継承した記述子を閉じることだ。ロックは親だけが持っていればよい。</p>
+
+                    <p>この三つを並べると性質が一つにまとまる。<strong>三つとも「安全装置がある」という事実が「安全装置が働く」を保証しない事例</strong>だ。だからこの系統はコードを読んでもうまく捕まらない。壊れたリンクを作ってみて、長いパスを作ってみて、親を殺してみるという形で<strong>配布されるコードを実際にその状況に入れてみて</strong>初めて現れる。</p>
+
+                    <h2 id="sec-15">使うべきでない場合</h2>
+
+                    <p>前編で三つを書いた。運用記録が溜まる過程で一つ増え、一つは説明がもっと必要になった。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>条件</th><th>なぜ利得がないか、あるいは損か</th><th>根拠</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><strong>初回シーディング</strong></td><td>全部転送しなければならないので飛ばす区間がそもそもない</td><td>初期全体同期で二つの方式の差が約6%だった</td></tr>
+                            <tr><td><strong>ディレクトリを常時大量生成するワークロード</strong></td><td>新しいディレクトリごとにマーカーを残さねばならず、その費用がスキャン節約を超える</td><td>新規ディレクトリ5万個を一度に作ったラウンドで全走査が1.7倍速かった</td></tr>
+                            <tr><td><strong>変更が全ディレクトリへ均等に散らばるワークロード</strong></td><td>切る枝がないので降下が木全体に収束する</td><td>コスト関数で変更ディレクトリ数が全体数に近づけば二つの方式が同じになる</td></tr>
+                            <tr><td><strong>スナップショットを頻繁に作って消す環境</strong></td><td>データ変更がなくても値が上がって無駄スキャンが繰り返される</td><td>スナップショット削除一度が1.97時間を費やして転送0だった</td></tr>
+                            <tr><td><strong>非常に浅いか非常に深い木</strong></td><td>深さのつまみが働く区間そのものがないか、最適点が測定区間の外にある</td><td>深さ感度が木の形によって変わる</td></tr>
+                            <tr><td><strong>CephFS でないファイルシステム</strong></td><td>判定の根拠となる値そのものが存在しない</td><td>再帰変更時刻は CephFS が維持する値だ</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>四つ目の項目がこの記事で新しく付いたものだ。スナップショット削除が値を揺らすという性質自体は前編でも書いたが、そのときは「既知の相互作用」の水準だった。実測が付いてみると判断が変わる。<strong>スナップショットを頻繁に消す環境ではこの方式の利得がその分だけ削られる。</strong> 整理を暇な時間帯へ移せるなら使えるし、移せないなら考え直さなければならない。</p>
+
+                    <p>五つ目の項目もこの記事で付いた。非常に浅い木では降下する階層がいくつもないので、深さをいくらいじっても rsync の範囲がほとんどそのままだ。つまみがあっても回すところがないわけである。逆にとても深い木では上の表の5〜10という区間がそのまま移らない。<strong>推奨値を書き写さず自分の木で三つの項を測れ</strong>というのがこの項目の実質だ。</p>
+
+                    <p>三つ目の項目は構造から直接出るものなので実測が要らない。この設計の利得は<strong>「見る必要のない枝を安く切ること」</strong>ひとつから出る。変更がすべてのディレクトリに均等に広がっていれば切る枝がなく、そうなると値を読むコストだけ乗った全走査になる。この方式がよく効くワークロードの条件は「変更が少ないこと」ではなく<strong>「変更が偏っていること」</strong>である。</p>
+
+                    <h2 id="sec-16">まとめ - 五つの文</h2>
+
+                    <ul>
+                        <li><strong>深さは二つのコストを交換するつまみで、両端ともに悪い。</strong> 3で6秒、5・8・10で4秒、15で6秒、20で8秒だった。深さ20の8秒のうち rsync は2秒だけで、残りは値を読み書きするのに行った。</li>
+                        <li><strong>変わったのは速度ではなく周期だ。</strong> 日平均16.7時間が15秒になってセッション長がデータ総量から解け、そのおかげで一日2回が12回になり RPO が12時間から1時間へ下がった。</li>
+                        <li><strong>SKIP が半分というのは半分が空回りしたという意味ではない。</strong> 95セッションのうち47セッションが rsync を呼びさえせず、同じ回に転換前の方式は8.4時間を使った。何もしないことがここでは成果である。</li>
+                        <li><strong>もっとも悪い回を表に残してこそ表が役に立つ。</strong> スナップショット削除が作った false INCR 一件が1.97時間を費やして転送0だった。その一件を含めても4日合計は1.98時間対66.93時間で33.8倍だ。</li>
+                        <li><strong>データをずらすのは深さではなく失敗モードだ。</strong> ソースが空のときに止まらないこと、運ばなかった変更を同期済みと表示すること — この二つは症状がなく、症状がないから危険である。</li>
+                    </ul>
+
+                    <p>二編を一文でつなぐとこうなる。<strong>比較範囲を減らせばコスト関数が変わり、コスト関数が変われば周期を設計できるようになる。</strong> そしてその設計が運用で耐えるかどうかは倍率ではなく<strong>もっとも悪い回ともっとも静かな失敗</strong>が決める。前編は<a href="cephfs_rctime_incremental_sync.html">CephFS の rctime で全走査を省く増分同期の設計</a>にある。レプリケーションとバックアップが同じ言葉ではないという話は<a href="backup_restore_verification.html">「バックアップがある」と「復元できる」は別の命題だ</a>で別に扱った。</p>
+
+                    <h2 id="sec-17">確認できなかったこと</h2>
+
+                    <p>以下の項目はこの条件のなかで答えが出なかった。根拠が揃うまで断定しない。</p>
+
+                    <ul>
+                        <li><strong>ほかの木の形での最適な深さ</strong> — 深さ感度は約1 TB・約90,000ディレクトリという一つの木でのみ測定した。平坦な木やはるかに深い木で底がどこへ移るかはこの表が答えない。</li>
+                        <li><strong>深さ感度の変更分布への依存</strong> — 測定はすべて「ファイル1個変更」の条件だった。変更が複数の枝に散らばったとき三つの項の均衡がどう変わるかは測定していない。</li>
+                        <li><strong>前後比較の期間が違う</strong> — 転換前の4日と転換後の4日は同じ期間ではない。同じ対象・同じワークロードという点で比較は成立するが、二つの期間のあいだにワークロードが変わった部分があったかはこの記録では分離されない。</li>
+                        <li><strong>外れ値の再現</strong> — スナップショット削除が false INCR を作ることは確認したが、観測したのはその1件だ。削除規模や対象の大きさによって所要がどう変わるかは何度も測っていない。</li>
+                        <li><strong>スナップショット整理の時間帯調整の効果</strong> — 対策として書いたものであり、調整以降の SKIP 比率の変化を別に測定してはいない。</li>
+                        <li><strong>失敗モード5種の発生頻度</strong> — それぞれを実際に踏んで防いだということと、それがどれくらい頻繁に起きるかは別の話だ。頻度はこの記録からは読めない。</li>
+                        <li><strong>マーカー保留が作る再スキャンの累積コスト</strong> — 変更が多い対象で毎回 INCR として報告されることは確認したが、その状態が長期間続いたときの累積コストは別に測っていない。</li>
+                        <li><strong>ほかの Ceph バージョンでの伝播特性</strong> — 前編と同じだ。一つのバージョン系列でのみ測定しており、値が上位へ伝播する時点と遅延がバージョンによって同じかは範囲外である。</li>
+                    </ul>
+
+                    <h2 id="sec-18">参考資料</h2>
+
+                    <ul>
+                        <li><a href="cephfs_rctime_incremental_sync.html">変更がなくても全体を走査する - CephFS の rctime で全走査を省く増分同期の設計</a> — この記事の前編。問題定義、再帰変更時刻の意味論、判定構造、失敗時の未記録という安全装置、合成ベンチマーク10ラウンドを扱う。</li>
+                        <li><a href="https://docs.ceph.com/en/reef/man/8/mount.ceph/" target="_blank" rel="noopener">Ceph 公式ドキュメント・mount.ceph マニュアル</a> — ディレクトリの <code>st_size</code> を配下の内容の再帰的サイズとして報告するマウントオプションとその逆のオプションの定義。CephFS が再帰集計値を維持するという根拠。</li>
+                        <li><a href="https://docs.ceph.com/en/reef/cephfs/posix/" target="_blank" rel="noopener">Ceph 公式ドキュメント・POSIX との違い</a> — 再帰サイズフィールドを CephFS が維持するという記述。</li>
+                        <li><a href="https://docs.ceph.com/en/latest/releases/luminous/" target="_blank" rel="noopener">Ceph 公式ドキュメント・Luminous リリースノート</a> — <code>ceph.dir.rctime</code> がリリースノートに現れる箇所。この属性値のナノ秒成分の表記の欠陥を直した項目が載っている。</li>
+                        <li>この記事の深さ感度測定、前後比較、外れ値の記録、失敗モード5種は筆者が作って運用に適用したものであり、上記3件を除く外部出典はない。</li>
+                    </ul>
+
+                </div>
+
+                <div class="share-section">
+                    <h3>この記事をシェア</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">スレッズ</button>
+                        <button id="link-copy" class="share-btn link-btn">リンクをコピー</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">一覧に戻る</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">一緒に使うと便利な無料ツール</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/code_image.html">コード画像ジェネレーター</a></li>
+      <li><a href="../static/char_counter.html">文字数カウント</a></li>
+      <li><a href="../static/json_formatter.html">JSON フォーマッター</a></li>
+      <li><a href="../static/regex_tester.html">正規表現テスター</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">すべてのツールを見る &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">関連記事</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="cephfs_rctime_incremental_sync.html">変更がなくても全体を走査する - CephFS の rctime で全走査を省く増分同期の設計</a></li>
+      <li><a href="backup_restore_verification.html">「バックアップがある」と「復元できる」は別の命題である - 成功したバックアップが嘘をつく場所と、復元検証が実際に要求するもの</a></li>
+      <li><a href="postgres_horizontal_scaling_cost.html">Postgresを複数台に分割するという選択 - 水平スケーリングがトランザクション・結合・制約に請求する対価</a></li>
+      <li><a href="oss_ownership_beyond_license.html">コードは開いていても名前は開いていない - オープンソースライセンスが決めない商標・ドメイン・リリース権限</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('リンクがコピーされました。Threadsアプリに貼り付けてシェアしてください！');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('リンクがコピーされました！'); });
+    });
+    </script>
+</body>
+</html>

@@ -1,0 +1,672 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="en">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>The Gain Lives Between Depth 5 and 10 - Operational Limits and Failure Modes of ceph.dir.rctime Incremental Sync</title>
+    <meta name="description" content="Depth 3 took 6 seconds, depths 5, 8 and 10 took 4, depth 15 took 6, depth 20 took 8. Scan depth sensitivity of ceph.dir.rctime sync, plus five failure modes.">
+    <meta name="keywords" content="CephFS, rctime, ceph.dir.rctime, scan depth, recursive change time, incremental sync, failure modes, TOCTOU, RPO, cross-cluster replication, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/en/posts/cephfs_rctime_operational_limits.html">
+
+    <meta property="og:title" content="The Gain Lives Between Depth 5 and 10 - Operational Limits and Failure Modes of ceph.dir.rctime Incremental Sync">
+    <meta property="og:description" content="Depth is not a free knob. Going deeper narrows the rsync scope while making scanning and marking more expensive. Here is where that trade bottoms out, and what it costs outside that band.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/en/posts/cephfs_rctime_operational_limits.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="en_US">
+    <meta property="article:published_time" content="2026-09-12">
+    <meta property="article:section" content="Dev &amp; Infra">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="The Gain Lives Between Depth 5 and 10 - Operational Limits of ceph.dir.rctime Incremental Sync">
+    <meta name="twitter:description" content="The deepest setting was the slowest one. Six depth measurements, and the five failure modes that showed up in production.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "The Gain Lives Between Depth 5 and 10 - Operational Limits and Failure Modes of ceph.dir.rctime Incremental Sync",
+      "alternativeHeadline": "The deepest setting was the slowest one",
+      "datePublished": "2026-09-12",
+      "dateModified": "2026-09-12",
+      "inLanguage": "en-US",
+      "articleSection": "Dev & Infra",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "CephFS, rctime, ceph.dir.rctime, scan depth, incremental sync, failure modes, TOCTOU, RPO, cross-cluster replication",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/en/posts/cephfs_rctime_operational_limits.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "Does a deeper scan depth always make the sync faster?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "No. Measured on roughly 1 TB across about 90,000 directories with exactly one file changed, depth 3 took 6 seconds, depth 5 took 4, depth 8 took 4, depth 10 took 4, depth 15 took 6 and depth 20 took 8. The deepest setting was the slowest. Increasing depth narrows the scope handed to rsync, but it also makes both the attribute scan and the marker write more expensive. Those two curves move in opposite directions, so the total is U shaped, and on this tree the floor sat between depth 5 and depth 10."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "What does it mean that half the sessions were SKIP?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Across four days there were 95 sessions. 47 were SKIP and 48 were INCR. There were zero FULL and zero FAIL sessions, for a 100 percent success rate. A SKIP session is one where the root value matched the marker, so rsync was never invoked at all. In other words half the sessions did nothing. Under the previous approach the equivalent session spent about 8.4 hours. Making the do-nothing session cheap is the entire point of this design, so the SKIP ratio is a measure of savings realised, not of wasted runs."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "A sync took two hours after I deleted a snapshot. Is that a fault?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "It is a known interaction rather than a fault. Deleting a CephFS snapshot changes the recursive change time on the affected directories, and this design reads a change in that value as a signal that something changed, so the range is judged INCR. One measured occurrence took 7,074 seconds, which is 1.97 hours, and transferred zero files. No data is at risk; only time is spent. The fix is scheduling rather than code. Move snapshot cleanup to a window where sync is idle."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Why must the run stop when the source looks empty?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Because delete propagation is enabled. When a CephFS mount drops, the mount point does not disappear; it reverts to an ordinary empty directory. Running in that state reads as nothing exists on the source, and delete propagation faithfully carries that fact to the target, wiping it. So the check treats the two sides asymmetrically. If the source base is empty the run is refused outright, while an empty target base only raises a warning, because an empty target is the normal state during initial seeding."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "When should this approach not be used?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "There are four cases. Initial seeding transfers everything, so there is no subtree to skip. A workload that constantly creates directories in bulk pays a marker write per new directory, which offsets the scan savings. A workload whose changes are spread evenly across every directory leaves no branch to prune, so the cost converges on a full walk. And an environment that creates and deletes snapshots frequently sees the value rise with no data change, producing repeated pointless scans. On top of that, outside CephFS the value the decision rests on simply does not exist."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/cephfs_rctime_operational_limits.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/cephfs_rctime_operational_limits.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/cephfs_rctime_operational_limits.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/cephfs_rctime_operational_limits.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/cephfs_rctime_operational_limits.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "Home",
+      "item": "https://braindetox.kr/en/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "Dev & Infra",
+      "item": "https://braindetox.kr/en/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "The Gain Lives Between Depth 5 and 10 - Operational Limits and Failure Modes of ceph.dir.rctime Incremental Sync",
+      "item": "https://braindetox.kr/en/posts/cephfs_rctime_operational_limits.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="The Gain Lives Between Depth 5 and 10 - Operational Limits and Failure Modes of ceph.dir.rctime Incremental Sync">
+                <meta itemprop="datePublished" content="2026-09-12">
+                <meta itemprop="dateModified" content="2026-09-12">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="CephFS, rctime, ceph.dir.rctime, scan depth, incremental sync, failure modes, TOCTOU, RPO, cross-cluster replication">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/en/posts/cephfs_rctime_operational_limits.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">The Gain Lives Between Depth 5 and 10 - Operational Limits and Failure Modes of ceph.dir.rctime Incremental Sync</h1>
+                    <h2 class="post-subtitle">How far a one-value skip carries, and where it stops being the right tool</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-12">2026-09-12</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">Dev &amp; Infra</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>Set the descent to go all the way down to depth 20 and the sync becomes as precise as it can be, and also <strong>the slowest it has been.</strong> Hold the tree and the change fixed, vary only the depth, and the measurements come out as <strong>6 seconds at depth 3, 4 at depth 5, 4 at depth 8, 4 at depth 10, 6 at depth 15 and 8 at depth 20.</strong> The curve is not monotonic. The floor sits in the middle, and the two ends rise for entirely different reasons.</p>
+
+                    <p>This is the second part of <a href="cephfs_rctime_incremental_sync.html">the incremental CephFS replication design that skips subtrees with ceph.dir.rctime</a>. Where the first part answered <strong>why it works</strong>, this one answers <strong>how far it works and when it should not be used.</strong> Four things are on the table. Sensitivity to the depth limit, a before-and-after comparison of four days on each side in production, one outlier that burned 1.97 hours and transferred nothing at all, and the five failure modes that are actually guarded against in the code.</p>
+
+                    <p>The conclusion of the first part compresses to one line. <strong>If the comparison stage walks the whole tree, the cost is not incremental no matter what the job is called.</strong> <code>ceph.dir.rctime</code> is a read-only extended attribute that propagates a change in a subtree up to its ancestors, and reading it requires no descent. If the value matches, skip; if it differs, go down one level. Where that descent is cut off is the <strong>depth</strong>, and that is where this article starts.</p>
+
+                    <div class="callout">
+                        The design and the measurements below are the author's own, built and put into operation. The only external references used are the Ceph project documentation on recursive statistics and extended attributes. No cluster, namespace or host is named; the two clusters appear only as Cluster-A for the source and Cluster-B for the target. Synchronised directories are referred to by role and order of magnitude rather than by name. No source code or command examples are included; the algorithm and the failure modes are described in prose and tables only.
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>What this article covers</h3>
+                        <ol>
+                            <li><a href="#sec-1">Depth is not a free knob</a></li>
+                            <li><a href="#sec-2">Depth sensitivity - 6, 4, 4, 4, 6, 8</a></li>
+                            <li><a href="#sec-3">Why the curve is U shaped - the two ends fail differently</a></li>
+                            <li><a href="#sec-4">A rule for choosing depth - compare the three terms</a></li>
+                            <li><a href="#sec-5">Before and after - 16.7 hours became 15 seconds</a></li>
+                            <li><a href="#sec-6">What actually produced the difference - the cadence came loose</a></li>
+                            <li><a href="#sec-7">Session mode distribution - half of them did nothing</a></li>
+                            <li><a href="#sec-8">A design where doing nothing is the result</a></li>
+                            <li><a href="#sec-9">One outlier - 1.97 hours burned, zero bytes moved</a></li>
+                            <li><a href="#sec-10">Why the outlier stays in the total</a></li>
+                            <li><a href="#sec-11">Five failure modes met in operation</a></li>
+                            <li><a href="#sec-12">A dropped mount - an empty source wipes the target</a></li>
+                            <li><a href="#sec-13">The window between comparing and recording - hold the marker</a></li>
+                            <li><a href="#sec-14">The other three - dangling links, name length, an inherited lock</a></li>
+                            <li><a href="#sec-15">When not to use this</a></li>
+                            <li><a href="#sec-16">Summary in five sentences</a></li>
+                            <li><a href="#sec-17">What could not be confirmed</a></li>
+                            <li><a href="#sec-18">References</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">Depth is not a free knob</h2>
+
+                    <p>The descent in this design walks from the top down, repeating the same comparison at every level. A branch whose value matches is cut on the spot; only the branches that differ are opened one level further. On reaching the depth limit, the descent stops and <strong>hands that directory to rsync whole.</strong></p>
+
+                    <p>That limit moves three cost terms at once, and they do not move in the same direction.</p>
+
+                    <ul>
+                        <li><strong>Scan</strong> — reading values. More depth means more levels, and every level requires checking the sibling directories, so <strong>the number of reads goes up.</strong></li>
+                        <li><strong>Rsync</strong> — comparing and transferring within the scope it is handed. More depth pushes that scope closer to the leaves, so <strong>it goes down.</strong></li>
+                        <li><strong>Mark</strong> — writing the sync timestamp onto the target. More depth means more directories that need a marker, so <strong>it goes up.</strong></li>
+                    </ul>
+
+                    <p>Two terms rise and one falls. That is why the total is not monotonic in depth, and it is where the intuition that more precision is always better breaks down. Raising the depth buys exactly one thing, <strong>a narrower rsync scope</strong>, and pays for it with two. The shallow end is symmetric. Lower the depth to save on scanning and marking and <strong>rsync receives a wide subtree in one piece.</strong></p>
+
+                    <p>Which of those two losses is worse then depends on the conditions. Every measurement in the first part was taken with the limit pinned at 10; what changes when that number moves is the subject from here on.</p>
+
+                    <h2 id="sec-2">Depth sensitivity - 6, 4, 4, 4, 6, 8</h2>
+
+                    <p>The measurement conditions match the first part. Roughly 1 TB across about 90,000 directories, <strong>exactly one file changed</strong>, and the same sync run repeatedly with only the depth varied. With the change volume pinned to one, every difference in the numbers comes from depth.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Depth</th><th>Scan</th><th>Rsync</th><th>Mark</th><th>Total</th><th>Scope handed to rsync</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>3</td><td>0 s</td><td>5 s</td><td>1 s</td><td><strong>6 s</strong></td><td>Wide. A large subtree goes over in one piece</td></tr>
+                            <tr><td>5</td><td>0 s</td><td>3 s</td><td>1 s</td><td><strong>4 s</strong></td><td>Starting to narrow</td></tr>
+                            <tr><td>8</td><td>1 s</td><td>2 s</td><td>1 s</td><td><strong>4 s</strong></td><td>Nearly at the leaves</td></tr>
+                            <tr><td>10</td><td>1 s</td><td>2 s</td><td>1 s</td><td><strong>4 s</strong></td><td>Narrow. Only the directory that changed</td></tr>
+                            <tr><td>15</td><td>2 s</td><td>2 s</td><td>2 s</td><td><strong>6 s</strong></td><td>Cannot narrow any further</td></tr>
+                            <tr><td>20</td><td>3 s</td><td>2 s</td><td>3 s</td><td><strong>8 s</strong></td><td>Cannot narrow any further</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>Read the totals alone and you get <strong>6 → 4 → 4 → 4 → 6 → 8.</strong> The minimum is a band rather than a point, and both sides of it rise. But the more informative part of the table is <strong>the three middle columns</strong>, because they explain why the shape is a U.</p>
+
+                    <p>Read the rsync column downward and it goes <strong>5 s → 3 s → 2 s → 2 s → 2 s → 2 s.</strong> Past depth 8 it stops falling. On this tree <strong>the descent has effectively reached the leaves by around depth 8</strong>, and below that there is no scope left to narrow. The scan and mark columns, meanwhile, start at 0 and 1 and <strong>keep climbing to 3 and 3.</strong> One side has bottomed out while the other has not stopped.</p>
+
+                    <p>So the increase past depth 10 is less a case of diminishing returns than of <strong>returns having ended while the cost carries on.</strong> Of the 8 seconds at depth 20, rsync accounts for 2 and the remaining 6 go entirely to reading and writing attributes. <strong>The time spent not working is three times the time spent working.</strong></p>
+
+                    <h2 id="sec-3">Why the curve is U shaped - the two ends fail differently</h2>
+
+                    <p>Depth 3 and depth 15 both read 6 seconds, and the two sixes have nothing in common. That distinction is what sets the direction of a fix in practice.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Band</th><th>Dominant term</th><th>What happens</th><th>What is wasted</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Too shallow (3)</td><td>Rsync at 5 s</td><td>The descent is cut before the change is pinpointed and a wide subtree goes over whole</td><td>Rsync re-compares entries that have nothing to do with the change</td></tr>
+                            <tr><td>Optimal band (5 to 10)</td><td>Evenly spread</td><td>The descent ends near the leaves and the rsync scope converges on the actual change site</td><td>Close to nothing</td></tr>
+                            <tr><td>Too deep (15 to 20)</td><td>Scan plus mark at 6 s</td><td>The rsync scope no longer shrinks while every level still checks siblings and writes markers</td><td>A finished search continues, and markers that need not be written are written</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>The loss at the shallow end is <strong>a partial return of the very cost the first part set out to remove.</strong> Inside the subtree it is handed, rsync still performs a comparison proportional to the number of entries. Only the scope has shrunk; the nature of the work is the same as a full walk. Cutting the descent too early amounts to running <strong>a miniature O(n)</strong> on every cycle.</p>
+
+                    <p>The loss at the deep end is different in kind. Nothing is compared unnecessarily here; instead, <strong>values are read and written unnecessarily.</strong> And those two do not draw on the same resource. Rsync's comparison is file metadata access, while scanning and marking are extended attribute access. Both end up as requests to the metadata server, but requests at the deep end <strong>also generate writes on the target side</strong>, because leaving a marker is a write, not a read.</p>
+
+                    <p>An excessive depth setting therefore does not merely slow down its own session. It lengthens the window in which it contends for metadata resources with every other client on the same filesystem. The general performance characteristics of that layer are covered in the <a href="ceph_performance_optimization_guide.html">Ceph performance optimisation guide</a>.</p>
+
+                    <p>One more thing needs stating. <strong>The optimum that depth produces is set by the shape of the tree.</strong> The floor in the table above sits between 5 and 10 on this tree; it is not a universal constant. A flat tree with many files per directory favours a shallower setting, while a deep tree with many levels and few files per leaf favours a deeper one. That is why the next section is about <strong>a decision rule</strong> rather than a number.</p>
+
+                    <h2 id="sec-4">A rule for choosing depth - compare the three terms</h2>
+
+                    <p>Depth is not a recommended value to copy down; it is <strong>a value to measure on your own tree.</strong> Fortunately measuring it is simple. Every run records the three terms separately, so all that is needed is to compare their magnitudes.</p>
+
+                    <ul>
+                        <li><strong>Scan plus mark exceeds rsync</strong> — the depth is too high. More time is going to searching and marking than to the actual reconciliation, so <strong>lower it.</strong> Depths 15 and 20 in the table above are exactly this state.</li>
+                        <li><strong>Rsync dominates overwhelmingly</strong> — the depth may be too low. A wide scope is probably being handed over whole, so <strong>try raising it.</strong> It may also simply be that the change volume itself is large, so read this alongside the transfer figures.</li>
+                        <li><strong>All three are small and balanced</strong> — that is the optimal band. There is nothing further to gain from touching the depth in this state.</li>
+                        <li><strong>Start at 10.</strong> It is the right-hand end of the floor in the measurements, and it leaves room to move toward the shallower side.</li>
+                        <li><strong>Depth can be changed while running.</strong> No restart is needed, and on the first cycle after the change the markers for the newly included levels fill in automatically.</li>
+                    </ul>
+
+                    <p>That said, <strong>the first cycle after raising the depth is slow.</strong> The newly included levels have no markers, so every directory on those levels registers as a mismatch and every one of them becomes a write target. This is not a defect; it is exactly what the cost structure predicts, and it involves comparison and marking with no transfer. The opposite direction, lowering the depth, carries no such cost. Markers on levels that fall out of range are simply never queried again and stay where they are.</p>
+
+                    <p>One point deserves to be made explicitly. <strong>Depth is a performance knob, not a safety knob.</strong> Whatever depth the descent stops at, the last thing that runs is an rsync with delete propagation enabled, and the responsibility for making the two trees identical sits there. Getting the depth wrong makes things slow; it does not make them diverge. The paths that actually cause divergence are in <strong>the failure modes further down.</strong></p>
+
+                    <h2 id="sec-5">Before and after - 16.7 hours became 15 seconds</h2>
+
+                    <p>From here the numbers come from a replication that actually runs, not from a test harness. Four days were recorded under the previous approach and four days under the current one, against the same target, and set side by side.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Metric</th><th>Before</th><th>After</th><th>What changed</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Daily average sync time</td><td>16.7 hours</td><td><strong>15 seconds</strong></td><td>Two thirds of the day came back free</td></tr>
+                            <tr><td>Time per session</td><td>About 8.4 hours</td><td>Around a second on a normal cycle</td><td>Session length detached from total data volume</td></tr>
+                            <tr><td>Syncs per day</td><td>2</td><td><strong>12</strong></td><td>A consequence of shorter sessions, not a cause</td></tr>
+                            <tr><td>RPO</td><td>12 hours</td><td><strong>1 hour</strong></td><td>Followed the cadence directly</td></tr>
+                            <tr><td>Daily average processed volume</td><td>11.25 GB</td><td>0.88 MB</td><td>The former is comparison volume, not transfer</td></tr>
+                            <tr><td>Actual daily change</td><td colspan="2">133 items, 0.88 MB (same target, same workload)</td><td>A figure that does not differ between the two</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>The last two rows have to be read together for the table to make sense. <strong>The actual change on the same target is identical on both sides.</strong> 133 items and 0.88 MB a day. The 11.25 GB on the before side is <strong>metadata comparison volume</strong> generated while walking the tree in search of that 0.88 MB, and the 0.88 MB on the after side is what was actually moved. They sit in the same column and mean different things.</p>
+
+                    <p>The fact that the before side <strong>barely moved across four days</strong> tells the same story. Day-to-day variance in processed volume was around 1.3 percent. The change volume differed from day to day while the processed volume stayed fixed. A figure that responds to change volume ought to wobble. <strong>That it did not wobble is direct evidence that it came from a term unrelated to change volume.</strong></p>
+
+                    <p>The 8.4 hours per session was equally fixed, and that number is what created the ceiling. Two sessions of 8.4 hours fit into a 24 hour day, so sync ran twice daily, and the result was an RPO of 12 hours. <strong>Nobody set 12 hours as a target; it was the remainder left by the session length.</strong></p>
+
+                    <h2 id="sec-6">What actually produced the difference - the cadence came loose</h2>
+
+                    <p>Summarising 16.7 hours becoming 15 seconds as it got faster is only half right. More precisely, <strong>the length of a session detached from the total data volume, which made the cadence something that could be designed.</strong> The second half is the part with practical value.</p>
+
+                    <p>Before the change, cadence was not a choice. If a session takes 8.4 hours, the next one cannot be scheduled any tighter than a 12 hour interval; schedule it tighter and it overlaps a run still in progress. Session length was set by total data volume, and total data volume is not something you can reduce on demand. So <strong>RPO was an outcome rather than a design parameter.</strong></p>
+
+                    <p>After the change the order inverts. A normal cycle finishes in seconds, so <strong>you pick the cadence first and schedule to it.</strong> Set it to the top of every hour and you get 12 runs a day, and the RPO follows that interval down to one hour. This was not bought with a different link or more hardware. <strong>It came from the headroom created by not doing work that did not need doing</strong>, spent on cadence.</p>
+
+                    <p>Why the distinction matters is that <strong>stating the improvement only as a multiplier erases what actually changed.</strong> A multiplier moves when conditions move. The structural statement — that the cost function shifted from total data volume to change volume — survives a change of conditions, and it <strong>answers the next question.</strong> What happens when the data doubles? Under the previous approach the session doubles and the RPO stretches with it. Under the current one, if the change volume is unchanged, nothing moves.</p>
+
+                    <h2 id="sec-7">Session mode distribution - half of them did nothing</h2>
+
+                    <p>Counting every cycle over the four days by its verdict gives the following.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Verdict</th><th>Sessions</th><th>Share</th><th>What happened that cycle</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>SKIP</td><td>47</td><td><strong>49.5%</strong></td><td>Root value matched, so rsync was never invoked</td></tr>
+                            <tr><td>INCR</td><td>48</td><td><strong>50.5%</strong></td><td>Only directories whose value differed were rsynced</td></tr>
+                            <tr><td>FULL</td><td>0</td><td>0%</td><td>A full sync never occurred once</td></tr>
+                            <tr><td>FAIL</td><td>0</td><td>0%</td><td>100 percent success rate</td></tr>
+                            <tr><td colspan="2"><strong>95 sessions total</strong></td><td colspan="2">Four days, 1.98 hours of total time including one outlier</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>Looking only at the normal operating days, each day ran 24 sessions with <strong>13 SKIP and 11 INCR</strong>, and daily totals of 14, 16 and 15 seconds. Files transferred were 126, 142 and 130, and transferred volume 750 KB, 1.09 MB and 842 KB. The quiet part of this table is that <strong>the same pattern repeated three days running.</strong> Not wobbling from day to day means the verdicts are not accidental; they reflect the character of the workload directly.</p>
+
+                    <p>What the INCR cycles caught was equally consistent. Most of it was log rotation and configuration rotation, that is, <strong>scheduled activity that creates and removes files on the clock.</strong> Overnight the runs are SKIP until a rotation fires and produces an INCR, and during working hours small changes appear intermittently. The distribution itself is an activity profile of that target.</p>
+
+                    <p>That FULL is zero is also worth reading. A full sync ran once at cutover and was never needed again. Once the markers have settled, every cycle lands on either SKIP or INCR. <strong>The first part's claim that the initial cost is a one-off is confirmed directly in the operating record.</strong></p>
+
+                    <h2 id="sec-8">A design where doing nothing is the result</h2>
+
+                    <p>Half of the sessions being SKIP reads like waste at first glance — as though half the runs spun for nothing. The point where that reading flips is the heart of this design.</p>
+
+                    <p><strong>The share of cycles with no changes was identical before the switch.</strong> The workload is the same, so of course it was. What differed was the price of such a cycle. On a no-change cycle the previous approach spent <strong>8.4 hours.</strong> It read every entry and spent all of that time arriving at a single conclusion: everything matches. On the same cycle the current approach spends <strong>zero seconds.</strong></p>
+
+                    <p>So the SKIP ratio is not a measure of waste; it is <strong>the share of cycles on which savings were realised.</strong> And a higher ratio means the workload is a better fit for this design, because the gain grows as changes become rarer. Conversely, on a workload whose SKIP ratio is near zero, this design ends up behaving much like a full walk.</p>
+
+                    <p>That gives an observation axis. <strong>Track the SKIP ratio itself as a metric.</strong> On this target, 40 to 55 percent was the normal band. If the figure drops suddenly it is one of two things.</p>
+
+                    <ul>
+                        <li><strong>Changes genuinely increased</strong> — file counts and transferred volume rise alongside it. The workload changed; the design is not at fault.</li>
+                        <li><strong>Only the values rose and there is nothing to move</strong> — transferred volume is flat while INCR counts climb. That is the point at which to suspect a cause other than data change. The next section is that case.</li>
+                    </ul>
+
+                    <p>Telling the two apart requires <strong>reading the verdict distribution and the transferred volume together.</strong> Neither alone resolves it. That INCR rose says nothing about what happened, and that the transfer was zero says nothing about whether the cycle was expensive.</p>
+
+                    <h2 id="sec-9">One outlier - 1.97 hours burned, zero bytes moved</h2>
+
+                    <p>On one of the four days there was one cycle where this design <strong>lost badly.</strong> Removing it would make every table above considerably prettier, and it is also the single highest-information line in this article.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Item</th><th>Detail</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Duration</td><td><strong>7,074 seconds, or 1.97 hours</strong> for that single cycle</td></tr>
+                            <tr><td>Verdict</td><td>INCR — the value differed, so it was read as a change</td></tr>
+                            <tr><td>Cause</td><td>A CephFS snapshot deletion changed the recursive change time (a false INCR)</td></tr>
+                            <tr><td>Scope affected</td><td>The two largest directories, on the order of tens of millions of entries</td></tr>
+                            <tr><td>Actual transfer</td><td><strong>Zero files.</strong> What crossed the wire was 1,748 bytes of metadata</td></tr>
+                            <tr><td>Resolution</td><td>Rsync compared the whole scope, finished with zero transferred, and the next cycle was normal</td></tr>
+                            <tr><td>The rest of that day</td><td>23 sessions, of which 8 SKIP and 15 INCR. Everything else was ordinary</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>What happened is fully explained by one property stated in the first part. <strong>A data change is not the only path by which the value rises.</strong> Deleting a CephFS snapshot changes the recursive change time on the affected directory. The file contents are untouched and the value goes up anyway. This design reads a change in the value as a signal of change, so that range is judged INCR.</p>
+
+                    <p>What follows is where the cost actually arose. The range that got flagged happened to be <strong>the two largest directories.</strong> Narrowed or not, the number of entries inside that scope is on the order of tens of millions, so rsync had to compare all of them. The comparison concluded that there was nothing to move, so the transfer was zero. <strong>Nearly all of those 1.97 hours went into confirming that there was nothing to move.</strong> The exact waste the first article set out to eliminate came back in once, through a different door.</p>
+
+                    <p>The data was safe. Nothing diverged and nothing was deleted. The loss was time and only time. The reason this single case matters is that <strong>it shows in the field which way this design's verdicts fail.</strong> The first part put it as: a matching value is a strong signal and a differing value is a weak one. This cycle is a failure on the weak side. And failing on the weak side <strong>wastes work rather than losing data.</strong> That asymmetry was deliberately engineered to point this way, and this table is the result.</p>
+
+                    <p>The countermeasure is scheduling, not code. Three things are used together.</p>
+
+                    <ul>
+                        <li><strong>Move snapshot cleanup into a quiet window.</strong> Keep the moment the values wobble apart from the moment the sync runs. It does not remove the pointless scan, but it pushes the impact outside the window that matters.</li>
+                        <li><strong>Treat an unexpected INCR spike as something to watch.</strong> If transferred volume is flat while INCR counts rise, look for a cause other than data change first.</li>
+                        <li><strong>Set separate expectations for ranges with frequent snapshot deletion.</strong> A low SKIP ratio there is normal, so judging by a single global average points the diagnosis at the wrong thing.</li>
+                    </ul>
+
+                    <p>And this interaction is not specific to this implementation. <strong>Every structure that uses a recursive change time as a signal carries the same error term.</strong> The moment you assume a data change is the only path by which the value rises, you fail in the same place wherever you are.</p>
+
+                    <h2 id="sec-10">Why the outlier stays in the total</h2>
+
+                    <p>Drop that one cycle as a known exception and the four day total becomes <strong>45 seconds.</strong> Keep it and the total is <strong>1.98 hours.</strong> The same four days under the previous approach came to <strong>66.93 hours</strong>, so the two ways of counting split like this.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Counting method</th><th>Four day total, after</th><th>Versus before</th><th>What the figure describes</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Normal cycles only (outlier excluded)</td><td>45 seconds</td><td>About 5,300 times</td><td>The value when the workload behaves as expected</td></tr>
+                            <tr><td><strong>Outlier included</strong></td><td><strong>1.98 hours</strong></td><td><strong>33.8 times</strong></td><td>The value including the day snapshot cleanup overlapped</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>Which of these to publish as the headline figure is not a matter of taste. <strong>Operational decisions are decided by the worst cycle, not the average.</strong> If one cycle runs 1.97 hours, the RPO for that day is not one hour but something in the two hour range. Write RPO of one hour on the strength of the average and those two hours are unaccounted for.</p>
+
+                    <p>And with the outlier included it is still <strong>33.8 times.</strong> That number is the point of this section. If putting the worst day in unchanged still leaves a two-digit multiplier rather than a single-digit one, <strong>there is no reason to strip the outlier to inflate the figure.</strong> What stripping it buys is one larger number, 5,300 times; what it costs is every piece of information about the conditions under which this approach degrades.</p>
+
+                    <p>That honest counting is more useful in practice is not a moral point. <strong>A stripped figure does not reproduce on the next target.</strong> Carry it to somewhere with a different snapshot cleanup policy and 5,300 times will not appear; the 33.8 side will. That produces a verdict of underperforming against expectations, and sends the investigation off in the wrong direction.</p>
+
+                    <h2 id="sec-11">Five failure modes met in operation</h2>
+
+                    <p>Up to here the subject has been fast versus slow. From here it is <strong>consistent versus divergent.</strong> Five things turned up after this went into operation and are now guarded against in the code. They differ in kind, so they are separated in a table first.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Failure mode</th><th>Symptom</th><th>Why it is dangerous</th><th>How it is guarded</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><strong>Dropped mount</strong></td><td>The source appears to be empty</td><td>Delete propagation carries that fact to the target and <strong>wipes it</strong></td><td>Refuse to run at all if the source base is empty</td></tr>
+                            <tr><td><strong>The window between comparing and recording</strong></td><td>Looks normal. There is no symptom</td><td>A change that was not copied gets <strong>recorded as synced</strong></td><td>Hold the marker if the value is later than the rsync start time</td></tr>
+                            <tr><td><strong>Dangling symbolic link</strong></td><td>Repeated failure in the same place</td><td>The situation the guard existed for <strong>survives while looking guarded</strong></td><td>Add a check that does not follow the link</td></tr>
+                            <tr><td><strong>Name length limit</strong></td><td>Evidence files quietly disappear</td><td>The fallback after a failed move <strong>deletes the original</strong></td><td>Use the trailing part of the basename plus a collision-proof prefix</td></tr>
+                            <tr><td><strong>Inherited lock descriptor</strong></td><td>Every subsequent cycle backs off</td><td>The lock <strong>is not released even when the parent dies</strong></td><td>Close the inherited descriptor as each worker starts</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>Of the five, the top two <strong>can make data diverge</strong> and the bottom three <strong>leak resources and evidence.</strong> The first two therefore get their own sections. One shared trait is worth flagging: <strong>only three of the five announced themselves with a symptom</strong>, and the other two have none. The ones with no symptom are the more dangerous.</p>
+
+                    <h2 id="sec-12">A dropped mount - an empty source wipes the target</h2>
+
+                    <p>This design finishes with an rsync that has delete propagation turned on, because anything removed on the source that survives on the target leaves the two trees divergent. The whole of this failure mode is that what that option does in normal operation and what it does when the source has vanished <strong>are indistinguishable to it.</strong></p>
+
+                    <p>One fact has to come first. <strong>When a CephFS mount drops, the mount point does not disappear.</strong> The local directory that was underneath becomes visible again, and that is usually <strong>an ordinary empty directory.</strong> The path still exists, it is still accessible, and reading it still succeeds. There is simply nothing inside.</p>
+
+                    <p>Run a sync in that state and the input rsync receives is: nothing exists on the source. That is <strong>grammatically the same input as everything on the source was deleted.</strong> With delete propagation enabled, rsync performs its job exactly correctly. It makes the target match the source. In other words <strong>it empties the target.</strong></p>
+
+                    <p>It is worth being precise about where the danger sits. The dangerous thing is not that the sync stops when the source is empty; stopping causes no harm at all. The dangerous thing is that <strong>the sync succeeds when the source is empty.</strong> Rsync raises no error. The exit code is zero, the statistics show a healthy deletion count, and the verdict is recorded as success. <strong>And then the marker is updated.</strong> The next cycle sees the two trees as identical and skips. Nothing anywhere records that an accident occurred.</p>
+
+                    <p>So the check has to move in front of rsync. Before a run is even constructed, look at <strong>whether the mount base is empty.</strong> And that check treats source and target <strong>asymmetrically</strong>, because the risk is asymmetric.</p>
+
+                    <ul>
+                        <li><strong>If the source base is empty, refuse to run.</strong> There is no legitimate reason for it to be empty, and the price of proceeding wrongly is the entire target.</li>
+                        <li><strong>If the target base is empty, only warn.</strong> During initial seeding an empty target is normal. Blocking here means the first cycle never runs at all.</li>
+                        <li><strong>Look at the base, not at the individual sync directories.</strong> Target subdirectories are legitimately empty on the first cycle, so checking those alone produces a false positive. A dropped mount shows up at the base.</li>
+                        <li><strong>The check costs effectively nothing.</strong> It is one test of whether a directory is empty, once per cycle. Safety available at that price is worth buying.</li>
+                    </ul>
+
+                    <p>The lesson here is not confined to one option. <strong>Code that does not distinguish the input was empty from the input could not be read will treat a failure as normal.</strong> A sync with delete propagation enabled is simply one of the places where that confusion carries the highest price. A related trap in the shape of rsync's arguments is covered separately in <a href="rsync_trailing_slash_guide.html">why one trailing slash changes everything in rsync</a>.</p>
+
+                    <h2 id="sec-13">The window between comparing and recording - hold the marker</h2>
+
+                    <p>The first part described this design's safety mechanism as: if it fails, do not record. There is one more window that this does not close. <strong>The case where it succeeded and still must not be recorded.</strong></p>
+
+                    <p>Follow the sequence and it becomes visible. A cycle compares the values, rsyncs the narrowed scope, and finally records the source value of that moment onto the target. But <strong>the source is live while rsync runs.</strong> If a file changes in that interval, the change is not in this copy and yet the source's recursive change time has already risen. The value the recording step reads is <strong>the post-change value.</strong></p>
+
+                    <p>Stamping that value makes the marker a lie. A marker means the target matches the source as of this time, when in fact it matches only up to just before that time. The next cycle compares the source's current value against the marker, <strong>finds them equal, and skips.</strong> That change is <strong>permanently missing until the next full sync.</strong> There is no symptom. No error, no warning, no failure verdict.</p>
+
+                    <p>The fix is <strong>to make recording conditional on one more test.</strong> If the value read is later than this cycle's rsync start time, it necessarily includes a change that this copy did not capture, so <strong>do not write the marker.</strong> The cost is one re-scan on the next cycle. What is bought is the guarantee that nothing goes missing. The first part's principle applies unchanged here: <strong>if it can be wrong, make it wrong in the direction of wasted work.</strong></p>
+
+                    <p>That hold needs three conditions attached, though, and omitting any of them turns the fix into a new problem.</p>
+
+                    <ul>
+                        <li><strong>The hold applies only to that directory's own marker; children are still recorded.</strong> Recursive change time is <strong>the maximum across the entire subtree</strong>, so on a live tree a single changed file anywhere pushes the root value past the rsync start time. Hold at the root and return, and <strong>not a single marker is left on the target</strong>, so the next cycle descends through everything. Every cycle then locks into a full re-scan.</li>
+                        <li><strong>There is a justification for recording the children.</strong> This step runs only when every rsync in that scope succeeded. And if a child's value is at or below the rsync start time, then because the value is a recursive maximum, that subtree saw no change after rsync began. Put together, that child's target is current.</li>
+                        <li><strong>Account for there being two clocks.</strong> The value comes from the metadata server's clock and the rsync start time from the executing host's clock. If the two drift so that the value appears to be in the future, the hold never releases. So a value more than a set margin ahead of the current time is <strong>treated as skew and not held.</strong> That margin is exposed as configuration.</li>
+                    </ul>
+
+                    <p>This mechanism also leaves behind <strong>a property that is normal behaviour.</strong> On a directory that changes frequently, the root value rises every cycle, so <strong>the root marker is held every time.</strong> That target is therefore reported as INCR rather than SKIP, continuously. The child markers are written normally, so the scan still stops at the changed portion, and the cost is far below a full descent. Even so, <strong>do not expect SKIP on a busy target.</strong> Expecting it turns correct behaviour into a misdiagnosis.</p>
+
+                    <h2 id="sec-14">The other three - dangling links, name length, an inherited lock</h2>
+
+                    <p>The remaining three do not make data diverge directly. Instead they <strong>stop an existing guard from working, or destroy the evidence needed to find a cause.</strong> All three showed up in the same shape: documented as fixed while not actually catching anything.</p>
+
+                    <h3>A dangling symbolic link passes the check</h3>
+
+                    <p>When a name that was a directory on the source becomes a file, or the reverse, the target still holds the old type and collides. So before reconciling there is a step that checks <strong>whether stale content exists on the target side</strong> and moves it aside. The problem was that the check was written <strong>as a question about whether the target exists.</strong></p>
+
+                    <p>That form of check <strong>follows symbolic links.</strong> If a link is present but its target is gone, the link itself is perfectly real and the check answers not present. The move-aside step is then skipped, and the subsequent attempt to create a directory fails <strong>because something already exists there.</strong> The situation the guard existed for survives <strong>while everyone believes it was guarded.</strong> The only fix is to use a check that does not follow the link alongside the existing one.</p>
+
+                    <h3>Evidence file names exceed the limit</h3>
+
+                    <p>Stale content that gets moved aside is not deleted but <strong>moved into a holding area</strong>, because what was moved and why is the raw material for a later investigation. If that filename is built by joining the full original path, then at sufficient depth it <strong>exceeds the 255 byte filename limit.</strong></p>
+
+                    <p>Exceeding it makes the move fail. That is bad on its own, but the real problem is what came next. The fallback on failure was <strong>to simply delete.</strong> So the file that was being preserved in order to diagnose a cause was <strong>deleted precisely because its path was too long to preserve.</strong> There is even a bias in it: the deeper the path, the more likely it disappears. The fixed form keeps the path out of the name entirely. Use only the final name component, keep the trailing portion if it is long, add a timestamp and a process identifier to prevent collisions, and <strong>record the full path only in the log.</strong></p>
+
+                    <p>The holding area had one more hole of the same family. The cleanup that removes old entries only targeted <strong>regular files</strong>, so entries moved aside as whole directories, and links that had been moved, <strong>stayed forever.</strong> The holding area grows without bound. The cleanup target was changed to every entry directly beneath the holding area, with a guard that aborts immediately if the path variable is empty. What gets deleted when a path variable is empty inside a recursive delete probably does not need spelling out.</p>
+
+                    <h3>Workers hold on to the lock descriptor</h3>
+
+                    <p>To prevent overlapping runs, a lock file is taken at startup. If the previous cycle is still running, this one backs off immediately. That is normal behaviour and the log says so.</p>
+
+                    <p>The problem is that <strong>the file descriptor holding that lock is inherited by child processes.</strong> This design processes several targets in parallel, so multiple workers start, and the commands those workers invoke inherit the descriptor in turn. The result is that <strong>the lock is not released even when the parent dies.</strong> As long as one surviving child holds that descriptor, the lock stays held.</p>
+
+                    <p>The outcome is quiet. The next cycle backs off because a previous session is still running, and so does the one after that. <strong>That log line is character for character identical to the one written during correct behaviour.</strong> So the state does not look like an error; it looks like an unusually busy day for lock contention. Meanwhile the RPO quietly stretches. The fix is for each worker to close the inherited descriptor the moment it starts. Only the parent needs to hold the lock.</p>
+
+                    <p>Put the three side by side and one character emerges. <strong>All three are cases where the existence of a guard did not guarantee the operation of that guard.</strong> This family is therefore hard to catch by reading code. It surfaces only by <strong>putting the code that will actually ship into the situation</strong> — creating a dangling link, creating a long path, killing the parent — and watching what happens.</p>
+
+                    <h2 id="sec-15">When not to use this</h2>
+
+                    <p>The first part listed three cases. The operating record added one more, and one of the originals now needs more explanation.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Condition</th><th>Why there is no gain, or a loss</th><th>Evidence</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><strong>Initial seeding</strong></td><td>Everything has to be transferred, so there is no subtree to skip in the first place</td><td>The two approaches differed by about 6 percent on the initial full sync</td></tr>
+                            <tr><td><strong>Workloads that create directories in bulk continuously</strong></td><td>Every new directory needs a marker, and that cost exceeds the scan savings</td><td>On a round that created 50,000 directories at once, the full walk was 1.7 times faster</td></tr>
+                            <tr><td><strong>Workloads whose changes spread evenly across every directory</strong></td><td>There is no branch to prune, so the descent converges on the whole tree</td><td>In the cost function, once the changed directory count approaches the total, the two become equivalent</td></tr>
+                            <tr><td><strong>Environments that create and delete snapshots frequently</strong></td><td>Values rise with no data change, producing repeated pointless scans</td><td>One snapshot deletion burned 1.97 hours and transferred nothing</td></tr>
+                            <tr><td><strong>Very shallow or very deep trees</strong></td><td>There is no range for the depth knob to act in, or the optimum lies outside the measured band</td><td>Depth sensitivity varies with the shape of the tree</td></tr>
+                            <tr><td><strong>Filesystems other than CephFS</strong></td><td>The value the decision rests on does not exist</td><td>Recursive change time is a value CephFS maintains</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>The fourth row is the one this article adds. The property that snapshot deletion disturbs the value was already noted in the first part, but at the level of a known interaction. With a measurement attached the judgement changes. <strong>In an environment that deletes snapshots often, the gain from this approach is reduced accordingly.</strong> If cleanup can be moved to a quiet window it remains worthwhile; if it cannot, the decision deserves a second look.</p>
+
+                    <p>The fifth row is also new here. On a very shallow tree there are only a few levels to descend, so no amount of adjusting the depth meaningfully changes the rsync scope; the knob exists with nothing to turn. On a very deep tree, the 5 to 10 band in the table above does not transfer as is. The practical content of this row is: <strong>do not copy the recommended value down, measure the three terms on your own tree.</strong></p>
+
+                    <p>The third row follows directly from the structure and needs no measurement. The entire gain of this design comes from one thing, <strong>cheaply pruning branches that do not need to be looked at.</strong> If changes are spread evenly across all directories there is nothing to prune, and what remains is a full walk with the cost of reading values added on top. The condition for a workload that suits this approach is not that changes are few but that <strong>changes are clustered.</strong></p>
+
+                    <h2 id="sec-16">Summary in five sentences</h2>
+
+                    <ul>
+                        <li><strong>Depth is a knob that trades two costs against each other, and both ends are bad.</strong> 6 seconds at depth 3, 4 at 5, 8 and 10, 6 at 15 and 8 at 20. Of the 8 seconds at depth 20, rsync was only 2, and the rest went to reading and writing values.</li>
+                        <li><strong>What changed is not speed but cadence.</strong> A daily average of 16.7 hours becoming 15 seconds detached session length from total data volume, which turned 2 runs a day into 12 and brought the RPO down from 12 hours to 1.</li>
+                        <li><strong>Half the sessions being SKIP does not mean half of them spun for nothing.</strong> 47 of 95 sessions never invoked rsync at all, and on the same cycle the previous approach spent 8.4 hours. Here, doing nothing is the result.</li>
+                        <li><strong>A table only becomes useful once the worst cycle stays in it.</strong> One false INCR created by a snapshot deletion burned 1.97 hours and transferred nothing. Even with it included, the four day totals are 1.98 hours against 66.93, a factor of 33.8.</li>
+                        <li><strong>What makes data diverge is not depth but the failure modes.</strong> Not stopping when the source is empty, and recording an uncopied change as synced — both have no symptom, and having no symptom is what makes them dangerous.</li>
+                    </ul>
+
+                    <p>Joining the two parts into one sentence: <strong>narrowing the comparison scope changes the cost function, and changing the cost function makes the cadence designable.</strong> Whether that design holds up in operation is then decided not by a multiplier but by <strong>the worst cycle and the quietest failure.</strong> The first part is at <a href="cephfs_rctime_incremental_sync.html">the incremental CephFS replication design that skips subtrees with ceph.dir.rctime</a>. Why replication and backup are not the same claim is covered separately in <a href="backup_restore_verification.html">having a backup and being able to restore are two different claims</a>.</p>
+
+                    <h2 id="sec-17">What could not be confirmed</h2>
+
+                    <p>The following did not get an answer under these conditions. Nothing is asserted about them until there is evidence.</p>
+
+                    <ul>
+                        <li><strong>The optimal depth on other tree shapes</strong> — depth sensitivity was measured on exactly one tree of roughly 1 TB across about 90,000 directories. Where the floor moves on a flat tree or a far deeper one is not something that table answers.</li>
+                        <li><strong>How depth sensitivity depends on the change distribution</strong> — every measurement used a single changed file. How the balance of the three terms shifts when changes are scattered across several branches was not measured.</li>
+                        <li><strong>The two comparison periods are different</strong> — the four days before and the four days after are not the same four days. The comparison holds in that the target and workload are the same, but whether anything about the workload differed between the two periods cannot be separated out of this record.</li>
+                        <li><strong>Reproducing the outlier</strong> — that snapshot deletion produces a false INCR is confirmed, but what was observed is one occurrence. How the duration scales with the size of the deletion or the affected scope was not measured repeatedly.</li>
+                        <li><strong>The effect of moving snapshot cleanup</strong> — it is written down as a countermeasure, but the change in SKIP ratio after the schedule adjustment was not measured separately.</li>
+                        <li><strong>How often the five failure modes occur</strong> — meeting each of them and guarding against it is one thing; how frequently they arise is another. Frequency cannot be read out of this record.</li>
+                        <li><strong>The accumulated cost of re-scans caused by marker holds</strong> — that a frequently changing target reports INCR every cycle is confirmed, but the cumulative cost of that state over a long period was not measured.</li>
+                        <li><strong>Propagation behaviour on other Ceph versions</strong> — the same as in the first part. Measurement was on one release line, and whether the timing and lag of upward propagation match on others is out of scope.</li>
+                    </ul>
+
+                    <h2 id="sec-18">References</h2>
+
+                    <ul>
+                        <li><a href="cephfs_rctime_incremental_sync.html">Nothing Changed, Yet It Scanned Everything - Incremental CephFS Replication That Skips Subtrees with ceph.dir.rctime</a> — part one. Problem definition, the semantics of recursive change time, the verdict structure, the do-not-record-on-failure safeguard, and ten rounds of synthetic benchmarks.</li>
+                        <li><a href="https://docs.ceph.com/en/reef/man/8/mount.ceph/" target="_blank" rel="noopener">Ceph documentation, mount.ceph manual</a> — defines the mount option that reports a directory's <code>st_size</code> as the recursive size of its contents, and its inverse. Evidence that CephFS maintains recursively aggregated values.</li>
+                        <li><a href="https://docs.ceph.com/en/reef/cephfs/posix/" target="_blank" rel="noopener">Ceph documentation, differences from POSIX</a> — states that the recursive size field is maintained by CephFS.</li>
+                        <li><a href="https://docs.ceph.com/en/latest/releases/luminous/" target="_blank" rel="noopener">Ceph documentation, Luminous release notes</a> — where <code>ceph.dir.rctime</code> appears in the release notes, including the entry fixing a defect in how the nanosecond component of this attribute was rendered.</li>
+                        <li>The depth sensitivity measurements, the before-and-after comparison, the outlier record and the five failure modes in this article are the author's own, built and put into operation. Apart from the three items above there are no external sources.</li>
+                    </ul>
+
+                </div>
+
+                <div class="share-section">
+                    <h3>Share this post</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X (Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">Copy link</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">Back to list</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Free tools you may find useful</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/code_image.html">Code Image Generator</a></li>
+      <li><a href="../static/char_counter.html">Character Counter</a></li>
+      <li><a href="../static/json_formatter.html">JSON Formatter</a></li>
+      <li><a href="../static/regex_tester.html">Regex Tester</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">See all tools &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Related Posts</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="cephfs_rctime_incremental_sync.html">Nothing Changed, Yet It Scanned Everything - Incremental CephFS Replication That Skips Subtrees with ceph.dir.rctime</a></li>
+      <li><a href="backup_restore_verification.html">Having a Backup and Being Able to Restore Are Two Different Claims - Where a Successful Backup Lies, and What Restore Verification Actually Demands</a></li>
+      <li><a href="postgres_horizontal_scaling_cost.html">Choosing to Split Postgres Across Multiple Nodes - The Cost Horizontal Scaling Levies on Transactions, Joins, and Constraints</a></li>
+      <li><a href="oss_ownership_beyond_license.html">The Code Is Open, the Name Is Not - Trademarks, Domains and Release Access an Open Source License Never Grants</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('Link copied. Paste it into the Threads app to share.');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('Link copied.'); });
+    });
+    </script>
+</body>
+</html>

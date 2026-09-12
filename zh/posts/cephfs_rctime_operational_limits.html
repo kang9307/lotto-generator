@@ -1,0 +1,672 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>深度超出5到10这一区间，收益就消失了 - CephFS rctime 增量同步的运行边界与失败模式</title>
+    <meta name="description" content="深度3为6秒，5、8、10为4秒，15为6秒，20为8秒。本文整理 CephFS rctime 增量同步的扫描深度敏感性、切换前后四天对比、一次耗掉1.97小时却传输为零的异常值，以及运行中真正踩过并防住的五种失败模式，还有不该使用这套方案的场合。">
+    <meta name="keywords" content="CephFS, rctime, ceph.dir.rctime, 扫描深度, 递归变更时间, 增量同步, 失败模式, TOCTOU, RPO, 跨集群复制, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/cephfs_rctime_operational_limits.html">
+
+    <meta property="og:title" content="深度超出5到10这一区间，收益就消失了 - CephFS rctime 增量同步的运行边界与失败模式">
+    <meta property="og:description" content="深度不是免费的旋钮。往下走得越深，rsync 的范围越窄，而扫描和标记越贵。这里用测量写清这笔交换的最优区间，以及区间之外的代价。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/cephfs_rctime_operational_limits.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-09-12">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="深度超出5到10这一区间，收益就消失了 - CephFS rctime 增量同步的运行边界">
+    <meta name="twitter:description" content="走得最深的那档设置反而最慢。六个深度测量点，以及运行中踩过的五种失败模式。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "深度超出5到10这一区间，收益就消失了 - CephFS rctime 增量同步的运行边界与失败模式",
+      "alternativeHeadline": "走得最深的那档设置反而最慢",
+      "datePublished": "2026-09-12",
+      "dateModified": "2026-09-12",
+      "inLanguage": "zh-CN",
+      "articleSection": "开发/基础设施",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "CephFS, rctime, ceph.dir.rctime, 扫描深度, 增量同步, 失败模式, TOCTOU, RPO, 跨集群复制",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/cephfs_rctime_operational_limits.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "扫描深度设得越深就越快吗？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "并不会。在约1 TB、约90,000个目录、只改动一个文件的条件下测量，深度3耗时6秒，5为4秒，8为4秒，10为4秒，15为6秒，20为8秒。走得最深的那档反而最慢。提高深度确实会让交给 rsync 的范围变窄，但读取值的扫描和写入值的标记会同时变贵。两条曲线方向相反，所以总和呈U形，在这棵树上谷底落在5到10之间。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "SKIP 占一半意味着什么？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "四天里共运行95个会话，其中47个是 SKIP，48个是 INCR。FULL 与 FAIL 均为0，成功率100%。SKIP 指的是根目录的值相同、因此根本没有调用 rsync 的那一轮。也就是说有一半的轮次什么都没做。在原方案下，同样条件的一轮要花掉约8.4小时。让什么都不做的那一轮变得便宜，正是这套设计的目的，所以 SKIP 比例不是浪费的指标，而是成效的指标。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "删了快照之后同步花了两小时，这是故障吗？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "这不是故障，而是已知的相互作用。删除 CephFS 快照会改变相关目录的递归变更时间，而这套设计把值的变化读作发生了变更的信号，于是那一段被判定为 INCR。实测的一次耗时7,074秒，即1.97小时，实际传输为零。数据没有风险，损失的只有时间。对策不在代码而在排程，把快照清理挪到同步空闲的时段。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "为什么源端为空时必须停下来？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "因为同步选项里带着删除同步。CephFS 挂载掉线时挂载点并不会消失，而是回到一个空的普通目录。在那种状态下运行，读出来的意思就是源端什么都没有，删除同步会忠实地把这个事实带到目标端，把目标整个清空。所以判断要对源端和目标端区别对待。源端基准目录为空就直接拒绝执行，目标端基准目录为空只发出警告，因为首次播种时目标为空本来就是正常的。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "什么情况下不该用这套方案？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "有四种。第一，首次播种要把所有数据都传过去，根本没有可跳过的子树。第二，持续大批量创建目录的负载，为每个新目录写标记的成本会抵消扫描省下的时间。第三，变更均匀散布在所有目录上的负载没有枝可剪，结果和全量遍历一样。第四，频繁创建和删除快照的环境，即使数据没变值也会上升，导致反复的无用扫描。此外在 CephFS 之外，作为判断依据的那个值本身并不存在。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/cephfs_rctime_operational_limits.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/cephfs_rctime_operational_limits.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/cephfs_rctime_operational_limits.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/cephfs_rctime_operational_limits.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/cephfs_rctime_operational_limits.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "首页",
+      "item": "https://braindetox.kr/zh/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "开发/基础设施",
+      "item": "https://braindetox.kr/zh/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "深度超出5到10这一区间，收益就消失了 - CephFS rctime 增量同步的运行边界与失败模式",
+      "item": "https://braindetox.kr/zh/posts/cephfs_rctime_operational_limits.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="深度超出5到10这一区间，收益就消失了 - CephFS rctime 增量同步的运行边界与失败模式">
+                <meta itemprop="datePublished" content="2026-09-12">
+                <meta itemprop="dateModified" content="2026-09-12">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="CephFS, rctime, ceph.dir.rctime, 扫描深度, 增量同步, 失败模式, TOCTOU, RPO, 跨集群复制">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/cephfs_rctime_operational_limits.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">深度超出5到10这一区间，收益就消失了 - CephFS rctime 增量同步的运行边界与失败模式</h1>
+                    <h2 class="post-subtitle">一个值就能跳过的设计能走多远，又该从哪里停下</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-12">2026-09-12</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">开发/基础设施</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>把深度设成一直下探到20，同步会达到最高的精度，同时也变成<strong>最慢的一档</strong>。在同一棵树上放同一处变更，只改深度去测，得到的是<strong>深度3为6秒，5为4秒，8为4秒，10为4秒，15为6秒，20为8秒</strong>。曲线并不单调。谷底在中间，而两端各有各的上升理由。</p>
+
+                    <p>这是<a href="cephfs_rctime_incremental_sync.html">用 CephFS rctime 跳过全量扫描的增量同步设计</a>的下篇。上篇回答的是<strong>为什么有效</strong>，这里回答的是<strong>有效到什么程度，以及什么时候不该用</strong>。要讲的有四件事：改变深度时的敏感性、切换前后各四天的运行对比、一次耗掉1.97小时却什么都没传输的异常值，以及代码里真正防住的五种失败模式。</p>
+
+                    <p>上篇的结论压成一行是这样：<strong>如果比较阶段要遍历整棵树，那么名字叫增量，代价也不是增量。</strong> <code>ceph.dir.rctime</code> 是一个只读扩展属性，会把子树中的变更向上传播，而读取它不需要往下遍历。相同就跳过，不同就下探一层。这个下探在哪里截断，就是<strong>深度</strong>，也是本文的第一个主题。</p>
+
+                    <div class="callout">
+                        以下的设计与测量都是笔者自己做出来并投入运行的。外部资料只使用 Ceph 官方文档中关于递归统计与扩展属性的部分作为依据。不使用能识别集群、命名空间或主机的名称，两个集群只记作源端 Cluster-A 与目标端 Cluster-B。同步目录也只按角色和规模来指代，而不用名字。文中不放源代码和命令示例，算法与失败模式只用文字和表格说明。
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>本文要讲的内容</h3>
+                        <ol>
+                            <li><a href="#sec-1">深度不是免费的旋钮</a></li>
+                            <li><a href="#sec-2">深度敏感性 - 6·4·4·4·6·8</a></li>
+                            <li><a href="#sec-3">曲线为何呈U形 - 两端的代价不同</a></li>
+                            <li><a href="#sec-4">怎么定深度 - 比较三项的大小</a></li>
+                            <li><a href="#sec-5">切换前后 - 16.7小时变成15秒</a></li>
+                            <li><a href="#sec-6">真正造成这个差别的是什么 - 周期松开了</a></li>
+                            <li><a href="#sec-7">会话模式分布 - 有一半什么都没做</a></li>
+                            <li><a href="#sec-8">把不做事变成成果的结构</a></li>
+                            <li><a href="#sec-9">一次异常值 - 烧掉1.97小时，传输为零</a></li>
+                            <li><a href="#sec-10">为什么要把异常值算进总数</a></li>
+                            <li><a href="#sec-11">运行中踩过的五种失败模式</a></li>
+                            <li><a href="#sec-12">挂载丢失 - 源端为空就会清空目标</a></li>
+                            <li><a href="#sec-13">比较与记录之间的窗口 - 暂缓写标记</a></li>
+                            <li><a href="#sec-14">其余三种 - 断链、名字长度、锁描述符</a></li>
+                            <li><a href="#sec-15">不该使用的场合</a></li>
+                            <li><a href="#sec-16">小结 - 五句话</a></li>
+                            <li><a href="#sec-17">没能确认的部分</a></li>
+                            <li><a href="#sec-18">参考资料</a></li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">深度不是免费的旋钮</h2>
+
+                    <p>这套设计的下探是自上而下重复同一个比较。值相同的枝当场剪掉，只有不同的枝再往下开一层。触到深度上限就不再下探，而是<strong>把那个目录整个交给 rsync</strong>。</p>
+
+                    <p>这个上限会同时改变三项成本，而且方向彼此相反。</p>
+
+                    <ul>
+                        <li><strong>扫描</strong> — 读取值的工作。深度增加则层数增加，每层都要确认兄弟目录，所以<strong>读取次数上升</strong>。</li>
+                        <li><strong>rsync</strong> — 在拿到的范围内比对和搬运的工作。深度越大，交出去的范围越贴近叶子，所以<strong>下降</strong>。</li>
+                        <li><strong>标记</strong> — 在目标端写下同步时刻的工作。深度增加则需要放标记的目录增多，所以<strong>上升</strong>。</li>
+                    </ul>
+
+                    <p>两项涨、一项跌。所以总和对深度并不单调，「越精细越好」这个直觉就在这里失效。提高深度换来的只有<strong>rsync 范围的收窄这一样</strong>，代价是另外两项。浅的那一端也一样：降低深度省下扫描和标记，<strong>rsync 就要整块接下一棵很宽的子树</strong>。</p>
+
+                    <p>于是「哪一边的损失更大」要看条件。上篇所有测量都是把上限钉在10的状态下得到的，而这个值一动会发生什么，从这里开始讲。要注意的是，这三项并不是同一个量纲上的东西：rsync 那一项随接到的范围里的条目数变化，扫描和标记两项随经过的目录数变化。所以在条目密集的树上和目录密集的树上，同一个深度给出的答案不会一样。</p>
+
+                    <h2 id="sec-2">深度敏感性 - 6·4·4·4·6·8</h2>
+
+                    <p>测量条件和上篇相同。约1 TB、约90,000个目录，<strong>只改动一个文件</strong>，然后只变深度反复跑同一个同步。变更量固定为一，所以差异全部来自深度。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>深度</th><th>扫描</th><th>rsync</th><th>标记</th><th>总计</th><th>rsync 接到的范围</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>3</td><td>0秒</td><td>5秒</td><td>1秒</td><td><strong>6秒</strong></td><td>宽。一大片子树整块交过去</td></tr>
+                            <tr><td>5</td><td>0秒</td><td>3秒</td><td>1秒</td><td><strong>4秒</strong></td><td>开始收窄</td></tr>
+                            <tr><td>8</td><td>1秒</td><td>2秒</td><td>1秒</td><td><strong>4秒</strong></td><td>基本触到叶子</td></tr>
+                            <tr><td>10</td><td>1秒</td><td>2秒</td><td>1秒</td><td><strong>4秒</strong></td><td>窄。只有发生变更的那个目录</td></tr>
+                            <tr><td>15</td><td>2秒</td><td>2秒</td><td>2秒</td><td><strong>6秒</strong></td><td>不会再窄了</td></tr>
+                            <tr><td>20</td><td>3秒</td><td>2秒</td><td>3秒</td><td><strong>8秒</strong></td><td>不会再窄了</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>只看总计是<strong>6 → 4 → 4 → 4 → 6 → 8</strong>。最小值不是一个点而是一段区间，两侧都在抬升。不过比总计更重要的是<strong>中间那三列</strong>，它们解释了为什么形状是U。</p>
+
+                    <p>竖着读 rsync 那一列是<strong>5秒 → 3秒 → 2秒 → 2秒 → 2秒 → 2秒</strong>。过了深度8就不再下降。因为在这棵树上<strong>大约深度8就已经触到叶子</strong>，再往下没有可收窄的范围了。反过来扫描和标记两列从<strong>0和1一路涨到3和3</strong>。一边触底了，另一边还没停。</p>
+
+                    <p>所以深度10之后的增长与其说是「收益递减」，不如说更接近<strong>「收益已经结束，只剩成本」</strong>。深度20的8秒里 rsync 只占2秒，剩下6秒全花在读写属性值上。<strong>不干活的时间成了干活时间的三倍。</strong></p>
+
+                    <h2 id="sec-3">曲线为何呈U形 - 两端的代价不同</h2>
+
+                    <p>同样是6秒，深度3的6秒和深度15的6秒性质完全不同。这个区分在实务中决定修正的方向。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>区间</th><th>主导项</th><th>发生了什么</th><th>浪费在哪里</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>太浅（3）</td><td>rsync 5秒</td><td>还没定位到变更点就截断下探，把一大片子树整块交出去</td><td>rsync 重新比对了与变更无关的条目</td></tr>
+                            <tr><td>最优区间（5到10）</td><td>三项均匀分摊</td><td>下探在叶子附近结束，rsync 范围收敛到实际变更点</td><td>几乎没有</td></tr>
+                            <tr><td>太深（15到20）</td><td>扫描加标记 6秒</td><td>rsync 范围不再缩小，却仍在每层确认兄弟并写标记</td><td>已经结束的搜索还在继续，不必写的标记还在写</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>浅端的损失是<strong>上篇想要消除的那笔成本部分回流</strong>。在接到的子树内部，rsync 最终仍要做与条目数成正比的比较。只是范围小了，性质和全量遍历一样。下探截断得太早，等于每一轮都在跑<strong>一个缩小版的 O(n)</strong>。</p>
+
+                    <p>深端的损失性质不同。这里不是白比较，而是<strong>白读写值</strong>。而且这两者用的不是同一种资源。rsync 的比对是文件元数据访问，扫描和标记是扩展属性访问。两者最终都变成发往元数据服务器的请求，但深端的请求<strong>还会在目标端引发写入</strong>，因为留下标记是写而不是读。</p>
+
+                    <p>所以深度取得过大，并不是自己这个会话慢一点就完了。它拉长了与同一文件系统上其他客户端争抢元数据资源的时间窗口。这一层的一般性能特征整理在<a href="ceph_performance_optimization_guide.html">Ceph 性能优化指南</a>里。</p>
+
+                    <p>还要补一句。<strong>深度造出的最优点由树的形状决定。</strong> 上表的谷底落在5到10，只是说在这棵树上如此，并不是通用常数。每个目录文件很多的扁平树更适合浅一些，层级多、每个叶子文件少的深树更适合深一些。所以下一节讲的不是数字，而是<strong>判断规则</strong>。</p>
+
+                    <h2 id="sec-4">怎么定深度 - 比较三项的大小</h2>
+
+                    <p>深度不是「抄下推荐值」的东西，而是<strong>在自己的树上量出来的东西</strong>。好在量法很简单。每次运行留下的记录里三项时间是分开的，只要看这三者的大小关系就行。</p>
+
+                    <ul>
+                        <li><strong>扫描加标记大于 rsync</strong> — 深度偏高。花在搜索和标记上的时间超过了花在实际对齐上的时间，所以<strong>调低</strong>。上表的深度15和20正是这个状态。</li>
+                        <li><strong>rsync 占绝对大头</strong> — 深度可能偏低。很可能在把一大片范围整块交出去，所以<strong>试着调高</strong>。不过也可能只是变更量本身大，要结合传输量一起看。</li>
+                        <li><strong>三项都小而均衡</strong> — 那就是最优区间。在这个状态下再动深度也没什么可得的。</li>
+                        <li><strong>起点定在10。</strong> 它是测量中谷底区间的右端，同时给往浅的一侧调留出了余地。</li>
+                        <li><strong>深度可以在运行中修改。</strong> 不需要重启，改值之后的第一轮就会自动把新深度范围内的标记补齐。</li>
+                    </ul>
+
+                    <p>不过<strong>调高深度之后的第一轮是慢的</strong>。新纳入的层级没有标记，所以那些层的目录会全部被判为不一致，也全部成为写入对象。这不是缺陷，而正是成本结构所预测的，并且只有比较和标记，没有传输。反方向，也就是调低深度，没有这笔成本。落到范围之外的层级，其标记只是不再被查询，仍旧留在原处。</p>
+
+                    <p>这里有一点必须讲明。<strong>深度是性能旋钮，不是安全旋钮。</strong> 无论在哪个深度截断，最后跑的都是带删除同步的 rsync，让两棵树一致的责任在那里。深度定错会变慢，但不会让数据错开。让数据错开的路径不在深度，而在<strong>后面那些失败模式</strong>。</p>
+
+                    <h2 id="sec-5">切换前后 - 16.7小时变成15秒</h2>
+
+                    <p>从这里开始，数字来自真正在跑的复制，而不是测试环境。用原方案记录了四天，用切换后的方案对同一对象记录了四天，然后并排放在一起。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>指标</th><th>切换前</th><th>切换后</th><th>改变了什么</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>日均同步耗时</td><td>16.7小时</td><td><strong>15秒</strong></td><td>一天里三分之二的时间空了出来</td></tr>
+                            <tr><td>单会话耗时</td><td>约8.4小时</td><td>正常轮次1秒上下</td><td>会话长度从数据总量里脱钩了</td></tr>
+                            <tr><td>每日同步次数</td><td>2次</td><td><strong>12次</strong></td><td>是会话变短的结果，不是原因</td></tr>
+                            <tr><td>RPO</td><td>12小时</td><td><strong>1小时</strong></td><td>周期缩短多少就跟着降多少</td></tr>
+                            <tr><td>日均处理量</td><td>11.25 GB</td><td>0.88 MB</td><td>前者不是传输量，而是比较量</td></tr>
+                            <tr><td>实际日变更量</td><td colspan="2">133项、0.88 MB（同一对象、同一负载）</td><td>这个值在两边都不变</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>最后两行要合起来读，表才读得通。<strong>同一对象的实际变更量在两边是一样的</strong>，一天133项、0.88 MB。切换前的11.25 GB 是为了找出那0.88 MB 而遍历树时产生的<strong>元数据比较量</strong>，切换后的0.88 MB 是真正搬运的量。它们在同一列里，性质却不同。</p>
+
+                    <p>切换前那一侧<strong>四天几乎纹丝不动</strong>，说的是同一件事。每日处理量的偏差在1.3%左右。每天的变更量不同，处理量却是固定的。一个对变更量有反应的值理应每天摇摆。<strong>它没有摇摆，这件事本身就是它来自与变更量无关的那一项的直接证据。</strong></p>
+
+                    <p>单会话8.4小时同样是固定的，而这个数字直接造出了上限。一天24小时里能放下两个8.4小时的会话，所以同步是每天2次，结果就是12小时的 RPO。<strong>没有人把12小时定为目标，那只是会话长度剩下的余数。</strong></p>
+
+                    <h2 id="sec-6">真正造成这个差别的是什么 - 周期松开了</h2>
+
+                    <p>把16.7小时变成15秒概括为「变快了」，只对了一半。更准确的说法是<strong>单个会话的长度从数据总量里分离出来，因而周期变成了可以设计的东西</strong>。在实务上有价值的是后半句。</p>
+
+                    <p>切换前，周期不是一个选项。会话要8.4小时，下一个会话就不可能排得比12小时间隔更密；排了也会跟没结束的上一轮撞上。会话长度由数据总量决定，而数据总量是减不下去的。所以<strong>RPO 不是设计对象而是结果</strong>。</p>
+
+                    <p>切换后顺序反了过来。正常轮次以秒结束，所以<strong>先定周期，再照着排</strong>。定成每小时整点就是每天12次，RPO 跟着这个间隔降到1小时。这不是换链路或加设备换来的，而是<strong>把「不必做的事不做」腾出来的余量</strong>花在了周期上。</p>
+
+                    <p>这个区分之所以重要，是因为<strong>只用倍数来说改进幅度，会把到底改变了什么抹掉</strong>。倍数会随条件一起变。而「成本函数从数据总量转到了变更量」这种结构性的说法，条件变了也还在，并且它<strong>能回答下一个问题</strong>：数据翻倍会怎样。原方案的会话会翻倍，RPO 跟着拉长；切换后的方案只要变更量不变就不变。</p>
+
+                    <h2 id="sec-7">会话模式分布 - 有一半什么都没做</h2>
+
+                    <p>把四天里所有轮次按判定结果数一遍，是这样。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>判定</th><th>会话数</th><th>占比</th><th>那一轮发生了什么</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>SKIP</td><td>47</td><td><strong>49.5%</strong></td><td>根目录的值相同，没有调用 rsync</td></tr>
+                            <tr><td>INCR</td><td>48</td><td><strong>50.5%</strong></td><td>只对值不同的目录收窄后做 rsync</td></tr>
+                            <tr><td>FULL</td><td>0</td><td>0%</td><td>全量同步一次都没有发生</td></tr>
+                            <tr><td>FAIL</td><td>0</td><td>0%</td><td>成功率100%</td></tr>
+                            <tr><td colspan="2"><strong>合计95个会话</strong></td><td colspan="2">四天、总耗时1.98小时（含1次异常值）</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>只看正常运行的那几天，每天24个会话里重复着<strong>SKIP 13、INCR 11</strong>，每天总耗时分别是14秒、16秒、15秒。传输文件为126、142、130项，传输量为750 KB、1.09 MB、842 KB。这张表里安静的部分是<strong>同一个模式连着三天重复</strong>。不逐日摇摆意味着判定不是偶然，而是直接反映了负载的性质。</p>
+
+                    <p>INCR 轮次抓到的东西性质也很一致。大部分是日志轮转和配置轮转这类<strong>按时刻规律地创建和删除文件的动作</strong>。夜间是连续的 SKIP，到轮转触发的时刻冒出 INCR，工作时间里断断续续混进小规模变更。这个分布本身就是那个对象的活动画像。</p>
+
+                    <p>FULL 为0也值得一读。全量同步在切换时点跑过一次，之后再没用到。标记一旦稳定下来，每一轮就只会落在 SKIP 或 INCR 上。<strong>上篇说初期成本是一次性的，这在运行记录里得到了直接确认。</strong> FAIL 为0同样如此：四天里没有一轮需要把失败的区段顺延到下一轮，所以「失败就不记录」这条安全装置在这段记录里没有被触发过。它没被触发，不代表它不需要存在。</p>
+
+                    <h2 id="sec-8">把不做事变成成果的结构</h2>
+
+                    <p>SKIP 占一半这件事，乍看像是浪费，容易被读成「有一半轮次空转了」。这个读法翻转的地方，正是这套设计的核心。</p>
+
+                    <p>切换前<strong>没有变更的轮次占比是一样的</strong>。负载相同，当然如此。不同的是那一轮的价格。在没有变更的一轮里，原方案花掉<strong>8.4小时</strong>，把所有条目都读一遍，只为得到「全都一样」这一个结论。同样的一轮，切换后的方案花<strong>0秒</strong>。</p>
+
+                    <p>所以 SKIP 比例不是浪费的指标，而是<strong>产生了节省的那部分轮次的占比</strong>。而且这个比例越高，说明这套设计越贴合该负载，因为变更越稀少收益越大。反过来，如果某个负载的 SKIP 接近0，那么用这套设计也会退化成接近全量遍历。</p>
+
+                    <p>这里就有了一条观测线索。<strong>把 SKIP 比例本身当作指标来追踪。</strong> 在这个对象上40到55%是正常区间。这个值突然下跌，只有两种可能。</p>
+
+                    <ul>
+                        <li><strong>变更确实增加了</strong> — 传输文件数和传输量会一起上升。是负载变了，不是设计的问题。</li>
+                        <li><strong>只有值上升了，没有东西可搬</strong> — 传输量不动而 INCR 在涨。这时该怀疑数据变更之外的原因。下一节就是这种情况。</li>
+                    </ul>
+
+                    <p>把两种情况分开，靠的是<strong>把判定分布和传输量放在一起看</strong>。只看一边分不出来。只知道 INCR 涨了，说明不了发生过什么；只知道传输量是0，也说明不了那一轮贵不贵。</p>
+
+                    <h2 id="sec-9">一次异常值 - 烧掉1.97小时，传输为零</h2>
+
+                    <p>四天里有一天出现过一轮<strong>这套设计输得很惨</strong>的情况。把它藏起来，上面的表会漂亮得多，但它同时也是本文信息量最大的一行。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>项目</th><th>内容</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>耗时</td><td><strong>7,074秒 = 1.97小时</strong>（仅这一轮）</td></tr>
+                            <tr><td>判定</td><td>INCR — 值不同，于是被读作有变更</td></tr>
+                            <tr><td>原因</td><td>删除 CephFS 快照改变了递归变更时间（false INCR）</td></tr>
+                            <tr><td>影响范围</td><td>最大的两个目录，数千万文件量级</td></tr>
+                            <tr><td>实际传输</td><td><strong>0个文件。</strong> 往返的只有1,748字节元数据</td></tr>
+                            <tr><td>消解</td><td>rsync 把整个范围比对完，以0项传输结束，下一轮恢复正常</td></tr>
+                            <tr><td>当天其余</td><td>同一天23个会话中 SKIP 8、INCR 15，其余与平日无异</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>发生了什么，用上篇写过的一条性质就能全部解释。<strong>让值上升的路径不止数据变更这一条。</strong> 删除 CephFS 快照会改变相关目录的递归变更时间。文件内容原封不动，值却上去了。这套设计把值的变化读作变更的信号，于是那一段被判为 INCR。</p>
+
+                    <p>接下来才是真正产生成本的地方。被判定的那一段<strong>偏偏是最大的两个目录</strong>。就算收窄了，那个范围里的条目数也是数千万量级，rsync 必须把它们全部比对一遍。比对的结论是没有东西可搬，所以传输是0。<strong>那1.97小时几乎全部花在「确认没有东西可搬」上。</strong> 上篇第一句瞄准的那种浪费，从另一个入口又进来了一次。</p>
+
+                    <p>数据是安全的。既没有错开，也没有被删。损失只有时间这一项。这一件之所以重要，是因为<strong>它用实物展示了这套设计的判定会往哪个方向出错</strong>。上篇写过「值相同是强信号，值不同是弱信号」。这一轮就是在弱的那一侧出错的例子。而在弱的一侧出错<strong>只是白做工，不会丢数据</strong>。这种不对称是被有意造成这个方向的，这张表就是结果。</p>
+
+                    <p>对策在排程而不在代码，三条一起用。</p>
+
+                    <ul>
+                        <li><strong>把快照清理挪到空闲时段。</strong> 让值发生抖动的时刻和同步运行的时刻错开。这消不掉无用扫描本身，但能把影响推出关键时段。</li>
+                        <li><strong>把意料之外的 INCR 激增列为观测对象。</strong> 传输量不变而 INCR 增加时，先看数据变更之外的原因。</li>
+                        <li><strong>对快照删除频繁的区段单独设定期望值。</strong> 那里 SKIP 比例偏低是正常的，用一个总体平均去判断会把原因找错。</li>
+                    </ul>
+
+                    <p>而且这种相互作用并不只属于这一个实现。<strong>凡是把递归变更时间当信号用的结构，都带着同样的误差。</strong> 一旦假定让值上升的路径只有数据变更这一条，在哪里都会在同一个地方出错。</p>
+
+                    <h2 id="sec-10">为什么要把异常值算进总数</h2>
+
+                    <p>把这一件当作「已知例外」剔掉，四天总计就是<strong>45秒</strong>；不剔掉就是<strong>1.98小时</strong>。同样四天里切换前的总计是<strong>66.93小时</strong>，于是两个数字这样分岔。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>计法</th><th>切换后四天总计</th><th>相对切换前</th><th>这个数字在说什么</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>只算正常轮次（剔除异常值）</td><td>45秒</td><td>约5,300倍</td><td>负载按预期运转时的值</td></tr>
+                            <tr><td><strong>含异常值</strong></td><td><strong>1.98小时</strong></td><td><strong>33.8倍</strong></td><td>把快照清理撞上的那天也算进去的值</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>拿哪一个当代表值，不是口味问题。<strong>运行上的判断由最差的那一轮决定，而不是由平均值决定。</strong> 有一轮跑了1.97小时，那天的 RPO 就不是1小时，而是拉到两小时那一档。只看平均就写「RPO 1小时」，那两个小时便无从解释。</p>
+
+                    <p>而且把异常值算进去仍然是<strong>33.8倍</strong>。这个数字是本节的要点。把最差的一天原样放进去，剩下的还是两位数倍率而不是一位数，那么<strong>就没有理由剔掉异常值去把数字做大</strong>。剔掉得到的只是5,300倍这一个更大的数字，失去的却是「这套方案在什么条件下会变差」的全部信息。</p>
+
+                    <p>老实地计数在实务上更有用，这不是道德劝告。<strong>剔过的数字在下一个对象上不会重现。</strong> 把它搬到快照清理策略不同的地方，出来的不会是5,300倍，而是33.8倍那一侧。于是会得出「不及预期」的判断，然后到错误的地方去找原因。</p>
+
+                    <h2 id="sec-11">运行中踩过的五种失败模式</h2>
+
+                    <p>到这里为止讲的是快还是慢，从这里开始讲的是<strong>会不会错开</strong>。上线之后真正踩到并已在代码里防住的有五种。它们性质各异，先用表格分开。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>失败模式</th><th>症状</th><th>为什么危险</th><th>怎么防住的</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><strong>挂载丢失</strong></td><td>源端看上去是空的</td><td>删除同步把这个事实带到目标端<strong>清空目标</strong></td><td>源端基准目录为空就直接拒绝执行</td></tr>
+                            <tr><td><strong>比较与记录之间的窗口</strong></td><td>表面正常，没有症状</td><td>这一轮没搬过去的变更<strong>被标成已同步</strong></td><td>值晚于 rsync 起始时刻就暂缓写标记</td></tr>
+                            <tr><td><strong>断开的符号链接</strong></td><td>在同一个地方反复失败</td><td>想防的情形<strong>在自以为防住的状态下留存</strong></td><td>并用一个不跟随链接的检查</td></tr>
+                            <tr><td><strong>名字长度上限</strong></td><td>证据文件悄悄消失</td><td>清理失败后的回退<strong>把原件删掉</strong></td><td>只用名字末尾并加上防冲突前缀</td></tr>
+                            <tr><td><strong>锁描述符继承</strong></td><td>后续每一轮都一直退让</td><td>父进程死掉<strong>锁也不释放</strong></td><td>工作进程启动时关掉继承来的描述符</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>五种里上面两种<strong>会让数据错开</strong>，下面三种<strong>是资源和证据在漏</strong>。所以前两种各给一节。有一个共同点值得点出来：<strong>五种里先以症状现身的只有三种</strong>，剩下两种没有症状。没有症状的那两种更危险。</p>
+
+                    <h2 id="sec-12">挂载丢失 - 源端为空就会清空目标</h2>
+
+                    <p>这套设计最后跑的是开着删除同步的 rsync，因为源端删掉的东西若在目标端留下，两棵树就错开了。这个失败模式的全部内容是：那个选项在正常运转时做的事，和源端消失时做的事，<strong>对它来说无法区分</strong>。</p>
+
+                    <p>先要立住一个事实。<strong>CephFS 挂载掉线时，挂载点不会消失。</strong> 原本压在下面的本地目录重新可见，而那通常是<strong>一个空的普通目录</strong>。路径照样存在，也能访问，读取也会成功，只是里面什么都没有。</p>
+
+                    <p>在这种状态下跑同步，rsync 收到的输入就是「源端什么都没有」。这<strong>在语法上和「源端全被删了」是同一个输入</strong>。既然开着删除同步，rsync 就会准确地完成本职：让目标端和源端一致。也就是<strong>把目标清空</strong>。</p>
+
+                    <p>这里需要把危险的位置说准。危险的不是「源端为空时同步停下来」——停下来不会造成任何损害。危险的是<strong>「源端为空时同步会成功」</strong>。rsync 不报错，退出码是0，统计里删除数正常刻上，判定被记为成功。<strong>并且标记也被更新了。</strong> 下一轮会认为两棵树一致而跳过。事故发生过的信号哪里都没留下。</p>
+
+                    <p>所以判断必须挪到 rsync 前面。在构造这次执行之前，先看<strong>挂载基准目录是不是空的</strong>。而且这个判断要对源端和目标端<strong>区别对待</strong>，因为风险本身是不对称的。</p>
+
+                    <ul>
+                        <li><strong>源端基准目录为空就拒绝执行。</strong> 它没有理由正常为空，而误判着往下走，代价是整个目标端。</li>
+                        <li><strong>目标端基准目录为空只发警告。</strong> 首次播种时目标为空是正常的。在这里拦住，第一轮就永远跑不起来。</li>
+                        <li><strong>看基准目录而不是单个同步目录。</strong> 首轮的目标端子目录本来就是空的，只看那个会误判。挂载丢失会在基准目录上显形。</li>
+                        <li><strong>检查成本实际上是0。</strong> 就是看一个目录是否为空，每轮一次。这个价钱能买到的安全，买下来是对的。</li>
+                    </ul>
+
+                    <p>这个失败模式给出的教训不止于一个选项。<strong>不区分「输入是空的」和「输入没读到」的代码，会把失败当成正常来处理。</strong> 开着删除同步的同步作业，只是这种混淆代价最高的场合之一。同一类陷阱在 rsync 参数形态上的版本，另写在<a href="rsync_trailing_slash_guide.html">rsync 末尾一个斜杠就让结果分岔的原因</a>里。</p>
+
+                    <h2 id="sec-13">比较与记录之间的窗口 - 暂缓写标记</h2>
+
+                    <p>上篇把这套设计的安全装置写成「失败就不记录」。还有一个窗口它堵不住：<strong>成功了却不该记录的情况</strong>。</p>
+
+                    <p>顺着次序走一遍就看得见。一轮先比较值，再对收窄后的范围做 rsync，最后把当时源端的值记到目标端。但<strong>rsync 在跑的时候源端是活的</strong>。这期间若有一个文件变了，那个变更并不在这份副本里，源端的递归变更时间却已经上去了。记录阶段读到的是<strong>变更之后的值</strong>。</p>
+
+                    <p>把那个值原样刻下去，标记就在说谎。标记的含义是「以这个时刻为准，目标端与源端一致」，而实际上只到那个时刻之前才一致。下一轮拿源端当前值和这个标记比较，<strong>判为相同并跳过</strong>。那个变更会<strong>一直缺失到下一次全量同步</strong>。没有症状，没有错误，没有告警，也没有失败判定。</p>
+
+                    <p>防法是<strong>给记录再加一道条件</strong>。如果读到的值晚于这一轮 rsync 的起始时刻，就意味着它包含了「这份副本没装进去的变更」，于是<strong>不写标记</strong>。代价是下一轮多扫一次，换来的是不会产生缺失的保证。上篇的原则在这里原样适用：<strong>如果可能出错，就让它往白做工的方向出错。</strong></p>
+
+                    <p>不过这个暂缓必须附带三个条件，漏掉任何一个，修补本身就会造出新问题。</p>
+
+                    <ul>
+                        <li><strong>暂缓只作用于该目录自身的标记，子目录照常记录。</strong> 递归变更时间是<strong>整个子树的最大值</strong>，在活的树上只要任何地方变了一个文件，根的值就会越过 rsync 起始时刻。若在根上暂缓并返回，<strong>目标端会一个标记都留不下</strong>，下一轮就全量下探，于是每一轮都固定成全量重扫。</li>
+                        <li><strong>记录子目录是有依据的。</strong> 这个阶段只在该范围内所有 rsync 都成功时才执行。而如果某个子目录的值不晚于 rsync 起始时刻，由于值是递归最大值，就意味着那棵子树在 rsync 开始之后没有变更。两条合起来，那个子目录的目标端是最新的。</li>
+                        <li><strong>要把「有两个时钟」算进去。</strong> 值来自元数据服务器的时钟，rsync 起始时刻来自执行主机的时钟。两个时钟漂移导致值看起来在未来时，暂缓就永远解不开。所以比当前时刻超前到一定幅度以上的值<strong>视为时钟偏斜，不予暂缓</strong>。这个幅度做成配置项。</li>
+                    </ul>
+
+                    <p>这个装置还会留下<strong>一条属于正常行为的性质</strong>。变更频繁的目录每一轮根的值都在涨，所以<strong>根标记每轮都被暂缓</strong>。于是那个对象会持续被报成 INCR 而不是 SKIP。子目录的标记照常刻上，所以扫描仍会停在变更处，比起全量下探成本要小得多。即便如此，<strong>不要在繁忙的对象上期待 SKIP</strong>。一期待，就会把正常行为误诊成异常。</p>
+
+                    <h2 id="sec-14">其余三种 - 断链、名字长度、锁描述符</h2>
+
+                    <p>剩下三种不会直接让数据错开，而是<strong>让已经布好的装置失效，或者把找原因的材料弄没</strong>。三者都有一个共同点：以「文档写着已修复、实际却抓不到」的形态出现。</p>
+
+                    <h3>断开的符号链接通过了检查</h3>
+
+                    <p>当源端上原本是目录的名字变成文件，或者反过来，目标端还留着旧类型的东西，于是发生冲突。所以在对齐之前有一步要确认<strong>目标端是否有残留</strong>并把它挪开。问题在于那个确认写成了<strong>询问对象是否存在</strong>的形式。</p>
+
+                    <p>那种形式的检查<strong>会跟随符号链接</strong>。链接还在但目标已经没了的时候，链接本身好端端地存在，检查却答「不存在」。于是挪开这一步被跳过，接下来创建目录的尝试<strong>因为已经存在而失败</strong>。想防的情形<strong>在大家以为已经防住的状态下</strong>原样留了下来。修法只有一个：并用一个不跟随链接的检查。</p>
+
+                    <h3>证据文件的名字超出上限</h3>
+
+                    <p>挪开的残留不删除，而是<strong>移进保管区</strong>，因为什么被挪开、为什么被挪开，是日后找原因的材料。可是如果那个文件名是把原路径整条拼起来做的，在深度较大时<strong>会超过255字节的文件名上限</strong>。</p>
+
+                    <p>一超，移动就失败。这本身就不好，但真正的问题在后面：失败时的回退是<strong>直接删掉</strong>。也就是说，为了查原因而想保留的文件，恰恰因为路径长到没法保留而<strong>被删掉了</strong>。而且还带偏差——路径越深越容易消失。修好的形态是不把路径放进名字：只用最后一个名字片段，太长就保留末尾，再加上时刻和进程标识防冲突，<strong>完整路径只写进日志</strong>。</p>
+
+                    <p>保管区那边还有一个同类的洞。清除旧条目的整理只以<strong>普通文件</strong>为对象，于是整个目录被挪进来的条目，以及被挪进来的链接，<strong>永远留着</strong>，保管区无限膨胀。把整理对象改成保管区正下方的全部条目，并加上路径变量为空时立即中止的保护。在跑递归删除的代码里路径变量为空会删掉什么，大概不必解释。</p>
+
+                    <h3>工作进程攥着锁描述符</h3>
+
+                    <p>为防止重复执行，启动时会取一个锁文件。上一轮还在跑，这一轮就立刻退让。这是正常行为，日志里也这么写。</p>
+
+                    <p>问题在于持有那把锁的<strong>文件描述符会被子进程继承</strong>。这套设计并行处理多个对象，所以会起多个工作进程，而工作进程调用的下层命令也会继承那个描述符。于是<strong>父进程死了锁也解不开</strong>。只要活下来的子进程里还有一个攥着那个描述符，锁就一直被持有。</p>
+
+                    <p>结果很安静。下一轮以「上一个会话仍在运行」为由退让，再下一轮也退让。<strong>那条日志和正常行为时一个字都不差。</strong> 所以这个状态看起来不像错误，而像「今天锁等待怎么这么频繁」。与此同时 RPO 在悄悄拉长。防法是工作进程一启动就关掉继承来的描述符，锁只由父进程持有就够了。</p>
+
+                    <p>把这三种并排看，性质归到了一点上。<strong>三者都是「有安全装置」这个事实并不保证「安全装置在起作用」的例子。</strong> 所以这一类靠读代码不太抓得到。造一个断链、造一条长路径、把父进程杀掉——只有<strong>把真正要发布的代码放进那个情形里跑一遍</strong>，它才会现形。</p>
+
+                    <h2 id="sec-15">不该使用的场合</h2>
+
+                    <p>上篇写了三条。运行记录积累下来之后多了一条，另有一条需要更多说明。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>条件</th><th>为什么没有收益，或者是亏的</th><th>依据</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><strong>首次播种</strong></td><td>所有数据都要传过去，本来就没有可跳过的区段</td><td>初次全量同步中两种方式的差异约为6%</td></tr>
+                            <tr><td><strong>持续大批量创建目录的负载</strong></td><td>每个新目录都要留标记，这笔成本超过扫描省下的量</td><td>一次性创建5万个新目录的那一轮，全量遍历快了1.7倍</td></tr>
+                            <tr><td><strong>变更均匀散布在所有目录上的负载</strong></td><td>没有枝可剪，下探会收敛到整棵树</td><td>在成本函数里，变更目录数接近总数时两种方式就相同了</td></tr>
+                            <tr><td><strong>频繁创建和删除快照的环境</strong></td><td>数据没变值也会上升，无用扫描反复发生</td><td>一次快照删除烧掉1.97小时，传输为零</td></tr>
+                            <tr><td><strong>非常浅或非常深的树</strong></td><td>深度旋钮根本没有作用的区间，或者最优点落在测量区间之外</td><td>深度敏感性随树的形状而变</td></tr>
+                            <tr><td><strong>CephFS 之外的文件系统</strong></td><td>作为判断依据的那个值本身不存在</td><td>递归变更时间是 CephFS 维护的值</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>第四条是本文新增的。快照删除会扰动值这一性质上篇也写过，但当时停在「已知相互作用」这个层面。有了实测，判断就变了。<strong>在频繁删除快照的环境里，这套方案的收益会被相应地削掉一块。</strong> 清理能挪到空闲时段就还值得用，挪不了就得重新考虑。</p>
+
+                    <p>第五条也是本文新增的。非常浅的树没有几层可下探，深度怎么调，rsync 的范围几乎都不变——旋钮在那里却没地方转。反过来在很深的树上，上表那个5到10的区间不会原样搬过去。这一条的实质是：<strong>别抄推荐值，在自己的树上把三项量出来。</strong></p>
+
+                    <p>第三条直接来自结构，不需要实测。这套设计的收益只来自一件事：<strong>便宜地剪掉不必看的枝</strong>。变更若均匀铺在所有目录上，就没有枝可剪，剩下的是一次多加了读值成本的全量遍历。适合这套方案的负载，条件不是「变更少」，而是<strong>「变更集中」</strong>。</p>
+
+                    <h2 id="sec-16">小结 - 五句话</h2>
+
+                    <ul>
+                        <li><strong>深度是一个在两种成本之间做交换的旋钮，两端都不好。</strong> 3为6秒，5、8、10为4秒，15为6秒，20为8秒。深度20的8秒里 rsync 只有2秒，其余都花在读写值上。</li>
+                        <li><strong>变的不是速度而是周期。</strong> 日均16.7小时变成15秒，会话长度从数据总量里脱了钩，于是每天2次变成12次，RPO 从12小时降到1小时。</li>
+                        <li><strong>SKIP 占一半不等于有一半在空转。</strong> 95个会话里有47个连 rsync 都没调用，而同样的一轮原方案要花8.4小时。在这里，什么都不做就是成果。</li>
+                        <li><strong>把最差的一轮留在表里，表才有用。</strong> 快照删除造出的一次 false INCR 烧掉1.97小时、传输为零。把这一件算进去，四天总计仍是1.98小时对66.93小时，相差33.8倍。</li>
+                        <li><strong>让数据错开的不是深度而是失败模式。</strong> 源端为空时不停下来，以及把没搬过去的变更标成已同步——这两者都没有症状，而没有症状正是危险所在。</li>
+                    </ul>
+
+                    <p>把两篇连成一句话就是：<strong>缩小比较范围会改变成本函数，成本函数一变，周期就成了可以设计的东西。</strong> 而这个设计在运行中扛不扛得住，不由倍数决定，而由<strong>最差的一轮和最安静的失败</strong>决定。上篇在<a href="cephfs_rctime_incremental_sync.html">用 CephFS rctime 跳过全量扫描的增量同步设计</a>。复制与备份不是同一个命题，这件事另写在<a href="backup_restore_verification.html">「有备份」和「能恢复」是两个不同的命题</a>里。</p>
+
+                    <h2 id="sec-17">没能确认的部分</h2>
+
+                    <p>下列项目在这个条件下没有得出答案。在依据齐备之前不下断言。</p>
+
+                    <ul>
+                        <li><strong>其他树形下的最优深度</strong> — 深度敏感性只在约1 TB、约90,000个目录这一棵树上测过。在扁平的树或深得多的树上谷底会挪到哪里，这张表回答不了。</li>
+                        <li><strong>深度敏感性对变更分布的依赖</strong> — 所有测量都是「一个文件变更」的条件。变更散在多个枝上时三项的平衡会怎么移动，没有测过。</li>
+                        <li><strong>前后对比的时间段不同</strong> — 切换前的四天和切换后的四天不是同一段时间。就同一对象、同一负载而言比较是成立的，但这两段时间里负载是否有过变化，从这份记录里分不出来。</li>
+                        <li><strong>异常值的复现</strong> — 快照删除会造出 false INCR 已经确认，但观测到的只有那一件。耗时随删除规模或对象大小如何变化，没有反复测量。</li>
+                        <li><strong>挪动快照清理时段的效果</strong> — 这是作为对策写下的，调整之后 SKIP 比例的变化没有另行测量。</li>
+                        <li><strong>五种失败模式的发生频率</strong> — 逐一踩到并防住，和它们多久发生一次，是两回事。频率从这份记录里读不出来。</li>
+                        <li><strong>暂缓标记带来的重扫累计成本</strong> — 变更频繁的对象每轮被报成 INCR 已经确认，但这种状态长期持续时的累计成本没有另行测量。</li>
+                        <li><strong>其他 Ceph 版本上的传播特性</strong> — 与上篇相同。只在一个版本线上测过，值向上传播的时点与延迟在其他版本上是否相同，不在范围内。</li>
+                    </ul>
+
+                    <h2 id="sec-18">参考资料</h2>
+
+                    <ul>
+                        <li><a href="cephfs_rctime_incremental_sync.html">没有变更也要全量扫描 - 用 CephFS rctime 跳过全量扫描的增量同步设计</a> — 本文的上篇。讲问题定义、递归变更时间的语义、判定结构、失败时不记录这一安全装置，以及十轮合成基准测试。</li>
+                        <li><a href="https://docs.ceph.com/en/reef/man/8/mount.ceph/" target="_blank" rel="noopener">Ceph 官方文档 · mount.ceph 手册</a> — 定义了把目录的 <code>st_size</code> 报告为其内容递归大小的挂载选项及其反选项。这是 CephFS 维护递归聚合值的依据。</li>
+                        <li><a href="https://docs.ceph.com/en/reef/cephfs/posix/" target="_blank" rel="noopener">Ceph 官方文档 · 与 POSIX 的差异</a> — 其中写明递归大小字段由 CephFS 维护。</li>
+                        <li><a href="https://docs.ceph.com/en/latest/releases/luminous/" target="_blank" rel="noopener">Ceph 官方文档 · Luminous 发行说明</a> — <code>ceph.dir.rctime</code> 出现在发行说明中的位置，其中载有修复该属性值纳秒部分表示缺陷的条目。</li>
+                        <li>本文的深度敏感性测量、前后对比、异常值记录与五种失败模式，均为笔者自行构建并投入运行的成果，除上述三项外没有外部来源。</li>
+                    </ul>
+
+                </div>
+
+                <div class="share-section">
+                    <h3>分享本文</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">返回列表</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/code_image.html">代码图片生成器</a></li>
+      <li><a href="../static/char_counter.html">字数统计</a></li>
+      <li><a href="../static/json_formatter.html">JSON 格式化工具</a></li>
+      <li><a href="../static/regex_tester.html">正则表达式测试器</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="cephfs_rctime_incremental_sync.html">没有变更也要全量扫描 - 用 CephFS rctime 跳过全量扫描的增量同步设计</a></li>
+      <li><a href="backup_restore_verification.html">「有备份」与「能恢复」是两个不同的命题 - 成功的备份在哪里说谎，以及恢复验证真正要求什么</a></li>
+      <li><a href="postgres_horizontal_scaling_cost.html">把Postgres拆分至多台机器的选择 - 水平扩展向事务、连接与约束收取的代价</a></li>
+      <li><a href="oss_ownership_beyond_license.html">代码是开放的，名字不是 - 开源许可证不决定的商标、域名与发布权限</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制！请粘贴到Threads应用中分享。');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制！'); });
+    });
+    </script>
+</body>
+</html>
