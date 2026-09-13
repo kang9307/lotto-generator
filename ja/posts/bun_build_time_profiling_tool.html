@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<!--
+ * 技術ブログ記事テンプレート
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ja">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bunのビルドが24分かかる本当の理由 - buildprofが暴いたリンカーのボトルネック</title>
+    <meta name="description" content="Bunの開発チームがZigベースのビルドからRustへ移行して5倍速くなったという主張を、開発者自らbuildprofで検証した事例を整理する。Full LTOリンカーのボトルネックとThinLTO最適化実験の結果を扱う。">
+    <meta name="keywords" content="Bun, buildprof, Zig, Rust, LTO, ThinLTO, ビルド時間, リンカーのボトルネック, ビルドプロファイリング, コンパイル最適化">
+
+    <link rel="canonical" href="https://braindetox.kr/ja/posts/bun_build_time_profiling_tool.html">
+
+    <meta property="og:title" content="Bunのビルドが24分かかる本当の理由 - buildprofが暴いたリンカーのボトルネック">
+    <meta property="og:description" content="ZigベースのビルドがRustより4倍以上遅かった理由を、自作ツールbuildprofで追跡した実測事例。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/ja/posts/bun_build_time_profiling_tool.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ja_JP">
+    <meta property="article:published_time" content="2026-09-14">
+    <meta property="article:section" content="開発・インフラ">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Bunのビルドが24分かかる本当の理由 - buildprofが暴いたリンカーのボトルネック">
+    <meta name="twitter:description" content="Full LTOリンク段階がビルド時間の3分の2を占めていた理由を実測値で読み解く。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "Bunのビルドが24分かかる本当の理由 - buildprofが暴いたリンカーのボトルネック",
+      "alternativeHeadline": "自作プロファイラbuildprofで、BunのZigベースビルドがRustより4倍以上遅かった原因を実測追跡した事例分析",
+      "datePublished": "2026-09-14",
+      "dateModified": "2026-09-14",
+      "inLanguage": "ja-JP",
+      "articleSection": "開発・インフラ",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "Bun, buildprof, Zig, Rust, LTO, ThinLTO, ビルド時間, リンカーのボトルネック, ビルドプロファイリング, コンパイル最適化",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/ja/posts/bun_build_time_profiling_tool.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "buildprofとは何をするツールですか？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "buildprofは、Linux上でビルドコマンドが生成するプロセスツリー全体を追跡し、どのサブプロセスがいつ開始・終了したかをタイムラインとして示すオープンソースツールだ。使い方は簡単で、既存のビルドコマンドの前にbuildprof --を付けるだけでよい。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Bunのビルド時間がなぜ話題になったのですか？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Bunの開発者が、新しいRustベースのビルドが従来のZigベースのビルドよりLinux上で5倍以上速いと発表したことがきっかけだ。著者はこの主張を鵜呑みにせず、buildprofを使って両方のビルドを直接実測して検証した。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Zigベースのビルドが遅かった核心的な原因は何ですか？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Full LTO方式の最終リンク段階が16分35秒かかり、ビルド全体時間の約3分の2を占めていた。この段階はほとんど並列化できない単一の処理として実行されていた。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "ThinLTOに切り替えるとどれくらい速くなりますか？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Bunバイナリだけを ThinLTOに切り替えると20分20秒に、WebKitとICUまでThinLTOで再ビルドすると15分11秒まで短縮された。これは元のFull LTOビルドと比べて約38%の短縮にあたる。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Zigビルドが並列化できない構造的な理由は何ですか？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Rustビルドは90個以上のcrateに分割されているためコンパイル作業を並列に分散できるが、Zigビルドはすべてのコードが単一モジュールとしてコンパイルされる構造のため、並列化の余地がほとんどない。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/bun_build_time_profiling_tool.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/bun_build_time_profiling_tool.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/bun_build_time_profiling_tool.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/bun_build_time_profiling_tool.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/bun_build_time_profiling_tool.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "ホーム",
+      "item": "https://braindetox.kr/ja/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "開発・インフラ",
+      "item": "https://braindetox.kr/ja/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "Bunのビルドが24分かかる本当の理由 - buildprofが暴いたリンカーのボトルネック",
+      "item": "https://braindetox.kr/ja/posts/bun_build_time_profiling_tool.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="Bunのビルドが24分かかる本当の理由 - buildprofが暴いたリンカーのボトルネック">
+                <meta itemprop="datePublished" content="2026-09-14">
+                <meta itemprop="dateModified" content="2026-09-14">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="Bun, buildprof, Zig, Rust, LTO, ThinLTO, ビルド時間, リンカーのボトルネック, ビルドプロファイリング, コンパイル最適化">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/ja/posts/bun_build_time_profiling_tool.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">Bunのビルドが24分かかる本当の理由 - buildprofが暴いたリンカーのボトルネック</h1>
+                    <h2 class="post-subtitle">自作プロファイラが、BunのZigベースビルドがRustより4倍以上遅かった理由を追跡した実測事例</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-14">2026-09-14</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">開発・インフラ</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>「新しいビルドは以前より5倍速い」という開発チームの発表は、たいてい祝うべきニュースだ。しかし一部のエンジニアにとっては、逆に「では以前のビルドはなぜそれほど遅かったのか」という疑問を残す。JavaScriptランタイムBunのビルドシステムがZigからRustへ移行し、Linux基準で5倍以上速くなったという知らせが広まると、開発者Lalit Magantiはその差の正体を推測ではなく実測で確かめることにした。その過程で自作したツールが<strong>buildprof</strong>である。</p>
+
+                    <p>本稿は、Magantiが自身のブログで公開した実測結果をもとに、Bunの旧Zigベースビルドがなぜそれほど時間がかかったのか、そしてそのボトルネックをどこまで削減できたのかを整理する。</p>
+
+                    <div class="callout">
+                        本稿はLalit Magantiが自身のブログ（lalitm.com）に掲載したbuildprof関連記事の実測値と説明に基づいている。原文にない具体的な数値や結論は創作せず、原文が実際に示した測定値のみを扱う。
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>目次</h3>
+                        <ol>
+                            <li>buildprofとは何か</li>
+                            <li>発端 - 「RustはZigより5倍速い」という発表</li>
+                            <li>実測 - Zig 24分24秒 vs Rust 5分40秒</li>
+                            <li>ボトルネックの解剖 - Full LTOリンク段階が3分の2を占める</li>
+                            <li>最適化実験 - ThinLTOに切り替えると何が起きるか</li>
+                            <li>構造的原因 - 90個以上のRust crate対単一のZigモジュール</li>
+                            <li>buildprofはどう動作するのか</li>
+                            <li>実務への教訓 - ビルドが遅いとき勘で直さない</li>
+                            <li>確認できなかった事項</li>
+                            <li>参考文献</li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">1. buildprofとは何か</h2>
+                    <p>buildprofは、Linux上でビルドコマンドを実行している間に生成される<strong>プロセスツリー全体を追跡</strong>し、どのサブプロセスがいつ開始し、いつ終了したかをタイムラインとして再構成して示すオープンソースツールだ。使い方は単純で、これまで実行していたビルドコマンドの前に<code>buildprof --</code>を付けるだけでよい。</p>
+                    <p>この種のツールが必要な理由は明確だ。<code>make -j16</code>や<code>ninja</code>のようなビルドシステムは、内部で数百ものコンパイラ・リンカープロセスを同時に実行するが、その中で実際に全体のビルド時間を左右しているのがどれなのかは、ログを目で追うだけではわかりにくい。「ビルドが遅い」という体感と、「正確にどの段階の、どのプロセスがボトルネックなのか」という問いの間には大きな隔たりがあり、buildprofはその隔たりを実測データで埋める。</p>
+                    <ul>
+                        <li>使用例: <code>buildprof -- make -j16</code>、<code>buildprof -- cargo build</code>、<code>buildprof -- ninja -C out/target</code>のように、既存のビルドコマンドをそのまま包んで実行する。</li>
+                        <li>ptrace（デバッガが使うのと同じLinuxインターフェース）を利用してプロセスの生成・終了を追跡する。</li>
+                        <li>Clang、LLD、nightly版Rustコンパイラが残すトレース情報まで併せて解釈できる。</li>
+                        <li>既存のビルドコマンドを変更する必要がないため、大規模なビルドスクリプトにも負担なく適用できる。</li>
+                    </ul>
+
+                    <h2 id="sec-2">2. 発端 - 「RustはZigより5倍速い」という発表</h2>
+                    <p>話はBun開発会社の代表Jarred Sumnerが投稿したツイートから始まった。Rustで新たに書き直されたBunのビルドシステムが、Linux上で従来のZigベースビルドより<strong>5倍以上速い</strong>という内容だった。Magantiはこの主張を直感に反すると感じた。一般にZigはコンパイル速度が速い言語として知られており、実際Zigビルドは重量級のFull LTOを使っていたのに対し、Rustビルドは比較的軽量なThinLTOを使っていたからだ。「本当にそれほどの差があるのか、あるとすれば正確にどこで生まれているのか」を確かめるため、彼は自ら両方のビルドをプロファイリングすることにした。</p>
+                    <p>この種の「直感に反するベンチマーク主張」は、オープンソースの世界では珍しくない。問題は、それを受け入れる側も反論する側も、たいていは根拠なく感覚で語ってしまうことだ。Magantiのアプローチが際立っているのは、論争に加わる代わりに<strong>両方を同じ条件で実際に動かし、プロセス単位で時間を測る</strong>方を選んだ点にある。</p>
+                    <ul>
+                        <li>発端: Bun代表による「RustビルドはLinux上でZigビルドより5倍以上速い」という公開発言。</li>
+                        <li>疑問点: Zigは本来速いコンパイルで知られる言語なのに、なぜそれほど遅かったのか。</li>
+                        <li>アプローチ: 感覚で判断せず、buildprofというツールを自作して実測した。</li>
+                    </ul>
+
+                    <h2 id="sec-3">3. 実測 - Zig 24分24秒 vs Rust 5分40秒</h2>
+                    <p>Magantiが自身の単一マシンで両方のビルドを再現した結果は次の通りだった。旧Zigベースビルド（Bun 1.3.14）は<strong>24分24秒</strong>かかり、新Rustベースビルド（Bun 1.4.0）は<strong>5分40秒</strong>で完了した。参考までに、実際のCI環境で計測された中央値はそれぞれ約30分6秒（Zig）、約5分37秒（Rust）で、ローカルでの再現値と大きく一致していた。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>区分</th><th>単一マシン再現時間</th><th>CI環境中央値</th><th>主なリンク方式</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Zigベースビルド（Bun 1.3.14、旧版）</td><td>24分24秒</td><td>約30分6秒</td><td>Full LTO</td></tr>
+                            <tr><td>Rustベースビルド（Bun 1.4.0、現行版）</td><td>5分40秒</td><td>約5分37秒</td><td>ThinLTO</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>つまりBunはもともとZigでビルドされていたが、Rustベースのビルドシステムに移行したことで速くなったのだ。本稿が実際に掘り下げるのは、「なぜZigはこれほど遅かったのか」という問いである。</p>
+
+                    <h2 id="sec-4">4. ボトルネックの解剖 - Full LTOリンク段階が3分の2を占める</h2>
+                    <p>buildprofでZigビルドのタイムラインを分解した結果、原因はコンパイルそのものではなく<strong>最後のリンク段階</strong>にあった。<code>ld.lld</code>リンカーの呼び出し一つが<strong>16分35秒</strong>単独で実行されており、これは全体のビルド時間（24分24秒）の約3分の2にあたる。その中でも、LTO最適化を行う<code>OptModule</code>段階だけで<strong>10分以上</strong>を占めていた。</p>
+                    <ul>
+                        <li>コンパイル段階自体はそれほど遅くなかった - 問題は最後のリンク段階に集中していた。</li>
+                        <li>ld.lldリンカーの呼び出し: 16分35秒（全体の約3分の2）。</li>
+                        <li>そのうちOptModule（LTO最適化）段階だけで10分以上を消費していた。</li>
+                        <li>この段階は並列に分割しにくい単一の処理として実行されていた。</li>
+                    </ul>
+
+                    <h2 id="sec-5">5. 最適化実験 - ThinLTOに切り替えると何が起きるか</h2>
+                    <p>ボトルネックを特定したMagantiは、実際にZigビルドのリンク方式をFull LTOから<strong>ThinLTO</strong>に切り替える実験を2回行った。1回目の実験はBunバイナリ自体だけをThinLTOに切り替えたもので、2回目の実験はさらにWebKitとICUまでThinLTOで再ビルドしたものだった。</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>構成</th><th>全体ビルド時間</th><th>リンカー時間</th><th>従来比</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>基準線（Full LTO、元のZigビルド）</td><td>24分24秒</td><td>16分35秒</td><td>-</td></tr>
+                            <tr><td>実験1: Bunバイナリのみ ThinLTO</td><td>20分20秒</td><td>12分55秒</td><td>約4分短縮</td></tr>
+                            <tr><td>実験2: Bun + WebKit + ICU 全体 ThinLTO</td><td>15分11秒</td><td>7分22秒</td><td>約38%短縮（9分13秒）</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>WebKitとICUまで一緒にThinLTOに切り替えた2回目の実験では、全体のビルド時間が15分11秒まで短縮された。これは元のFull LTOビルド（24分24秒）と比べて約38%の短縮であり、最適化されたRustビルド（5分40秒）にはまだ及ばないものの、ボトルネックの正体を明確に示している。</p>
+
+                    <h2 id="sec-6">6. 構造的原因 - 90個以上のRust crate対単一のZigモジュール</h2>
+                    <p>ThinLTO実験でもRustの水準に追いつけなかった理由は、両言語の根本的な構造の違いにある。Rustビルドは<strong>90個以上のcrate</strong>に細かく分割されているため、コンパイル作業を複数のコアに並列で分散できる。一方Zigビルドは、コード全体が<strong>単一モジュール</strong>としてコンパイルされる構造であり、そもそも並列化の余地がほとんどない。</p>
+                    <p>この違いは、リンク方式（Full LTOかThinLTOか）とは別の問題だ。リンカーをThinLTOに切り替えるのは「すでに作られた複数の断片をどれだけ緩やかに最適化しながらつなぎ合わせるか」という問題だが、crateの数はそもそも「いくつの独立した断片に分けて同時にコンパイルできるか」を決定する。Zigビルドのように単一モジュールにまとまっていると、リンカー設定をいくら調整しても、コンパイル段階自体を複数のコアに分散できる余地は根本的に狭い。</p>
+                    <ul>
+                        <li>Rust: 90個以上のcrateに分散 → コンパイル作業を並列処理しやすい構造。</li>
+                        <li>Zig: コード全体が単一モジュール → 並列化が構造的に制限される。</li>
+                        <li>この差は、リンカーをThinLTOに切り替えるだけでは完全には解消されない。</li>
+                        <li>つまり実験2（5章の表を参照）の38%短縮は、リンカー段階の改善であって、crate分割そのものを代替するものではない。</li>
+                    </ul>
+
+                    <h2 id="sec-7">7. buildprofはどう動作するのか</h2>
+                    <p>buildprofはLinux専用のツールで、ptraceを利用してビルドコマンドが生み出すすべてのサブプロセスの開始・終了時刻を記録する。この方式の利点は、ビルドシステムやコンパイラを特別に改変しなくても、プロセス単位の「誰がいつ実行されたか」という事実だけからボトルネックを見つけられることにある。ただし、プロセスを追跡すること自体がビルド速度に負担を与えないかという懸念は当然ついて回る。</p>
+                    <p>Magantiはこのツール自身のオーバーヘッドが実際の測定を歪めないかも確認した。Redisビルドを追跡した際は、元は26.78秒だったビルドが約5秒延びる程度のオーバーヘッドがあり、ripgrepビルドでは12.27秒と12.43秒でほぼ差がなかった。つまりオーバーヘッドは、ファイルシステムイベントまで併せて追跡するとプロジェクト規模によって多少増える可能性はあるものの、本稿で扱ったBunビルド規模のボトルネック（数分から数十分単位）を診断する用途では無視できる水準だというのがMagantiの結論だ。</p>
+                    <ul>
+                        <li>追跡方式: ptraceベースのプロセスツリー追跡（macOS・Windowsは本稿執筆時点では未対応で、今後の計画としてのみ言及されている）。</li>
+                        <li>オーバーヘッド検証1: Redisビルド基準で約26.78秒 → 追跡時は約5秒増加。</li>
+                        <li>オーバーヘッド検証2: ripgrepビルド基準で12.27秒 → 追跡時は12.43秒でほぼ無視できる水準。</li>
+                        <li>WebKitのコールドダウンロード・展開自体にも約20秒かかることも併せて計測された。</li>
+                    </ul>
+
+                    <h2 id="sec-8">8. 実務への教訓 - ビルドが遅いとき勘で直さない</h2>
+                    <p>この事例が開発チームに与える教訓は、ツールそのものよりも<strong>アプローチ</strong>にある。「ビルドが遅い」という漠然とした不満を、実際のボトルネック地点まで段階ごとに切り分けて実測して初めて、どこを直すべきかが明確になった。</p>
+                    <p>もしMagantiが実測せずに「Zigはもともと遅いのだろう」で済ませていたら、リンク段階が3分の2を占めているという事実も、ThinLTOへの切り替えだけで38%削減できるという事実も明らかにならなかっただろう。ビルド1回に20分かかるチームと5分で済むチームとでは、1日にこなせる反復（イテレーション）の回数自体が異なる。この事例は、その差を「感覚」ではなく「タイムライン上の特定の一つのプロセス」にまで絞り込んで示した点で、単なるベンチマーク記事以上の実務的価値を持つ。</p>
+                    <ul>
+                        <li><strong>遅いという印象だけで最適化を始めない。</strong>コンパイル段階なのかリンク段階なのかをまず実測で切り分ける（4章参照）。</li>
+                        <li><strong>Full LTOは最終的な実行性能に有利だが、ビルド時間のコストが大きいことを認識する。</strong>ThinLTOに切り替えればビルド時間を大幅に削減できる（5章参照）。</li>
+                        <li><strong>単一モジュール構造は並列ビルドの限界に直結する。</strong>大規模なコードベースを設計する際、コンパイル単位をどう分割するかもビルド時間に大きく影響する（6章参照）。</li>
+                        <li><strong>適したプロファイリングツールがなければ、自作するのも一つの方法だ。</strong>buildprofのような目的特化の小さなツールを作れば、漠然とした推測ではなく根拠のある結論を得られる。</li>
+                    </ul>
+
+                    <h2 id="unconfirmed">確認できなかった事項</h2>
+                    <ul>
+                        <li><strong>Bunプロジェクトが実際にどのThinLTO構成を最終的に採用したか</strong>: 原文はThinLTO実験の結果を提示しているが、Bunチームがこの実験結果を実際のプロダクションビルドに反映したかどうかは原文からは確認できなかった。</li>
+                        <li><strong>macOS・Windows対応の時期</strong>: 原文はこの2つのプラットフォームへの対応を「今後の計画」としてのみ言及しており、具体的な対応時期は明示していない。</li>
+                    </ul>
+
+                    <h2 id="references">参考文献</h2>
+                    <ul>
+                        <li><a href="https://lalitm.com/post/buildprof/" target="_blank" rel="noopener noreferrer">buildprof: tracing where your build time goes</a> — Lalit Magantiのブログ。本稿が扱った実測値とツール説明の一次情報源。</li>
+                        <li><a href="https://news.hada.io/topic?id=33611" target="_blank" rel="noopener noreferrer">Bunのビルドが24分かかる理由を追跡したbuildprofツール | GeekNews</a> — 韓国の開発者コミュニティGeekNewsでこのトピックが取り上げられたきっかけとなったスレッド。</li>
+                    </ul>
+
+                </div>
+
+                <div class="share-section">
+                    <h3>この記事をシェア</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">スレッズ</button>
+                        <button id="link-copy" class="share-btn link-btn">リンクをコピー</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">一覧に戻る</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">一緒に使うと便利な無料ツール</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/code_image.html">コード画像ジェネレーター</a></li>
+      <li><a href="../static/char_counter.html">文字数カウント</a></li>
+      <li><a href="../static/json_formatter.html">JSON フォーマッター</a></li>
+      <li><a href="../static/regex_tester.html">正規表現テスター</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">すべてのツールを見る &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">関連記事</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="antirez_c_return_ai_era.html">AIがコードを書く時代になぜCを選ぶのか - 生成量が増えるほど読むコストはどこに乗るか</a></li>
+      <li><a href="rust_tier1_microsoft_msvc.html">RustがMicrosoftのTier-1言語に - MSVCバックエンド共有が実際にもたらす変化</a></li>
+      <li><a href="go_language_ai_coding_fit.html">AI生成コードの検証コストを下げる言語特性 - Goが有利になる5つとその代償</a></li>
+      <li><a href="grok_build_opensource_2026.html">Grok Buildオープンソース化 - xAIのRustエージェントランタイムと信頼回復の賭け</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('リンクがコピーされました。Threadsアプリに貼り付けてシェアしてください！');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('リンクがコピーされました！'); });
+    });
+    </script>
+</body>
+</html>

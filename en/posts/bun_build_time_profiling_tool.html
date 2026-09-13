@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<!--
+ * Technical Blog Post Template
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="en">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Why Bun's Build Took 24 Minutes - The Linker Bottleneck buildprof Found</title>
+    <meta name="description" content="How buildprof traced why Bun's Zig-based build ran over four times slower than its Rust replacement, exposing a Full LTO linker bottleneck.">
+    <meta name="keywords" content="Bun, buildprof, Zig, Rust, LTO, ThinLTO, build time, linker bottleneck, build profiling, compile optimization">
+
+    <link rel="canonical" href="https://braindetox.kr/en/posts/bun_build_time_profiling_tool.html">
+
+    <meta property="og:title" content="Why Bun's Build Took 24 Minutes - The Linker Bottleneck buildprof Found">
+    <meta property="og:description" content="Why a Zig-based build was more than four times slower than Rust, traced with a homemade profiler called buildprof.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/en/posts/bun_build_time_profiling_tool.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="en_US">
+    <meta property="article:published_time" content="2026-09-14">
+    <meta property="article:section" content="Dev &amp; Infra">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Why Bun's Build Took 24 Minutes - The Linker Bottleneck buildprof Found">
+    <meta name="twitter:description" content="Why the Full LTO link stage ate two-thirds of the build time, backed by real measurements.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "Why Bun's Build Took 24 Minutes - The Linker Bottleneck buildprof Found",
+      "alternativeHeadline": "A case study using a homemade profiler called buildprof to trace why Bun's Zig-based build was more than four times slower than its Rust replacement",
+      "datePublished": "2026-09-14",
+      "dateModified": "2026-09-14",
+      "inLanguage": "en-US",
+      "articleSection": "Dev & Infra",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "Bun, buildprof, Zig, Rust, LTO, ThinLTO, build time, linker bottleneck, build profiling, compile optimization",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/en/posts/bun_build_time_profiling_tool.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "What does buildprof do?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "buildprof is an open-source Linux tool that traces the entire process tree of a build command and shows, as a timeline, when each subprocess started and finished. You run it by prefixing your normal build command with buildprof --."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Why did Bun's build time become an issue?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Bun's team announced that its new Rust-based build was more than 5 times faster on Linux than the old Zig-based build. The author decided to verify that gap directly with buildprof instead of taking the claim at face value."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "What was the core reason the Zig-based build was slow?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "The final Full LTO link stage took 16 minutes 35 seconds, about two-thirds of the entire build. This stage ran as a single, largely unparallelizable operation."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How much faster does switching to ThinLTO make it?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Switching just the Bun binary to ThinLTO brought the build down to 20 minutes 20 seconds; rebuilding WebKit and ICU with ThinLTO as well brought it to 15 minutes 11 seconds, about a 38% reduction from the original Full LTO build."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "What is the structural reason the Zig build cannot be parallelized?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "The Rust build is split across more than 90 crates, so compilation work can be distributed in parallel. The Zig build compiles everything through a single module, leaving almost no room for that kind of parallelization."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/bun_build_time_profiling_tool.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/bun_build_time_profiling_tool.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/bun_build_time_profiling_tool.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/bun_build_time_profiling_tool.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/bun_build_time_profiling_tool.html">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "Home",
+      "item": "https://braindetox.kr/en/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "Dev & Infra",
+      "item": "https://braindetox.kr/en/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "Why Bun's Build Took 24 Minutes - The Linker Bottleneck buildprof Found",
+      "item": "https://braindetox.kr/en/posts/bun_build_time_profiling_tool.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="Why Bun's Build Took 24 Minutes - The Linker Bottleneck buildprof Found">
+                <meta itemprop="datePublished" content="2026-09-14">
+                <meta itemprop="dateModified" content="2026-09-14">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="Bun, buildprof, Zig, Rust, LTO, ThinLTO, build time, linker bottleneck, build profiling, compile optimization">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/en/posts/bun_build_time_profiling_tool.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">Why Bun's Build Took 24 Minutes - The Linker Bottleneck buildprof Found</h1>
+                    <h2 class="post-subtitle">A homemade profiler traces why Bun's Zig-based build was over four times slower than Rust</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-14">2026-09-14</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">Dev &amp; Infra</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>When a team announces "our new build is 5 times faster than the old one," that's usually cause for celebration. But for some engineers, it raises the opposite question: why on earth was the old build so slow in the first place? When word got out that the JavaScript runtime Bun's build system had moved from Zig to Rust and become more than five times faster on Linux, developer Lalit Maganti decided not to guess at the answer but to measure it directly. The tool he built along the way is called <strong>buildprof</strong>.</p>
+
+                    <p>This article walks through the measurements Maganti published on his own blog: why Bun's old Zig-based build took as long as it did, and how much of that bottleneck could actually be trimmed away.</p>
+
+                    <div class="callout">
+                        This article is based on the measurements and explanations in a post Lalit Maganti published on his blog (lalitm.com) about buildprof. No specific numbers or conclusions beyond what the original article actually presents are invented here.
+                    </div>
+
+                    <nav class="post-toc">
+                        <h3>What This Article Covers</h3>
+                        <ol>
+                            <li>What Is buildprof</li>
+                            <li>The Trigger - The "Rust Is 5 Times Faster Than Zig" Announcement</li>
+                            <li>The Measurements - Zig at 24m24s vs. Rust at 5m40s</li>
+                            <li>Dissecting the Bottleneck - The Full LTO Link Stage Ate Two-Thirds of the Build</li>
+                            <li>The Optimization Experiments - What Happens When You Switch to ThinLTO</li>
+                            <li>The Structural Cause - Over 90 Rust Crates vs. a Single Zig Module</li>
+                            <li>How buildprof Actually Works</li>
+                            <li>Practical Lessons - Don't Fix a Slow Build by Guesswork</li>
+                            <li>What We Could Not Confirm</li>
+                            <li>References</li>
+                        </ol>
+                    </nav>
+
+                    <h2 id="sec-1">1. What Is buildprof</h2>
+                    <p>buildprof is an open-source tool that traces the <strong>entire process tree</strong> spawned while a build command runs on Linux, reconstructing when each subprocess started and finished as a timeline. Using it is simple: you just prefix your existing build command with <code>buildprof --</code>.</p>
+                    <p>The need for a tool like this is straightforward. Build systems like <code>make -j16</code> or <code>ninja</code> spawn hundreds of compiler and linker processes concurrently under the hood, and it's nearly impossible to tell by eyeballing logs which one is actually dominating the total build time. There's a real gap between "the build feels slow" and "exactly which stage, which specific process, is the bottleneck" — and buildprof closes that gap with real measurements.</p>
+                    <ul>
+                        <li>Example usage: wraps an existing build command as-is, e.g. <code>buildprof -- make -j16</code>, <code>buildprof -- cargo build</code>, <code>buildprof -- ninja -C out/target</code>.</li>
+                        <li>Tracks process creation and termination using ptrace, the same Linux interface debuggers rely on.</li>
+                        <li>Can also parse the trace output left behind by Clang, LLD, and nightly Rust compilers.</li>
+                        <li>Since it doesn't require modifying the existing build command, it can be applied to large build scripts with little friction.</li>
+                    </ul>
+
+                    <h2 id="sec-2">2. The Trigger - The "Rust Is 5 Times Faster Than Zig" Announcement</h2>
+                    <p>The story starts with a tweet from Jarred Sumner, the founder of Bun's development company. It claimed that Bun's build system, freshly rewritten in Rust, was <strong>more than 5 times faster</strong> on Linux than the old Zig-based build. Maganti found the claim counterintuitive: Zig is generally known for fast compilation, and in fact the Zig build used Full LTO while the Rust build used the comparatively lighter ThinLTO. To find out whether the gap was really that large — and if so, exactly where it came from — he decided to profile both builds himself.</p>
+                    <p>This kind of counterintuitive benchmark claim isn't rare in open source. The problem is that both the people who accept it and the people who dispute it usually argue from gut feeling rather than evidence. What makes Maganti's approach stand out is that instead of joining the argument, he chose to <strong>run both builds under identical conditions and measure time at the process level</strong>.</p>
+                    <ul>
+                        <li>Trigger: Bun's founder publicly stating the Rust build is more than 5 times faster than the Zig build on Linux.</li>
+                        <li>The puzzle: Zig is normally known for fast compilation, so why was it that slow?</li>
+                        <li>Approach: rather than judging by gut feeling, he built a tool, buildprof, and measured directly.</li>
+                    </ul>
+
+                    <h2 id="sec-3">3. The Measurements - Zig at 24m24s vs. Rust at 5m40s</h2>
+                    <p>When Maganti reproduced both builds on his own single machine, the old Zig-based build (Bun 1.3.14) took <strong>24 minutes 24 seconds</strong>, and the new Rust-based build (Bun 1.4.0) finished in <strong>5 minutes 40 seconds</strong>. For reference, the CI environment's own median measurements were about 30 minutes 6 seconds (Zig) and about 5 minutes 37 seconds (Rust) respectively, broadly consistent with the local reproduction.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Build</th><th>Single-machine reproduction</th><th>CI median</th><th>Primary link mode</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Zig-based build (Bun 1.3.14, old)</td><td>24m 24s</td><td>~30m 6s</td><td>Full LTO</td></tr>
+                            <tr><td>Rust-based build (Bun 1.4.0, current)</td><td>5m 40s</td><td>~5m 37s</td><td>ThinLTO</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>In other words, Bun originally built with Zig and got faster after moving to a Rust-based build system. The question this article actually digs into is: why was the Zig build so slow to begin with?</p>
+
+                    <h2 id="sec-4">4. Dissecting the Bottleneck - The Full LTO Link Stage Ate Two-Thirds of the Build</h2>
+                    <p>Once Maganti broke down the Zig build's timeline with buildprof, the cause turned out not to be compilation itself but the <strong>final link stage</strong>. A single <code>ld.lld</code> linker invocation ran alone for <strong>16 minutes 35 seconds</strong> — about two-thirds of the total build time (24m24s). Within that, the <code>OptModule</code> phase, which performs LTO optimization, alone took <strong>just over 10 minutes</strong>.</p>
+                    <ul>
+                        <li>The compilation stage itself wasn't particularly slow — the problem was concentrated in the final link stage.</li>
+                        <li>The ld.lld linker invocation: 16m35s (about two-thirds of the total).</li>
+                        <li>Of that, the OptModule (LTO optimization) phase alone consumed over 10 minutes.</li>
+                        <li>This stage ran as a single operation that's hard to split up in parallel.</li>
+                    </ul>
+
+                    <h2 id="sec-5">5. The Optimization Experiments - What Happens When You Switch to ThinLTO</h2>
+                    <p>Having identified the bottleneck, Maganti ran two experiments switching the Zig build's link mode from Full LTO to <strong>ThinLTO</strong>. The first experiment switched only the Bun binary itself to ThinLTO; the second went further and rebuilt WebKit and ICU with ThinLTO as well.</p>
+
+                    <table>
+                        <thead>
+                            <tr><th>Configuration</th><th>Total build time</th><th>Linker time</th><th>vs. baseline</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td>Baseline (Full LTO, original Zig build)</td><td>24m 24s</td><td>16m 35s</td><td>—</td></tr>
+                            <tr><td>Experiment 1: Bun binary only, ThinLTO</td><td>20m 20s</td><td>12m 55s</td><td>~4 min faster</td></tr>
+                            <tr><td>Experiment 2: Bun + WebKit + ICU, all ThinLTO</td><td>15m 11s</td><td>7m 22s</td><td>~38% faster (9m 13s)</td></tr>
+                        </tbody>
+                    </table>
+
+                    <p>In the second experiment, switching WebKit and ICU to ThinLTO as well brought total build time down to 15 minutes 11 seconds. That's about a 38% reduction from the original Full LTO build (24m24s), and while it still doesn't reach the optimized Rust build's 5m40s, it makes the identity of the bottleneck unmistakably clear.</p>
+
+                    <h2 id="sec-6">6. The Structural Cause - Over 90 Rust Crates vs. a Single Zig Module</h2>
+                    <p>The reason the ThinLTO experiments still couldn't catch up to Rust's speed lies in a fundamental structural difference between the two languages. The Rust build is split into <strong>more than 90 crates</strong>, allowing compilation work to be distributed across multiple cores in parallel. The Zig build, by contrast, compiles the entire codebase through a <strong>single module</strong>, leaving almost no room for parallelization to begin with.</p>
+                    <p>This difference is separate from the choice between Full LTO and ThinLTO. Switching the linker to ThinLTO is a question of "how loosely should already-produced pieces be optimized and stitched together," while the crate count determines "how many independent pieces can even be compiled at the same time" in the first place. When everything is bound into a single module the way the Zig build is, no amount of linker tuning changes how narrow the room is to spread compilation itself across cores.</p>
+                    <ul>
+                        <li>Rust: spread across more than 90 crates → a structure that's easy to compile in parallel.</li>
+                        <li>Zig: the entire codebase is a single module → parallelization is structurally limited.</li>
+                        <li>This gap is not fully closed just by switching the linker to ThinLTO.</li>
+                        <li>In other words, the 38% reduction from Experiment 2 (see the table in Section 5) is a linker-stage improvement, not a substitute for splitting the codebase into crates.</li>
+                    </ul>
+
+                    <h2 id="sec-7">7. How buildprof Actually Works</h2>
+                    <p>buildprof is a Linux-only tool that uses ptrace to record the start and end time of every subprocess a build command spawns. Its advantage is that it can locate bottlenecks purely from process-level facts — who ran when — without requiring any special modification to the build system or compiler. Naturally, though, tracing processes at all raises the question of whether the tracing itself slows the build down.</p>
+                    <p>Maganti checked whether the tool's own overhead distorted the measurements. Tracing a Redis build added about 5 seconds to what was otherwise a 26.78-second build, while tracing a ripgrep build showed essentially no difference — 12.27 seconds versus 12.43 seconds. In other words, the overhead can grow somewhat with project size when filesystem events are also traced, but for diagnosing bottlenecks at the scale discussed in this article (minutes to tens of minutes for the Bun build), Maganti's conclusion is that the overhead is negligible.</p>
+                    <ul>
+                        <li>Tracing method: ptrace-based process-tree tracing (macOS and Windows were unsupported at the time of writing and mentioned only as future plans).</li>
+                        <li>Overhead check 1: a Redis build baseline of about 26.78s grew by about 5 seconds when traced.</li>
+                        <li>Overhead check 2: a ripgrep build baseline of 12.27s came in at 12.43s when traced, essentially negligible.</li>
+                        <li>Also measured: cold WebKit download and extraction alone took about 20 seconds.</li>
+                    </ul>
+
+                    <h2 id="sec-8">8. Practical Lessons - Don't Fix a Slow Build by Guesswork</h2>
+                    <p>The lesson this case offers teams isn't really about the tool itself — it's about <strong>the approach</strong>. Only after breaking the vague complaint "the build is slow" down into a stage-by-stage measurement did it become clear exactly what needed fixing.</p>
+                    <p>If Maganti had simply concluded "I guess Zig is just slow" without measuring, neither the fact that the link stage ate two-thirds of the build nor the fact that switching to ThinLTO alone could cut 38% off it would ever have surfaced. If a build takes 20 minutes for one team and 5 minutes for another, the number of iterations each team can run in a day is fundamentally different. What makes this case more than just another benchmark post is that it narrowed that gap down from "a feeling" to "one specific process on a timeline."</p>
+                    <ul>
+                        <li><strong>Don't start optimizing just because a build feels slow.</strong> First measure whether the bottleneck is in compilation or in linking (see Section 4).</li>
+                        <li><strong>Recognize that Full LTO benefits runtime performance but costs build time.</strong> Switching to ThinLTO can cut build time substantially (see Section 5).</li>
+                        <li><strong>A single-module structure directly limits parallel builds.</strong> How you split compilation units when designing a large codebase has a major effect on build time (see Section 6).</li>
+                        <li><strong>If no profiling tool fits your needs, building your own is a valid option.</strong> A small, purpose-built tool like buildprof turns vague guesses into evidence-backed conclusions.</li>
+                    </ul>
+
+                    <h2 id="unconfirmed">What We Could Not Confirm</h2>
+                    <ul>
+                        <li><strong>Which ThinLTO configuration, if any, the Bun project actually adopted</strong>: the original article presents the ThinLTO experiment results, but whether the Bun team incorporated them into its actual production build could not be confirmed from the source.</li>
+                        <li><strong>Timeline for macOS and Windows support</strong>: the original article mentions support for these platforms only as "future plans," without specifying a timeframe.</li>
+                    </ul>
+
+                    <h2 id="references">References</h2>
+                    <ul>
+                        <li><a href="https://lalitm.com/post/buildprof/" target="_blank" rel="noopener noreferrer">buildprof: tracing where your build time goes</a> — Lalit Maganti's blog. The primary source for the measurements and tool description covered in this article.</li>
+                        <li><a href="https://news.hada.io/topic?id=33611" target="_blank" rel="noopener noreferrer">The buildprof tool that traced why Bun's build took 24 minutes | GeekNews</a> — the Korean developer community GeekNews thread that surfaced this topic.</li>
+                    </ul>
+
+                </div>
+
+                <div class="share-section">
+                    <h3>Share this article</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">Copy Link</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">Back to list</a>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Free tools you may find useful</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/code_image.html">Code Image Generator</a></li>
+      <li><a href="../static/char_counter.html">Character Counter</a></li>
+      <li><a href="../static/json_formatter.html">JSON Formatter</a></li>
+      <li><a href="../static/regex_tester.html">Regex Tester</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">See all tools &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Related Posts</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="antirez_c_return_ai_era.html">Why Pick C When AI Writes the Code - Where Reading Cost Lands as Generation Scales</a></li>
+      <li><a href="rust_tier1_microsoft_msvc.html">Rust Becomes a Tier-1 Language at Microsoft - What Sharing the MSVC Backend Really Changes</a></li>
+      <li><a href="go_language_ai_coding_fit.html">Language Properties That Lower the Verification Cost of AI-Generated Code - Five Traits Go Has and What They Cost</a></li>
+      <li><a href="grok_build_opensource_2026.html">Grok Build Goes Open Source - xAI's Rust Agent Runtime and a Trust-Rebuilding Bet</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('Link copied! Paste it in the Threads app to share.');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('Link copied!'); });
+    });
+    </script>
+</body>
+</html>
