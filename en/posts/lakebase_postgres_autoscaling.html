@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="en">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Scaling Postgres Up and Down Without Dropping Connections - Neon Lakebase Autoscaling</title>
+    <meta name="description" content="Explore how Neon Lakebase Postgres autoscales without dropping connections, using live signals and time-aware HyperLogLog cache sizing.">
+    <meta name="keywords" content="PostgreSQL, Lakebase, Neon, autoscaling, vertical scaling, HyperLogLog, working set, NeonVM, Kubernetes, cache projection, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/en/posts/lakebase_postgres_autoscaling.html">
+
+    <meta property="og:title" content="Scaling Postgres Up and Down Without Dropping Connections - Neon Lakebase Autoscaling">
+    <meta property="og:description" content="Deep architectural dive into zero-downtime vertical autoscaling via CPU, memory, working set tracking, and timestamped HyperLogLog cache sizing.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/en/posts/lakebase_postgres_autoscaling.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="en_US">
+    <meta property="article:published_time" content="2026-09-14">
+    <meta property="article:section" content="Dev &amp; Infra">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Scaling Postgres Up and Down Without Dropping Connections - Neon Lakebase Autoscaling">
+    <meta name="twitter:description" content="How Neon Lakebase Postgres resizes live virtual machines without severing TCP connections.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "Scaling Postgres Up and Down Without Dropping Connections - Neon Lakebase Autoscaling",
+      "alternativeHeadline": "Deep dive into real-time vertical autoscaling driven by CPU, memory, working set size, and timestamped HyperLogLog cache projections",
+      "datePublished": "2026-09-14",
+      "dateModified": "2026-09-14",
+      "inLanguage": "en-US",
+      "articleSection": "Dev & Infra",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "PostgreSQL, Lakebase, Neon, autoscaling, vertical scaling, HyperLogLog, working set, NeonVM, Kubernetes, cache projection",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/en/posts/lakebase_postgres_autoscaling.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "How does Lakebase Postgres autoscaling differ from traditional horizontal sharding?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Horizontal sharding partitions data across separate database instances, introducing distributed two-phase commit overhead, complex cross-shard joins, and sequence serialization bottlenecks. In contrast, Lakebase Postgres vertical autoscaling preserves complete single-instance relational semantics and full ACID compliance while dynamically modifying the vCPU and RAM allocations of running virtual machines in real time."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Why is relying solely on CPU utilization flawed for database autoscaling?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "When query data falls outside the local buffer cache, Postgres stalls on network round-trips fetching blocks from remote storage nodes. Because worker processes block on I/O, measured CPU utilization drops significantly. A CPU-only autoscaler misinterprets this stall as an idle workload and downscales the instance, aggravating latency instead of allocating the cache space required to relieve the bottleneck."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Why does Lakebase embed timestamps into HyperLogLog registers instead of standard bits?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Standard HyperLogLog cardinality estimators only grow monotonically; once a register bit is set, it cannot record when the item was accessed. Past heavy batch queries or temporary table imports would permanently inflate the working set estimate. By storing observation timestamps, the estimator can filter for distinct pages accessed within sliding windows such as the past 1, 5, or 60 minutes."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How does autoscaling maintain open client connections when a physical host node is exhausted?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Because Lakebase completely decouples stateless compute from persistent storage, local virtual machines maintain no durable disk state. When a Kubernetes node runs out of physical memory to scale up in place, the NeonVM controller live-migrates the entire virtual machine to a less congested host while preserving its private IP address, keeping existing client TCP connections uninterrupted."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How does the system safeguard against out-of-memory crashes during scale-down operations?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "The in-guest vm-monitor inspects Postgres memory consumption at a 100-millisecond cadence. Before any memory reduction is applied by the hypervisor, the vm-monitor validates whether the remaining memory will safely satisfy current process requirements and maintain a 25 percent operating headroom. If shrinking risks triggering the Linux OOM Killer, the downscale is immediately rejected."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/lakebase_postgres_autoscaling.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/lakebase_postgres_autoscaling.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/lakebase_postgres_autoscaling.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/lakebase_postgres_autoscaling.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/lakebase_postgres_autoscaling.html">
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BreadcrumbList",
+      "itemListElement": [
+        {
+          "@type": "ListItem",
+          "position": 1,
+          "name": "Home",
+          "item": "https://braindetox.kr/en/"
+        },
+        {
+          "@type": "ListItem",
+          "position": 2,
+          "name": "Dev & Infra",
+          "item": "https://braindetox.kr/en/category/dev.html"
+        },
+        {
+          "@type": "ListItem",
+          "position": 3,
+          "name": "Scaling Postgres Up and Down Without Dropping Connections - Neon Lakebase Autoscaling",
+          "item": "https://braindetox.kr/en/posts/lakebase_postgres_autoscaling.html"
+        }
+      ]
+    }
+    </script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="Scaling Postgres Up and Down Without Dropping Connections - Neon Lakebase Autoscaling">
+                <meta itemprop="datePublished" content="2026-09-14">
+                <meta itemprop="dateModified" content="2026-09-14">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="PostgreSQL, Lakebase, Neon, autoscaling, vertical scaling, HyperLogLog, working set, NeonVM, Kubernetes, cache projection">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/en/posts/lakebase_postgres_autoscaling.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">Scaling Postgres Up and Down Without Dropping Connections - Neon Lakebase Autoscaling</h1>
+                    <h2 class="post-subtitle">Real-Time Vertical Resizing Governed by Three Signals, Working-Set Projections, and In-Guest Memory Monitoring</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-14">2026-09-14</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">Dev &amp; Infra</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>Selecting a database instance size prior to deploying a production workload has long been one of the most frustrating compromises in cloud systems engineering. When software teams are forced to predict traffic volumes, concurrent connection spikes, and memory consumption before running real queries, they inevitably veer toward extreme inefficiencies. Engineers either vastly overprovision virtual machines to guarantee headroom during rare traffic bursts—wasting immense cloud capital on idle silicon—or underestimate requirements, triggering saturated memory, connection timeouts, and cascading downtime when unexpected loads hit. In an era where cloud computing resources are increasingly contested and expensive, guessing hardware capacity in advance represents a fragile and obsolete architectural paradigm.</p>
+
+                    <p>Neon’s Lakebase Postgres eliminates the upfront sizing dilemma entirely by introducing continuous, zero-downtime vertical autoscaling directly to running PostgreSQL instances. Rather than relying on traditional replica failovers or scheduled maintenance windows that sever active database connections, Lakebase dynamically adjusts the vCPU cores and RAM allocated to a live virtual machine without terminating client TCP sockets. Production telemetry released by Neon reveals that an average production database cluster changes compute capacity 32,016 times per month, translating to an instance resize roughly once every 81 seconds. This demonstrates that continuous, sub-minute vertical scaling is not an abstract academic concept, but an actively proven production reality running at scale.</p>
+
+                    <div class="post-toc">
+                        <h3>Contents</h3>
+                        <ol>
+                            <li><a href="#section1">The Dilemma of Database Sizing and Real Production Scaling Frequency</a></li>
+                            <li><a href="#section2">Decoupling Compute from Storage: Foundation for Zero-Downtime Resizing</a></li>
+                            <li><a href="#section3">Three Target Metrics: CPU, Memory, and Working Set Size</a></li>
+                            <li><a href="#section4">Augmenting HyperLogLog with Time for Real-Time Cache Projection</a></li>
+                            <li><a href="#section5">Searching for Working-Set Jumps and Forward Cache Allocation</a></li>
+                            <li><a href="#section6">Four Coordinating Components and the Three-Tier Control Loop</a></li>
+                            <li><a href="#section7">Engineering Implications: Eliminating Overprovisioning and Cloud Waste</a></li>
+                            <li><a href="#section8">What We Could Not Verify</a></li>
+                            <li><a href="#section9">References</a></li>
+                        </ol>
+                    </div>
+
+                    <h2 id="section1">The Dilemma of Database Sizing and Real Production Scaling Frequency</h2>
+
+                    <p>Within legacy database deployments, altering instance dimensions has historically imposed severe operational friction. Conventional managed relational database services require physical machine restarts or DNS failovers across read replicas to swap instance classes. During those failovers, established client connection pools are forcibly dismantled, pending transactions are aborted, and applications suffer connection storms while attempting to reconnect. Consequently, infrastructure teams systematically configure oversized compute instances, paying for idle gigabytes of memory around the clock simply to survive peak moments that may occur only a few times each month.</p>
+
+                    <h3>Fundamental Differences Between Horizontal Sharding and Vertical Autoscaling</h3>
+
+                    <p>Architects possess two primary pathways to expand database throughput: splitting data across multiple independent nodes via horizontal sharding, or expanding and contracting the hardware limits of a single node through vertical scaling. As explored in our companion analysis, <a href="postgres_horizontal_scaling_cost.html">Choosing to Split Postgres Across Multiple Nodes - The Cost Horizontal Scaling Levies on Transactions, Joins, and Constraints</a>, sharding PostgreSQL across multiple instances levies steep functional taxes. Distributed two-phase commit (2PC) protocols introduce pervasive network round-trip overhead, cross-shard joins cripple throughput, and relational sequence guarantees break down. Conversely, the vertical autoscaling implemented in Lakebase Postgres preserves full relational semantics, complete transactional ACID guarantees, and rich SQL queries on a single logical engine, dynamically modulating physical vCPUs and RAM to match incoming load.</p>
+
+                    <h3>Averaging 32,016 Monthly Scale Events: One Adjustment Every 81 Seconds</h3>
+
+                    <p>Neon’s empirical operational datasets highlight that active production databases undergo an average of 32,016 compute unit adjustments every month. This staggering figure equates to a sizing alteration approximately every 81 seconds across daily operations. Real-world database traffic rarely adheres to steady states; morning business hours, seasonal sales, marketing campaigns, and background analytics generate volatile workload curves. An 81-second control cadence ensures that capacity curves tightly hug real workload demands, provisioning compute instantly when required and returning unused allocations as soon as pressure subsides.</p>
+
+                    <ul>
+                        <li>Elimination of capacity guesswork: Removing the necessity of sizing databases before real-world query behavior is understood.</li>
+                        <li>Non-disruptive in-place resizing: Expanding and shrinking live guest virtual machine resources without closing client connection sockets.</li>
+                        <li>Bidirectional efficiency: Equalizing the urgency of scaling up to protect performance and scaling down to curtail cloud costs.</li>
+                        <li>Sub-minute production responsiveness: Proven stability across 32,016 monthly automated scaling adjustments in live enterprise clusters.</li>
+                    </ul>
+
+                    <h2 id="section2">Decoupling Compute from Storage: Foundation for Zero-Downtime Resizing</h2>
+
+                    <p>The primary barrier that historically prevented PostgreSQL from resizing dynamically on the fly was the intimate coupling of execution state and durable storage on the same physical disks. In a monolithic database server, resizing or migrating a node is fundamentally a heavy storage operation because the host owns both query processing and data durability. Lakebase Postgres eliminates this constraint by enforcing a strict architectural separation of concerns between ephemeral compute and resilient distributed storage.</p>
+
+                    <h3>Stateless Compute Nodes and the Durable Distributed Storage Tier</h3>
+
+                    <p>Under the Lakebase architecture, the compute tier functions as an ephemeral, stateless execution engine dedicated exclusively to running PostgreSQL and processing client queries. Compute nodes utilize local RAM and high-speed local NVMe solid-state drives strictly as low-latency caching tiers, completely abdicating ownership of persistent storage. Long-term durability, WAL ingestion, and version history are offloaded to an independent, distributed storage subsystem composed of three distinct services.</p>
+
+                    <ul>
+                        <li>Safekeepers: SSD-backed consensus nodes that ingest and replicate PostgreSQL write-ahead logs (WAL) to ensure instant write durability.</li>
+                        <li>Pageservers: Highly scalable SSD storage nodes that continuously reconstruct and serve requested page versions across historical LSN timelines.</li>
+                        <li>Object Storage: Cost-effective cloud storage (such as Amazon S3) maintaining immutable, long-term block archives and historical checkpoints.</li>
+                    </ul>
+
+                    <p>Because the compute node holds no unique, uncommitted state on its local disks, the database engine can be started, stopped, resized, or transferred across physical hardware boundaries without relocating the underlying dataset. Decoupling storage transforms database scaling from a risky disk migration into a lightweight compute allocation workflow.</p>
+
+                    <h3>Preserving Client Sockets via Live Migration with Static Private IPs</h3>
+
+                    <p>While in-place adjustments to vCPU and RAM can occur instantaneously when a Kubernetes host node possesses surplus capacity, physical hosts eventually face resource saturation. When a Kubernetes worker node lacks the physical memory needed to accommodate an expanding Postgres instance, Lakebase invokes live virtual machine migration powered by NeonVM and QEMU/KVM hypervisors.</p>
+
+                    <p>During a live migration, the running virtual machine is transferred to an uncongested Kubernetes node while retaining its designated private IP address and network interfaces. Client connection pools maintain their existing TCP handshakes completely unaware that the underlying hypervisor has shifted. Because the compute instance maintains negligible durable local state, the migration payload consists solely of guest RAM contents and active CPU execution registers, allowing zero-downtime transfers to finalize in fractions of a second.</p>
+
+                    <h2 id="section3">Three Target Metrics: CPU, Memory, and Working Set Size</h2>
+
+                    <p>Establishing the low-level infrastructure to alter VM resources without terminating connections solves only half the scaling challenge; determining precisely when and how much to resize requires sophisticated telemetry. Naive threshold monitoring produces disruptive resource oscillations, where instances thrash between oversized and undersized allocations. Lakebase Postgres balances stability and responsiveness by synthesizing three independent metric signals into distinct compute targets.</p>
+
+                    <ul>
+                        <li>CPU load target: Tracking processor demand via <code>cpuGoalCU</code>.</li>
+                        <li>Memory consumption target: Protecting guest OS stability via <code>memGoalCU</code>.</li>
+                        <li>Working-set cache target: Maintaining buffer hit rates via <code>lfcGoalCU</code>.</li>
+                    </ul>
+
+                    <p>The autoscaling engine calculates each target independently and selects the maximum compute unit value among the three, clamping the result within user-configured minimum and maximum bounds (the autoscaling limits) to determine final capacity.</p>
+
+                    <pre><code class="language-bash">goalCU = max(cpuGoalCU, memGoalCU, lfcGoalCU)</code></pre>
+
+                    <h3>One-Minute Load Average Regulation for CPU (cpuGoalCU)</h3>
+
+                    <p>Processor utilization is governed through the node-level <code>autoscaler-agent</code>, which samples the guest VM's one-minute CPU load average every five seconds. The target sizing, designated as <code>cpuGoalCU</code>, seeks to keep the one-minute load average at or below 90 percent of available CPU capacity. Utilizing a one-minute rolling average successfully damps micro-bursts and fleeting query spikes, while the rapid five-second polling frequency guarantees that legitimate workload surges trigger timely capacity expansions.</p>
+
+                    <h3>Sub-Second Polling and Out-of-Memory Defense (memGoalCU)</h3>
+
+                    <p>Memory operates under severe failure characteristics that demand vastly different handling from CPU contention. When CPU capacity is temporarily saturated, queries merely experience latency degradation; conversely, when PostgreSQL exhausts physical RAM, the Linux kernel invokes the Out-of-Memory (OOM) Killer, terminating database processes via SIGKILL and triggering abrupt service failure. Memory exhaustion therefore requires an exceptionally rapid defense mechanism.</p>
+
+                    <p>The autoscaling architecture observes memory through a dual-cadence model: the host-level <code>autoscaler-agent</code> inspects overall virtual machine memory metrics every five seconds, while the internal <code>vm-monitor</code> daemon resident inside the guest VM tracks PostgreSQL memory allocation every 100 milliseconds (0.1 seconds). The memory algorithm establishes <code>memGoalCU</code> to ensure memory consumption remains strictly below 75 percent of total allocated RAM. The remaining 25 percent headroom provides an essential buffer against aggressive query allocations while reserving space for the guest Linux kernel.</p>
+
+                    <p>In early engineering iterations, Neon attempted to utilize Linux cgroup <code>memory.high</code> notifications to drive memory expansion. However, crossing <code>memory.high</code> boundaries triggered aggressive kernel memory reclamation and throttled active processes inside the cgroup, inducing erratic query latency. Transitioning to 100-millisecond active polling delivered predictable, stable telemetry without kernel throttling artifacts.</p>
+
+                    <h3>Eliminating Network Wait Blind Spots via Cache Sizing (lfcGoalCU)</h3>
+
+                    <p>Conventional autoscalers possess a profound blind spot regarding database buffer caches. In transactional database operations, query throughput depends directly on having frequently accessed index and table blocks cached locally in memory. When the local cache is undersized, worker threads continuously stall waiting for pages to be pulled across the network from remote pageservers.</p>
+
+                    <p>During these network I/O stalls, CPU cores remain largely idle waiting on data packets, resulting in deceptively low CPU utilization metrics. A simplistic CPU-driven autoscaler observes 15 percent processor usage and mistakenly downscales the instance, starving the engine of cache precisely when memory expansion is needed most. Lakebase Postgres resolves this paradox by introducing <code>lfcGoalCU</code>, which directly measures and projects the active working set of the database cache (historically known as the Local File Cache or LFC) as an autonomous third signal.</p>
+
+                    <table>
+                        <caption>Table 1: Comparison of Lakebase Postgres Autoscaling Metrics and Sizing Thresholds</caption>
+                        <thead>
+                            <tr>
+                                <th>Metric Identifier</th>
+                                <th>Monitored Telemetry &amp; Source</th>
+                                <th>Polling &amp; Evaluation Interval</th>
+                                <th>Target Threshold &amp; Limit</th>
+                                <th>System Risk if Ignored</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><code>cpuGoalCU</code></td>
+                                <td>1-minute VM CPU load average (OS kernel metric)</td>
+                                <td>5 seconds (autoscaler-agent)</td>
+                                <td>Maintain load &le; 90% of available CPU capacity</td>
+                                <td>Query execution queue starvation and latency spikes</td>
+                            </tr>
+                            <tr>
+                                <td><code>memGoalCU</code></td>
+                                <td>Postgres process allocations &amp; VM memory usage</td>
+                                <td>100ms (vm-monitor) / 5s (agent)</td>
+                                <td>Maintain memory usage &lt; 75% of allocated RAM</td>
+                                <td>Kernel OOM Killer invoked, crashing database processes</td>
+                            </tr>
+                            <tr>
+                                <td><code>lfcGoalCU</code></td>
+                                <td>Timestamped HyperLogLog working set size</td>
+                                <td>20 seconds (1-to-60 minute window evaluation)</td>
+                                <td>Size cache up to 75% of VM RAM capacity</td>
+                                <td>Severe network I/O stalls fetching pages from Pageservers</td>
+                            </tr>
+                        </tbody>
+                    </table>
+
+                    <h2 id="section4">Augmenting HyperLogLog with Time for Real-Time Cache Projection</h2>
+
+                    <p>A database workload's working set represents the distinct collection of table blocks, metadata, and index pages accessed repeatedly over a given evaluation period. While maintaining an exhaustive in-memory hash set of every visited page identifier would yield exact counts, the memory overhead of storing millions of block addresses would defeat the purpose of optimization, introducing severe memory bloat.</p>
+
+                    <h3>Inherent Limitations of Standard Monotonic HyperLogLog</h3>
+
+                    <p>Probabilistic cardinality estimation via HyperLogLog (HLL) has long been the standard technique for estimating distinct elements within constrained memory. Standard HLL hashes item identifiers, routes them to register buckets via leading bits, and tallies maximum observed leading zeroes in the remaining hash bits. This statistical approach permits tracking millions of distinct items with just a few kilobytes of state and bounded error.</p>
+
+                    <p>However, traditional HyperLogLog exhibits a fatal flaw when applied to dynamic autoscaling: standard registers are strictly monotonic. Once a register bucket records an observation, it retains that high-water mark indefinitely. It cannot record when that item was observed, or whether the query responsible for the page access terminated hours ago. If standard HLL were employed, a single early morning batch export or analytical table scan would permanently inflate the cardinality estimate, forcing the database to maintain an oversized cache long after the heavy query completed.</p>
+
+                    <h3>Storing Observation Timestamps in Place of Static Bitflags</h3>
+
+                    <p>The Lakebase engineering team resolved this accumulation dilemma by fundamentally transforming the internal storage format of HyperLogLog registers. Rather than setting static bit values upon observing a hash pattern, the Lakebase estimator stores the **current epoch timestamp** directly within the register array.</p>
+
+                    <p>When the system seeks to estimate unique pages accessed since a historical threshold timestamp T, the algorithm treats register entries containing timestamps updated after T as active, while treating older entries as empty. This elegant modification allows a single compact register structure to yield accurate cardinality estimates for any arbitrary sliding time window ending at the present moment.</p>
+
+                    <ul>
+                        <li>Unique database pages accessed within the trailing 1-minute window.</li>
+                        <li>Unique database pages accessed within the trailing 5-minute window.</li>
+                        <li>Unique database pages accessed within the trailing 60-minute window.</li>
+                    </ul>
+
+                    <p>Every 20 seconds, the node-level <code>autoscaler-agent</code> queries this timestamped HyperLogLog array, capturing a granular spectrum of working set curves across historical windows spanning 1 to 60 minutes.</p>
+
+                    <h2 id="section5">Searching for Working-Set Jumps and Forward Cache Allocation</h2>
+
+                    <p>Even with timestamp-aware working-set estimation, determining the optimal evaluation window poses a critical engineering trade-off. Selecting a window that is too short (such as 1 or 2 minutes) causes the autoscaler to aggressively evict cache allocations during brief query pauses, inducing thrashing when the next batch of requests arrives. Conversely, enforcing an indiscriminate 60-minute window retains memory allocations for terminated batch workloads far longer than necessary, inflating billing costs.</p>
+
+                    <h3>Detecting Cardinality Jump Points Beyond the Five-Minute Boundary</h3>
+
+                    <p>Lakebase Postgres resolves this dilemma through an automated jump detection algorithm that inspects the rate of cardinality expansion across expanding window durations. For a steady, healthy transactional workload, increasing the time window from 5 to 30 minutes adds elapsed time but relatively few new page addresses, because the engine repeatedly touches the same active dataset. Consequently, the estimated working set size plateaus into a stable curve.</p>
+
+                    <p>When a heavy analytical workload has recently terminated, the estimated working set exhibits a distinct structural signature: short windows reflect only the modest working set of current light traffic, but as the window expands to encompass the recent historical batch query, the cardinality estimate jumps sharply. The algorithm systematically scans for this jump point, selecting the stable plateau preceding the jump as the genuine working set of the active workload.</p>
+
+                    <pre><code class="language-text">start after the initial downscale delay
+
+for each working-set window:
+    measure growth before this point
+    measure growth after this point
+
+    if later growth is much larger than earlier growth:
+        return the estimate before the jump
+
+return the estimate from the 60-minute window</code></pre>
+
+                    <p>The jump search begins evaluating strictly after the 5-minute mark. This deliberate initial delay prevents compute resources from prematurely contracting during transient workload pauses. If no sharp cardinality surge is detected across the full span, the algorithm falls back to the 60-minute estimate, which represents the natural steady-state profile of an active, stable database.</p>
+
+                    <h3>Forward Cache Projection Over Twenty-Second Control Cycles</h3>
+
+                    <p>Merely measuring past and current working set sizes introduces latency when workloads abruptly begin scanning new tables. If cache allocation expands only after blocks have already been read, early pages are evicted to accommodate subsequent pages, forcing the engine to fetch those evicted blocks over the network a second time.</p>
+
+                    <p>To preempt this thrashing, the algorithm calculates the rate of change across consecutive window estimates and projects working-set growth forward into the upcoming control cycle. Because cache metrics are evaluated every 20 seconds, this projection covers only a fraction of a minute into the future. Restricting projections to sub-minute horizons prevents the system from overreacting to short-lived data spikes, avoiding severe capacity oscillations. The resulting projected value sets <code>lfcGoalCU</code>, allocating local cache headroom up to 75 percent of VM RAM.</p>
+
+                    <h2 id="section6">Four Coordinating Components and the Three-Tier Control Loop</h2>
+
+                    <p>Once <code>goalCU</code> is synthesized from CPU, memory, and working-set signals, the system must execute the resize operation on the live database virtual machine. Standard Linux container architectures face significant limitations when attempting to dynamically adjust physical memory limits on running processes without violating kernel security boundaries. Lakebase Postgres overcomes this by executing each PostgreSQL instance within a dedicated lightweight virtual machine orchestrated within Kubernetes, delivering hardware-level virtualization with dynamic resource hot-plugging.</p>
+
+                    <h3>Architectural Roles of Agent, Monitor, Scheduler, and NeonVM</h3>
+
+                    <p>Four specialized distributed components coordinate every capacity adjustment to guarantee seamless resource modifications.</p>
+
+                    <ul>
+                        <li>autoscaler-agent: Runs as a daemon on every Kubernetes worker node, gathering telemetry from local Postgres VMs, computing goalCU targets, and driving scaling workflows.</li>
+                        <li>vm-monitor: Resides inside each guest VM alongside PostgreSQL, continuously tracking process memory allocations, validating downscale commands, and dynamically resizing cache boundaries.</li>
+                        <li>Modified Kubernetes Scheduler: Maintains the authoritative global inventory of cluster physical capacity, validating and approving all upscale requests before memory is committed.</li>
+                        <li>NeonVM Controller: A custom Kubernetes operator built on QEMU and KVM that hot-plugs vCPU and RAM directly into active guest VMs and manages live migrations.</li>
+                    </ul>
+
+                    <table>
+                        <caption>Table 2: Responsibilities and Interactions of Lakebase Autoscaling Infrastructure Components</caption>
+                        <thead>
+                            <tr>
+                                <th>Component Name</th>
+                                <th>Execution Domain</th>
+                                <th>Primary Operational Role</th>
+                                <th>Inter-Component Communication</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><code>autoscaler-agent</code></td>
+                                <td>Kubernetes Host Node (per worker)</td>
+                                <td>Collects VM metrics, calculates goalCU, triggers scaling workflows</td>
+                                <td>Requests allocations from K8s scheduler; updates NeonVM CRD specs</td>
+                            </tr>
+                            <tr>
+                                <td><code>vm-monitor</code></td>
+                                <td>Guest VM (alongside Postgres)</td>
+                                <td>100ms memory tracking, downscale validation, cache expansion</td>
+                                <td>Communicates with agent via socket; adjusts PostgreSQL shared buffers</td>
+                            </tr>
+                            <tr>
+                                <td><code>Modified K8s Scheduler</code></td>
+                                <td>Kubernetes Control Plane</td>
+                                <td>Global inventory management, gatekeeping scale-up memory commits</td>
+                                <td>Prevents race conditions between pod scheduling and VM expansions</td>
+                            </tr>
+                            <tr>
+                                <td><code>NeonVM Controller</code></td>
+                                <td>Kubernetes Operator &amp; QEMU/KVM</td>
+                                <td>Executes live vCPU/RAM hot-plugging; initiates zero-downtime migrations</td>
+                                <td>Interfaces with KVM hypervisor; maintains static private IP bindings</td>
+                            </tr>
+                        </tbody>
+                    </table>
+
+                    <p>The scale-up workflow executes through an explicit five-step coordination sequence:</p>
+
+                    <ol>
+                        <li>The autoscaler-agent evaluates CPU, memory, and cache telemetry, establishing a higher goalCU target.</li>
+                        <li>The modified Kubernetes scheduler checks host node memory headroom and formally approves the allocation.</li>
+                        <li>The autoscaler-agent updates the corresponding NeonVM custom resource definition (CRD).</li>
+                        <li>The NeonVM controller commands the QEMU hypervisor to hot-plug vCPUs and memory into the live guest.</li>
+                        <li>The in-guest vm-monitor detects the expanded RAM and immediately expands the compute cache buffer.</li>
+                    </ol>
+
+                    <p>Maintaining the modified Kubernetes scheduler as the single source of truth for resource commitments is critical. Without centralized scheduler approval, a standard Kubernetes scheduler might schedule a heavy unrelated container on a node at the exact moment the autoscaler committed remaining memory to an expanding Postgres VM, inducing severe host-level memory overcommit.</p>
+
+                    <p>Scale-down operations employ the same architectural components but enforce rigorous validation within the guest. If a downward adjustment is requested, the <code>vm-monitor</code> verifies that current active queries and operating system routines can safely execute within the reduced footprint. If shrinking memory threatens to compress headroom below safe operational boundaries, the downscale is rejected, eliminating the risk of kernel-level crashes.</p>
+
+                    <h3>The Multi-Tiered Feedback Loop Across 100ms, 5s, and 20s Intervals</h3>
+
+                    <p>The operational resilience of the autoscaling architecture stems from three distinct control timescales operating concurrently:</p>
+
+                    <ul>
+                        <li>100-millisecond cycle: The in-guest vm-monitor checks PostgreSQL heap and query allocations to prevent sudden memory exhaustion and block unsafe shrink commands.</li>
+                        <li>5-second cycle: The host autoscaler-agent polls 1-minute CPU load averages and overall memory metrics to adjust to shifting compute demands.</li>
+                        <li>20-second cycle: The autoscaler-agent computes timestamped HyperLogLog working set windows and forward projections to tune cache capacity.</li>
+                    </ul>
+
+                    <p>Treating capacity reductions with the same algorithmic rigor as capacity expansions ensures that workloads stop paying for cloud resources the precise instant those resources are no longer required.</p>
+
+                    <h2 id="section7">Engineering Implications: Eliminating Overprovisioning and Cloud Waste</h2>
+
+                    <p>In modern cloud engineering environments, volatile database workloads have historically incurred severe cost penalties. Applications experiencing dramatic diurnal traffic swings, promotional flash sales, or scheduled batch pipelines have routinely maintained instances provisioned for tenfold their baseline load. Over an annual billing cycle, this defensive overprovisioning squanders millions of dollars in unutilized compute capacity.</p>
+
+                    <p>As advanced artificial intelligence workloads drive global competition for data center compute capacity, overpaying for idle peak capacity is becoming an unsustainable engineering habit. The mechanisms demonstrated by Lakebase Postgres outline a clear path forward for cloud data architectures.</p>
+
+                    <ul>
+                        <li>Rethinking sharding thresholds: Before undertaking the immense developmental burden of horizontal partitioning and distributed query gateways, teams should leverage zero-downtime vertical scaling to absorb traffic surges within a single relational instance.</li>
+                        <li>Adopting cache-aware observability: Engineering teams must look past CPU-only dashboard alerts, establishing monitoring pipelines that distinguish network I/O stalls from genuine idle states via buffer cache working set tracking.</li>
+                        <li>Reclaiming idle capital through symmetric scaling: Infrastructure designs must prioritize aggressive, safe scale-down capabilities that immediately relinquish surplus capacity once workloads stabilize.</li>
+                    </ul>
+
+                    <p>Lakebase Postgres is deployed across both Neon's serverless platform and Databricks' Data Intelligence Platform. While Neon optimizes the engine as a flexible backend for developers, startups, and autonomous agent infrastructure, Databricks integrates the same core architecture directly into Unity Catalog governance, lakehouse analytics, and enterprise data workflows.</p>
+
+                    <h2 id="section8">What We Could Not Verify</h2>
+
+                    <p>This technical analysis is grounded in Neon's official engineering blog posts and architecture documentation. However, certain low-level operational specifications were not detailed in the published source materials and could not be verified.</p>
+
+                    <ul>
+                        <li>Live migration cutover latency metrics: The precise sub-second switching duration in milliseconds during QEMU/KVM live migrations, along with cluster-wide concurrent migration limits, was not disclosed in the source text.</li>
+                        <li>Internal algorithms of the modified Kubernetes scheduler: The proprietary source code and queuing logic differentiating the modified scheduler from upstream kube-scheduler remain private to Neon's infrastructure.</li>
+                        <li>Databricks Unity Catalog cache synchronization benchmarks: Specific latency benchmarks and cache invalidation overheads when operating within the Databricks Lakehouse platform were outside the scope of the primary engineering post.</li>
+                    </ul>
+
+                    <h2 id="section9">References</h2>
+
+                    <p>The architectural concepts, operational metrics, and algorithmic details presented in this article are derived from the following verified primary engineering resources.</p>
+
+                    <ul>
+                        <li>Neon Official Engineering Blog: <a href="https://neon.com/blog/autoscaling-lakebase-postgres" target="_blank" rel="noopener noreferrer">Autoscaling Lakebase Postgres (Author: Carlota Soto)</a></li>
+                        <li>GeekNews Topic 33655 (Trigger Article): <a href="https://news.hada.io/topic?id=33655" target="_blank" rel="noopener noreferrer">Autoscaling Lakebase Postgres Without Severing Connections | GeekNews</a></li>
+                        <li>Neon Architectural Documentation: <a href="https://neon.com/docs/introduction/architecture-overview" target="_blank" rel="noopener noreferrer">Lakebase Architecture Overview - Neon Docs</a></li>
+                        <li>Neon Autoscaling Limits Documentation: <a href="https://neon.com/docs/introduction/autoscaling" target="_blank" rel="noopener noreferrer">Configuring Autoscaling and Resource Bounds - Neon Docs</a></li>
+                        <li>Neon Storage Subsystem Deep Dive: <a href="https://neon.com/blog/wal-s3-lakebase-storage-for-the-era-of-agents" target="_blank" rel="noopener noreferrer">WAL in S3: Lakebase storage for the era of agents - Neon Blog</a></li>
+                        <li>Related Internal Analysis: <a href="postgres_horizontal_scaling_cost.html">Choosing to Split Postgres Across Multiple Nodes - The Cost Horizontal Scaling Levies on Transactions, Joins, and Constraints</a></li>
+                    </ul>
+
+                </div>
+
+                <div class="share-section">
+                    <h3>Share this post</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">Copy Link</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">Back to list</a>
+                </div>
+
+                <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Free tools you may find useful</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/regex_tester.html">Regex Tester</a></li>
+      <li><a href="../static/jwt_decoder.html">JWT Decoder Generator 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 Encoder/Decoder</a></li>
+      <li><a href="../static/yaml_json_converter.html">YAML JSON Converter 2026</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">See all tools &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">Related Posts</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="postgres_horizontal_scaling_cost.html">Choosing to Split Postgres Across Multiple Nodes - The Cost Horizontal Scaling Levies on Transactions, Joins, and Constraints</a></li>
+      <li><a href="mongodb_to_postgres_sync.html">Copying Once and Staying in Sync Are Different Problems - What Moving a MongoDB Collection Into PostgreSQL Forces You to Decide</a></li>
+      <li><a href="sql_not_in_null_empty_result.html">One NULL in a NOT IN List Empties the Whole Result - SQL Three-Valued Logic 2026</a></li>
+      <li><a href="openai_habitat_storage_billion_users.html">How OpenAI Powers Storage for 1 Billion Users - The 2-Engineer Rust Rewrite</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('Link copied. Paste it into the Threads app to share!');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('Link copied!'); });
+    });
+    </script>
+</body>
+</html>

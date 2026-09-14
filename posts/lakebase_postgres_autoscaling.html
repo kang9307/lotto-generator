@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ko">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>연결을 안 끊고 Postgres를 늘리고 줄이는 법 - Neon Lakebase 오토스케일링</title>
+    <meta name="description" content="Neon Lakebase Postgres의 무중단 오토스케일링 원리를 분석합니다. CPU·메모리·작업 세트 기반 3중 제어와 HyperLogLog 예측, K8s 스케줄러 협업으로 연결 단절 없는 실시간 수직 확장을 달성한 방식을 정리합니다.">
+    <meta name="keywords" content="PostgreSQL, Lakebase, Neon, 오토스케일링, 수직 스케일링, HyperLogLog, 작업 세트, NeonVM, Kubernetes, 캐시 예측, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/posts/lakebase_postgres_autoscaling.html">
+
+    <meta property="og:title" content="연결을 안 끊고 Postgres를 늘리고 줄이는 법 - Neon Lakebase 오토스케일링">
+    <meta property="og:description" content="CPU, 메모리, 작업 세트 3중 신호와 타임스탬프 HyperLogLog로 연결 단절 없이 Postgres VM을 실시간 조정하는 아키텍처 심층 분석.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/posts/lakebase_postgres_autoscaling.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ko_KR">
+    <meta property="article:published_time" content="2026-09-14">
+    <meta property="article:section" content="개발/인프라">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="연결을 안 끊고 Postgres를 늘리고 줄이는 법 - Neon Lakebase 오토스케일링">
+    <meta name="twitter:description" content="단일 VM의 CPU·메모리를 라이브로 변경하며 연결을 끊지 않는 Neon Lakebase Postgres 오토스케일링 메커니즘.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "연결을 안 끊고 Postgres를 늘리고 줄이는 법 - Neon Lakebase 오토스케일링",
+      "alternativeHeadline": "CPU·메모리·작업 세트 기반 3중 제어와 HyperLogLog 캐시 예측으로 구현한 무중단 실시간 수직 스케일링",
+      "datePublished": "2026-09-14",
+      "dateModified": "2026-09-14",
+      "inLanguage": "ko-KR",
+      "articleSection": "개발/인프라",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "PostgreSQL, Lakebase, Neon, 오토스케일링, 수직 스케일링, HyperLogLog, 작업 세트, NeonVM, Kubernetes, 캐시 예측",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/posts/lakebase_postgres_autoscaling.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "Lakebase Postgres의 오토스케일링은 기존 수평 확장(샤딩)과 어떻게 다른가?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "수평 확장은 데이터를 여러 인스턴스로 분할 저장하므로 분산 트랜잭션, 2단계 커밋(2PC), 크로스 샤드 조인 등 복잡한 오버헤드가 발생한다. 반면 Lakebase Postgres의 오토스케일링은 단일 인스턴스 관계형 데이터베이스의 완전한 기능과 ACID 트랜잭션을 유지하면서 실행 중인 가상 머신(VM)의 CPU와 메모리를 실시간으로 늘리고 줄이는 수직 스케일링 방식이다."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "CPU 사용률만으로 오토스케일링을 수행할 때 발생하는 문제는 무엇인가?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "데이터베이스 워크로드에서 필요한 데이터가 로컬 캐시에 없어 원격 스토리지(pageserver)로부터 네트워크를 통해 페이지를 읽어오는 경우, 쿼리는 심각한 응답 지연을 겪으면서도 CPU는 I/O 대기로 인해 사용률이 낮게 측정된다. 따라서 CPU만 모니터링하면 캐시 증설이 시급한 상황을 감지하지 못하고 오히려 용량을 축소하는 심각한 병목을 유발할 수 있다."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "HyperLogLog 알고리즘에 타임스탬프를 추가한 이유는 무엇인가?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "표준 HyperLogLog는 페이지 접근 시 비트만 설정하므로 관측값이 누적되기만 하여 과거의 대규모 배치 작업이나 분석 쿼리 기록이 계속 남아 현재 작업 집합을 과대평가하게 만든다. 비트 대신 최근 접근 타임스탬프를 저장함으로써 특정 시점 T 이후에 접근된 고유 페이지만을 선별해 최근 1분, 5분, 60분 등 슬라이딩 윈도우별 실시간 작업 집합 크기를 정확히 추정할 수 있다."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "노드의 물리적 메모리가 가득 찼을 때 오토스케일링은 어떻게 연결을 유지하는가?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Lakebase 아키텍처는 컴퓨트와 영속 스토리지를 물리적으로 분리하여 로컬 VM에 영속 상태가 없다. 따라서 현재 Kubernetes 노드의 메모리가 부족해지면 NeonVM 컨트롤러가 가상 머신의 IP 주소를 그대로 유지한 채 다른 노드로 라이브 마이그레이션(Live Migration)을 수행하므로, 클라이언트의 TCP 연결 단절 없이 안전하게 자원을 확장할 수 있다."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "리소스 축소(Scale-down) 시 발생할 수 있는 메모리 고갈(OOM)은 어떻게 방지하는가?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "축소 요청이 발생하면 VM 내부에서 상주하는 vm-monitor가 100밀리초 주기로 PostgreSQL 엔진과 게스트 OS의 실제 메모리 요구량을 검증한다. 메모리를 회수했을 때 실행 중인 프로세스가 안전 여유분(할당 RAM의 75% 기준)을 유지할 수 없다고 판단되면 축소 요청을 거부하여 커널의 OOM Killer에 의한 프로세스 강제 종료를 원천 차단한다."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <script src="https://t1.kakaocdn.net/kakao_js_sdk/2.4.0/kakao.min.js" crossorigin="anonymous" defer></script>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/lakebase_postgres_autoscaling.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/lakebase_postgres_autoscaling.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/lakebase_postgres_autoscaling.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/lakebase_postgres_autoscaling.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/lakebase_postgres_autoscaling.html">
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BreadcrumbList",
+      "itemListElement": [
+        {
+          "@type": "ListItem",
+          "position": 1,
+          "name": "홈",
+          "item": "https://braindetox.kr/"
+        },
+        {
+          "@type": "ListItem",
+          "position": 2,
+          "name": "개발/인프라",
+          "item": "https://braindetox.kr/category/dev.html"
+        },
+        {
+          "@type": "ListItem",
+          "position": 3,
+          "name": "연결을 안 끊고 Postgres를 늘리고 줄이는 법 - Neon Lakebase 오토스케일링",
+          "item": "https://braindetox.kr/posts/lakebase_postgres_autoscaling.html"
+        }
+      ]
+    }
+    </script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="연결을 안 끊고 Postgres를 늘리고 줄이는 법 - Neon Lakebase 오토스케일링">
+                <meta itemprop="datePublished" content="2026-09-14">
+                <meta itemprop="dateModified" content="2026-09-14">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="PostgreSQL, Lakebase, Neon, 오토스케일링, 수직 스케일링, HyperLogLog, 작업 세트, NeonVM, Kubernetes, 캐시 예측">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/posts/lakebase_postgres_autoscaling.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">연결을 안 끊고 Postgres를 늘리고 줄이는 법 - Neon Lakebase 오토스케일링</h1>
+                    <h2 class="post-subtitle">CPU·메모리·작업 세트 기반 3중 제어와 HyperLogLog 캐시 예측으로 구현한 무중단 실시간 수직 스케일링</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-14">2026-09-14</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">개발/인프라</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>관계형 데이터베이스를 운영하는 엔지니어링 팀에게 인스턴스 크기를 사전에 결정하는 일은 언제나 까다로운 숙제였다. 아직 프로덕션 워크로드의 실제 트래픽 패턴과 데이터 증가 속도를 정확히 파악하지 못한 상태에서 인스턴스 사양을 고정하면 필연적으로 두 가지 위험 중 하나에 직면한다. 트래픽 피크에 대비해 너무 큰 사양을 프로비저닝하여 유휴 컴퓨트 자원에 막대한 클라우드 비용을 낭비하거나, 반대로 비용 절감을 위해 작게 설정했다가 급작스러운 스파이크 트래픽에 데이터베이스 연결이 거부되고 장애로 이어지는 문제다. 컴퓨팅 파워의 확보가 곧 서비스의 경쟁력이 된 현대 소프트웨어 생태계에서 이러한 사전 사이징은 비효율적이고 낡은 인프라 패턴으로 평가받고 있다.</p>
+
+                    <p>Neon의 Lakebase Postgres는 이러한 사전 사이징 절차를 완전히 걷어내고, 실행 중인 단일 데이터베이스 가상 머신의 리소스를 실시간으로 확장하고 축소하는 무중단 오토스케일링을 구현했다. 가장 주목할 점은 데이터베이스 클라이언트와의 TCP 연결을 일체 끊지 않은 채 실행 중인 게스트 OS의 CPU와 메모리를 동적으로 재조정한다는 사실이다. Neon이 발표한 공식 통계에 따르면, 실제 프로덕션 데이터베이스 클러스터에서 발생하는 평균 크기 변경 횟수는 월 32,016회에 달하며 이는 약 81초마다 한 번꼴로 컴퓨트 크기가 조정되고 있음을 보여준다. 단순한 이론적 설계가 아니라 초 단위의 세밀한 제어가 프로덕션 환경에서 끊임없이 작동하고 있는 것이다.</p>
+
+                    <div class="post-toc">
+                        <h3>목차</h3>
+                        <ol>
+                            <li><a href="#section1">데이터베이스 용량 산정의 딜레마와 실제 프로덕션 스케일링 빈도</a></li>
+                            <li><a href="#section2">컴퓨트와 스토리지의 분리: 무중단 크기 변경의 기반</a></li>
+                            <li><a href="#section3">목표 용량을 결정하는 3대 지표: CPU·메모리·작업 세트</a></li>
+                            <li><a href="#section4">HyperLogLog에 시간을 결합한 실시간 캐시 요구량 예측</a></li>
+                            <li><a href="#section5">시간 윈도우 급증 탐색과 1분 미만 선행 캐시 확보</a></li>
+                            <li><a href="#section6">실행 중인 VM을 조율하는 4대 컴포넌트와 3단계 제어 루프</a></li>
+                            <li><a href="#section7">국내 엔지니어링 실무 시사점: 오버프로비저닝 탈피와 비용 효율화</a></li>
+                            <li><a href="#section8">확인하지 못한 것</a></li>
+                            <li><a href="#section9">참고 자료</a></li>
+                        </ol>
+                    </div>
+
+                    <h2 id="section1">데이터베이스 용량 산정의 딜레마와 실제 프로덕션 스케일링 빈도</h2>
+
+                    <p>전통적인 데이터베이스 아키텍처에서 인스턴스 크기 변경은 항상 커다란 운영 부담을 수반했다. 일반적인 클라우드 관계형 데이터베이스 서비스(RDS)에서 인스턴스 타입을 변경하려면 수 분 이상의 다운타임이 불가피하거나, 페일오버(Failover)를 수반하는 읽기 복제본 전환 과정을 거쳐야 했다. 이 과정에서 활성 세션은 일제히 끊어지고 애플리케이션 계층에서는 일시적인 연결 거부 에러와 재연결 폭풍이 발생하기 십상이었다. 결과적으로 인프라 담당자들은 안전성을 위해 일상적인 트래픽 평균보다 서너 배 이상 높은 고사양 인스턴스를 상시 켜두는 오버프로비저닝을 선택할 수밖에 없었다.</p>
+
+                    <h3>수평 샤딩과 수직 오토스케일링의 근본적 차이</h3>
+
+                    <p>데이터베이스의 용량을 늘리는 방법은 크게 두 가지 축으로 나뉜다. 데이터를 여러 노드로 쪼개어 분산하는 수평 확장(샤딩)과, 단일 노드의 자원을 유연하게 확장하고 축소하는 수직 오토스케일링이다. 이전 글인 <a href="postgres_horizontal_scaling_cost.html">Postgres를 여러 대로 나눈다는 선택 - 수평 확장이 트랜잭션·조인·제약에 청구하는 값</a>에서 심층적으로 살펴보았듯이, Postgres를 여러 노드로 분할하는 수평 확장은 2단계 커밋(2PC)으로 인한 네트워크 지연, 크로스 샤드 조인의 병목, 전역 유니크 제약 훼손 등 관계형 엔진의 핵심 편의성을 심각하게 희생시키는 청구서를 요구한다. 반면 이번 글에서 다루는 Lakebase Postgres의 실시간 수직 오토스케일링은 단일 인스턴스의 완전한 ACID 트랜잭션과 관계형 연산 편의성을 그대로 유지하면서, 인스턴스 자체의 CPU와 메모리만 매끄럽게 늘리고 줄이는 전혀 다른 차원의 접근법이다.</p>
+
+                    <h3>월 32,016회, 81초마다 일어나는 실시간 크기 변경</h3>
+
+                    <p>Neon이 공개한 실제 운영 데이터에 따르면 프로덕션 데이터베이스 인스턴스는 한 달 동안 평균 32,016회에 달하는 크기 변경을 경험한다. 이를 시간 단위로 환산하면 약 81초마다 한 번씩 가상 머신의 컴퓨트 단위(CU, Compute Unit)가 올라가거나 내려가는 셈이다. 데이터베이스 워크로드는 하루 중에도 극심한 굴곡을 보인다. 사용자가 집중되는 오전 시간대나 정기 배치 작업이 돌아가는 새벽 시간대에는 순간적으로 수 배 이상의 연산 자원이 필요하지만, 트래픽이 잦아드는 심야나 유휴 시간대에는 최소 자원만 유지하는 것이 바람직하다. 81초 단위의 세밀한 반응성은 트래픽 변화를 실시간으로 추적하여 필요한 순간에만 비용을 지불할 수 있도록 뒷받침한다.</p>
+
+                    <ul>
+                        <li>사전 크기 산정의 불확실성: 워크로드 특성을 사전에 알지 못한 채 정적 인스턴스를 지정함으로써 발생하는 구조적 컴퓨트 자원 낭비.</li>
+                        <li>단절 없는 인-플레이스 리사이징: 연결을 재수립하지 않고 실행 중인 VM의 vCPU와 RAM을 즉각 할당하거나 회수하는 메커니즘.</li>
+                        <li>스파이크 대응과 유휴 비용 회수: 급증하는 쿼리 부하에는 초 단위로 신속히 대응하고, 부하 종료 즉시 메모리를 반환하여 비용 누수 차단.</li>
+                        <li>초단위 프로덕션 실증: 월 32,016회(81초 주기)의 실제 스케일링 통계가 입증하는 프로덕션 레벨의 제어 안정성.</li>
+                    </ul>
+
+                    <h2 id="section2">컴퓨트와 스토리지의 분리: 무중단 크기 변경의 기반</h2>
+
+                    <p>전통적인 PostgreSQL이 실행 중인 머신의 크기를 쉽게 바꾸지 못했던 근본적인 이유는 연산 처리와 영속적 저장 상태가 물리적으로 같은 머신과 디스크에 단단히 결합되어 있었기 때문이다. 기존 데이터베이스 환경에서는 머신을 교체하거나 사양을 바꾸는 행위 자체가 데이터 디렉터리를 마운트 해제하고 복제본을 동기화해야 하는 거대한 데이터베이스 운영 작업이었다. Lakebase Postgres는 이러한 결합을 완전히 해체하여 연산과 저장의 책임을 명확히 분리했다.</p>
+
+                    <h3>무상태(Stateless) 컴퓨트 노드와 영속 스토리지 계층</h3>
+
+                    <p>Lakebase 아키텍처에서 컴퓨트 계층은 순수하게 PostgreSQL 엔진과 클라이언트 쿼리를 실행하는 무상태(Stateless) 성격을 띤다. 컴퓨트 노드는 초저지연 읽기 처리를 위해 로컬 RAM과 고속 로컬 NVMe 기반의 성능 캐시를 적극적으로 활용하지만, 영속적인 원본 데이터 상태는 일체 소유하지 않는다. 영속성과 내구성, 그리고 트랜잭션 이력 관리는 전적으로 하부의 분산 스토리지 계층이 전담한다. 분산 스토리지 계층은 다음과 같은 세 가지 핵심 요소로 구성된다.</p>
+
+                    <ul>
+                        <li>Safekeeper: 고성능 NVMe/SSD 환경에서 실행되며 PostgreSQL이 생성하는 WAL(Write-Ahead Log)을 즉시 복제하여 커밋 내구성을 보장하는 합의 노드.</li>
+                        <li>Pageserver: SSD 기반으로 동작하며 WAL 레코드를 지속적으로 재생하여 특정 시점의 데이터베이스 페이지 버전을 실시간으로 재구성하는 분산 페이지 서버.</li>
+                        <li>오브젝트 스토리지: S3 등 클라우드 객체 스토리지에 변경 불가능한(Immutable) 장기 데이터 블록과 이력을 영구 보관하는 저비용 대용량 저장소.</li>
+                    </ul>
+
+                    <p>컴퓨트 노드가 로컬에 영속적 상태를 보관하지 않기 때문에, 데이터베이스 엔진은 하부 데이터를 다른 물리 노드로 복사하거나 마이그레이션할 필요 없이 언제든 자유롭게 시작, 중지, 이동, 그리고 크기 조정을 수행할 수 있다. 이와 같은 스토리지 분리 덕분에 실행 계층의 리사이징이 순수한 연산 자원의 동적 할당 문제로 단순화될 수 있었다.</p>
+
+                    <h3>IP를 유지하는 무중단 라이브 마이그레이션</h3>
+
+                    <p>단일 물리 서버(Kubernetes 노드) 내부에서 가상 머신의 CPU와 메모리를 증설하는 작업은 노드에 유휴 자원이 남아 있는 동안에는 즉시 이루어진다. 그러나 특정 호스트 노드가 이미 다른 가상 머신들로 가득 차서 더 이상 메모리를 늘릴 수 없는 한계 상황이 발생할 수 있다. Lakebase 아키텍처는 이 문제를 해결하기 위해 QEMU/KVM 기반의 라이브 마이그레이션(Live Migration) 기술을 접목했다.</p>
+
+                    <p>물리 노드가 포화되었을 때 NeonVM 컨트롤러는 실행 중인 데이터베이스 VM 전체를 여유 공간이 있는 다른 Kubernetes 노드로 실시간 이동시킨다. 이때 가상 머신이 사용하는 내부 가상 사설 IP 주소와 네트워크 인터페이스가 그대로 유지되므로, 외부 클라이언트와 맺고 있던 수천 개의 TCP 데이터베이스 커넥션은 끊어지지 않고 정상 유지된다. 또한 컴퓨트 노드에는 이동해야 할 거대한 영속 데이터 파일이 없기 때문에, 마이그레이션 대상 데이터는 오직 VM의 메모리 덤프와 런타임 실행 상태에 불과하다. 따라서 수 초 내외의 극히 짧은 순간에 노드 간 라이브 마이그레이션이 완료된다.</p>
+
+                    <h2 id="section3">목표 용량을 결정하는 3대 지표: CPU·메모리·작업 세트</h2>
+
+                    <p>오토스케일링 시스템이 데이터베이스의 연결을 끊지 않고 용량을 바꿀 수 있는 인프라 기반을 갖추었더라도, 정작 언제 얼마만큼 크기를 늘리거나 줄여야 하는지를 결정하는 알고리즘이 정교하지 못하면 실무에서 쓸 수 없다. 너무 민감하게 반응하면 리소스 크기가 초 단위로 출렁이는 진동(Oscillation) 현상이 발생하고, 너무 둔감하면 트래픽 폭증 시 성능 저하를 방어하지 못한다. Lakebase Postgres는 3가지 독립적인 핵심 신호를 지속적으로 관측하여 각각의 목표 용량을 계산한다.</p>
+
+                    <ul>
+                        <li>CPU 부하 목표: 가용 연산 처리량을 감시하는 <code>cpuGoalCU</code>.</li>
+                        <li>메모리 사용량 목표: 프로세스 안정성과 여유 공간을 확보하는 <code>memGoalCU</code>.</li>
+                        <li>작업 세트 크기 목표: 로컬 캐시 히트율을 보장하는 <code>lfcGoalCU</code>.</li>
+                    </ul>
+
+                    <p>시스템은 이 세 가지 신호가 요구하는 컴퓨트 단위(CU) 중 가장 큰 값을 최종 목표로 선택하며, 사용자가 데이터베이스 설정에서 지정한 최소 CU와 최대 CU의 허용 범위(Autoscaling Limits) 내로 클램핑(Clamping)하여 최종 크기를 도출한다.</p>
+
+                    <pre><code class="language-bash">goalCU = max(cpuGoalCU, memGoalCU, lfcGoalCU)</code></pre>
+
+                    <h3>1분 부하 평균 기반의 CPU 제어 (cpuGoalCU)</h3>
+
+                    <p>CPU 제어 알고리즘은 가상 머신의 1분 CPU 부하 평균(Load Average)을 지속적으로 모니터링한다. 노드 레벨에서 동작하는 <code>autoscaler-agent</code>는 5초마다 VM의 1분 부하 평균을 수집하며, 이 부하가 현재 할당된 전체 CPU 용량의 90% 이하로 유지되도록 목표치인 <code>cpuGoalCU</code>를 산출한다. 순간적인 수십 밀리초 단위의 찰나성 스파이크에 일일이 반응하지 않도록 1분 평균값을 필터로 활용하되, 5초라는 짧은 폴링 주기를 통해 추세의 변화를 기민하게 반영한다. 지속적인 연산 부하가 증가하면 <code>cpuGoalCU</code>가 즉각 상향되고, 부하가 해소되면 점진적으로 하향 조정된다.</p>
+
+                    <h3>100밀리초 주기 검사와 OOM 방지 메모리 제어 (memGoalCU)</h3>
+
+                    <p>메모리는 CPU와는 완전히 다른 치명적인 장애 모드를 가진다. CPU 요구량이 일시적으로 가용 용량을 초과하면 쿼리 처리 시간이 길어질 뿐 시스템이 다운되지는 않는다. 하지만 메모리가 부족해지면 운영체제 커널의 OOM(Out of Memory) Killer가 즉시 동작하여 PostgreSQL 마스터 프로세스나 워커 프로세스를 강제로 강제 종료(SIGKILL)시킨다. 이는 곧바로 데이터베이스 비정상 다운과 복구 모드 진입으로 이어진다.</p>
+
+                    <p>따라서 메모리 신호는 CPU보다 훨씬 높은 빈도로 감시된다. <code>autoscaler-agent</code>가 5초마다 VM의 전반적인 메모리 메트릭을 읽는 것에 더해, VM 내부에서 상주하는 <code>vm-monitor</code>가 매 100밀리초(0.1초)마다 PostgreSQL 프로세스의 실제 메모리 사용량을 직접 점검한다. 메모리 제어의 목표는 할당된 전체 RAM의 75% 미만을 사용하도록 유지하는 것이다. 나머지 25%의 헤드룸은 예기치 못한 대규모 쿼리 메모리 할당에 즉각 대응하고, 게스트 OS 커널과 보조 프로세스가 안정적으로 동작할 공간을 남겨둔다.</p>
+
+                    <p>과거 초기 설계에서는 리눅스 cgroup의 <code>memory.high</code> 이벤트를 감지하여 반응하는 이벤트 기반 방식을 시도했으나, <code>memory.high</code> 임계값을 넘어서는 순간 리눅스 커널이 공격적인 메모리 회수와 프로세스 스로틀링(Throttling)을 가해 쿼리 성능이 요동치는 부작용이 발생했다. 이에 따라 현재는 100밀리초 주기 초고속 폴링 방식으로 전환되었으며, 훨씬 안정적이고 예측 가능한 메모리 관리를 달성했다.</p>
+
+                    <h3>네트워크 지연의 맹점을 해소하는 캐시 제어 (lfcGoalCU)</h3>
+
+                    <p>전통적인 오토스케일러들이 가장 자주 실패하는 영역이 바로 데이터베이스의 I/O 캐시 영역이다. 많은 OLTP 워크로드에서 성능의 핵심은 자주 읽히는 인덱스와 데이터 페이지가 로컬 메모리에 들어와 있는가에 달려 있다. 만약 로컬 메모리가 부족하여 캐시 미스가 대량으로 발생하면, 쿼리는 원격 Pageserver로부터 네트워크를 통해 페이지를 전송받기 위해 디스크 I/O 및 네트워크 대기 상태(Wait Event)에 빠지게 된다.</p>
+
+                    <p>이때 CPU는 데이터를 기다리느라 놀고 있으므로 CPU 사용률은 10~20% 수준으로 극히 낮게 측정된다. 오직 CPU 사용률만 바라보는 단순한 오토스케일러는 이 상황을 유휴 상태로 오판하여 인스턴스 사양을 오히려 축소해 버리는 치명적인 오작동을 일으킨다. 사용자는 쿼리 응답이 심각하게 느려지는데 데이터베이스는 오히려 다운스케일링되는 역설에 빠진다. Lakebase Postgres는 과거 Local File Cache(LFC)로 불렸던 디스크/메모리 기반 컴퓨트 캐시의 실제 작업 세트 크기를 직접 추정하는 <code>lfcGoalCU</code>를 제3의 독립 신호로 도입하여 이 맹점을 완벽히 해결했다.</p>
+
+                    <table>
+                        <caption>표 1: Lakebase Postgres 오토스케일링 3대 측정 지표 및 제어 기준 비교</caption>
+                        <thead>
+                            <tr>
+                                <th>지표 식별자</th>
+                                <th>측정 대상 및 데이터 소스</th>
+                                <th>폴링 및 평가 주기</th>
+                                <th>목표 임계값 및 상한</th>
+                                <th>미대응 시 시스템 위험</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><code>cpuGoalCU</code></td>
+                                <td>VM의 1분 CPU 로드 애버리지 (OS 커널 메트릭)</td>
+                                <td>5초 (autoscaler-agent)</td>
+                                <td>가용 CPU 용량의 90% 이하 유지</td>
+                                <td>쿼리 실행 대기열 누적 및 응답 지연 증가</td>
+                            </tr>
+                            <tr>
+                                <td><code>memGoalCU</code></td>
+                                <td>Postgres 프로세스 및 VM 전체 메모리 할당량</td>
+                                <td>100ms (vm-monitor) / 5초 (agent)</td>
+                                <td>할당 RAM의 75% 미만 유지 (25% 여유)</td>
+                                <td>커널 OOM Killer 발동으로 인한 DB 프로세스 비정상 종료</td>
+                            </tr>
+                            <tr>
+                                <td><code>lfcGoalCU</code></td>
+                                <td>시간 윈도우 기반 추정 작업 세트 크기 (HyperLogLog)</td>
+                                <td>20초 (1~60분 윈도우 다각도 분석)</td>
+                                <td>컴퓨트 RAM의 최대 75% 캐시 공간에 수용</td>
+                                <td>원격 Pageserver 네트워크 I/O 병목 및 지연율 급증</td>
+                            </tr>
+                        </tbody>
+                    </table>
+
+                    <h2 id="section4">HyperLogLog에 시간을 결합한 실시간 캐시 요구량 예측</h2>
+
+                    <p>데이터베이스의 작업 세트(Working Set)는 특정 기간 동안 반복적으로 조회되거나 수정되는 테이블 및 인덱스 페이지들의 집합을 의미한다. 쿼리 성능을 최상으로 유지하려면 이 작업 세트 전체가 로컬 컴퓨트 노드의 캐시에 온전히 적재되어 있어야 한다. 그러나 수천만 개에 달하는 데이터베이스 페이지의 고유 식별자를 메모리에 일일이 기록하고 카운팅하는 방식은 그 자체로 막대한 메모리 오버헤드를 발생시켜 배보다 배꼽이 더 커지는 모순을 낳는다.</p>
+
+                    <h3>표준 HyperLogLog의 한계와 누적 오차 문제</h3>
+
+                    <p>카디널리티(고유 항목 수)를 적은 메모리로 추정할 때 널리 쓰이는 표준 알고리즘은 HyperLogLog(HLL)이다. 표준 HyperLogLog는 페이지 번호를 해시한 뒤, 앞자리 비트로 고정된 개수의 레지스터 중 하나를 선택하고, 나머지 비트에서 맨 처음 나타나는 0의 개수를 세어 레지스터 값을 갱신한다. 이 확률적 방식을 사용하면 수 킬로바이트 수준의 극소 메모리만으로도 수십억 건의 고유 페이지 수를 높은 정확도로 추정할 수 있다.</p>
+
+                    <p>하지만 표준 HyperLogLog에는 오토스케일링에 치명적인 구조적 한계가 존재한다. 바로 레지스터 값이 오직 단조 증가(Monotonic Increase)만 한다는 점이다. 표준 HLL은 특정 레지스터가 언제 갱신되었는지, 그리고 해당 값을 만든 페이지가 방금 전 읽힌 것인지 아니면 3시간 전 대규모 배치 덤프 때 딱 한 번 읽힌 것인지 알 수 없다. 만약 표준 HLL을 캐시 예측에 그대로 적용하면, 새벽에 잠시 실행되었던 대용량 테이블 풀 스캔이나 분석 쿼리의 흔적이 하루 종일 추정치에 남아 있게 되어 트래픽이 완전히 끝난 뒤에도 데이터베이스가 거대한 캐시를 쥔 채 과다 프로비저닝 상태를 유지하게 된다.</p>
+
+                    <h3>비트 대신 타임스탬프를 기록하는 슬라이딩 윈도우 추정</h3>
+
+                    <p>Lakebase Postgres 엔지니어링 팀은 이 누적 문제를 해결하기 위해 HyperLogLog의 레지스터 구조를 혁신적으로 개조했다. 해시 관측 시 특정 비트를 1로 세팅하는 대신, 관측이 일어난 **현재 타임스탬프**를 레지스터 배열의 해당 위치에 직접 저장하도록 변경한 것이다.</p>
+
+                    <p>임의의 시점 T 이후에 접근된 고유 페이지 수를 계산하고자 할 때, 추정기는 타임스탬프가 T 이후로 갱신된 위치만을 활성 상태로 간주하고, T 이전에 기록된 오래된 위치는 미설정 상태로 취급하여 HyperLogLog 공식을 적용한다. 이 단순하면서도 강력한 아이디어를 통해 시스템은 추가적인 메모리 구조 없이도 현재 시점에 종료되는 다양한 슬라이딩 시간 윈도우의 고유 페이지 수를 완벽히 추정할 수 있게 되었다.</p>
+
+                    <ul>
+                        <li>최근 1분간 접근된 고유 페이지 수 추정치.</li>
+                        <li>최근 5분간 접근된 고유 페이지 수 추정치.</li>
+                        <li>최근 60분간(1시간) 지속적으로 접근된 고유 페이지 수 추정치.</li>
+                    </ul>
+
+                    <p>노드의 <code>autoscaler-agent</code>는 20초마다 이 타임스탬프 기반 HyperLogLog를 질의하여, 1분부터 60분까지 다양한 길이의 시간 윈도우에 걸친 작업 세트 추정 곡선을 정밀하게 수집한다.</p>
+
+                    <h2 id="section5">시간 윈도우 급증 탐색과 1분 미만 선행 캐시 확보</h2>
+
+                    <p>시간 정보를 갖춘 작업 세트 추정기를 확보했더라도, "몇 분짜리 윈도우를 현재의 진짜 작업 세트로 볼 것인가"라는 새로운 난제가 발생한다. 윈도우를 1~2분처럼 너무 짧게 잡으면 무거운 작업이 끝났을 때 신속하게 캐시를 줄일 수 있지만, 잠시 쿼리가 뜸해진 틈을 타 캐시를 너무 성급하게 날려버려 바로 뒤이어 들어오는 요청에서 대량의 캐시 미스를 유발한다. 반대로 윈도우를 60분처럼 길게 잡으면 캐시는 안전하게 보존되지만 이미 끝난 작업의 메모리를 쓸데없이 오래 붙들고 있어 비용이 낭비된다.</p>
+
+                    <h3>5분 이후 급증 지점 탐색 알고리즘</h3>
+
+                    <p>Lakebase Postgres는 윈도우 길이를 점진적으로 늘려갈 때 추정 페이지 수의 변화 곡선을 분석하는 급증(Jump) 탐색 알고리즘으로 이 상충 관계를 해결했다. 정상적이고 안정적인 워크로드에서는 윈도우 길이를 5분에서 10분, 30분으로 늘려도 동일한 핵심 테이블과 인덱스를 반복 접근하므로 고유 페이지 추정치가 초반에 완만히 증가하다가 평탄한 고원(Plateau)을 형성한다.</p>
+
+                    <p>반면 무거운 쿼리가 최근에 종료된 상태라면 상황이 다르다. 짧은 윈도우 구간에서는 현재 수행 중인 가벼운 쿼리의 작은 작업 세트만 관측되지만, 윈도우가 과거의 무거운 쿼리가 실행되었던 시간대까지 거슬러 올라가는 순간 추정 페이지 수가 수직으로 급증하게 된다. 알고리즘은 바로 이 급증 지점을 포착하여, 급증이 일어나기 직전의 고원부 추정치를 현재 워크로드의 실제 작업 세트 크기로 확정한다.</p>
+
+                    <pre><code class="language-text">start after the initial downscale delay
+
+for each working-set window:
+    measure growth before this point
+    measure growth after this point
+
+    if later growth is much larger than earlier growth:
+        return the estimate before the jump
+
+return the estimate from the 60-minute window</code></pre>
+
+                    <p>이 탐색 로직은 최소 5분 이후의 윈도우부터 시작된다. 이는 1~2분의 일시적인 트래픽 소강상태에서 캐시를 섣부르게 축소했다가 다음 요청 스파이크 때 다시 급격히 확장하는 불필요한 리소스 진동(Chapping)을 방지하기 위함이다. 만약 60분 구간 전체에서 뚜렷한 급증 지점이 발견되지 않는다면, 이는 지난 1시간 동안 작업 세트가 꾸준히 활성 상태를 유지한 안정적인 워크로드임을 뜻하므로 60분 윈도우의 추정치를 안전하게 채택한다.</p>
+
+                    <h3>20초 주기와 1분 미만 선행 예측</h3>
+
+                    <p>현재 시점의 작업 세트만을 사후적으로 측정하여 캐시를 늘리면 한 박자 늦는 문제가 발생할 수 있다. 애플리케이션이 새로운 대규모 데이터 범위를 순차 스캔하기 시작했을 때, 캐시 크기가 사후에 커진다면 초기에 읽어 들인 페이지들이 메모리 부족으로 즉시 방출(Eviction)되어 나중에 동일 데이터를 다시 읽을 때 원격 Pageserver에서 중복 호출을 해야 한다.</p>
+
+                    <p>이를 방어하기 위해 알고리즘은 윈도우 간 성장 속도의 미분값을 계산하여 **다음 제어 주기까지 예상되는 작업 세트의 선행 증가량**을 미리 투영(Projection)한다. <code>autoscaler-agent</code>의 평가 주기가 20초이므로, 이 예측은 1분 미만의 지극히 짧은 미래 구간만을 대상으로 제한된다. 만약 수 분 이상의 긴 미래를 공격적으로 예측하면 일시적인 데이터 스캔 노이즈를 과대 해석하여 컴퓨트 크기가 과도하게 널뛰는 부작용이 생기기 때문이다. 이렇게 산출된 최종 투영 크기가 <code>lfcGoalCU</code>로 설정되며, 시스템은 컴퓨트 노드 RAM의 최대 75%까지 캐시 공간으로 유연하게 할당한다.</p>
+
+                    <h2 id="section6">실행 중인 VM을 조율하는 4대 컴포넌트와 3단계 제어 루프</h2>
+
+                    <p>목표 용량인 <code>goalCU</code>가 결정되면, 실제 실행 중인 데이터베이스 가상 머신에 무중단으로 하드웨어 자원을 반영해야 한다. 일반적인 컨테이너(Docker 등) 환경에서는 실행 중인 컨테이너 프로세스의 메모리 한도를 동적으로 늘리는 데 한계가 있으며 강한 보안 격리를 제공하기 어렵다. Lakebase Postgres는 각 PostgreSQL 인스턴스를 Kubernetes 클러스터 내부의 독립적인 전용 경량 가상 머신(VM)에서 실행함으로써 완전한 커널 수준 격리와 실시간 핫플러그(Hot-plug) 자원 변경을 동시에 달성했다.</p>
+
+                    <h3>autoscaler-agent, vm-monitor, K8s 스케줄러, NeonVM의 역할 분담</h3>
+
+                    <p>실행 중인 데이터베이스의 크기를 안전하게 조정하기 위해 네 개의 분산 컴포넌트가 유기적으로 맞물려 동작한다.</p>
+
+                    <ul>
+                        <li>autoscaler-agent: 모든 Kubernetes 워커 노드마다 데몬셋 형태로 실행되며, 해당 노드에 위치한 Postgres VM들의 지표를 주기적으로 수집하고 3대 신호를 바탕으로 최종 목표 크기(goalCU)를 계산하여 스케일링을 트리거한다.</li>
+                        <li>vm-monitor: 각 가상 머신 내부 게스트 OS에 상주하며, PostgreSQL 엔진의 메모리 상태를 100밀리초 단위로 초정밀 감시하고, 축소(Downscale) 요청 시 메모리 안전성을 검증하며, 캐시 크기를 동적으로 조절한다.</li>
+                        <li>수정된 Kubernetes 스케줄러: 클러스터 전체 노드의 가용 물리 자원 상태를 단일 진실 공급원(Single Source of Truth)으로 관리하며, 모든 VM 확장 요청이 노드의 물리 메모리를 초과하지 않는지 사전에 인가(Approval)한다.</li>
+                        <li>NeonVM 컨트롤러: QEMU 및 KVM 가상화 기술을 기반으로 구축된 커스텀 Kubernetes CRD 및 오퍼레이터로, 실행 중인 게스트 OS의 vCPU와 RAM을 중단 없이 추가하거나 회수하고 필요 시 라이브 마이그레이션을 집행한다.</li>
+                    </ul>
+
+                    <table>
+                        <caption>표 2: 오토스케일링 4대 핵심 구성 요소와 제어 계층별 역할 및 동작 방식</caption>
+                        <thead>
+                            <tr>
+                                <th>구성 요소</th>
+                                <th>실행 위치</th>
+                                <th>주요 역할 및 책임</th>
+                                <th>상호작용 대상 및 협력 방식</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><code>autoscaler-agent</code></td>
+                                <td>Kubernetes 호스트 노드 (노드당 1개)</td>
+                                <td>VM 지표 수집, 목표 크기 산출, 스케일링 오케스트레이션 시작</td>
+                                <td>K8s 스케줄러에 자원 승인 요청, NeonVM CRD 리소스 사양 갱신</td>
+                            </tr>
+                            <tr>
+                                <td><code>vm-monitor</code></td>
+                                <td>Postgres 가상 머신 내부 게스트 OS</td>
+                                <td>엔진 메모리 초고속 감시, 축소 안전성 검증, LFC 캐시 확장/축소</td>
+                                <td>autoscaler-agent와 소켓 통신, PostgreSQL 공유 버퍼 확장 영역 관리</td>
+                            </tr>
+                            <tr>
+                                <td><code>수정된 K8s 스케줄러</code></td>
+                                <td>Kubernetes 컨트롤 플레인</td>
+                                <td>클러스터 자원 배분 총괄, 오토스케일링 메모리 승인 독점권 행사</td>
+                                <td>일반 Pod 스케줄링과 VM 확장 간의 자원 경합(Race Condition) 방지</td>
+                            </tr>
+                            <tr>
+                                <td><code>NeonVM</code></td>
+                                <td>K8s 컨트롤러 및 QEMU/KVM 하이퍼바이저</td>
+                                <td>실행 중인 VM의 vCPU/메모리 실시간 핫플러그 반영 및 라이브 마이그레이션</td>
+                                <td>KVM 하이퍼바이저 제어, IP를 유지한 채 포화된 노드 탈출 실행</td>
+                            </tr>
+                        </tbody>
+                    </table>
+
+                    <p>확장(Scale-up) 시퀀스는 매우 엄격한 5단계 절차를 거친다.</p>
+
+                    <ol>
+                        <li>autoscaler-agent가 CPU, 메모리, 작업 세트 3대 목표의 최댓값으로 신규 목표 용량을 확정한다.</li>
+                        <li>수정된 Kubernetes 스케줄러에 해당 노드의 잔여 물리 메모리를 초과하지 않는지 질의하고 승인을 획득한다.</li>
+                        <li>승인이 완료되면 autoscaler-agent가 NeonVM 커스텀 리소스를 업데이트한다.</li>
+                        <li>NeonVM 컨트롤러가 QEMU 하이퍼바이저를 통해 실행 중인 VM에 vCPU와 메모리를 즉시 추가한다.</li>
+                        <li>게스트 내부의 vm-monitor가 증설된 메모리를 감지하고 로컬 컴퓨트 캐시 크기를 확장하여 즉시 쿼리 가속에 투입한다.</li>
+                    </ol>
+
+                    <p>스케줄러를 단일 자원 인가 창구로 삼는 이유는 일반 Kubernetes Pod 스케줄링과의 충돌을 방지하기 위함이다. 만약 이 조율 메커니즘이 없다면, 일반 스케줄러가 노드의 남은 메모리에 새로운 파드를 배치하는 바로 그 순간에 autoscaler-agent가 동일한 메모리를 Postgres VM에 할당해 버리는 심각한 자원 경합이 발생할 수 있다.</p>
+
+                    <p>축소(Scale-down) 과정 역시 동일한 컴포넌트를 사용하지만 내부에서 훨씬 보수적인 검증을 거친다. 확장은 실패해도 서비스가 느려질 뿐이지만, 과도한 축소는 프로세스 크래시(OOM)를 유발하기 때문이다. 축소 지시가 내려오면 VM 내부의 <code>vm-monitor</code>가 현재 실행 중인 쿼리들과 게스트 OS가 안전하게 구동될 수 있는 메모리가 남는지를 꼼꼼히 역검증하며, 조금이라도 위험하다고 판단되면 축소 명령의 집행을 단호하게 거부한다.</p>
+
+                    <h3>100밀리초·5초·20초의 3단계 제어 주기</h3>
+
+                    <p>최종 제어 시스템은 세 가지 서로 다른 타임스케일(Timescale)이 유기적으로 중첩된 3단계 다중 루프로 완성된다.</p>
+
+                    <ul>
+                        <li>100밀리초 루프 (초고속 방어): vm-monitor가 PostgreSQL의 급격한 메모리 할당을 0.1초 단위로 추적하여 커널 패닉을 방지하고 불완전한 축소를 차단.</li>
+                        <li>5초 루프 (단기 추세 대응): autoscaler-agent가 1분 CPU 부하 평균과 전체 시스템 메모리를 읽어 지속적인 연산 요구량 변화에 즉각 대응.</li>
+                        <li>20초 루프 (중장기 캐시 최적화): autoscaler-agent가 1분부터 60분 슬라이딩 윈도우 HLL 작업 세트를 분석하고 1분 미만 미래를 예측하여 캐시 최적화 단행.</li>
+                    </ul>
+
+                    <p>확장에는 민첩하게 대응하면서도 부하가 끝나면 지체 없이 용량을 반환하는 이 양방향 대칭 제어야말로, 사용자가 실제로 쓰지 않은 자원에 비용을 낭비하지 않도록 보장하는 오토스케일링의 핵심 철학이다.</p>
+
+                    <h2 id="section7">국내 엔지니어링 실무 시사점: 오버프로비저닝 탈피와 비용 효율화</h2>
+
+                    <p>국내 커머스, 핀테크, SaaS 기업들의 인프라 운영 환경을 살펴보면, 트래픽 변동 폭이 극심한 서비스일수록 데이터베이스 오버프로비저닝으로 인한 인프라 비용 누수가 심각한 수준이다. 대규모 정기 할인 프로모션, 시즌성 마케팅 캠페인, 방송 노출이나 푸시 알림 발송 직후 발생하는 수 분에서 수십 분 단위의 순간적인 스파이크 트래픽을 감당하기 위해, 한 달 내내 평시 트래픽의 5배에서 10배에 달하는 거대한 데이터베이스 인스턴스를 유지하는 사례가 빈번하다.</p>
+
+                    <p>하지만 생성형 AI 모델 연산과 인프라 확보 경쟁으로 인해 클라우드 컴퓨트 비용이 전례 없이 비싸지고 있는 2026년 현재의 환경에서, "일 년에 며칠 도달하지도 않는 피크 트래픽을 위해 최고 사양 인스턴스 비용을 365일 지불하는 방식"은 더 이상 지속 가능한 엔지니어링 전략이 될 수 없다. Lakebase Postgres가 보여준 아키텍처는 데이터베이스 확장의 패러다임이 어떻게 진화해야 하는지를 명확히 제시한다.</p>
+
+                    <ul>
+                        <li>수평 확장의 도입 시점 재고: 분산 트랜잭션과 리샤딩의 복잡성을 떠안아야 하는 수평 샤딩을 섣부르게 도입하기 전에, 연결 단절 없는 고성능 수직 오토스케일링을 통해 단일 인스턴스 환경에서 트래픽 피크를 유연하게 흡수할 수 있는지 먼저 검토해야 한다.</li>
+                        <li>I/O 캐시 상태 중심의 모니터링 체계 구축: CPU 사용률 중심의 레거시 모니터링에서 탈피하여, 실제 쿼리가 필요로 하는 작업 세트 크기와 로컬 버퍼 캐시 히트율을 분리 측정하는 관측성(Observability) 파이프라인을 확립해야 한다.</li>
+                        <li>양방향 리사이징을 통한 유휴 비용 회수: 스케일업만큼이나 스케일다운을 정밀하게 다루어, 이벤트나 피크가 종료되는 즉시 베이스라인 사양으로 복귀시켜 클라우드 청구 요금을 극적으로 절감하는 체계를 도입해야 한다.</li>
+                    </ul>
+
+                    <p>Lakebase Postgres는 현재 Neon 플랫폼뿐만 아니라 Databricks 환경에서도 동일한 핵심 인프라로 제공되고 있다. 개발자와 스타트업을 위한 클라우드 백엔드의 중심축으로 동작하는 동시에, 엔터프라이즈 환경에서는 Unity Catalog 거버넌스와 레이크하우스 분석 플랫폼에 완벽히 녹아들어 연산 효율을 극대화하고 있다.</p>
+
+                    <h2 id="section8">확인하지 못한 것</h2>
+
+                    <p>본 포스트는 Neon 공식 엔지니어링 블로그와 아키텍처 문서를 대조하여 작성되었으나, 공개된 기술 자료의 범위상 아래 항목의 구체적인 세부 사항은 공식 문서에서 확인할 수 없었다.</p>
+
+                    <ul>
+                        <li>NeonVM 라이브 마이그레이션 전환 지연 시간: 포화 노드에서 신규 노드로 VM을 실시간 마이그레이션할 때 발생하는 서브세컨드(Sub-second) 네트워크 스위칭의 구체적인 밀리초(ms) 수치 및 클러스터당 동시 마이그레이션 제한 수는 공식 본문에 수치로 명시되지 않았다.</li>
+                        <li>수정된 Kubernetes 스케줄러의 구체적 내부 코드: 기본 kube-scheduler 대비 수정된 커스텀 알고리즘의 세부 구현체 및 메모리 부킹 큐 관리 로직의 상세 소스 코드는 외부 자료에서 확인할 수 없었다.</li>
+                        <li>Databricks 환경에서의 내부 레이크하우스 캐시 벤치마크: Databricks Data Intelligence Platform과 통합되어 동작할 때의 Unity Catalog 메타데이터 동기화 지연율 등 구체적인 성능 벤치마크 수치는 본 원문에서 다루지 않았다.</li>
+                    </ul>
+
+                    <h2 id="section9">참고 자료</h2>
+
+                    <p>본 포스트에서 분석한 아키텍처 원리와 공식 지표, 알고리즘 구현 내용은 아래의 검증된 공식 1차 출처 자료들을 기반으로 작성되었습니다.</p>
+
+                    <ul>
+                        <li>Neon 공식 블로그: <a href="https://neon.com/blog/autoscaling-lakebase-postgres" target="_blank" rel="noopener noreferrer">Autoscaling Lakebase Postgres (저자: Carlota Soto)</a></li>
+                        <li>GeekNews 33655 토픽 (계기 자료): <a href="https://news.hada.io/topic?id=33655" target="_blank" rel="noopener noreferrer">연결을 끊지 않는 Lakebase Postgres의 오토스케일링 | GeekNews</a></li>
+                        <li>Neon 공식 아키텍처 문서: <a href="https://neon.com/docs/introduction/architecture-overview" target="_blank" rel="noopener noreferrer">Lakebase Architecture Overview - Neon Docs</a></li>
+                        <li>Neon 공식 오토스케일링 설정 문서: <a href="https://neon.com/docs/introduction/autoscaling" target="_blank" rel="noopener noreferrer">Autoscaling Configuration and Limits - Neon Docs</a></li>
+                        <li>Neon 스토리지 아키텍처 심층 분석: <a href="https://neon.com/blog/wal-s3-lakebase-storage-for-the-era-of-agents" target="_blank" rel="noopener noreferrer">WAL in S3: Lakebase storage for the era of agents - Neon Blog</a></li>
+                        <li>기존 관련 포스트 (수평 분할 비용 분석): <a href="postgres_horizontal_scaling_cost.html">Postgres를 여러 대로 나눈다는 선택 - 수평 확장이 트랜잭션·조인·제약에 청구하는 값</a></li>
+                    </ul>
+
+                </div>
+
+                <div class="share-section">
+                    <h3>이 글 공유하기</h3>
+                    <div class="social-share">
+                        <button id="kakao-share" class="share-btn kakao-btn"><img src="https://developers.kakao.com/assets/img/about/logos/kakaolink/kakaolink_btn_small.png" alt="카카오톡" loading="lazy" decoding="async" width="34" height="35">카카오톡</button>
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(트위터)</button>
+                        <button id="threads-share" class="share-btn threads-btn">쓰레드</button>
+                        <button id="link-copy" class="share-btn link-btn">링크 복사</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">목록으로 돌아가기</a>
+                </div>
+
+                <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">함께 쓰면 좋은 무료 도구</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/regex_tester.html">정규식 테스트기</a></li>
+      <li><a href="../static/jwt_decoder.html">JWT 디코더·생성기 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 인코더/디코더</a></li>
+      <li><a href="../static/yaml_json_converter.html">YAML JSON 변환기 2026</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">전체 도구 보기 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">관련 글</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="postgres_horizontal_scaling_cost.html">Postgres를 여러 대로 나눈다는 선택 - 수평 확장이 트랜잭션·조인·제약에 청구하는 값</a></li>
+      <li><a href="mongodb_to_postgres_sync.html">한 번 옮기는 것과 계속 맞춰 두는 것은 다른 문제다 - MongoDB 컬렉션을 PostgreSQL 로 보낼 때 강제되는 선택들</a></li>
+      <li><a href="sql_not_in_null_empty_result.html">NOT IN에 NULL 하나가 섞이면 결과가 통째로 빈다 - 에러 없이 0행이 되는 SQL 3값 논리 2026</a></li>
+      <li><a href="openai_habitat_storage_billion_users.html">OpenAI가 10억 사용자의 스토리지를 버티는 법 - 엔지니어 2명이 끝낸 Rust 재작성</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const kakaoShareBtn = document.getElementById('kakao-share');
+        if (kakaoShareBtn) {
+            kakaoShareBtn.addEventListener('click', function() {
+                if (!window.Kakao) return;
+                if (!window.Kakao.isInitialized()) window.Kakao.init('e06d0ee93e450a11bc6451d46e09cd88');
+                if (window.Kakao.Share) {
+                    window.Kakao.Share.sendDefault({
+                        objectType: 'feed',
+                        content: { title: document.title, description: document.querySelector('meta[name="description"]')?.content || '', imageUrl: 'https://braindetox.kr/site_logo.png', link: { mobileWebUrl: location.href, webUrl: location.href } },
+                        buttons: [{ title: '웹으로 보기', link: { mobileWebUrl: location.href, webUrl: location.href } }]
+                    });
+                }
+            });
+        }
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('링크가 복사되었습니다. 쓰레드 앱에 붙여넣기하여 공유하세요!');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('링크가 복사되었습니다!'); });
+    });
+    </script>
+</body>
+</html>

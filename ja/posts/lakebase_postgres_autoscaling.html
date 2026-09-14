@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ja">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>接続を切断せずにPostgresを拡大・縮小する方法 - Neon Lakebaseの自動スケーリング</title>
+    <meta name="description" content="Neon Lakebase Postgresの無停止自動スケーリングの仕組みを解説します。CPU・メモリ・ワーキングセットの3大指標、時間認識型HyperLogLogによるキャッシュ予測、K8sスケジューラとNeonVMの連携による接続維持型垂直拡張を詳解します。">
+    <meta name="keywords" content="PostgreSQL, Lakebase, Neon, オートスケーリング, 垂直スケーリング, HyperLogLog, ワーキングセット, NeonVM, Kubernetes, キャッシュ予測, 2026">
+
+    <link rel="canonical" href="https://braindetox.kr/ja/posts/lakebase_postgres_autoscaling.html">
+
+    <meta property="og:title" content="接続を切断せずにPostgresを拡大・縮小する方法 - Neon Lakebaseの自動スケーリング">
+    <meta property="og:description" content="CPU、メモリ、ワーキングセットの3大指標とタイムスタンプ付きHyperLogLogにより、接続を切断せずPostgres VMをリアルタイム調整するアーキテクチャ。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/ja/posts/lakebase_postgres_autoscaling.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ja_JP">
+    <meta property="article:published_time" content="2026-09-14">
+    <meta property="article:section" content="開発・インフラ">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="接続を切断せずにPostgresを拡大・縮小する方法 - Neon Lakebaseの自動スケーリング">
+    <meta name="twitter:description" content="単一VMのCPUとメモリを実行中に動的変更し、クライアント接続を維持するNeon Lakebase Postgresの垂直スケーリング機構。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "接続を切断せずにPostgresを拡大・縮小する方法 - Neon Lakebaseの自動スケーリング",
+      "alternativeHeadline": "CPU・メモリ・ワーキングセットに基づく3重制御とHyperLogLogキャッシュ予測による無停止リアルタイム垂直スケーリング",
+      "datePublished": "2026-09-14",
+      "dateModified": "2026-09-14",
+      "inLanguage": "ja-JP",
+      "articleSection": "開発・インフラ",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "PostgreSQL, Lakebase, Neon, オートスケーリング, 垂直スケーリング, HyperLogLog, ワーキングセット, NeonVM, Kubernetes, キャッシュ予測",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/ja/posts/lakebase_postgres_autoscaling.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "Lakebase Postgresの自動スケーリングは従来の水平シャーディングと何が異なるのか？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "水平シャーディングはデータを複数インスタンスに分割するため、分散2相コミット（2PC）、クロスシャード結合、シーケンス採番の衝突といった複雑なオーバーヘッドが発生します。一方、Lakebase Postgresの垂直スケーリングは、完全な単一インスタンスのリレーショナル機能とACIDトランザクションを維持しながら、稼働中の仮想マシン（VM）のCPUとメモリをリアルタイムに増減させます。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "CPU使用率のみで自動スケーリングを実行するとどのような問題が生じるのか？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "必要なデータがローカルバッファキャッシュに存在せず、リモートストレージ（pageserver）からのネットワーク読み出しが発生すると、クエリは深刻な待機遅延に陥りながらも、I/O待機のためCPU使用率は極端に低く測定されます。CPUのみを監視していると、キャッシュ増設が不可欠な状況をアイドル状態と誤認して逆に縮小を行い、深刻な性能悪化を招きます。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "HyperLogLogアルゴリズムにタイムスタンプを追加した理由は何か？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "標準的なHyperLogLogはビットを設定するのみで観測値が単調増加するため、過去に一度だけ実行された大量バッチ処理の記録が残り続け、現在のワーキングセットを過大評価してしまいます。ビットの代わりに観測タイムスタンプを保持することで、特定の過去時点T以降にアクセスされたユニークページのみを抽出し、直近1分、5分、60分などのスライディングウィンドウごとに正確な作業セットを推定できます。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "物理ホストのメモリが枯渇した際、自動スケーリングはどのように接続を維持するのか？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Lakebaseアーキテクチャはコンピュートと永続ストレージを物理的に分離しているため、ローカルVM内に永続状態が存在しません。現在のKubernetesノードの物理メモリが枯渇した場合、NeonVMコントローラが仮想マシンのプライベートIPアドレスを維持したまま別のノードへライブマイグレーションを実行するため、クライアントのTCP接続を切断することなく安全に容量を拡大できます。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "リソース縮小（スケールダウン）時に発生し得るOOM障害はどのように防止されるのか？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "縮小要求が発行されると、VM内部に常駐するvm-monitorが100ミリ秒周期でPostgreSQLプロセスとゲストOSの実際のメモリ需要を検証します。メモリを回収した際に安全なバッファ（割り当てRAMの75％基準）を維持できないと判断された場合、縮小処理を拒否してLinuxカーネルのOOM Killerによるプロセス強制終了を未然に防止します。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/lakebase_postgres_autoscaling.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/lakebase_postgres_autoscaling.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/lakebase_postgres_autoscaling.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/lakebase_postgres_autoscaling.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/lakebase_postgres_autoscaling.html">
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BreadcrumbList",
+      "itemListElement": [
+        {
+          "@type": "ListItem",
+          "position": 1,
+          "name": "ホーム",
+          "item": "https://braindetox.kr/ja/"
+        },
+        {
+          "@type": "ListItem",
+          "position": 2,
+          "name": "開発・インフラ",
+          "item": "https://braindetox.kr/ja/category/dev.html"
+        },
+        {
+          "@type": "ListItem",
+          "position": 3,
+          "name": "接続を切断せずにPostgresを拡大・縮小する方法 - Neon Lakebaseの自動スケーリング",
+          "item": "https://braindetox.kr/ja/posts/lakebase_postgres_autoscaling.html"
+        }
+      ]
+    }
+    </script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="接続を切断せずにPostgresを拡大・縮小する方法 - Neon Lakebaseの自動スケーリング">
+                <meta itemprop="datePublished" content="2026-09-14">
+                <meta itemprop="dateModified" content="2026-09-14">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="PostgreSQL, Lakebase, Neon, オートスケーリング, 垂直スケーリング, HyperLogLog, ワーキングセット, NeonVM, Kubernetes, キャッシュ予測">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/ja/posts/lakebase_postgres_autoscaling.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">接続を切断せずにPostgresを拡大・縮小する方法 - Neon Lakebaseの自動スケーリング</h1>
+                    <h2 class="post-subtitle">CPU・メモリ・ワーキングセットに基づく3重制御とHyperLogLogキャッシュ予測による無停止リアルタイム垂直スケーリング</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-14">2026-09-14</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">開発・インフラ</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <p>リレーショナルデータベースを運用するエンジニアリング組織にとって、インスタンスサイズを事前に決定する作業は常に困難を極める課題でした。本番環境の実際のクエリ特性やトラフィックの変動幅を事前に完全予測することは不可能に近く、固定的なサイジング方針は不可避的に2つの極端な非効率をもたらします。稀に発生するピークトラフィックに備えて過剰に巨大なインスタンスを常時プロビジョニングし、膨大なクラウド費用をアイドル状態のリソースに浪費するか、あるいはコスト削減を優先して小さく設定した結果、突発的なスパイクによってコネクション枯渇やシステム障害を引き起こすかのいずれかです。コンピュートリソースの確保競争が激化する現代のインフラ運用において、静的な事前サイジングはすでに時代遅れのパターンとなりつつあります。</p>
+
+                    <p>NeonのLakebase Postgresは、こうした事前のサイズ見積もり作業を完全に排除し、稼働中の仮想マシンリソースをリアルタイムに自動拡張・縮小する無停止自動スケーリングを実現しました。特筆すべき点は、データベースクライアントとの既存TCP接続を一切切断することなく、実行中のゲストOSのCPUコア数とメモリ容量をその場で動的変更できる点です。Neonが公開した本番環境の運用統計によると、稼働中のデータベースクラスタにおける月間平均リサイズ回数は32,016回に達し、これは約81秒に1回の頻度でコンピュート容量が自動調整されている計算になります。理論上の設計にとどまらず、秒単位の極めて精緻なリソース制御が実環境の大規模トラフィック下で安定稼働しています。</p>
+
+                    <div class="post-toc">
+                        <h3>目次</h3>
+                        <ol>
+                            <li><a href="#section1">データベースサイジングのジレンマと本番環境におけるスケーリング頻度</a></li>
+                            <li><a href="#section2">コンピュートとストレージの分離：無停止サイジングの基礎</a></li>
+                            <li><a href="#section3">目標容量を導く3大指標：CPU・メモリ・ワーキングセット</a></li>
+                            <li><a href="#section4">HyperLogLogに時間を統合したリアルタイムキャッシュ需要予測</a></li>
+                            <li><a href="#section5">時間枠の急増検知と制御周期を見据えた先行キャッシュ確保</a></li>
+                            <li><a href="#section6">実行中VMを協調制御する4大コンポーネントと3段階の制御周期</a></li>
+                            <li><a href="#section7">実務への示唆：過剰プロビジョニングの脱却とコスト効率化</a></li>
+                            <li><a href="#section8">確認できなかった事項</a></li>
+                            <li><a href="#section9">参考資料</a></li>
+                        </ol>
+                    </div>
+
+                    <h2 id="section1">データベースサイジングのジレンマと本番環境におけるスケーリング頻度</h2>
+
+                    <p>従来のデータベース構成において、インスタンスサイズの変更は常に重大な運用リスクを伴う作業でした。一般的なクラウド型マネージドリレーショナルサービス（RDSなど）でインスタンスタイプを変更するには、数分以上のダウンタイムが発生するか、レプリカ切り替えに伴うフェイルオーバーが必要でした。このプロセスにおいて既存のセッションは強制切断され、アプリケーション側では接続エラーや再接続ラッシュによるカスケード障害が誘発される恐れがありました。その結果、インフラ設計者は安全を担保するために、日常平均の数倍ものスペックを常時稼働させる過剰プロビジョニングを余儀なくされてきたのです。</p>
+
+                    <h3>水平シャーディングと垂直オートスケーリングの根本的相違</h3>
+
+                    <p>データベースの処理容量を拡大する手法には、データを複数ノードに分散する水平スケーリング（シャーディング）と、単一ノードのリソースを柔軟に伸縮させる垂直スケーリングの2つのアプローチが存在します。先行記事<a href="postgres_horizontal_scaling_cost.html">Postgresを複数台に分割するという選択 - 水平スケーリングがトランザクション・結合・制約に請求する対価</a>で詳述したように、PostgreSQLを複数台に分割する水平拡張は、2相コミット（2PC）によるネットワーク遅延、クロスシャード結合の処理限界、シーケンスや一意性制約の破綻など、リレーショナル機能の利便性を大きく損なう代償を伴います。これに対し、Lakebase Postgresが採用する垂直自動スケーリングは、完全なACIDトランザクションと単一エンジンのクエリ整合性を保持したまま、物理的なvCPUとRAM容量のみを伸縮させるアプローチです。</p>
+
+                    <h3>月間32,016回、81秒ごとに発生するリアルタイムリサイズの実態</h3>
+
+                    <p>Neonの公式データによれば、本番データベースインスタンスは月平均で32,016回ものリサイズを経験します。これは実質的に約81秒に1回の間隔でコンピュートユニット（CU）が増加または減少していることを意味します。WebサービスやSaaSのトラフィックは1日の中でも激しく変動し、業務開始時間やバッチ処理のタイミングでは瞬時に大容量リソースが要求される一方、夜間や閑散時間帯には最小構成で稼働させることが理想です。81秒という微細な制御周期によって、ワークロードの変動にぴったりと追従し、真に必要なリソースに対してのみ費用を支払う運用が成り立ちます。</p>
+
+                    <ul>
+                        <li>事前見積もりの不確実性の解消：実際のクエリ負荷を事前に把握することなく静的インスタンスを指定する浪費の根絶。</li>
+                        <li>インプレース・リサイジングの実現：接続を切断することなく稼働中の仮想マシンのvCPUとRAMを即時割り当て・回収。</li>
+                        <li>双方向の対称的制御：スパイク負荷への迅速な拡張と同時に、負荷低下時の速やかなメモリ返還によるコスト抑制。</li>
+                        <li>本番実績による信頼性証明：月間32,016回（81秒周期）の自動調整が示す高可用性と堅牢な制御機構。</li>
+                    </ul>
+
+                    <h2 id="section2">コンピュートとストレージの分離：無停止サイジングの基礎</h2>
+
+                    <p>従来のPostgreSQLが稼働中マシンのサイズを容易に変更できなかった根本的な理由は、クエリ実行エンジンと永続的なデータストレージが同一のハードウェアに密結合していた点にあります。スタンドアロンの環境では、マシンの変更や交換はストレージディスクのアンマウントや同期を伴う大がかりなデータベース作業となっていました。Lakebase Postgresは、この密結合を完全に解体し、実行系と保存系の責務を物理的に分離しました。</p>
+
+                    <h3>ステートレスなコンピュート層と永続分散ストレージ層</h3>
+
+                    <p>Lakebaseアーキテクチャにおいて、コンピュート層はPostgreSQLエンジンとクライアントクエリを実行するステートレスな役割に純化されています。コンピュートノードは超低レイテンシの処理を実現するためにローカルRAMと高速NVMeによるキャッシュを最大限に活用しますが、永続的な元データ状態は一切保持しません。耐久性やWALの保存、トランザクション履歴の管理は、独立した分散ストレージ層が専任で担当します。分散ストレージは以下の3つの要素で構成されます。</p>
+
+                    <ul>
+                        <li>Safekeeper：高速SSD環境で稼働し、PostgreSQLが生成するWALを即時複製してコミットの耐久性を合意形成するノード群。</li>
+                        <li>Pageserver：SSDベースで動作し、WALレコードを逐次再生して任意の時点のデータブロックバージョンを再構成・提供するページサーバ。</li>
+                        <li>オブジェクトストレージ：S3などのクラウドストレージを活用し、不変の長期的履歴ブロックとチェックポイントを保管する永続層。</li>
+                    </ul>
+
+                    <p>コンピュートノードが永続状態をローカルに保持しないため、データベースエンジンはストレージデータを物理移動させることなく、自由自在に起動、停止、ノード間移動、リサイズを行うことができます。ストレージの分離こそが、安全な無停止スケーリングを実現する絶対的な前提基盤です。</p>
+
+                    <h3>固定プライベートIPを維持する無停止ライブマイグレーション</h3>
+
+                    <p>単一のホストマシン（Kubernetesワーカーノード）内で仮想マシンのCPUとメモリを増設する処理は、ノードに空き容量がある限りインプレースで即座に完了します。しかし、ホストノード全体が他の仮想マシンで埋め尽くされ、物理メモリの空きが枯渇する状況が発生し得ます。Lakebaseアーキテクチャは、QEMU/KVMベースのライブマイグレーション機構によってこの制約を突破しました。</p>
+
+                    <p>ノードの物理リソースが逼迫した場合、NeonVMコントローラは稼働中のデータベースVM全体を余力のある別のKubernetesノードへリアルタイムに移送します。この際、仮想マシンに割り当てられたプライベートIPアドレスとネットワークインターフェースがそのまま維持されるため、外部クライアントと確立されていたTCPコネクションは一切切断されません。コンピュートVM上には巨大な永続データが存在せず、転送対象はゲストメモリと実行レジスタのみであるため、極めて短時間のスイッチングでノード間移送が完了します。</p>
+
+                    <h2 id="section3">目標容量を導く3大指標：CPU・メモリ・ワーキングセット</h2>
+
+                    <p>接続を切断せずにリサイズできるインフラが整っていても、適切なスケーリング判断を下すアルゴリズムがなければ実用に耐えません。感度が高すぎるとリソースサイズが激しく乱高下する発振（Oscillation）が発生し、逆に鈍感すぎると急激なアクセス増に追従できずクエリ遅延を招きます。Lakebase Postgresは、3つの独立したシグナルを並行監視して目標容量を算出します。</p>
+
+                    <ul>
+                        <li>CPU負荷目標：演算処理能力の飽和度を監視する <code>cpuGoalCU</code>。</li>
+                        <li>メモリ使用量目標：プロセスの安定性と安全マージンを監視する <code>memGoalCU</code>。</li>
+                        <li>ワーキングセット目標：ローカルキャッシュの適合度を監視する <code>lfcGoalCU</code>。</li>
+                    </ul>
+
+                    <p>システムはこれら3つのシグナルが要求するコンピュートユニット（CU）のうち最大値を最終目標として選択し、ユーザーが設定した最小CU・最大CUの許容範囲（Autoscaling Limits）内に収まるよう制限します。</p>
+
+                    <pre><code class="language-bash">goalCU = max(cpuGoalCU, memGoalCU, lfcGoalCU)</code></pre>
+
+                    <h3>1分間ロードアベレージに基づくCPU制御 (cpuGoalCU)</h3>
+
+                    <p>CPU制御アルゴリズムは、仮想マシンの1分間CPUロードアベレージを継続的に監視します。ホストノード上で動作する <code>autoscaler-agent</code> は5秒ごとにこの値を収集し、負荷が利用可能なCPU容量の90％以下に維持されるよう目標値 <code>cpuGoalCU</code> を決定します。1分間の移動平均を用いることで数ミリ秒単位の瞬間的ノイズを平滑化しつつ、5秒間隔の高頻度ポーリングにより需要の持続的変化を素早く捉えます。負荷の上昇に伴い <code>cpuGoalCU</code> は即座に引き上げられ、負荷の低下に応じて段階的に縮小されます。</p>
+
+                    <h3>100ミリ秒周期の高速検査とOOM防止メモリ制御 (memGoalCU)</h3>
+
+                    <p>メモリはCPUとは異なり、枯渇時に即座に致命的な障害へと直結します。CPUが不足した場合はクエリ処理が遅延するだけで済みますが、メモリが枯渇するとLinuxカーネルのOOM Killerが発動し、PostgreSQLの主要プロセスを強制終了（SIGKILL）させてしまいます。これはデータベースのクラッシュと障害復旧を意味するため、メモリ制御には極めて高い応答性が要求されます。</p>
+
+                    <p>そのため、メモリ監視は2段階の周期で実行されます。ホスト上の <code>autoscaler-agent</code> が5秒ごとにVM全体のメモリを監視するのに加え、VM内部に常駐する <code>vm-monitor</code> が100ミリ秒（0.1秒）ごとにPostgreSQLプロセスの実使用量を直接検証します。メモリ目標は割り当てRAMの75％未満を維持するよう定められており、残りの25％のマージンは突発的なクエリ割り当ての吸収およびゲストOSの安定動作のために確保されます。</p>
+
+                    <p>初期設計ではLinux cgroupの <code>memory.high</code> イベントによる検知が試みられましたが、閾値到達時にカーネルが強制的なメモリ回収とプロセス抑制（スロットリング）を発動させ、クエリ性能が激しく乱れる要因となりました。そのため現在は100ミリ秒周期のポーリング方式に刷新され、高い予測可能性と安定した動作を実現しています。</p>
+
+                    <h3>ネットワーク遅延の盲点を解消するキャッシュ制御 (lfcGoalCU)</h3>
+
+                    <p>従来のオートスケーラーが最も頻繁に失敗する領域が、データベースのバッファキャッシュ管理です。多くのOLTP環境では、頻繁にアクセスされるインデックスやテーブルブロックがローカルメモリに収まっているかどうかが性能を決定づけます。キャッシュが不足してミスヒットが多発すると、クエリはリモートのPageserverからネットワーク経由でブロックを取り寄せるために長時間のI/O待機状態に陥ります。</p>
+
+                    <p>この待機中、CPUコアはデータ到着を待つだけでほとんど稼働しないため、CPU使用率は10〜20％程度と極めて低く記録されます。CPU使用率のみを監視する単純なオートスケーラーは、この状態を負荷が低いと誤認し、インスタンスを縮小させてしまうという致命的な判断ミスを犯します。クエリが激しく遅延しているにもかかわらずインスタンスが縮小されるという矛盾を防ぐため、Lakebase Postgresは実際のワーキングセットサイズを推計する <code>lfcGoalCU</code> を第3の独立シグナルとして組み込みました。</p>
+
+                    <table>
+                        <caption>表1：Lakebase Postgres自動スケーリングの3大指標と制御基準の比較</caption>
+                        <thead>
+                            <tr>
+                                <th>指標識別子</th>
+                                <th>監視対象およびデータソース</th>
+                                <th>収集・評価周期</th>
+                                <th>目標閾値および上限</th>
+                                <th>未対応時のシステム障害リスク</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><code>cpuGoalCU</code></td>
+                                <td>VMの1分間CPUロードアベレージ（OSカーネル指標）</td>
+                                <td>5秒（autoscaler-agent）</td>
+                                <td>利用可能CPU容量の90％以下を維持</td>
+                                <td>クエリ待機列の増大およびレイテンシ急上昇</td>
+                            </tr>
+                            <tr>
+                                <td><code>memGoalCU</code></td>
+                                <td>PostgresプロセスおよびVM全体のメモリ割り当て量</td>
+                                <td>100ミリ秒（vm-monitor）/ 5秒（agent）</td>
+                                <td>割り当てRAMの75％未満を維持（25％マージン）</td>
+                                <td>カーネルOOM Killer発動によるDB強制終了</td>
+                            </tr>
+                            <tr>
+                                <td><code>lfcGoalCU</code></td>
+                                <td>時間枠ベースの推定作業セット量（HyperLogLog）</td>
+                                <td>20秒（1〜60分の複数時間窓を多角評価）</td>
+                                <td>VMのRAMの最大75％をキャッシュ空間に適合</td>
+                                <td>リモートPageserverからのネットワークI/O遅延爆発</td>
+                            </tr>
+                        </tbody>
+                    </table>
+
+                    <h2 id="section4">HyperLogLogに時間を統合したリアルタイムキャッシュ需要予測</h2>
+
+                    <p>データベースのワーキングセットとは、一定期間内に繰り返し参照・更新されるテーブルおよびインデックスページの集合を指します。クエリ性能を最適に維持するには、このワーキングセット全体がローカルキャッシュに収まっている必要があります。しかし、膨大なページ番号をメモリ内に正確に記録・計数しようとすると、それ自体が莫大なメモリを消費し、本末転倒のオーバーヘッドを生み出します。</p>
+
+                    <h3>標準的なHyperLogLogの限界と累積誤差の問題</h3>
+
+                    <p>少ないメモリでユニークな要素数を推計する代表的なアルゴリズムがHyperLogLog（HLL）です。標準的なHLLは、ページ識別子をハッシュ化し、先頭ビットでレジスタを選択して残りのビットの先頭ゼロの数を記録します。この確率的手法により、わずか数キロバイトの固定メモリで数億件に及ぶユニークページ数を高い精度で推計可能です。</p>
+
+                    <p>しかし、標準HLLには自動スケーリング用途として致命的な欠陥があります。それはレジスタの値が単調増加するのみで、一度記録された値は減算できないという点です。標準HLLは特定の値がいつ記録されたのか、現在もアクセスされているのか、あるいは数時間前の単発バッチ処理で参照されただけなのかを区別できません。もしこれをそのまま採用すると、夜間に一度だけ走ったテーブルフルスキャンや大量エクスポートの履歴が残り続け、処理終了後もデータベースが無駄に巨大なキャッシュを抱え続けることになります。</p>
+
+                    <h3>ビットの代わりにタイムスタンプを保持するスライディングウィンドウ推計</h3>
+
+                    <p>Lakebase Postgresのエンジニアリングチームは、この累積問題を解決するためにHyperLogLogのレジスタ構造を根本から改良しました。ハッシュ観測時に特定のビットを1に設定する代わりに、観測が発生した**現在のタイムスタンプ**をレジスタ配列の該当箇所に直接書き込む方式を採用したのです。</p>
+
+                    <p>任意の過去時点T以降にアクセスされたユニークページ数を算出したい場合、推計器はタイムスタンプがT以降に更新されているレジスタのみを有効とみなし、T以前の古いレジスタは空として扱って推計計算を行います。この極めて優れた仕組みにより、追加のメモリを消費することなく、現在を終点とする任意のスライディング時間枠内のユニークページ数を自在に算出できるようになりました。</p>
+
+                    <ul>
+                        <li>直近1分間にアクセスされたユニークページ数の推計値。</li>
+                        <li>直近5分間にアクセスされたユニークページ数の推計値。</li>
+                        <li>直近60分間（1時間）にアクセスされたユニークページ数の推計値。</li>
+                    </ul>
+
+                    <p>ホストノードの <code>autoscaler-agent</code> は20秒ごとにこの改良型HyperLogLogに問い合わせを行い、1分から60分までの様々な時間枠におけるワーキングセット曲線を精緻に収集します。</p>
+
+                    <h2 id="section5">時間枠の急増検知と制御周期を見据えた先行キャッシュ確保</h2>
+
+                    <p>時間認識型の推計器を手に入れても、「どの長さの時間枠を現在の真のワーキングセットとみなすべきか」という新たな課題が生じます。時間枠を1〜2分のように短く設定すると、重い処理が完了した際に素早く縮小できる反面、クエリの合間のわずかな静止期間にキャッシュを性急に捨ててしまい、次のリクエストで激しいキャッシュミスを引き起こします。逆に60分のように長く設定すると、キャッシュは保護されますが終了した処理のメモリを長時間保持し続け、費用の無駄遣いとなります。</p>
+
+                    <h3>5分以降の急増（Jump）検知アルゴリズム</h3>
+
+                    <p>Lakebase Postgresは、時間枠の長さを段階的に広げていった際の推計ページ数の変化傾向を解析する「急増検知アルゴリズム」によってこのトレードオフを解消しました。定常的なトランザクションワークロードでは、時間枠を5分から30分へと伸ばしても同じデータブロックが反復参照されるため、推計値は初期に緩やかに増加したのち平坦な高原（Plateau）を形成します。</p>
+
+                    <p>一方、高負荷な処理が直前に完了していた場合、推計曲線には特徴的な変化が現れます。短い時間枠では現在実行中の軽いクエリの小さな作業セットのみが計測されますが、時間枠が過去の高負荷クエリの実行時刻に達した瞬間、推計値が急激に跳ね上がります（Jump）。アルゴリズムはこの急増点を検知し、跳ね上がりが生じる直前の平坦な推計値を現在の真のワーキングセットとして採用します。</p>
+
+                    <pre><code class="language-text">start after the initial downscale delay
+
+for each working-set window:
+    measure growth before this point
+    measure growth after this point
+
+    if later growth is much larger than earlier growth:
+        return the estimate before the jump
+
+return the estimate from the 60-minute window</code></pre>
+
+                    <p>この探索ロジックは、最短でも5分経過した時間枠から開始されます。これは1〜2分の短期的な負荷の谷間でキャッシュを慌てて縮小し、直後のスパイクで再拡張を繰り返すリソースのばたつき（チャタリング）を防ぐための配慮です。もし60分枠全体にわたって急増点が見つからない場合は、過去1時間にわたって作業セットが一貫して活発に利用されている定常状態と判断し、60分枠の推計値を採用します。</p>
+
+                    <h3>20秒周期と1分未満の先行予測</h3>
+
+                    <p>現時点の作業セットのみを事後的に測定してキャッシュを拡張した場合、対応が一歩遅れる危険があります。アプリケーションが新しいテーブルブロック群を順次読み込み始めた際、キャッシュ拡張が遅れると初期に読まれたページがメモリ不足で即座に追い出され、後続の処理で再びリモートPageserverからネットワーク再取得する無駄が生じるためです。</p>
+
+                    <p>これを防ぐため、アルゴリズムは時間枠間の成長率を算出し、**次の制御周期までに予想される作業セットの増加量**を先行予測（Projection）します。<code>autoscaler-agent</code> の評価周期が20秒であるため、この予測対象は1分未満のごく短い未来区間に限定されます。数分先のような長い未来を予測すると、一時的なノイズを過大評価してサイズが過剰に跳ね上がるリスクがあるためです。こうして算出された先行予測値が <code>lfcGoalCU</code> となり、VMのRAMの最大75％までがキャッシュ領域として割り当てられます。</p>
+
+                    <h2 id="section6">実行中VMを協調制御する4大コンポーネントと3段階の制御周期</h2>
+
+                    <p>目標容量である <code>goalCU</code> が定まったら、稼働中のデータベース仮想マシンに対して安全にリソース変更を反映させる必要があります。標準的なLinuxコンテナ環境では、稼働中のプロセスの物理メモリ上限を動的に拡張することに制約があり、強固なセキュリティ分離を保ちにくいという課題があります。Lakebase Postgresは、Kubernetesクラスタ内の独立した専用軽量仮想マシン（VM）上でPostgreSQLを実行することにより、カーネルレベルの完全な分離と動的ホットプラグを両立させています。</p>
+
+                    <h3>autoscaler-agent、vm-monitor、K8sスケジューラ、NeonVMの役割分担</h3>
+
+                    <p>稼働中データベースのサイズを無停止で変更するため、4つの分散コンポーネントが緊密に連携します。</p>
+
+                    <ul>
+                        <li>autoscaler-agent：Kubernetesの全ワーカーノード上でデーモンとして常駐し、ノード上のPostgres VMから指標を収集、目標サイズ（goalCU）を算出してスケーリングを主導。</li>
+                        <li>vm-monitor：各仮想マシン内のゲストOSに常駐し、PostgreSQLプロセスのメモリ動向を100ミリ秒単位で超高頻度監視。縮小時の安全性検証およびキャッシュサイズの動的制御を担当。</li>
+                        <li>改良型Kubernetesスケジューラ：クラスタ全体の物理空きリソース情報を一元管理し、すべてのVM拡張要求がホストの物理メモリ容量を超過しないか事前に承認。</li>
+                        <li>NeonVMコントローラ：QEMUおよびKVM仮想化技術を基盤とするカスタムCRDおよびオペレータであり、稼働中のVMに対してvCPUとRAMを無停止で動的追加・回収。</li>
+                    </ul>
+
+                    <table>
+                        <caption>表2：自動スケーリングを支える4大インフラコンポーネントの役割と協調方式</caption>
+                        <thead>
+                            <tr>
+                                <th>コンポーネント名</th>
+                                <th>実行領域</th>
+                                <th>主要な責務と機能</th>
+                                <th>他コンポーネントとの連携方式</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><code>autoscaler-agent</code></td>
+                                <td>Kubernetesホストノード（ノード単位）</td>
+                                <td>VM指標収集、goalCU算出、スケーリング処理の開始</td>
+                                <td>K8sスケジューラへの承認要請、NeonVMリソース仕様の更新</td>
+                            </tr>
+                            <tr>
+                                <td><code>vm-monitor</code></td>
+                                <td>Postgres仮想マシン内部ゲストOS</td>
+                                <td>100msメモリ監視、縮小時の安全確認、キャッシュ伸縮</td>
+                                <td>agentとソケット通信、PostgreSQL共有バッファの拡張制御</td>
+                            </tr>
+                            <tr>
+                                <td><code>改良型K8sスケジューラ</code></td>
+                                <td>Kubernetesコントロールプレーン</td>
+                                <td>クラスタ全域のリソース調停、拡張メモリの承認権行使</td>
+                                <td>通常PodスケジューリングとVM拡張の競合（レース）を完全排除</td>
+                            </tr>
+                            <tr>
+                                <td><code>NeonVMコントローラ</code></td>
+                                <td>K8sオペレータおよびQEMU/KVM</td>
+                                <td>稼働中VMへのCPU/RAMホットプラグ反映および移送管理</td>
+                                <td>KVMハイパーバイザ操作、固定IPを維持したライブ移送の実行</td>
+                            </tr>
+                        </tbody>
+                    </table>
+
+                    <p>リソース拡張（スケールアップ）は、厳格な5段階の手順で進行します。</p>
+
+                    <ol>
+                        <li>autoscaler-agentがCPU、メモリ、作業セットの3指標から最大値を割り出し、新たなgoalCUを策定する。</li>
+                        <li>改良型Kubernetesスケジューラに対し、ホストノードの物理メモリを超過しないか確認を求め、承認を得る。</li>
+                        <li>承認後、autoscaler-agentがNeonVMカスタムリソースの構成仕様を更新する。</li>
+                        <li>NeonVMコントローラがQEMUハイパーバイザを介して実行中のVMにvCPUとメモリを即座にホットプラグ追加する。</li>
+                        <li>ゲスト内部のvm-monitorが増設メモリを検知し、ローカルキャッシュ容量を拡張してクエリ処理に充当する。</li>
+                    </ol>
+
+                    <p>スケジューラを一元的な承認窓口とする理由は、Kubernetes本来のPod配置処理との競合を防ぐためです。もしこの調停機構がなければ、通常スケジューラがノードの空きメモリに別の大規模Podを配置しようとする瞬間と、autoscaler-agentが同じ空きメモリをPostgres VMに割り当てようとする処理が衝突し、ホストノードのメモリ過剰割り当て事故が発生してしまいます。</p>
+
+                    <p>縮小（スケールダウン）処理も同様のコンポーネント群で行われますが、内部ではより慎重な安全確認が実行されます。拡張の失敗は一時的な遅延を招くだけですが、無理な縮小はOOMクラッシュを引き起こすためです。縮小指示を受けると、VM内部の <code>vm-monitor</code> が現在実行中のクエリとゲストOSが安全に稼働できる十分なメモリが残るかを厳格に再検証し、少しでも危険と判定された場合は縮小処理を断固として拒否します。</p>
+
+                    <h3>100ミリ秒・5秒・20秒の多重フィードバックループ</h3>
+
+                    <p>自動スケーリングシステム全体は、互いに異なる時間軸で動く3段階の制御ループによって完成しています。</p>
+
+                    <ul>
+                        <li>100ミリ秒ループ（高速防壁）：vm-monitorがPostgreSQLの急激なメモリ割り当てを監視し、カーネルパニックと危険な縮小を即座に阻止。</li>
+                        <li>5秒ループ（短期トレンド対応）：autoscaler-agentが1分間CPU負荷とシステムメモリを監視し、持続的な負荷変動に素早く追従。</li>
+                        <li>20秒ループ（キャッシュ最適化）：autoscaler-agentがHyperLogLog作業セットの1〜60分枠を解析し、先行予測を交えてキャッシュを最適化。</li>
+                    </ul>
+
+                    <p>負荷増大時には機敏にリソースを追加し、負荷終息時には不要になった容量を遅滞なく返還する。この双方向の均等な俊敏性こそが、実利用のないインフラ費用を徹底的に削ぎ落とす自動スケーリングの神髄です。</p>
+
+                    <h2 id="section7">実務への示唆：過剰プロビジョニングの脱却とコスト効率化</h2>
+
+                    <p>Webサービスやエンタープライズシステムのインフラ現場では、突発的なアクセス変動に対応するためにデータベースの過剰プロビジョニングが常態化しています。定期的なキャンペーン、セールイベント、プッシュ通知の配信直後に発生する数分から数十分のスパイクに備え、1ヶ月を通じて通常負荷の5〜10倍もの大型インスタンスを維持し続けているケースは珍しくありません。</p>
+
+                    <p>しかし、AIインフラの需要急増に伴いデータセンターのコンピュートコストが高騰している現代において、月に数時間しか到達しないピークのために最高価格のインスタンスを365日契約し続けることは持続可能なエンジニアリングとは言えません。Lakebase Postgresが示したアーキテクチャは、データベース運用の未来に重要な指針を与えています。</p>
+
+                    <ul>
+                        <li>水平分割の採用タイミングの再検討：分散トランザクションや再シャーディングの困難を抱える水平シャーディングを導入する前に、無停止垂直オートスケーリングによって単一ノード内でピークを吸収できないか検証すべきです。</li>
+                        <li>キャッシュ適合度を中心とした監視体制への転換：CPU使用率のみを監視する旧来のダッシュボードから脱却し、実際の作業セット規模とローカルバッファの適合状況を独立監視する体制を確立する必要があります。</li>
+                        <li>双方向スケーリングによる遊休資産の回収：スケールアップと同様にスケールダウンを緻密に自動化し、イベント終了と同時にベースライン構成へ復帰させることで、クラウド請求額を劇的に圧縮できます。</li>
+                    </ul>
+
+                    <p>Lakebase Postgresは、現在NeonプラットフォームのみならずDatabricks環境でも同一のコアインフラとして稼働しています。開発者やスタートアップ向けの開発基盤を支える一方で、エンタープライズのUnity Catalogやレイクハウス分析プラットフォームとも密接に統合され、インフラ運用の効率性を劇的に高めています。</p>
+
+                    <h2 id="section8">確認できなかった事項</h2>
+
+                    <p>本記事はNeonの公式エンジニアリングブログおよび公式ドキュメントを精査して作成されましたが、公開情報の範囲上、以下の項目については具体的な数値や仕様を確認できませんでした。</p>
+
+                    <ul>
+                        <li>ライブマイグレーション時の切り替え遅延実測値：混雑ノードから新ノードへVMを無停止移送する際のサブセカンド単位の正確なミリ秒数値、およびクラスタごとの同時移送上限数は公式資料に記載されていませんでした。</li>
+                        <li>改良型Kubernetesスケジューラのソースコード詳細：上流の標準kube-schedulerと比較した際の具体的な独自アルゴリズム実装や内部キューイングのソースコードは一般公開されていません。</li>
+                        <li>Databricks環境での内部キャッシュ同期ベンチマーク：Databricks Data Intelligence Platform上で稼働する際のUnity Catalogメタデータ同期オーバーヘッド等の詳細な性能数値は元記事の範囲外となっていました。</li>
+                    </ul>
+
+                    <h2 id="section9">参考資料</h2>
+
+                    <p>本稿で解説したアーキテクチャ設計、性能指標、アルゴリズムの詳細は、以下の公式一次資料に基づいています。</p>
+
+                    <ul>
+                        <li>Neon公式ブログ：<a href="https://neon.com/blog/autoscaling-lakebase-postgres" target="_blank" rel="noopener noreferrer">Autoscaling Lakebase Postgres (著: Carlota Soto)</a></li>
+                        <li>GeekNews 33655トピック（契機資料）：<a href="https://news.hada.io/topic?id=33655" target="_blank" rel="noopener noreferrer">接続を切断しないLakebase Postgresの自動スケーリング | GeekNews</a></li>
+                        <li>Neon公式アーキテクチャドキュメント：<a href="https://neon.com/docs/introduction/architecture-overview" target="_blank" rel="noopener noreferrer">Lakebase Architecture Overview - Neon Docs</a></li>
+                        <li>Neon公式スケーリング設定ドキュメント：<a href="https://neon.com/docs/introduction/autoscaling" target="_blank" rel="noopener noreferrer">Autoscaling Configuration and Limits - Neon Docs</a></li>
+                        <li>Neonストレージ層アーキテクチャ分析：<a href="https://neon.com/blog/wal-s3-lakebase-storage-for-the-era-of-agents" target="_blank" rel="noopener noreferrer">WAL in S3: Lakebase storage for the era of agents - Neon Blog</a></li>
+                        <li>関連記事（水平スケーリングの代償分析）：<a href="postgres_horizontal_scaling_cost.html">Postgresを複数台に分割するという選択 - 水平スケーリングがトランザクション・結合・制約に請求する対価</a></li>
+                    </ul>
+
+                </div>
+
+                <div class="share-section">
+                    <h3>この投稿を共有する</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">リンクをコピー</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">一覧に戻る</a>
+                </div>
+
+                <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">一緒に使うと便利な無料ツール</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/regex_tester.html">正規表現テスター</a></li>
+      <li><a href="../static/jwt_decoder.html">JWTデコーダー・生成器 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 エンコーダー/デコーダー</a></li>
+      <li><a href="../static/yaml_json_converter.html">YAML JSON変換器 2026</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">すべてのツールを見る &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">関連記事</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="postgres_horizontal_scaling_cost.html">Postgresを複数台に分割するという選択 - 水平スケーリングがトランザクション・結合・制約に請求する対価</a></li>
+      <li><a href="mongodb_to_postgres_sync.html">一度移すことと合わせ続けることは別の問題だ - MongoDB コレクションを PostgreSQL へ送るとき強制される選択</a></li>
+      <li><a href="sql_not_in_null_empty_result.html">NOT IN のリストに NULL が一つ混ざると結果が丸ごと空になる - エラーなしで0行になる SQL 三値論理 2026</a></li>
+      <li><a href="openai_habitat_storage_billion_users.html">OpenAIが10億ユーザーのストレージを支える仕組み - エンジニア2名が完遂したRust再構築</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightBlock(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('リンクがコピーされました。Threadsアプリに貼り付けて共有してください！');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('リンクがコピーされました！'); });
+    });
+    </script>
+</body>
+</html>
