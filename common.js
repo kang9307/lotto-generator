@@ -26,25 +26,14 @@ const i18n = {
 
     // 기본 경로 계산 (언어 폴더 고려)
     getBasePath() {
-        const path = window.location.pathname;
-        const lang = this.detectLanguage();
-
-        // 웹 서버 환경
-        if (window.location.protocol !== 'file:') {
-            if (lang !== 'ko') {
-                // /en/, /ja/, /zh/ 폴더에서는 상위로
-                if (path.includes('/posts/')) {
-                    return `../../`;
-                }
-                return '../';
-            } else {
-                if (path.includes('/posts/')) {
-                    return '../';
-                }
-                return '';
-            }
-        }
-        return '';
+        // 사이트 루트까지의 상대 접두사. ★2026-09-15: '/posts/' 만 보던 옛 논리는
+        // /category/·/static/ 같은 다른 하위 경로에서 틀려 카테고리 허브마다 i18n 로딩이 404 났다.
+        // 컴포넌트 경로(loadComponents)와 같은 방식으로 실제 경로 깊이로 계산한다.
+        if (window.location.protocol === 'file:') return '';
+        const pathName = window.location.pathname;
+        const segs = pathName.replace(/^\/|\/$/g, '').split('/').filter(Boolean);
+        const depth = pathName.endsWith('/') ? segs.length : Math.max(0, segs.length - 1);
+        return '../'.repeat(depth);
     },
 
     // 번역 JSON 로딩
@@ -531,11 +520,9 @@ document.addEventListener('DOMContentLoaded', async function() {
             currentPage = pathParts[pathParts.length - 1] || 'index.html';
 
             // 디버깅
-            console.log('현재 활성화할 페이지(로컬):', currentPage);
         } else {
             // 웹 서버에서는 URL 경로의 마지막 부분만 사용
             currentPage = window.location.pathname.split('/').pop() || 'index.html';
-            console.log('현재 활성화할 페이지(웹):', currentPage);
         }
 
         const menuLinks = document.querySelectorAll('.nav-link');
@@ -555,14 +542,12 @@ document.addEventListener('DOMContentLoaded', async function() {
             // 현재 페이지와 링크 페이지 비교
             if (linkPage === currentPage) {
                 link.classList.add('active');
-                console.log('메뉴 활성화:', linkPage);
             }
 
             // 블로그 포스트 페이지 특별 처리
             if ((currentPage.startsWith('post_') || window.location.pathname.includes('/posts/')) &&
                 linkUrl.includes('blog.html')) {
                 link.classList.add('active');
-                console.log('블로그 메뉴 활성화');
             }
         });
     }

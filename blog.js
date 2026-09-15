@@ -39,10 +39,22 @@ function detectLang() {
 
 // UI 문구 사전
 const UI_TEXT = {
-    ko: { welcome: '기술 블로그에 오신 것을 환영합니다', noResults: '검색 결과가 없습니다.', all: '전체 글', featured: '추천', empty: '등록된 글이 없습니다.', error: '오류가 발생했습니다. 나중에 다시 시도하세요.', date: (y,m,d)=>`${y}년 ${m}월 ${d}일` },
-    en: { welcome: 'Welcome to the BrainDetox blog', noResults: 'No results found.', all: 'All posts', featured: 'Featured', empty: 'No posts yet.', error: 'Something went wrong. Please try again later.', date: (y,m,d)=>`${m}/${d}/${y}` },
-    ja: { welcome: '技術ブログへようこそ', noResults: '検索結果がありません。', all: 'すべての記事', featured: 'おすすめ', empty: '記事がありません。', error: 'エラーが発生しました。しばらくしてから再度お試しください。', date: (y,m,d)=>`${y}年${m}月${d}日` },
-    zh: { welcome: '欢迎来到技术博客', noResults: '没有搜索结果。', all: '全部文章', featured: '推荐', empty: '暂无文章。', error: '发生错误，请稍后重试。', date: (y,m,d)=>`${y}年${m}月${d}日` },
+    ko: { welcome: '기술 블로그에 오신 것을 환영합니다', noResults: '검색 결과가 없습니다.', all: '전체 글', featured: '추천', empty: '등록된 글이 없습니다.', error: '오류가 발생했습니다. 나중에 다시 시도하세요.', date: (y,m,d)=>`${y}년 ${m}월 ${d}일`,
+          latest: '최신 글', recent: '최근 글', featuredPosts: '추천 글', readMore: '더 보기...', readFull: '글 전체 보기', hint: '왼쪽 목록에서 관심있는 글을 선택하세요.',
+          excerpt: (t,c)=>`<p>이 글에서는 ${t}에 대한 핵심 내용을 살펴봅니다.</p><p>이는 ${c} 카테고리에 속하는 글로, 해당 주제에 관심 있는 독자들에게 유용한 정보를 제공합니다.</p>`,
+          datetime: (y,m,d,h,mi)=>`${y}년 ${m}월 ${d}일 ${h}:${mi}` },
+    en: { welcome: 'Welcome to the BrainDetox blog', noResults: 'No results found.', all: 'All posts', featured: 'Featured', empty: 'No posts yet.', error: 'Something went wrong. Please try again later.', date: (y,m,d)=>`${m}/${d}/${y}`,
+          latest: 'Latest post', recent: 'Recent posts', featuredPosts: 'Featured posts', readMore: 'Read more...', readFull: 'Read the full article', hint: 'Pick an article from the list on the left.',
+          excerpt: (t,c)=>`<p>This article covers the key points of ${t}.</p><p>It belongs to the ${c} category and is useful for readers interested in this topic.</p>`,
+          datetime: (y,m,d,h,mi)=>`${m}/${d}/${y} ${h}:${mi}` },
+    ja: { welcome: '技術ブログへようこそ', noResults: '検索結果がありません。', all: 'すべての記事', featured: 'おすすめ', empty: '記事がありません。', error: 'エラーが発生しました。しばらくしてから再度お試しください。', date: (y,m,d)=>`${y}年${m}月${d}日`,
+          latest: '最新記事', recent: '最近の記事', featuredPosts: 'おすすめ記事', readMore: '続きを読む...', readFull: '記事全文を見る', hint: '左の一覧から気になる記事を選んでください。',
+          excerpt: (t,c)=>`<p>この記事では「${t}」の要点を紹介します。</p><p>${c} カテゴリの記事で、このテーマに関心のある読者に役立つ情報を提供します。</p>`,
+          datetime: (y,m,d,h,mi)=>`${y}年${m}月${d}日 ${h}:${mi}` },
+    zh: { welcome: '欢迎来到技术博客', noResults: '没有搜索结果。', all: '全部文章', featured: '推荐', empty: '暂无文章。', error: '发生错误，请稍后重试。', date: (y,m,d)=>`${y}年${m}月${d}日`,
+          latest: '最新文章', recent: '近期文章', featuredPosts: '推荐文章', readMore: '查看更多...', readFull: '阅读全文', hint: '请从左侧列表中选择感兴趣的文章。',
+          excerpt: (t,c)=>`<p>本文介绍「${t}」的核心内容。</p><p>该文章属于 ${c} 分类，为关注此主题的读者提供实用信息。</p>`,
+          datetime: (y,m,d,h,mi)=>`${y}年${m}月${d}日 ${h}:${mi}` },
 };
 function t(key) {
     return (UI_TEXT[detectLang()] || UI_TEXT.ko)[key];
@@ -162,7 +174,13 @@ async function initBlog() {
                 renderPostList(selectedCategory);
             });
         }
-        
+
+        // 목록 새로고침 버튼(blog.html #refreshBtn) — 핸들러가 없어 죽은 버튼이었다
+        const refreshBtn = document.getElementById('refreshBtn');
+        if (refreshBtn) {
+            refreshBtn.addEventListener('click', function() { window.location.reload(); });
+        }
+
         // 포스트 데이터 로드
         posts = await loadPostData();
         
@@ -199,7 +217,7 @@ async function initBlog() {
         // 마지막 업데이트 시간 표시
         updateLastUpdatedTime();
 
-        console.log("블로그 초기화 완료!");
+        debugLog("블로그 초기화 완료!");
         
     } catch (error) {
         console.error('블로그 초기화 오류:', error);
@@ -228,7 +246,7 @@ async function loadPostData() {
             
             // index.json에 posts 배열이 있으면 그것을 우선 사용
             if (data.posts && data.posts.length > 0) {
-                console.log(`index.json에서 ${data.posts.length}개의 포스트 로드됨`);
+                debugLog(`index.json에서 ${data.posts.length}개의 포스트 로드됨`);
                 
                 // posts 배열을 그대로 사용하되, 필요한 필드 보정
                 const postsData = data.posts.map(post => {
@@ -247,7 +265,7 @@ async function loadPostData() {
                 // 날짜 기준 내림차순 정렬
                 postsData.sort((a, b) => new Date(b.date) - new Date(a.date));
                 
-                console.log(`포스트 데이터 정렬 완료: ${postsData.length}개`);
+                debugLog(`포스트 데이터 정렬 완료: ${postsData.length}개`);
                 return postsData;
             }
             
@@ -362,7 +380,7 @@ async function loadPostData() {
                 return 0;
             });
             
-            console.log(`실제 파일 기반 포스트 수: ${postsData.length}개 로드됨`);
+            debugLog(`실제 파일 기반 포스트 수: ${postsData.length}개 로드됨`);
             return postsData;
                     } else {
             console.error('index.json 파일을 로드할 수 없습니다.');
@@ -462,7 +480,7 @@ function formatTitle(id) {
     
     // 포스트 목록 렌더링
     function renderPostList(filterCategory = 'all') {
-    console.log(`포스트 목록 렌더링 시작 (카테고리: ${filterCategory})`);
+    debugLog(`포스트 목록 렌더링 시작 (카테고리: ${filterCategory})`);
     
     if (!postList) {
         console.error("포스트 목록 요소가 없습니다.");
@@ -476,7 +494,7 @@ function formatTitle(id) {
         let filteredPosts = posts;
         if (filterCategory !== 'all') {
             filteredPosts = posts.filter(post => post.category === filterCategory);
-        console.log(`카테고리 '${filterCategory}'로 필터링: ${filteredPosts.length}개 포스트`);
+        debugLog(`카테고리 '${filterCategory}'로 필터링: ${filteredPosts.length}개 포스트`);
         }
         
         // 날짜 최신순으로 정렬
@@ -493,7 +511,7 @@ function formatTitle(id) {
     
     // 모든 게시글 표시
     const displayPosts = filteredPosts;
-    console.log(`표시할 포스트 수: ${displayPosts.length}개`);
+    debugLog(`표시할 포스트 수: ${displayPosts.length}개`);
         
         // 포스트 항목을 목록에 추가
     displayPosts.forEach(post => {
@@ -536,7 +554,7 @@ function formatTitle(id) {
         totalPostsEl.textContent = filteredPosts.length;
     }
     
-    console.log("포스트 목록 렌더링 완료");
+    debugLog("포스트 목록 렌더링 완료");
 }
 
 // 마지막 업데이트 시간 표시 함수
@@ -544,7 +562,7 @@ function updateLastUpdatedTime() {
     const lastUpdatedEl = document.getElementById('lastUpdated');
     if (lastUpdatedEl) {
         const now = new Date();
-        const formattedDate = `${now.getFullYear()}년 ${String(now.getMonth() + 1).padStart(2, '0')}월 ${String(now.getDate()).padStart(2, '0')}일 ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+        const formattedDate = t('datetime')(now.getFullYear(), String(now.getMonth() + 1).padStart(2, '0'), String(now.getDate()).padStart(2, '0'), String(now.getHours()).padStart(2, '0'), String(now.getMinutes()).padStart(2, '0'));
         lastUpdatedEl.textContent = formattedDate;
     }
 }
@@ -557,7 +575,7 @@ function populateCategoryOptions() {
         }
         
     try {
-        console.log("카테고리 옵션 채우기 시작");
+        debugLog("카테고리 옵션 채우기 시작");
         
         // 기존 옵션 비우기
         categorySelect.innerHTML = '';
@@ -579,7 +597,7 @@ function populateCategoryOptions() {
         // 카테고리 정렬
         uniqueCategories.sort();
         
-        console.log(`추출된 카테고리 (${uniqueCategories.length}개):`, uniqueCategories);
+        debugLog(`추출된 카테고리 (${uniqueCategories.length}개):`, uniqueCategories);
         
         // 카테고리별로 옵션 추가
         uniqueCategories.forEach(category => {
@@ -589,15 +607,8 @@ function populateCategoryOptions() {
             categorySelect.appendChild(option);
         });
         
-        console.log("카테고리 옵션 채우기 완료");
-        
-        // 카테고리 변경 이벤트 리스너 다시 추가
-        if (categorySelect) {
-            categorySelect.addEventListener('change', function(e) {
-                const selectedCategory = e.target.value;
-                renderPostList(selectedCategory);
-            });
-        }
+        debugLog("카테고리 옵션 채우기 완료");
+        // change 리스너는 초기화 때 한 번만 건다(여기서 다시 걸면 변경마다 목록을 두 번 그렸다)
     } catch (error) {
         console.error('카테고리 옵션 채우기 오류:', error);
     }
@@ -627,7 +638,7 @@ async function loadLatestPost() {
         }
         
         const latestPost = latestPosts[0];
-        console.log('최신 포스트:', latestPost);
+        debugLog('최신 포스트:', latestPost);
         
         // 최근 3주 이내 최신 글 필터링
         const threeWeeksAgo = new Date();
@@ -635,17 +646,14 @@ async function loadLatestPost() {
         
         // 3주 이내의 글 필터링
         const recentPosts = latestPosts.filter(post => new Date(post.date) >= threeWeeksAgo);
-        console.log(`최근 3주 이내 글 수: ${recentPosts.length}개`);
+        debugLog(`최근 3주 이내 글 수: ${recentPosts.length}개`);
         
         // 추천 글 필터링
         const featuredPosts = latestPosts.filter(post => post.featured === true).slice(0, 8);
-        console.log(`추천 글 수: ${featuredPosts.length}개`);
+        debugLog(`추천 글 수: ${featuredPosts.length}개`);
         
         // 최신 포스트 미리보기 컨텐츠 생성
-        const excerptContent = `
-            <p>이 글에서는 ${latestPost.title}에 대한 핵심 내용을 살펴봅니다.</p>
-            <p>이는 ${latestPost.category} 카테고리에 속하는 글로, 해당 주제에 관심 있는 독자들에게 유용한 정보를 제공합니다.</p>
-        `;
+        const excerptContent = t('excerpt')(latestPost.title, latestPost.category);
         
         // 태그 HTML 생성
         let tagsHtml = '';
@@ -661,7 +669,7 @@ async function loadLatestPost() {
             if (otherRecentPosts.length > 0) {
                 recentPostsHtml = `
                 <div class="recent-posts">
-                    <h3>최근 글</h3>
+                    <h3>${t('recent')}</h3>
                     <ul class="recent-posts-list">
                         ${otherRecentPosts.map(post =>
                             `<li class="recent-post-item">
@@ -679,7 +687,7 @@ async function loadLatestPost() {
         if (featuredPosts.length > 0) {
             featuredPostsHtml = `
             <div class="featured-posts" style="border-left: 4px solid #e74c3c;">
-                <h3>추천 글</h3>
+                <h3>${t('featuredPosts')}</h3>
                 <ul class="recent-posts-list">
                     ${featuredPosts.map(post =>
                         `<li class="recent-post-item">
@@ -694,7 +702,7 @@ async function loadLatestPost() {
         // 마크다운 컨텐츠 영역에 포스트 출력
                 markdownContent.innerHTML = `
         <div class="latest-post">
-            <h2>최신 글</h2>
+            <h2>${t('latest')}</h2>
             <article class="post post-preview">
                 <header class="post-header">
                     <h1 class="post-title"><a href="${postsBasePath}posts/${latestPost.id}.html">${latestPost.title}</a></h1>
@@ -705,14 +713,14 @@ async function loadLatestPost() {
                 </header>
                 <div class="post-content">
                     ${excerptContent}
-                    <p class="read-more"><a href="${postsBasePath}posts/${latestPost.id}.html">더 보기...</a></p>
+                    <p class="read-more"><a href="${postsBasePath}posts/${latestPost.id}.html">${t('readMore')}</a></p>
                 </div>
                 <footer class="post-footer">
                     <div class="post-tags">
                         ${tagsHtml}
                     </div>
                     <div class="read-full">
-                        <a href="${postsBasePath}posts/${latestPost.id}.html" class="read-more-link">글 전체 보기</a>
+                        <a href="${postsBasePath}posts/${latestPost.id}.html" class="read-more-link">${t('readFull')}</a>
                     </div>
                 </footer>
             </article>
@@ -724,11 +732,7 @@ async function loadLatestPost() {
         console.error('최신 포스트 로드 실패:', error);
         
         // 오류 시 기본 메시지 표시
-            markdownContent.innerHTML = `
-        <div class="welcome-message">
-            <h2>기술 블로그에 오신 것을 환영합니다</h2>
-            <p>왼쪽 목록에서 관심있는 글을 선택하세요.</p>
-                </div>`;
+            markdownContent.innerHTML = '<div class="welcome-message"><h2>'+t('welcome')+'</h2><p>'+t('hint')+'</p></div>';
         }
     }
     
