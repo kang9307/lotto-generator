@@ -39,7 +39,7 @@ function detectLang() {
 
 // UI 문구 사전
 const UI_TEXT = {
-    ko: { welcome: '기술 블로그에 오신 것을 환영합니다', noResults: '검색 결과가 없습니다.', all: '전체 글', featured: '추천', empty: '등록된 글이 없습니다.', error: '오류가 발생했습니다. 나중에 다시 시도하세요.', date: (y,m,d)=>`${y}년 ${m}월 ${d}일`,
+    ko: { welcome: 'BrainDetox 블로그에 오신 것을 환영합니다', noResults: '검색 결과가 없습니다.', all: '전체 글', featured: '추천', empty: '등록된 글이 없습니다.', error: '오류가 발생했습니다. 나중에 다시 시도하세요.', date: (y,m,d)=>`${y}년 ${m}월 ${d}일`,
           latest: '최신 글', recent: '최근 글', featuredPosts: '추천 글', readMore: '더 보기...', readFull: '글 전체 보기', hint: '왼쪽 목록에서 관심있는 글을 선택하세요.',
           excerpt: (t,c)=>`<p>이 글에서는 ${t}에 대한 핵심 내용을 살펴봅니다.</p><p>이는 ${c} 카테고리에 속하는 글로, 해당 주제에 관심 있는 독자들에게 유용한 정보를 제공합니다.</p>`,
           datetime: (y,m,d,h,mi)=>`${y}년 ${m}월 ${d}일 ${h}:${mi}` },
@@ -47,11 +47,11 @@ const UI_TEXT = {
           latest: 'Latest post', recent: 'Recent posts', featuredPosts: 'Featured posts', readMore: 'Read more...', readFull: 'Read the full article', hint: 'Pick an article from the list on the left.',
           excerpt: (t,c)=>`<p>This article covers the key points of ${t}.</p><p>It belongs to the ${c} category and is useful for readers interested in this topic.</p>`,
           datetime: (y,m,d,h,mi)=>`${m}/${d}/${y} ${h}:${mi}` },
-    ja: { welcome: '技術ブログへようこそ', noResults: '検索結果がありません。', all: 'すべての記事', featured: 'おすすめ', empty: '記事がありません。', error: 'エラーが発生しました。しばらくしてから再度お試しください。', date: (y,m,d)=>`${y}年${m}月${d}日`,
+    ja: { welcome: 'BrainDetox ブログへようこそ', noResults: '検索結果がありません。', all: 'すべての記事', featured: 'おすすめ', empty: '記事がありません。', error: 'エラーが発生しました。しばらくしてから再度お試しください。', date: (y,m,d)=>`${y}年${m}月${d}日`,
           latest: '最新記事', recent: '最近の記事', featuredPosts: 'おすすめ記事', readMore: '続きを読む...', readFull: '記事全文を見る', hint: '左の一覧から気になる記事を選んでください。',
           excerpt: (t,c)=>`<p>この記事では「${t}」の要点を紹介します。</p><p>${c} カテゴリの記事で、このテーマに関心のある読者に役立つ情報を提供します。</p>`,
           datetime: (y,m,d,h,mi)=>`${y}年${m}月${d}日 ${h}:${mi}` },
-    zh: { welcome: '欢迎来到技术博客', noResults: '没有搜索结果。', all: '全部文章', featured: '推荐', empty: '暂无文章。', error: '发生错误，请稍后重试。', date: (y,m,d)=>`${y}年${m}月${d}日`,
+    zh: { welcome: '欢迎来到 BrainDetox 博客', noResults: '没有搜索结果。', all: '全部文章', featured: '推荐', empty: '暂无文章。', error: '发生错误，请稍后重试。', date: (y,m,d)=>`${y}年${m}月${d}日`,
           latest: '最新文章', recent: '近期文章', featuredPosts: '推荐文章', readMore: '查看更多...', readFull: '阅读全文', hint: '请从左侧列表中选择感兴趣的文章。',
           excerpt: (t,c)=>`<p>本文介绍「${t}」的核心内容。</p><p>该文章属于 ${c} 分类，为关注此主题的读者提供实用信息。</p>`,
           datetime: (y,m,d,h,mi)=>`${y}年${m}月${d}日 ${h}:${mi}` },

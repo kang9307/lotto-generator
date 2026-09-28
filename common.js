@@ -284,7 +284,7 @@ document.addEventListener('DOMContentLoaded', async function() {
         // 기본 한국어 텍스트
         const defaultTexts = {
             home: '홈',
-            blog: '기술 블로그',
+            blog: '블로그',
             lotto: '로또 번호 생성기',
             subnet: '서브넷 계산기',
             password: '비밀번호 생성기',
