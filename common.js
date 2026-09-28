@@ -502,10 +502,8 @@ document.addEventListener('DOMContentLoaded', async function() {
             const langSwitcherHtml = createLanguageSwitcher();
             const langDiv = document.createElement('div');
             langDiv.className = 'lang-switcher-nav';
-            langDiv.style.cssText = 'position: absolute; right: 10px; top: 10px; z-index: 100;';
             langDiv.innerHTML = langSwitcherHtml;
-            headerContainer.style.position = 'relative';
-            headerContainer.insertBefore(langDiv, headerContainer.firstChild);
+            headerContainer.appendChild(langDiv);
         }
     }
 

@@ -652,8 +652,18 @@ async function loadLatestPost() {
         const featuredPosts = latestPosts.filter(post => post.featured === true).slice(0, 8);
         debugLog(`추천 글 수: ${featuredPosts.length}개`);
         
-        // 최신 포스트 미리보기 컨텐츠 생성
-        const excerptContent = t('excerpt')(latestPost.title, latestPost.category);
+        // 최신 포스트 미리보기 — 모든 글에 같은 틀 문장을 쓰던 것을 실제 설명문(latest.json 의 meta description)으로 바꾼다
+        let latestDesc = '';
+        try {
+            const r = await fetch(postsBasePath + 'posts/latest.json', { cache: 'no-cache' });
+            if (r.ok) {
+                const d = await r.json();
+                const m = (d.posts || []).find(p => p.id === latestPost.id);
+                if (m && m.description) latestDesc = m.description;
+            }
+        } catch (e) { /* 설명문이 없으면 제목·메타만 보인다 */ }
+        const escText = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        const excerptContent = latestDesc ? `<p>${escText(latestDesc)}</p>` : '';
         
         // 태그 HTML 생성
         let tagsHtml = '';
@@ -705,7 +715,7 @@ async function loadLatestPost() {
             <h2>${t('latest')}</h2>
             <article class="post post-preview">
                 <header class="post-header">
-                    <h1 class="post-title"><a href="${postsBasePath}posts/${latestPost.id}.html">${latestPost.title}</a></h1>
+                    <h2 class="post-title"><a href="${postsBasePath}posts/${latestPost.id}.html">${latestPost.title}</a></h2>
                     <div class="post-meta">
                         <span class="post-date"><i class="fas fa-calendar-alt"></i> ${formatDate(latestPost.date)}</span>
                         <span class="post-category"><i class="fas fa-folder"></i> ${latestPost.category}</span>
@@ -713,7 +723,6 @@ async function loadLatestPost() {
                 </header>
                 <div class="post-content">
                     ${excerptContent}
-                    <p class="read-more"><a href="${postsBasePath}posts/${latestPost.id}.html">${t('readMore')}</a></p>
                 </div>
                 <footer class="post-footer">
                     <div class="post-tags">
