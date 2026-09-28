@@ -429,25 +429,19 @@ document.addEventListener('DOMContentLoaded', function() {
 
 // 헤더/푸터 로드 함수
 function loadHeaderFooter() {
-    // 헤더 로드
-    if (document.getElementById('header-placeholder')) {
-        fetch('components/header.html')
-            .then(response => response.text())
-            .then(data => {
-                document.getElementById('header-placeholder').innerHTML = data;
-            })
-            .catch(error => console.log('Header load failed:', error));
-    }
-    
-    // 푸터 로드
-    if (document.getElementById('footer-placeholder')) {
-        fetch('components/footer.html')
-            .then(response => response.text())
-            .then(data => {
-                document.getElementById('footer-placeholder').innerHTML = data;
-            })
-            .catch(error => console.log('Footer load failed:', error));
-    }
+    // en/ja/zh 판에서 상대 경로 'components/header.html' 은 없는 /en/components/… 를 가리켜 404 페이지 전체가 끼워졌다
+    const m = window.location.pathname.match(/^\/(en|ja|zh)\//);
+    const prefix = m ? m[1] + '-' : '';
+    const load = (id, file) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        fetch('/components/' + prefix + file)
+            .then(response => { if (!response.ok) throw new Error(response.status); return response.text(); })
+            .then(data => { el.innerHTML = data; })
+            .catch(error => console.log(id + ' load failed:', error));
+    };
+    load('header-placeholder', 'header.html');
+    load('footer-placeholder', 'footer.html');
 }
 
 // 탭 기능 초기화
