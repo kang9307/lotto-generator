@@ -1199,3 +1199,39 @@ const RecentTools = {
 
 // 최근 사용 도구 시스템 초기화
 RecentTools.init();
+
+// 화면보다 넓은 글 속 표만 가로 스크롤 상자로 감싼다 — 래퍼 없는 옛 글의 표가 모바일에서 페이지 전체를 가로로 밀던 문제
+(function wrapWideTables() {
+    if (!window.location.pathname.includes('/posts/')) return;
+    const hasScrollParent = el => {
+        for (let p = el.parentElement; p && p !== document.body; p = p.parentElement) {
+            const o = getComputedStyle(p).overflowX;
+            if (o === 'auto' || o === 'scroll') return true;
+        }
+        return false;
+    };
+    const run = () => {
+        document.querySelectorAll('article table, .post-content table').forEach(table => {
+            const parent = table.parentElement;
+            if (!parent || hasScrollParent(table)) return;
+            const ps = getComputedStyle(parent);
+            const contentWidth = parent.clientWidth - parseFloat(ps.paddingLeft) - parseFloat(ps.paddingRight);
+            if (table.getBoundingClientRect().width <= contentWidth + 1) return;
+            const cs = getComputedStyle(table);
+            const wrap = document.createElement('div');
+            wrap.className = 'tbl-wrap';
+            wrap.style.overflowX = 'auto';
+            wrap.style.margin = cs.marginTop + ' 0 ' + cs.marginBottom;
+            table.style.marginTop = '0';
+            table.style.marginBottom = '0';
+            parent.insertBefore(wrap, table);
+            wrap.appendChild(table);
+        });
+    };
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', run);
+    else run();
+    window.addEventListener('load', run);
+    if (document.fonts && document.fonts.ready) document.fonts.ready.then(run);
+    let timer;
+    window.addEventListener('resize', () => { clearTimeout(timer); timer = setTimeout(run, 200); });
+})();
