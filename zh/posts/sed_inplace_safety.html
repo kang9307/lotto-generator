@@ -1,0 +1,896 @@
+<!DOCTYPE html>
+<!--
+ * 技术博客文章模板
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>sed -i 不是原位修改 — 批量替换前的预览、备份与 diff 流程</title>
+    <meta name="description" content="sed -i 并不在原处修改文件，而是用临时文件替换原文件。本文以 Git Bash 实际运行结果展示文件 ID 变化、硬链接断开，以及零匹配时 CRLF 仍被改成 LF 的现象，并整理批量替换前的 5 步流程。">
+    <meta name="keywords" content="sed -i, sed inplace, 硬链接断裂, CRLF LF, Git Bash sed, sed 选项, 批量替换, GNU sed, BSD sed, diff 验证">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/sed_inplace_safety.html">
+
+    <meta property="og:title" content="sed -i 不是原位修改 — 批量替换前的预览、备份与 diff 流程">
+    <meta property="og:description" content="实测分析文件ID变化、硬链接断裂以及换行符强制转换陷阱，并梳理5步安全批量替换标准流程。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/sed_inplace_safety.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-09-29">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="sed -i 不是原位修改 — 批量替换前的预览、备份与 diff 流程">
+    <meta name="twitter:description" content="通过真实命令输出解析文件ID变化与换行符转换陷阱的批量替换指南。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js" defer></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "sed -i 不是原位修改 — 批量替换前的预览、备份与 diff 流程",
+      "alternativeHeadline": "sed -i Is Not an In-Place Edit — Preview, Backup, and diff Sequence Before Bulk Substitution",
+      "datePublished": "2026-09-29",
+      "dateModified": "2026-09-29",
+      "inLanguage": "zh-CN",
+      "articleSection": "开发/基础设施",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "sed -i, sed inplace, 硬链接断裂, CRLF, Git Bash, GNU sed, BSD sed, diff",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/sed_inplace_safety.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "sed -i 是否会在磁盘上直接修改原文件的物理内容？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "不会。GNU sed 手册说明，-i 会创建临时文件并把输出写入其中，到达文件末尾时再把该临时文件重命名为原文件名。在 Git Bash 中实际运行后，sed -i 之后 inode 编号与 NTFS 文件 ID 都发生了变化，通过硬链接相连的另一个名称仍保留旧内容 (a=1)。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "在没有匹配项的文件上运行 sed -i 是否仍会产生副作用？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "会。使用 Git Bash (MSYS 构建) 的 sed，对零匹配的 CRLF 文件执行 sed -i 后，inode 改变，换行符由 CRLF 变为 LF。GNU sed 手册写道，在 Windows 这类区分文本文件与二进制文件的环境中，sed 看不到行尾的 CR。这是 Windows 构建的行为；加上 -b 后 CRLF 得以保留。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "为何将扩展正则表达式连写为 -iE 会报错或生成异常备份文件？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "因为 GNU sed 会把紧跟在 -i 后面的字符读作备份扩展名。手册写明 sed -iE 等同于 --in-place=E，会创建名为 FILEE 的备份。实际运行中，使用捕获组的表达式以 invalid reference 错误 (exit=1) 结束，不含分组的表达式则没有报错并留下了 ie.txtE 备份文件。按 -Ei 的顺序书写才得到预期的 a=2。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "替换文本中包含与号 (&) 或斜杠 (/) 时会发生什么故障？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "在 sed 替换命令 s 中，& 是指代整个匹配内容的特殊引用符。当变量中含有未转义的 & 时，匹配原文会被意外插入替换文本中。此外路径中的斜杠会与分隔符冲突导致语法报错；解决办法是将分隔符改为竖线 (|) 并在传入前将 & 转义为反斜杠与号。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "安全执行批量替换的标准 5 步流程是什么？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "第1步使用 grep -c 核对匹配行数；第2步使用 sed -n p 预览仅变更的行；第3步使用 file 与 od -c 检查 CRLF 并在 Windows 下评估 -b；第4步使用 sed -i.bak 携带备份执行替换；第5步使用 diff 对比备份文件以确认变更符合预期。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .danger { background:#fdecea; border-left:4px solid #d9534f; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/sed_inplace_safety.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/sed_inplace_safety.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/sed_inplace_safety.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/sed_inplace_safety.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/sed_inplace_safety.html">
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BreadcrumbList",
+      "itemListElement": [
+        {
+          "@type": "ListItem",
+          "position": 1,
+          "name": "首页",
+          "item": "https://braindetox.kr/zh/"
+        },
+        {
+          "@type": "ListItem",
+          "position": 2,
+          "name": "开发/基础设施",
+          "item": "https://braindetox.kr/zh/category/dev.html"
+        },
+        {
+          "@type": "ListItem",
+          "position": 3,
+          "name": "sed -i 不是原位修改 — 批量替换前的预览、备份与 diff 流程",
+          "item": "https://braindetox.kr/zh/posts/sed_inplace_safety.html"
+        }
+      ]
+    }
+    </script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article class="blog-post-content" itemscope itemtype="https://schema.org/BlogPosting">
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="headline">sed -i 不是原位修改 — 批量替换前的预览、备份与 diff 流程</h1>
+                    <p class="post-subtitle">文件ID变化、硬链接断裂、CRLF换行符变更实测与安全替换流程</p>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-29">2026-09-29</span>
+                        <span class="post-category"><a href="../category/dev.html" style="text-decoration:none;color:inherit;">开发/基础设施</a></span>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+                    <p>在海量自动化脚本与运维交付流水线中，修改配置文件文本时调用最频繁的工具便是 <code>sed -i</code>。由于选项名称为 <code>--in-place</code>，工程师通常直觉地认为该命令会直接打开磁盘上的原文件，并在物理数据块的原位置覆盖写入修改后的字节流。然而，实测数据与官方手册证明事实恰恰相反：<code>sed -i</code> 并非原位编辑工具，而是通过在后台创建全新的临时文件写入替换流，并在完成处理后重命名为原文件名的文件替换程序。</p>
+
+                    <p>若不了解这一替换机制就进行批量替换，会得到意料之外的结果。通过硬链接相连的另一个名称收不到修改，文件 ID 也会改变。特别是在 Windows 的 Git Bash 中，即使文件里没有任何匹配的模式，整份文件的换行符也会由 CRLF 变为 LF，于是没打算修改的文件也显示为已变更。本文用实际执行记录展示这种替换带来的结果，并整理批量替换前应遵循的 5 步流程。</p>
+
+                    <p>本文所有实测数据均在以下环境下真实执行验证：Windows 10 Pro 10.0.19045, Git Bash (GNU sed 4.9, GNU Awk 5.0.0), curl 8.12.1 (Schannel), git 2.48.1.windows.1, Windows PowerShell 5.1, Python 3.13.3, Node 22.16.0 (非管理员权限)。关于跨平台换行符基础请参考 <a href="line_ending_crlf_lf_guide.html">CRLF 与 LF 实测指南</a>，Shell 引用与变量展开规则参见 <a href="shell_quoting_rules_guide.html">Shell 引用规则指南</a>，正则表达式方言兼容性请查阅 <a href="regex_everywhere_portable_2026.html">便携正则表达式指南</a>，脚本幂等性架构设计可参考 <a href="shell_readonly_idempotent_script.html">幂等脚本设计指南</a>。</p>
+
+                    <div class="callout">
+                        <strong>目录</strong>
+                        <ol>
+                            <li><a href="#sec-1">sed -i 的工作原理 — 为何是新文件替换而非原位改写</a></li>
+                            <li><a href="#sec-2">实测验证: 文件ID变化与硬链接断裂真相</a></li>
+                            <li><a href="#sec-3">换行符陷阱: 零匹配文件依然由CRLF被强制转换为LF</a></li>
+                            <li><a href="#sec-4">选项连写错误与空文件灾难: -iE 与 -n -i</a></li>
+                            <li><a href="#sec-5">替换文本中的 &amp; 与路径分隔符冲突</a></li>
+                            <li><a href="#sec-6">批量替换的安全 5 步流程</a></li>
+                            <li><a href="#sec-7">GNU sed 与 BSD sed 的语法差异与可移植性</a></li>
+                            <li><a href="#sec-8">未确认事项</a></li>
+                            <li><a href="#sec-9">参考资料</a></li>
+                        </ol>
+                    </div>
+
+                    <h2 id="sec-1">1. sed -i 的工作原理 — 为何是新文件替换而非原位改写</h2>
+                    <p>选项名称 <code>-i</code> 是英文 in-place 的缩写。使用者容易望文生义地认为它在原地改写目标文件。但作为流式编辑器诞生的 sed，其本质机制是从标准输入逐行将文本载入模式空间缓冲区，应用脚本指令处理后输出到标准输出，设计上并不支持在磁盘文件特定偏移量进行随机写入 (seek)。</p>
+
+                    <h3>临时文件生成与 rename 替换机制</h3>
+                    <p>GNU sed 手册的 Command-Line Options 章节这样说明 <code>-i</code>：GNU sed 不把输出送到标准输出，而是创建临时文件写入其中，到达文件末尾时再把该临时文件重命名为原文件名。</p>
+                    <p>也就是说，并不是在原处改写原文件的数据，而是新写出的文件接管了原来的名称。指定备份扩展名 (<code>-i.bak</code>) 时，修改前的内容会以 <code>app.conf.bak</code> 这样带扩展名的名称保留下来 (见第 6 节的执行结果)。这种替换与硬链接、换行符交织时会发生什么，由下面的执行结果说明。</p>
+
+                    <h3>与重定向覆盖写入 (&gt;) 的本质区别</h3>
+                    <p>在 Shell 中用 <code>printf 'y\n' &gt; keep.txt</code> 这样的重定向覆盖时，新内容写入的是同一个文件。实际运行中，<code>keep.txt</code> 的 inode 编号在覆盖前后保持不变。而 <code>sed -i</code> 会换成新文件，因此编号改变。下一节用执行结果说明这一差异对硬链接与换行符造成的影响。</p>
+
+                    <h2 id="sec-2">2. 实测验证: 文件ID变化与硬链接断裂真相</h2>
+                    <p>为了直观展现这一替换机制在实际操作系统层面的表现，我们执行了具体测试命令并完整记录了输出。</p>
+
+                    <h3>实测 inode 与 NTFS 文件 ID 变化</h3>
+                    <p>在 Git Bash 环境中创建测试配置文件 <code>conf.txt</code>，并通过 <code>stat</code> 与 <code>fsutil</code> 测量执行 <code>sed -i</code> 前后的 inode 编号及 Windows NTFS 64 位文件 ID。</p>
+
+<pre><code class="language-bash">printf 'host=old.example\nport=80\n' > conf.txt
+ls -i conf.txt; stat -c 'ino=%i links=%h mtime=%y' conf.txt
+sed -i 's/old/new/' conf.txt
+ls -i conf.txt; stat -c 'ino=%i links=%h mtime=%y' conf.txt
+# 比较: > 重定向覆盖写入
+printf 'x\n' > keep.txt; ls -i keep.txt; printf 'y\n' > keep.txt; ls -i keep.txt
+# Windows 文件 ID
+fsutil file queryfileid conf.txt; sed -i 's/new/newer/' conf.txt; fsutil file queryfileid conf.txt
+</code></pre>
+
+                    <p>终端实际输出结果如下：</p>
+
+<pre><code class="language-plaintext">=== before
+57702370226752894 conf.txt
+ino=57702370226752894 links=1 mtime=2026-09-29 07:44:07.786669900 +0900
+=== after sed -i
+314689023964208355 conf.txt
+ino=314689023964208355 links=1 mtime=2026-09-29 07:44:08.149979700 +0900
+host=new.example
+port=80
+=== compare: in-place write via > redirect keeps id?
+57983845203463550 keep.txt
+57983845203463550 keep.txt
+=== fsutil file id (before)
+文件 ID: 0x0000000000000000045e00000019dce3
+=== fsutil file id (after sed -i)
+文件 ID: 0x000000000000000000230000001f9069
+</code></pre>
+
+                    <p>修改前 <code>conf.txt</code> 的 inode 编号为 <code>57702370226752894</code>，而在执行 <code>sed -i</code> 后立即变成了 <code>314689023964208355</code>。<code>fsutil</code> 查询到的 NTFS 文件 ID 也由 <code>0x0000000000000000045e00000019dce3</code> 变更为了 <code>0x000000000000000000230000001f9069</code>。相反，采用重定向操作符 (<code>></code>) 写入的对照组 <code>keep.txt</code> 在经历两次改写后均精确保持 inode <code>57983845203463550</code>。这无可辩驳地证实了 <code>sed -i</code> 是换用新文件来替代旧文件。</p>
+
+                    <h3>硬链接同步断裂实测</h3>
+                    <p>当多个目录路径通过硬链接共享同一个文件节点时，<code>sed -i</code> 会静默切断它们之间的同步关系。</p>
+
+<pre><code class="language-bash">printf 'a=1\n' > orig.txt; ln orig.txt hard.txt
+stat -c '%n ino=%i links=%h' orig.txt hard.txt
+sed -i 's/1/2/' orig.txt
+stat -c '%n ino=%i links=%h' orig.txt hard.txt
+echo "orig: $(cat orig.txt) / hard: $(cat hard.txt)"
+</code></pre>
+
+                    <p>输出记录如下：</p>
+
+<pre><code class="language-plaintext">orig.txt ino=314970498940919011 links=2
+hard.txt ino=314970498940919011 links=2
+orig.txt ino=28147497673134196 links=1
+hard.txt ino=314970498940919011 links=1
+orig: a=2 / hard: a=1
+</code></pre>
+
+                    <p>最初两个文件均指向 inode <code>314970498940919011</code>，链接数为 2。但在对 <code>orig.txt</code> 执行 <code>sed -i</code> 之后，<code>orig.txt</code> 获得了全新 inode (<code>28147497673134196</code>)，链接数降为 1。最终 <code>orig.txt</code> 变成了 <code>a=2</code>，而 <code>hard.txt</code> 依然滞留在旧 inode 上保持 <code>a=1</code>。依靠硬链接实现的同源配置文件同步机制被彻底瓦解。</p>
+
+                    <table>
+                        <caption>表 1. 修改方式对文件唯一标识符及硬链接保持性的实测对比</caption>
+                        <thead>
+                            <tr>
+                                <th>修改方式</th>
+                                <th>修改前标识符 (inode)</th>
+                                <th>修改后标识符 (inode)</th>
+                                <th>硬链接数量变化</th>
+                                <th>底层判定结果</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>重定向覆盖 (<code>></code>)</td>
+                                <td>57983845203463550</td>
+                                <td>57983845203463550</td>
+                                <td>编号不变 (未测量链接数)</td>
+                                <td>覆盖写入同一文件</td>
+                            </tr>
+                            <tr>
+                                <td><code>sed -i 's/.../.../'</code></td>
+                                <td>57702370226752894</td>
+                                <td>314689023964208355</td>
+                                <td>编号改变 (硬链接实验中 links 2 &rarr; 1)</td>
+                                <td>新文件替换 (硬链接断裂)</td>
+                            </tr>
+                        </tbody>
+                    </table>
+
+                    <h2 id="sec-3">3. 换行符陷阱: 零匹配文件依然由CRLF被强制转换为LF</h2>
+                    <p>在 Windows 上工作时，常见事故之一是换行符被意外地批量转换。Git Bash 自带的 GNU sed 在这一点上有陷阱。以下是对 CRLF 文件执行 sed 的结果。</p>
+
+                    <h3>Git Bash sed 忽略 CR 行为与 -b 选项</h3>
+                    <p>针对包含 CRLF 换行符的文件进行测试，并利用 <code>od -c</code> 观察其字节级底层输出。</p>
+
+<pre><code class="language-bash">printf 'line1=a\r\nline2=b\r\n' > crlf.txt
+file crlf.txt; od -c crlf.txt
+sed -i 's/a/A/' crlf.txt
+file crlf.txt; od -c crlf.txt
+sed -i -b 's/a/A/' crlf_b.txt; file crlf_b.txt; od -c crlf_b.txt      # -b(binary)
+sed 's/a$/Z/' crlf_c.txt | od -c | head -2                           # $ 锚点
+sed 's/\r$//' crlf_c.txt | od -c | head -2
+printf 'p=a\r\n' | sed 's/a$/Z/' | od -c                               # 管道中测试
+</code></pre>
+
+                    <p>实际控制台输出：</p>
+
+<pre><code class="language-plaintext">=== CRLF before
+crlf.txt: ASCII text, with CRLF line terminators
+0000000   l   i   n   e   1   =   a  \r  \n   l   i   n   e   2   =   b
+0000020  \r  \n
+=== after sed -i 's/a/A/'
+crlf.txt: ASCII text
+0000000   l   i   n   e   1   =   A  \n   l   i   n   e   2   =   b  \n
+=== sed -i -b (binary)
+crlf_b.txt: ASCII text, with CRLF line terminators
+0000000   l   i   n   e   1   =   A  \r  \n   l   i   n   e   2   =   b
+0000020  \r  \n
+=== $ anchor test: s/a$/Z/ on CRLF
+0000000   l   i   n   e   1   =   Z  \n   l   i   n   e   2   =   b  \n
+=== s/\r$// strip
+0000000   l   i   n   e   1   =   a  \n   l   i   n   e   2   =   b  \n
+(管道) 0000000   p   =   Z  \n
+</code></pre>
+
+                    <p>结果显示两点。其一，Git Bash 的 sed 看不到回车符 (CR, <code>\r</code>)，因此行尾锚点 <code>$</code> 在 CR 之前也能匹配 (<code>a$</code> 命中 <code>a\r</code> 所在行并替换为 Z)。其二，一次 <code>sed -i</code> 就让没有发生替换的 <code>line2</code> 行的 CR 也消失，整份文件的换行符变成 LF。加上 <code>-b</code> (<code>--binary</code>) 后 CRLF 保持原样。GNU sed 手册写道，在 MS-DOS、Windows、Cygwin 这类区分文本文件与二进制文件的环境中，文本行以 CR 和 LF 分隔，sed 看不到行尾的 CR；并写明 <code>--binary</code> 只在有这种区分的操作系统上起作用。因此这一结果是 Windows (MSYS) 构建的行为，Linux 上的 GNU sed 是否相同见第 8 节。</p>
+
+                    <h3>零匹配目标文件遭受换行符破坏实测</h3>
+                    <p>当 <code>sed -i</code> 运行在完全不包含目标模式串的文件上时，破坏性表现更为隐蔽。</p>
+
+<pre><code class="language-bash">printf 'x=1\r\ny=2\r\n' > nomatch.txt
+stat -c 'ino=%i' nomatch.txt; sed -i 's/ZZZ/QQQ/' nomatch.txt; stat -c 'ino=%i' nomatch.txt; file nomatch.txt
+</code></pre>
+
+                    <p>输出数据：</p>
+
+<pre><code class="language-plaintext">ino=153685337286086914
+ino=10977524093784323
+nomatch.txt: ASCII text
+</code></pre>
+
+                    <p>一行都没有匹配，inode 却由 <code>153685337286086914</code> 变为 <code>10977524093784323</code>。用 <code>printf</code> 写入 CRLF 创建的文件，在 <code>file</code> 输出中显示为 <code>ASCII text</code> (没有 <code>with CRLF line terminators</code>)，即换行符变成了 LF。若对大量文件一次性执行 <code>sed -i</code>，本不需要修改的文件换行符也会改变，没有替换过的文件会全部出现在 git diff 中。</p>
+
+                    <table>
+                        <caption>表 2. Windows Git Bash 环境下针对 CRLF 文件运行 sed 的换行符保持实测表</caption>
+                        <thead>
+                            <tr>
+                                <th>执行命令</th>
+                                <th>是否存在匹配内容</th>
+                                <th>换行符格式演变</th>
+                                <th>inode 是否变更</th>
+                                <th>实务风险分析</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><code>sed -i 's/a/A/' file</code></td>
+                                <td>存在 (1行)</td>
+                                <td>CRLF &rarr; LF (全行转换)</td>
+                                <td>此文件未测量</td>
+                                <td>未变更行的 CR 也全部丢失</td>
+                            </tr>
+                            <tr>
+                                <td><code>sed -i -b 's/a/A/' file</code></td>
+                                <td>存在 (1行)</td>
+                                <td>保持 CRLF</td>
+                                <td>此文件未测量</td>
+                                <td>用 <code>-b</code> 保留 CRLF</td>
+                            </tr>
+                            <tr>
+                                <td><code>sed -i 's/ZZZ/QQQ/' file</code></td>
+                                <td>无匹配 (0行)</td>
+                                <td>CRLF &rarr; LF (全行转换)</td>
+                                <td>已变更 (新文件)</td>
+                                <td>零匹配文件仍被替换并强制转为 LF</td>
+                            </tr>
+                        </tbody>
+                    </table>
+
+                    <h2 id="sec-4">4. 选项连写错误与空文件灾难: -iE 与 -n -i</h2>
+                    <p>命令行参数解析规则同样隐藏着严重的人为失误风险。</p>
+
+                    <h3>-iE 被错误识别为备份后缀 E</h3>
+                    <p>在结合扩展正则表达式选项 (<code>-E</code>) 与原位编辑选项 (<code>-i</code>) 时，连写顺序错误会产生意想不到的结果。</p>
+
+<pre><code class="language-bash">printf 'a=1\n' > ie.txt
+sed -iE 's/(a)=1/\1=2/' ie.txt; echo "exit=$?"; ls ie.txt*
+sed -Ei 's/(a)=1/\1=2/' ie.txt; cat ie.txt
+sed -iE 's/a=2/a=3/' ie.txt; ls ie.txt*; echo "ie.txt: $(cat ie.txt) / ie.txtE: $(cat ie.txtE)"
+printf 'k1\nk2\n' > n.txt; sed -n -i 's/k1/K1/' n.txt; echo "size after: $(wc -c < n.txt)"
+</code></pre>
+
+                    <p>实测终端记录如下：</p>
+
+<pre><code class="language-plaintext">sed: -e expression #1, char 13: invalid reference \1 on `s' command's RHS
+exit=1
+ie.txt
+---
+a=2
+exit=0
+ie.txt
+ie.txtE
+ie.txt: a=3 / ie.txtE: a=2
+size after: 0
+</code></pre>
+
+                    <p>GNU sed 规定紧随在 <code>-i</code> 后面的非空格字符串统一被视作备份后缀。因此 <code>-iE</code> 等同于 <code>--in-place=E</code>，它不仅未能开启扩展正则表达式，反而将备份后缀设定为字母 <code>E</code>。此时执行分组替换会因正则引擎处于基础模式 (BRE) 而报出 <code>invalid reference \1</code> 错误。如果是简单替换，则会静默生成一个名为 <code>ie.txtE</code> 的异常文件。正确连写必须是 <code>-Ei</code> 或拆分为 <code>-E -i</code>。</p>
+
+                    <h3>-n 与 -i 混用导致文件瞬间清空</h3>
+                    <p>更为致命的操作是在从预览模式切换到修改模式时，保留了抑制输出的 <code>-n</code> 参数却又添加了 <code>-i</code>，且未在替换指令末尾提供打印标识 <code>p</code>。上述实测最后一行显示，执行 <code>sed -n -i 's/k1/K1/' n.txt</code> 后，文件大小立刻归零变为 <code>0</code> 字节。由于 <code>-n</code> 阻止了模式空间向临时文件的输出，新文件没有任何内容便替换了原文件，且没有备份，内容就此丢失。GNU sed 手册也提醒：<code>-n</code> 会关闭自动输出，<code>-i</code> 会在无备份的情况下原地修改文件，二者同时使用时要小心。</p>
+
+                    <table>
+                        <caption>表 3. 选项不同组合方式下的 sed 解析结果与风险等级</caption>
+                        <thead>
+                            <tr>
+                                <th>选项指定形式</th>
+                                <th>解析器内部实际语义</th>
+                                <th>执行表现</th>
+                                <th>风险等级</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><code>-iE</code></td>
+                                <td><code>--in-place=E</code> (备份后缀 E)</td>
+                                <td>ERE 未启用报错或生成 <code>.txtE</code> 文件</td>
+                                <td>警告 (偏离预期)</td>
+                            </tr>
+                            <tr>
+                                <td><code>-Ei</code> 或 <code>-E -i</code></td>
+                                <td>开启 ERE + 原位替换</td>
+                                <td>正确执行扩展正则表达式替换</td>
+                                <td>安全 (推荐写法)</td>
+                            </tr>
+                            <tr>
+                                <td><code>-n -i</code> (未加 p)</td>
+                                <td>抑制输出 + 原位替换</td>
+                                <td>文件被截断清空为 0 字节</td>
+                                <td>致命 (数据即刻损毁)</td>
+                            </tr>
+                        </tbody>
+                    </table>
+
+                    <h2 id="sec-5">5. 替换文本中的 &amp; 与路径分隔符冲突</h2>
+                    <p>在替换表达式自身的语法解析中，同样存在对动态变量极不友好的保留字符规则。</p>
+
+                    <h3>替换区与号 (&amp;) 展开与变量污染</h3>
+                    <p>在 <code>s/模式/替换内容/</code> 结构中，替换内容中的字符 <code>&amp;</code> 代表引用整段已匹配的文本。</p>
+
+<pre><code class="language-bash">echo 'name=Tom' | sed 's/Tom/Tom &amp; Jerry/'
+echo 'name=Tom' | sed 's/Tom/Tom \&amp; Jerry/'
+echo 'root=/usr/local/app' | sed 's/\/usr\/local/\/opt/'
+echo 'root=/usr/local/app' | sed 's//usr/local//opt/'; echo "exit=$?"
+NEW=/opt/app; echo 'root=OLD' | sed "s/OLD/$NEW/"; echo "exit=$?"
+echo 'root=OLD' | sed "s|OLD|$NEW|"
+V='A&amp;B'; echo 'x=OLD' | sed "s|OLD|$V|"
+echo 'ab' | sed -E 's/(a)(b)/[\10]/'
+echo 'port=80' | sed -E 's/(port)=([0-9]+)/\1=8\2/'
+</code></pre>
+
+                    <p>控制台实测输出：</p>
+
+<pre><code class="language-plaintext">name=Tom Tom Jerry
+name=Tom &amp; Jerry
+root=/opt/app
+sed: -e expression #1, char 8: unknown option to `s'
+exit=1
+sed: -e expression #1, char 8: unknown option to `s'
+exit=1
+root=/opt/app
+x=AOLDB
+[a0]
+port=880
+</code></pre>
+
+                    <p>执行 <code>s/Tom/Tom &amp; Jerry/</code> 时输出变成了 <code>Tom Tom Jerry</code>，因为 <code>&amp;</code> 被自动展开为匹配词 <code>Tom</code>。若要输出字面量符号必须转义为 <code>\&amp;</code>。当向 sed 传递外部 Shell 变量时该陷阱极易爆发：传入 <code>V='A&amp;B'</code> 时最终结果变成了 <code>x=AOLDB</code>，匹配词 <code>OLD</code> 被粗暴地插入到变量中间。动态变量传入替换表达式前，必须对其包含的 <code>&amp;</code> 进行预先转义。</p>
+
+                    <h3>路径替换斜杠冲突与竖线 (|) 分隔符</h3>
+                    <p>把保存路径的变量 <code>NEW=/opt/app</code> 放进 <code>s/OLD/$NEW/</code> 时，路径中的斜杠被当作分隔符，出现 <code>unknown option to `s'</code> 错误 (退出码 1)。根据 GNU sed 手册，<code>s</code> 命令中的 <code>/</code> 可以统一换成任意其他单个字符。使用竖线的 <code>s|OLD|$NEW|</code> 正确输出了 <code>root=/opt/app</code>。此外，后向引用 <code>\10</code> 被当作 <code>\1</code> 后接字面量 <code>0</code>，而非第 10 个捕获组 (<code>[a0]</code>)；<code>\1=8\2</code> 则把 8 和 80 连成了 <code>880</code>，在后向引用后面紧跟数字时需要注意。</p>
+
+                    <table>
+                        <caption>表 4. 替换文本特殊符号与分隔符冲突实测分析</caption>
+                        <thead>
+                            <tr>
+                                <th>测试指令</th>
+                                <th>实际输出结果</th>
+                                <th>错误机制剖析</th>
+                                <th>正确处理方案</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><code>s/Tom/Tom &amp; Jerry/</code></td>
+                                <td><code>Tom Tom Jerry</code></td>
+                                <td><code>&amp;</code> 展开为匹配串 'Tom'</td>
+                                <td>转义与号: <code>s/Tom/Tom \&amp; Jerry/</code></td>
+                            </tr>
+                            <tr>
+                                <td><code>V='A&amp;B'; s|OLD|$V|</code></td>
+                                <td><code>AOLDB</code></td>
+                                <td>变量内的 <code>&amp;</code> 展开为 'OLD' 并插在中间</td>
+                                <td>变量传入前先把 <code>&amp;</code> 替换为 <code>\&amp;</code></td>
+                            </tr>
+                            <tr>
+                                <td><code>s/OLD//opt/app/</code></td>
+                                <td><code>unknown option to `s'</code> (exit 1)</td>
+                                <td>路径中的斜杠与分隔符冲突导致语法错乱</td>
+                                <td>更换自定义分隔符: <code>s|OLD|/opt/app|</code></td>
+                            </tr>
+                        </tbody>
+                    </table>
+
+                    <h2 id="sec-6">6. 批量替换的安全 5 步流程</h2>
+                    <p>根据以上执行结果，整理出修改文件前应遵循的 5 步顺序。不要一次性直接运行 <code>sed -i</code>，而是每一步都确认结果。</p>
+
+                    <h3>标准 5 步安全执行流水线</h3>
+                    <p>下面的命令按 预览 → 匹配行数 → 带备份执行 → diff 的顺序实际运行过。</p>
+
+<pre><code class="language-bash">printf 'root=/usr/local/app\nlog=/usr/local/app/log\nname=Tom\n' > app.conf
+sed -n 's|/usr/local/app|/opt/app|gp' app.conf          # 1) 预览修改行
+grep -c '/usr/local/app' app.conf                        #    核对行数
+sed -i.bak 's|/usr/local/app|/opt/app|g' app.conf        # 2) 携带备份执行
+ls app.conf*
+diff app.conf.bak app.conf; echo "diff exit=$?"          # 3) 确认差异
+</code></pre>
+
+                    <p>实际执行输出：</p>
+
+<pre><code class="language-plaintext">=== 1) preview
+root=/opt/app
+log=/opt/app/log
+=== match count
+2
+=== 2) apply with backup
+app.conf
+app.conf.bak
+=== 3) diff
+1,2c1,2
+< root=/usr/local/app
+< log=/usr/local/app/log
+---
+> root=/opt/app
+> log=/opt/app/log
+diff exit=1
+</code></pre>
+
+                    <p>该流程的五大核心步骤包括：</p>
+                    <ul>
+                        <li><strong>第 1 步 (统计匹配行数)</strong>: 运行 <code>grep -c '模式' 文件</code>。若结果为 0，跳过该文件。即使匹配行数为 0，<code>sed -i</code> 也会创建新文件，在 Git Bash 中还会改变换行符。</li>
+                        <li><strong>第 2 步 (预览替换输出)</strong>: 运行 <code>sed -n 's|模式|替换文本|gp' 文件</code> 仅在终端打印被替换的行，校验打印行数是否与第 1 步精准吻合。</li>
+                        <li><strong>第 3 步 (换行符类型检测)</strong>: 使用 <code>file 文件</code> 及 <code>od -c 文件 | head</code> 确认是否包含 CRLF，若在 Windows 下处理该类文件则追加 <code>-b</code> 选项。</li>
+                        <li><strong>第 4 步 (保留备份执行替换)</strong>: 执行 <code>sed -i.bak 's|模式|替换文本|g' 文件</code>，确保磁盘上留存 <code>.bak</code> 副本。</li>
+                        <li><strong>第 5 步 (diff 校验差异)</strong>: 执行 <code>diff 文件.bak 文件</code>，确认仅有目标行发生了符合预期的变动。diff 退出码 1 代表正常检测到差异。</li>
+                    </ul>
+
+                    <h3>实务批量替换检查清单与故障排查表</h3>
+                    <p>针对运维排错，将实测总结的现象与处置方案整合为快速参考表：</p>
+
+                    <table>
+                        <caption>表 5. 安全批量替换 5 步执行检查清单</caption>
+                        <thead>
+                            <tr>
+                                <th>步骤</th>
+                                <th>执行命令</th>
+                                <th>核验目标</th>
+                                <th>判定准则</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>第 1 步: 行数统计</td>
+                                <td><code>grep -c '模式' 文件</code></td>
+                                <td>确认是否存在待处理目标及规模</td>
+                                <td>若为 0 行则直接跳过后续处理</td>
+                            </tr>
+                            <tr>
+                                <td>第 2 步: 内容预览</td>
+                                <td><code>sed -n 's|模|替|gp' 文件</code></td>
+                                <td>核实将被替换行的语法精确性</td>
+                                <td>预览行数必须与第 1 步计数一致</td>
+                            </tr>
+                            <tr>
+                                <td>第 3 步: 换行检测</td>
+                                <td><code>file 文件</code> 与 <code>od -c</code></td>
+                                <td>判断 CRLF 并决定二进制开关</td>
+                                <td>Windows 下含 CRLF 则附加 <code>-b</code></td>
+                            </tr>
+                            <tr>
+                                <td>第 4 步: 备份执行</td>
+                                <td><code>sed -i.bak 's|模|替|g' 文件</code></td>
+                                <td>带安全冗余执行磁盘改写</td>
+                                <td>确认生成了合法的 <code>.bak</code> 备份</td>
+                            </tr>
+                            <tr>
+                                <td>第 5 步: 差异对比</td>
+                                <td><code>diff 文件.bak 文件</code></td>
+                                <td>排查有无意料之外的附带破坏</td>
+                                <td>diff 退出状态码 1 (仅预期行变化)</td>
+                            </tr>
+                        </tbody>
+                    </table>
+
+                    <table>
+                        <caption>表 6. 生产环境异常现象归因排查表 (实测依据)</caption>
+                        <thead>
+                            <tr>
+                                <th>观察到的异常现象</th>
+                                <th>底层根本原因</th>
+                                <th>针对性处置方案</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>未修改的文件在 git diff 中全部显示变动</td>
+                                <td>Git Bash 的 sed 将 CRLF 自动转成了 LF (零匹配同样触发)</td>
+                                <td>追加 <code>-b</code> 参数，或预先过滤仅处理有匹配项的文件</td>
+                            </tr>
+                            <tr>
+                                <td>硬链接关联的另一个配置文件未更新</td>
+                                <td><code>sed -i</code> 通过生成临时文件 rename 替换了原对象</td>
+                                <td>需要保留硬链接的文件不要用 <code>sed -i</code> 替换，改用其他方法</td>
+                            </tr>
+                            <tr>
+                                <td>抛出 <code>unknown option to `s'</code> 报错</td>
+                                <td>替换变量中的斜杠 (<code>/</code>) 与默认分隔符冲突</td>
+                                <td>将替换分隔符变更为竖线 (<code>|</code>)</td>
+                            </tr>
+                            <tr>
+                                <td>替换结果中间强行插入了搜索词 (<code>AOLDB</code>)</td>
+                                <td>替换字符串或变量中的 <code>&amp;</code> 展开为匹配全文</td>
+                                <td>在传入前先将变量内部的 <code>&amp;</code> 预处理转义为 <code>\&amp;</code></td>
+                            </tr>
+                            <tr>
+                                <td>生成了诸如 <code>ie.txtE</code> 的异常冗余文件</td>
+                                <td>连写 <code>-iE</code> 导致 <code>E</code> 被误读为备份后缀</td>
+                                <td>调换顺序写为 <code>-Ei</code> 或拆分写为 <code>-E -i</code></td>
+                            </tr>
+                            <tr>
+                                <td>目标文件被清空成为 0 字节空文件</td>
+                                <td>混用 <code>-n -i</code> 且遗漏了打印指令 <code>p</code> 导致写入空流</td>
+                                <td>绝不可将用于预览的 <code>-n</code> 与用于落盘的 <code>-i</code> 混合调用</td>
+                            </tr>
+                            <tr>
+                                <td>使用 <code>ln -s</code> 创建的软链接与目标脱节</td>
+                                <td>Git Bash 默认 <code>ln -s</code> 创建的是普通副本而非软链接</td>
+                                <td>操作前通过 <code>[ -L 文件 ]</code> 条件校验其真伪</td>
+                            </tr>
+                        </tbody>
+                    </table>
+
+                    <h2 id="sec-7">7. GNU sed 与 BSD sed 的语法差异与可移植性</h2>
+                    <p>在 Linux (GNU sed) 与 macOS、FreeBSD (BSD sed) 之间使用的脚本中，<code>-i</code> 的参数处理方式不同。本节 BSD 部分未在 macOS 上运行，依据的是文档。</p>
+
+                    <h3>原位编辑参数解析机制的根本分歧</h3>
+                    <p>根据文档，区别如下：</p>
+                    <ul>
+                        <li><strong>GNU sed</strong>: <code>-i</code> 后面的备份扩展名是紧贴选项书写的可选参数。不需要备份时写 <code>sed -i 's/.../.../' file</code>，需要备份时写成 <code>sed -i.bak 's/.../.../' file</code> (本文的运行也采用此形式)。手册写明 <code>sed -iE</code> 等同于 <code>--in-place=E</code>，紧贴 <code>-i</code> 的字符会被读作扩展名。</li>
+                        <li><strong>BSD sed (FreeBSD / macOS)</strong>: FreeBSD 手册给出 <code>-i extension</code> 形式，并写明扩展名为空字符串时不保存备份。示例为 <code>sed -i '' -e 's/foo/bar/g' test.txt</code>。同一文档还写道，在磁盘空间耗尽等情况下文件可能损坏或只剩部分内容，因此不建议使用空扩展名。</li>
+                    </ul>
+
+                    <h3>跨平台通用脚本编写准则</h3>
+                    <p>两边都能使用的形式是 <code>sed -i.bak</code>。GNU 接受紧贴的扩展名，BSD 把扩展名作为参数接收，因此先生成备份、用 diff 确认、不需要时再删除备份的做法与两份文档都相符。不过这部分仅依据文档，未在 macOS 上运行。</p>
+
+                    <table>
+                        <caption>表 7. GNU sed 与 BSD sed (macOS) 原位替换语法差异对比</caption>
+                        <thead>
+                            <tr>
+                                <th>操作意图</th>
+                                <th>GNU sed (Linux / Git Bash)</th>
+                                <th>BSD sed (macOS / FreeBSD)</th>
+                                <th>推荐跨平台兼容写法</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>不保留备份直接替换</td>
+                                <td><code>sed -i 's/.../.../' file</code></td>
+                                <td><code>sed -i '' 's/.../.../' file</code></td>
+                                <td>不推荐 (需判断操作系统分支)</td>
+                            </tr>
+                            <tr>
+                                <td>保留备份执行替换</td>
+                                <td><code>sed -i.bak 's/.../.../' file</code></td>
+                                <td><code>sed -i.bak 's/.../.../' file</code></td>
+                                <td><code>sed -i.bak</code> 并在必要时 <code>rm file.bak</code></td>
+                            </tr>
+                        </tbody>
+                    </table>
+
+                    <h2 id="sec-8">8. 未确认事项</h2>
+                    <p>受测试机环境限制，以下细节未能进行直接执行实测：</p>
+                    <ul>
+                        <li><strong>符号链接在 <code>sed -i</code> 下被替换为实体文件的直接实测</strong>: 在当前测试系统 (Windows 10 普通权限，未启用开发者模式) 中，Git Bash 默认的 <code>ln -s</code> 仅生成普通副本文件 (<code>NOT a symlink</code>)，创建原生符号链接因权限受阻，未能实测到真实符号链接被实体覆盖的现场。GNU sed 手册写道，默认行为是断开符号链接，链接目标不会被修改。</li>
+                        <li><strong>Linux 原生环境下的 CRLF 换行符行为</strong>: 实验 3 中记录的行尾自动转 LF 与忽略 CR 特性是在基于 Windows MSYS 架构的 Git Bash 中测得的。在无文本模式概念的原生 Linux 系统上 GNU sed 是否表现出相同的换行符转换，受限于测试环境未能在 Linux 实机上直接执行验证。</li>
+                        <li><strong>macOS/FreeBSD 实机环境下 BSD sed 的运行验证</strong>: 关于 BSD sed 的 <code>sed -i ''</code> 语法要求，依据 FreeBSD 的 man 手册整理，未在苹果物理机终端上直接记录退出码与磁盘变动。</li>
+                    </ul>
+
+                    <h2 id="sec-9">9. 参考资料</h2>
+                    <ul>
+                        <li><a href="https://www.gnu.org/software/sed/manual/html_node/Command_002dLine-Options.html" target="_blank" rel="noopener noreferrer">GNU sed Manual — Command-Line Options (-i, -b, --follow-symlinks)</a></li>
+                        <li><a href="https://www.gnu.org/software/sed/manual/html_node/The-_0022s_0022-Command.html" target="_blank" rel="noopener noreferrer">GNU sed Manual — The "s" Command (Replacement string, &amp;, delimiters)</a></li>
+                        <li><a href="https://man.freebsd.org/cgi/man.cgi?query=sed&amp;sektion=1" target="_blank" rel="noopener noreferrer">FreeBSD Manual Pages — sed(1) (-i extension syntax)</a></li>
+                        <li><a href="line_ending_crlf_lf_guide.html">CRLF 与 LF — 跨平台开发中断裂的代码细节 2026</a></li>
+                        <li><a href="shell_quoting_rules_guide.html">Shell 引用规则 — 各类引号到底阻断了什么</a></li>
+                    </ul>
+
+                    <!-- md-artifact-start -->
+                    <div class="md-artifact" style="margin:2rem 0;border:1px solid #d7dce3;border-radius:10px;overflow:hidden;background:#fbfcfd;">
+                        <div style="display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;justify-content:space-between;padding:.7rem 1rem;background:#eef2f7;border-bottom:1px solid #d7dce3;">
+                            <span style="font-weight:700;font-size:.97rem;">📋 可直接带走的检查清单</span>
+                            <span style="display:flex;gap:.5rem;align-items:center;">
+                                <code style="font-size:.82rem;color:#5a6675;background:transparent;padding:0;">sed_inplace_safety.md</code>
+                                <button type="button" class="md-artifact-copy" style="cursor:pointer;border:1px solid #b9c2cf;background:#fff;color:#2c3e50;font-weight:600;line-height:1.3;border-radius:6px;padding:.32rem .7rem;font-size:.85rem;">复制全部</button>
+                            </span>
+                        </div>
+                        <pre style="margin:0;max-height:420px;overflow:auto;padding:1rem;background:#fbfcfd;font-size:.86rem;line-height:1.62;"><code class="nohighlight" style="background:transparent;padding:0;white-space:pre;"># sed -i 批量替换安全检查清单与实务参考表
+
+验证环境: Windows 10 Pro 10.0.19045, Git Bash (GNU sed 4.9, GNU Awk 5.0.0), curl 8.12.1 (Schannel), git 2.48.1.windows.1, Windows PowerShell 5.1, Python 3.13.3, Node 22.16.0 (非管理员权限)。
+以下内容来自该环境中的实际运行结果以及 GNU sed、FreeBSD 手册。换行符 (CRLF) 相关条目是在 Git Bash (Windows) 构建中观察到的行为。
+
+---
+
+## 1. 批量替换安全 5 步流程
+
+直接修改文件前，请务必执行以下标准流程：
+
+1. **核对目标行数**: 使用 `grep -c '模式' 文件` 统计将被替换的匹配行数。若为 0，跳过该文件。
+2. **预览替换内容**: 使用 `sed -n 's|模式|替换文本|gp' 文件` 仅输出将变更的行，核对行数是否与第 1 步一致。
+3. **检查换行符格式 (CRLF/LF)**: 使用 `file 文件` 或 `od -c 文件 | head` 确认换行符类型。在 Git Bash 中，评估是否需要添加 `-b` 选项以保留 CRLF。
+4. **生成备份并执行替换**: 执行 `sed -i.bak 's|模式|替换文本|g' 文件`，在保留原始备份 (`文件.bak`) 的同时完成替换。
+5. **diff 验证变更**: 执行 `diff 文件.bak 文件` 确认仅有目标行发生预期修改 (退出状态码 1 表示存在差异，并非错误)。
+
+---
+
+## 2. 故障现象、原因与处置表 (实测依据)
+
+| 故障现象 | 原因分析 | 应对处置 |
+|---|---|---|
+| 未替换的文件在 git diff 中全部显示为变动 | Git Bash 的 sed 将 CRLF 转为 LF (即使匹配行数为 0 也会发生) | 添加 `-b` 参数，或仅选出确需变更的文件进行处理 |
+| 通过硬链接相连的另一个名称内容未同步更新 | `sed -i` 并非原地改写原文件，而是生成临时文件后通过 rename 替换 | 需要保留硬链接的文件不要用 `sed -i` 替换，改用其他方法 |
+| 出现 ``unknown option to `s'`` 报错 | 路径字符串中的斜杠 (`/`) 与 sed 命令分隔符发生冲突 | 将替换分隔符改为竖线 (`|`)，如 `s|模式|替换文本|g` |
+| 替换结果中意外插入了匹配原文 (`A&amp;B` 变成 `AOLDB`) | 替换字符串中的 `&amp;` 字符被展开为完整匹配内容 | 在执行替换前将替换文本中的 `&amp;` 转义为 `\&amp;` |
+| 生成了类似于 `ie.txtE` 的意外备份文件 | 将选项连写为 `-iE`，导致 sed 将 `E` 识别为备份文件的后缀名 | 调整选项顺序为 `-Ei`，或分开写为 `-E -i` |
+| 文件内容清空变为空文件 (0 字节) | 同时使用了 `-n` 与 `-i` 参数，但遗漏了打印指令 (`p`) | 不要将用于预览的 `-n` 参数与直接写文件的 `-i` 参数混用 |
+| 使用 `ln -s` 创建的“链接”与目标文件脱节 | Git Bash 默认的 `ln -s` 命令仅生成副本而非真正的符号链接 | 操作前使用 `[ -L 文件 ]` 条件测试判断是否为真正的链接 |
+
+---
+
+## 3. sed -i 核心陷阱检查清单
+
+- [ ] `sed -i` 会改变 inode 编号与 NTFS 文件 ID，导致硬链接断裂 (Git Bash 实测)。
+- [ ] 在 Git Bash (MSYS) 环境下，即使匹配行数为 0，换行符也会被转为 LF。
+- [ ] 在 Git Bash 中若需保留 CRLF 换行符，需指定 `-b` (--binary) 选项。
+- [ ] 配合扩展正则表达式使用时，应写为 `-Ei` 而不是 `-iE`。
+- [ ] 向替换文本中传入 Shell 变量时，必须校验变量内的 `&amp;` 是否已转义为 `\&amp;`。
+- [ ] (仅依据文档) 在 BSD/FreeBSD 的 sed 中，不带备份的原地修改需传入空扩展名：`sed -i ''`。手册不建议使用空扩展名。
+- [ ] (仅依据文档) 若要在 GNU sed 与 BSD sed 间通用，使用 `sed -i.bak` 创建备份，并在不需要时删除备份。
+</code></pre>
+                        <p style="margin:0;padding:.6rem 1rem;font-size:.82rem;color:#5a6675;border-top:1px solid #e3e8ee;">复制后可直接粘贴到笔记应用或 AI 工具中。</p>
+                    </div>
+                    <script>
+                    (function(){
+                      if (window.__mdArtifactBound) return;
+                      window.__mdArtifactBound = true;
+                      document.addEventListener('click', function(ev){
+                        var btn = ev.target.closest && ev.target.closest('.md-artifact-copy');
+                        if (!btn) return;
+                        var box = btn.closest('.md-artifact');
+                        var code = box && box.querySelector('pre code');
+                        if (!code) return;
+                        var text = code.textContent;
+                        var label = btn.textContent;
+                        var ok = function(){
+                          btn.textContent = "已复制";
+                          setTimeout(function(){ btn.textContent = label; }, 1600);
+                          if (typeof gtag === 'function') {
+                            gtag('event', 'md_copy', { slug: "sed_inplace_safety", lang: "zh", chars: text.length });
+                          }
+                        };
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                          navigator.clipboard.writeText(text).then(ok).catch(function(){ fallback(); });
+                        } else { fallback(); }
+                        function fallback(){
+                          var ta = document.createElement('textarea');
+                          ta.value = text; ta.setAttribute('readonly','');
+                          ta.style.position='fixed'; ta.style.left='-9999px';
+                          document.body.appendChild(ta); ta.select();
+                          try { document.execCommand('copy'); ok(); } catch(e) {}
+                          document.body.removeChild(ta);
+                        }
+                      });
+                    })();
+                    </script>
+                    <!-- md-artifact-end -->
+
+                <div class="share-section">
+                        <h3>分享本文</h3>
+                        <div class="social-share">
+                            <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                            <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                            <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                            <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                        </div>
+                    </div>
+
+                    <div class="back-to-list">
+                        <a href="../blog.html" class="back-link">返回列表</a>
+                    </div>
+
+                    <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../docker_builder.html">Docker 命令构建器</a></li>
+      <li><a href="../rsync_tool.html">Rsync 命令构建器</a></li>
+      <li><a href="../static/code_image.html">代码图片生成器</a></li>
+      <li><a href="../static/char_counter.html">字数统计</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+
+                    </div>
+            <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="shell_readonly_idempotent_script.html">跑两次也安全的脚本 - 幂等性设计与真正会出问题的六种模式</a></li>
+      <li><a href="git_worktree_practical.html">git worktree 实战指南 - 将单一仓库展开至多个目录</a></li>
+      <li><a href="curl_debug_flags_guide.html">curl 诊断标志指南 - 用 -v 与 -w 拆解延迟阶段与退出码</a></li>
+      <li><a href="windows_path_length_limit.html">Windows MAX_PATH 260字符限制与各工具失败形态 - 静默遗漏与规避方案</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightElement(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert('链接已复制到剪贴板，可在 Threads 应用中粘贴分享！');
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert('链接已复制到剪贴板！'); });
+    });
+    </script>
+</body>
+</html>

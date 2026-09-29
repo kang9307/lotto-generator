@@ -1,0 +1,751 @@
+<!DOCTYPE html>
+<!--
+ * 技术博客文章模板
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>curl 诊断标志指南 - 用 -v 与 -w 拆解延迟阶段与退出码</title>
+    <meta name="description" content="当curl请求变慢时，利用-w累计时间的差值与-v输出按阶段拆解延迟，并在Windows环境实测退出码28、6和22。本文还整理了格式文件中实际换行被丢弃的陷阱、--connect-timeout与-m的优先级，以及%{json}导出的用法。">
+    <meta name="keywords" content="curl, curl 调试, curl 诊断, curl -w, curl -v, time_namelookup, time_connect, time_appconnect, time_starttransfer, time_total, curl 退出码, connect-timeout, max-time, curl 8.12">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/curl_debug_flags_guide.html">
+
+    <meta property="og:title" content="curl 诊断标志指南 - 用 -v 与 -w 拆解延迟阶段与退出码">
+    <meta property="og:description" content="用 -w 累计时间差值与 -v 输出拆解网络瓶颈，实测退出码 28、6 和 22。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/curl_debug_flags_guide.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-09-29">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="curl 诊断标志指南 - 用 -v 与 -w 拆解延迟阶段与退出码">
+    <meta name="twitter:description" content="利用 -w 累计时间差值与退出码排查网络请求延迟的实测指南。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js" defer></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "curl 诊断标志指南 - 用 -v 与 -w 拆解延迟阶段与退出码",
+      "alternativeHeadline": "How to Measure Slow HTTP Requests with curl -w and Exit Codes",
+      "datePublished": "2026-09-29",
+      "dateModified": "2026-09-29",
+      "inLanguage": "zh-CN",
+      "articleSection": "开发/基础设施",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "curl, curl 诊断, curl -w, curl -v, time_namelookup, time_connect, time_appconnect, time_starttransfer, time_total, curl 退出码",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/curl_debug_flags_guide.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "curl -w 输出的时间变量是各个阶段的单独耗时吗？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "不是。time_namelookup、time_connect、time_appconnect、time_starttransfer、time_total 等指标均为自请求发起时刻起算的「累计时刻」。因此，纯 TCP 连接耗时需由 connect 减去 namelookup 计算得出，而 TLS 握手耗时需由 appconnect 减去 connect 计算得出。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "在格式文件（@filename）中使用普通换行时，输出为何会被合并成一行？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "在 curl 8.12.1 源码（tool_paramhlp.c）的 file2string 函数中，memcrlf 函数会在读取文件时跳过物理 CR 和 LF 字符。因此，若要在格式文件中实现换行输出，必须在文件内写入字面量字符串「\\n」，而不能直接敲击物理回车换行。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "--connect-timeout 与 -m (--max-time) 哪个优先级更高？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "-m 选项限制的是整个操作的总耗时，该限制同样覆盖连接阶段。在实测中，若同时传入 --connect-timeout 5 与 -m 0.2，即使处于建连过程中，较短的 -m 0.2 也会优先触发并以退出码 28 终止运行。即只要 -m 较短，连接阶段同样由 -m 优先裁决。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "出现 HTTP 404 错误时，curl 脚本退出码为何仍为 0？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "在本文的实验中，curl 收到 404 响应时，未加 -f 仍以退出码 0 结束。若要在 HTTP 400 及以上错误时返回非零退出码，必须添加 -f (--fail) 选项，此时 curl 会返回退出码 22。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Schannel 构建的 curl 在 -v 输出中为何不显示 TLS 证书详情？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "本文使用的 curl 8.12.1（x86_64-w64-mingw32 构建）以 Schannel 作为 TLS 后端。该构建的 -v 中没有 TLS 版本、密码套件或证书相关行，只有「schannel: disabled automatic use of client certificate」一行，加上 --trace-config tls,dns 也没有额外输出。OpenSSL 构建的输出未在本环境中确认，因此 TLS 耗时用 -w 的 appconnect 值来测量。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/curl_debug_flags_guide.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/curl_debug_flags_guide.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/curl_debug_flags_guide.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/curl_debug_flags_guide.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/curl_debug_flags_guide.html">
+
+    <script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "首页",
+      "item": "https://braindetox.kr/zh/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "开发/基础设施",
+      "item": "https://braindetox.kr/zh/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "curl 诊断标志指南 - 用 -v 与 -w 拆解延迟阶段与退出码",
+      "item": "https://braindetox.kr/zh/posts/curl_debug_flags_guide.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="curl 诊断标志指南 - 用 -v 与 -w 拆解延迟阶段与退出码">
+                <meta itemprop="datePublished" content="2026-09-29">
+                <meta itemprop="dateModified" content="2026-09-29">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="curl, curl 诊断, curl -w, curl -v, time_namelookup, time_connect, time_appconnect, time_starttransfer, time_total, curl 退出码">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/curl_debug_flags_guide.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">curl 诊断标志指南 - 用 -v 与 -w 拆解延迟阶段与退出码</h1>
+                    <h2 class="post-subtitle">请求变慢时如何用数据定位卡顿点 — -w 累计时间差值计算与退出码速查表</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-29">2026-09-29</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">开发/基础设施</span></a>
+                    </div>
+                </div>
+
+                <div class="post-toc">
+                    <h3>目录</h3>
+                    <ol>
+                        <li><a href="#sec-1">引言：请求变慢时用具体数值切分瓶颈</a></li>
+                        <li><a href="#sec-2">运行环境与基准验证</a></li>
+                        <li><a href="#sec-3">格式文件换行陷阱 - 丢弃实际换行符的 curl</a></li>
+                        <li><a href="#sec-4">-w 时间变量的本质 - 累计数值与差值计算</a></li>
+                        <li><a href="#sec-5">分阶段耗时拆解与瓶颈排查表</a></li>
+                        <li><a href="#sec-6">-v 详细日志解读与 Schannel 环境的局限</a></li>
+                        <li><a href="#sec-7">两种超时机制（--connect-timeout vs -m）与退出码</a></li>
+                        <li><a href="#sec-8">脚本集成实践：-sS、-f 与 JSON 结构化输出</a></li>
+                        <li><a href="#sec-9">未能确认的事项</a></li>
+                        <li><a href="#sec-10">参考资料</a></li>
+                    </ol>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+                    <h2 id="sec-1">引言：请求变慢时用具体数值切分瓶颈</h2>
+                    <p>当针对特定 API 或 Web 服务的 HTTP 请求出现明显延迟时，工程师面临的首要难题是难以准确定位延迟属于哪一层网络交互。究竟是域名解析消耗了时间，还是跨越中间路由与防火墙的 TCP 三次握手受阻，亦或是 TLS 证书校验与密码套件协商较慢，还是服务端应用程序处理复杂导致等待首字节（TTFB）时间过长，仅凭直觉推测无法得出结论。</p>
+                    <p>终端工具 <code>curl</code> 是以明确数值厘清上述疑问的利器。然而，仅仅运行 <code>curl https://example.com/</code> 或使用系统的 <code>time</code> 命令封装，只能得到请求往返总耗时这一个笼统的数字。唯有合理搭配 curl 的诊断标志 <code>-w</code>（<code>--write-out</code>）与 <code>-v</code>（<code>--verbose</code>），方能将整体延迟拆解为毫秒级的各个独立阶段。</p>
+                    <p>本文并非罗列参数的手册，而是专注于<strong>请求变慢或失败时，如何通过数值准确切分各阶段耗时</strong>。我们将剖析格式文件中实际换行符被忽略的内部原理、自增累计时间指标的差值计算公式、Windows Schannel 环境下的日志特征，以及如何在自动化脚本中准确捕获退出码 28、6 和 22。</p>
+                    <p>关于各层网络协议的基础理论，站点其他文章已作详细梳理。关于递归 DNS 缓存层次，请参阅<a href="dns_cache_optimization.html">DNS 缓存给我们的启示</a>；关于 TLS 协议协商演进，请参阅<a href="tls_knowledge_expiry.html">在 SSL 中学到的知识如今为何失效</a>；关于 Shell 退出码捕获，请参阅<a href="shell_exit_code_pipefail.html">Shell 退出码与 set -e</a>；关于终端 REST 交互工具，请参阅<a href="slumber_terminal_http_client_2026.html">Slumber 终端 HTTP 客户端</a>。</p>
+
+                    <h2 id="sec-2">1. 运行环境与基准验证</h2>
+                    <p>本文收录的所有命令执行结果与输出内容，均在受控本地环境中实际运行得出。为方便读者复现，特列明测试环境的具体配置。</p>
+                    <ul>
+                        <li><strong>操作系统</strong>: Windows 10 Pro 10.0.19045</li>
+                        <li><strong>Shell 环境</strong>: Git Bash (GNU sed 4.9, GNU Awk 5.0.0), Windows PowerShell 5.1</li>
+                        <li><strong>curl 版本</strong>: curl 8.12.1 (x86_64-w64-mingw32 构建版本, TLS 后端: Schannel)</li>
+                        <li><strong>工具链及运行时</strong>: git 2.48.1.windows.1, Python 3.13.3, Node 22.16.0</li>
+                        <li><strong>执行权限</strong>: 普通用户权限（非管理员）</li>
+                    </ul>
+                    <p>在该环境下运行 <code>curl -V</code>，输出的功能特性列表如下：</p>
+                    <pre><code class="language-plaintext">alt-svc AsynchDNS brotli HSTS HTTPS-proxy IDN IPv6 Kerberos Largefile libz NTLM PSL SPNEGO SSL SSPI threadsafe UnixSockets zstd</code></pre>
+                    <p>需要注意的是，此 curl 构建不包含 <code>HTTP2</code> 特性，因此后续详细日志中显示 <code>using HTTP/1.x</code>。不同构建的 TLS 后端与支持特性可能不同，排查前应先核对 <code>curl -V</code> 的第一行（版本与 TLS 后端）和 Features 行。</p>
+                    <p>测试目标包括标准测试域名 <code>https://example.com/</code>、触发 301 重定向的 <code>http://google.com/</code>、无响应的私有 IP <code>10.255.255.1</code> 以及不存在的域名 <code>nonexistent.invalid</code>。本地文件路径统一简化表示为 <code>…/tech_lab/</code>。</p>
+
+                    <h2 id="sec-3">2. 格式文件换行陷阱 - 丢弃实际换行符的 curl</h2>
+                    <p>curl 的 <code>-w</code> 选项允许在传输结束后按自定义模板输出指标。当监测指标较多时，官方文档推荐使用 <code>@filename</code> 语法从外部文件读取格式定义。</p>
+
+                    <h3 id="sec-3-1">2.1 使用物理换行时的单行拼接现象</h3>
+                    <p>初次编写格式文件时，开发者通常会在每个变量后直接回车换行。以下是实际创建包含 9 行内容的 <code>curl-format.txt</code> 并调用的测试：</p>
+                    <pre><code class="language-bash">printf 'namelookup:    %%{time_namelookup}\nconnect:       %%{time_connect}\n…remote_ip:     %%{remote_ip}\n' &gt; curl-format.txt
+cat curl-format.txt
+curl -s -o /dev/null -w @curl-format.txt https://example.com/</code></pre>
+                    <p>虽然文件中存在 9 行文本，终端输出却将所有内容压缩成了一行：</p>
+                    <pre><code class="language-plaintext">namelookup:    %{time_namelookup}
+connect:       %{time_connect}
+…(文件中共有 9 行)
+=== run 1
+namelookup:    0.023826connect:       0.150990appconnect:    0.571661pretransfer:   0.571741starttransfer: 0.711580total:         0.734726http_code:     200size_download: 713remote_ip:     172.66.147.243=== run 2</code></pre>
+                    <p>文件中的所有物理换行符均被丢弃，输出内容粘连在一起，导致按行解析的下游逻辑失效。</p>
+
+                    <h3 id="sec-3-2">2.2 必须写入字面量 \n 的源码原因</h3>
+                    <p>这一现象源于 curl 本身的代码实现。查阅 curl 8.12.1 源码中 <code>src/tool_paramhlp.c</code> 的 <code>file2string()</code> 函数可以明确其机理。</p>
+                    <p>该函数在读取文件到内存时调用了 <code>memcrlf()</code>。代码注释指出：<code>countcrlf FALSE - return number of bytes from the start that DO NOT include any CR or LF or NULL</code>。换言之，加载格式模板时，curl 会自动跳过文件内的 CR 与 LF 字符。</p>
+                    <p>因此，若要在输出中保留换行，必须在文件内写入<strong>反斜杠加字母 n 的字面量字符串 <code>\n</code></strong>。Everything curl 文档中亦有明确说明：<code>You can also output a newline by using \n, a carriage return with \r and a tab space with \t</code>。</p>
+                    <p>修正后的 <code>curl-format2.txt</code> 内容如下：</p>
+                    <pre><code class="language-plaintext">namelookup:    %{time_namelookup}\n
+connect:       %{time_connect}\n
+appconnect:    %{time_appconnect}\n
+pretransfer:   %{time_pretransfer}\n
+starttransfer: %{time_starttransfer}\n
+total:         %{time_total}\n
+http_code:     %{http_code}\n
+size_download: %{size_download}\n
+remote_ip:     %{remote_ip}\n</code></pre>
+                    <p>经 <code>od -c</code> 检查，确认文件中物理写入了 <code>\</code> 和 <code>n</code> 两个字符。</p>
+
+                    <h2 id="sec-4">3. -w 时间变量的本质 - 累计数值与差值计算</h2>
+                    <p>使用修正后的 <code>curl-format2.txt</code> 对 <code>https://example.com/</code> 进行了两次测试：</p>
+                    <pre><code class="language-bash">for i in 1 2; do echo "=== run $i"; curl -s -o /dev/null -w @curl-format2.txt https://example.com/; done</code></pre>
+                    <p>输出得到了整齐的分行记录：</p>
+                    <pre><code class="language-plaintext">=== run 1
+namelookup:    0.016839
+connect:       0.148093
+appconnect:    0.476784
+pretransfer:   0.476995
+starttransfer: 0.619743
+total:         0.619873
+http_code:     200
+size_download: 713
+remote_ip:     172.66.147.243
+=== run 2
+namelookup:    0.016120
+connect:       0.143699
+appconnect:    0.463794
+pretransfer:   0.463936
+starttransfer: 0.600572
+total:         0.603125
+http_code:     200
+size_download: 713
+remote_ip:     172.66.147.243</code></pre>
+
+                    <h3 id="sec-4-1">3.1 六个时间指标描绘的请求生命周期</h3>
+                    <p>观察各项数值可知，数字自上而下呈现<strong>单调递增</strong>趋势。run 1 中 namelookup 约为 0.017 秒，connect 约为 0.148 秒，appconnect 约为 0.477 秒，total 约为 0.620 秒。</p>
+                    <p>这说明：<strong>curl 的 <code>time_*</code> 变量并非代表某一阶段的独立耗时，而是自请求发起（0.000 秒）至该阶段结束时的「累计时刻」</strong>。例如 <code>time_connect</code> 的 0.148093 秒包含此前 DNS 解析的时间，而非单纯的 TCP 建连耗时。</p>
+
+                    <h3 id="sec-4-2">3.2 获取各阶段耗时的差值减法公式</h3>
+                    <p>要获取各阶段实际消耗的毫秒数，必须进行相邻累计指标的差值计算。以 run 1 为例换算为毫秒（ms）：</p>
+                    <ul>
+                        <li><strong>DNS 解析耗时</strong>: <code>time_namelookup</code> = 16.8 ms (run 2: 16.1 ms)</li>
+                        <li><strong>TCP 握手耗时</strong>: <code>time_connect - time_namelookup</code> = 148.1 - 16.8 = 131.3 ms (run 2: 127.6 ms)</li>
+                        <li><strong>TLS 协商耗时</strong>: <code>time_appconnect - time_connect</code> = 476.8 - 148.1 = 328.7 ms (run 2: 320.1 ms)</li>
+                        <li><strong>请求准备耗时</strong>: <code>time_pretransfer - time_appconnect</code> = 477.0 - 476.8 = 0.2 ms (run 2: 0.1 ms)</li>
+                        <li><strong>等待服务端响应（TTFB）</strong>: <code>time_starttransfer - time_pretransfer</code> = 619.7 - 477.0 = 142.7 ms (run 2: 136.6 ms)</li>
+                        <li><strong>响应体下载传输</strong>: <code>time_total - time_starttransfer</code> = 619.87 - 619.74 = 0.1 ms (run 2: 2.6 ms)</li>
+                    </ul>
+                    <p>在总计约 0.62 秒的耗时中，<strong>TLS 握手阶段</strong>耗费约 328.7 ms，占比超过一半。在初次实验中，<code>appconnect - connect</code> 三次测量均在 0.30 至 0.42 秒之间，每次都是最长的阶段。该数值为特定环境单次测试所得，并非通用固定指标。</p>
+
+                    <h2 id="sec-5">4. 分阶段耗时拆解与瓶颈排查表</h2>
+                    <p>通过表格梳理时间差值计算，可迅速将延迟对应到相关技术层。下表结合 run 1 实测值列出各阶段耗时异常时的常见背景原因：</p>
+
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>异常偏高阶段</th>
+                                <th>计算公式（累计值差）</th>
+                                <th>本次实测（run 1，单次测量）</th>
+                                <th>出现延迟时应怀疑的背景因素</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>DNS 解析</td>
+                                <td><code>namelookup</code></td>
+                                <td>16.8 ms</td>
+                                <td>本地解析器缓存失效、上游 DNS 服务器拥塞或丢包</td>
+                            </tr>
+                            <tr>
+                                <td>TCP 握手</td>
+                                <td><code>connect - namelookup</code></td>
+                                <td>131.3 ms</td>
+                                <td>物理网络距离（RTT）、中间防火墙过滤延迟、SYN 包重传</td>
+                            </tr>
+                            <tr>
+                                <td>TLS 握手</td>
+                                <td><code>appconnect - connect</code></td>
+                                <td>328.7 ms</td>
+                                <td>大体积证书链校验、多轮往返密码套件协商、OCSP 查询挂起</td>
+                            </tr>
+                            <tr>
+                                <td>服务处理响应</td>
+                                <td><code>starttransfer - pretransfer</code></td>
+                                <td>142.7 ms</td>
+                                <td>服务端业务逻辑与数据库慢查询、反向代理缓存未命中</td>
+                            </tr>
+                            <tr>
+                                <td>响应体下载</td>
+                                <td><code>total - starttransfer</code></td>
+                                <td>0.1 ms (713 B)</td>
+                                <td>响应数据包体积过大、网络出口带宽饱和、TCP 接收窗口限制</td>
+                            </tr>
+                        </tbody>
+                    </table>
+
+                    <p>通过这套公式，可将总计 620ms 的请求清晰拆分为「DNS 17ms、TCP 131ms、TLS 329ms、服务端首字节等待 143ms」（本环境单次测量），为运维与开发协同提供明确数据支撑。</p>
+
+                    <h2 id="sec-6">5. -v 详细日志解读与 Schannel 环境的局限</h2>
+                    <p>除 <code>-w</code> 提供的量化数据外，<code>-v</code>（<code>--verbose</code>）展示了底层协议交互的详细文本。</p>
+
+                    <h3 id="sec-6-1">5.1 依据前缀符号（*、&gt;、&lt;、{）梳理交互</h3>
+                    <p>运行 <code>curl -v -o /dev/null https://example.com/ 2&gt;&amp;1</code> 输出的关键日志如下（已省略进度条；原输出中没有 Cookie 或跟踪头）：</p>
+                    <pre><code class="language-plaintext">* Host example.com:443 was resolved.                 ← DNS
+* IPv6: (none)
+* IPv4: 172.66.147.243, 104.20.23.154
+*   Trying 172.66.147.243:443...                      ← TCP 连接尝试
+* schannel: disabled automatic use of client certificate   ← TLS (Schannel)
+* Connected to example.com (172.66.147.243) port 443
+* using HTTP/1.x
+&gt; GET / HTTP/1.1                                      ← 请求头 ( &gt; )
+&gt; Host: example.com
+&gt; User-Agent: curl/8.12.1
+&gt; Accept: */*
+&gt;
+* Request completely sent off
+&lt; HTTP/1.1 200 OK                                     ← 响应头 ( &lt; )
+&lt; Date: Mon, 28 Sep 2026 22:43:27 GMT
+&lt; Content-Type: text/html; charset=utf-8
+&lt; Transfer-Encoding: chunked
+&lt; Connection: keep-alive
+&lt; Server: cloudflare
+&lt; last-modified: Mon, 28 Sep 2026 16:19:32 GMT
+&lt; allow: GET, HEAD
+&lt; Accept-Ranges: bytes
+&lt; Age: 7950
+&lt; cf-cache-status: HIT
+&lt;
+{ [725 bytes data]
+* Connection #0 to host example.com left intact</code></pre>
+                    <p>行首符号定义明确：</p>
+                    <ul>
+                        <li><code>*</code>: curl 内部诊断信息（DNS 解析、IP 选取、连接状态与 SSL 初始化）</li>
+                        <li><code>&gt;</code>: 客户端发送至服务端的 HTTP 请求头</li>
+                        <li><code>&lt;</code>: 服务端返回的 HTTP 响应头</li>
+                        <li><code>{</code>: 接收到的数据量（本输出中为 <code>{ [725 bytes data]</code>）</li>
+                    </ul>
+
+                    <h3 id="sec-6-2">5.2 --trace-time 时间戳与阶段边界解析</h3>
+                    <p>附加 <code>--trace-time</code> 后的带时间戳日志：</p>
+                    <pre><code class="language-plaintext">07:43:32.016000 * Host example.com:443 was resolved.
+07:43:32.018000 * IPv6: (none)
+07:43:32.018000 * IPv4: 172.66.147.243, 104.20.23.154
+07:43:32.018000 *   Trying 172.66.147.243:443...
+07:43:32.146000 * schannel: disabled automatic use of client certificate
+07:43:32.450000 * Connected to example.com (172.66.147.243) port 443
+07:43:32.450000 * using HTTP/1.x
+07:43:32.450000 &gt; GET / HTTP/1.1</code></pre>
+                    <p>此处反映出两个特点。首先，秒后小数部分末尾均为 <code>000</code>，表明 Windows 构建版本的时间分辨率仅到毫秒级。</p>
+                    <p>其次，注意 <code>Connected to</code> 的打印时机。TCP 尝试发起于 <code>.018</code>，Schannel 日志输出于 <code>.146</code>，而 <code>Connected to</code> 打印在 TLS 基本就绪的 <code>.450</code>。由此看来，在该 Schannel 构建中，连接日志是在 TLS 结束后才输出的。<strong>因此，不应仅凭详细日志行距估算阶段，使用 <code>-w</code> 的 <code>time_connect</code> 与 <code>time_appconnect</code> 才能获得准确边界</strong>。</p>
+                    <p>此外，该 Windows Schannel 版本在 <code>-v</code> 下未输出协商的密码套件和证书过期详情，即使指定 <code>--trace-config tls,dns</code> 亦无额外输出，Linux、macOS 上常用的 OpenSSL 构建的 <code>-v</code> 输出未在本环境中确认，只需注意不同构建的输出可能不同。</p>
+
+                    <h2 id="sec-7">6. 两种超时机制（--connect-timeout vs -m）与退出码</h2>
+                    <p>在脚本自动化中合理控制超时是防止进程假死的关键。curl 提供了限定建连耗时的 <code>--connect-timeout</code> 与限定全局周期的 <code>-m</code>（<code>--max-time</code>）。</p>
+
+                    <h3 id="sec-7-1">6.1 仅约束建连过程的 --connect-timeout</h3>
+                    <p>对无响应的私有 IP <code>10.255.255.1</code> 施加 <code>--connect-timeout 2</code>：</p>
+                    <pre><code class="language-bash">time curl -sS --connect-timeout 2 -o /dev/null http://10.255.255.1/; echo "exit=$?"</code></pre>
+                    <pre><code class="language-plaintext">curl: (28) Connection timed out after 2011 milliseconds
+real	0m2.122s
+exit=28</code></pre>
+                    <p>历时 2.011 秒后建连中断，返回<strong>退出码 28</strong>。该参数仅限制建连阶段，一旦 TCP 握手完成便不再干预后续传输。</p>
+
+                    <h3 id="sec-7-2">6.2 约束全程的 -m (--max-time) 及其优先级</h3>
+                    <p>而 <code>-m</code> 约束全程耗时。测试二者同时传入时的优先级表现：</p>
+                    <pre><code class="language-bash">curl -sS --connect-timeout 5 -m 0.2 -o /dev/null https://example.com/; echo "exit=$?"</code></pre>
+                    <pre><code class="language-plaintext">curl: (28) Connection timed out after 204 milliseconds
+exit=28</code></pre>
+                    <p>即使建连超时预设为 5 秒，较短的 <code>-m 0.2</code> 仍在 204 毫秒时率先动作。<strong>当 <code>-m</code> 短于 <code>--connect-timeout</code> 时，即使处于建连期亦由 <code>-m</code> 优先终止</strong>。</p>
+                    <p>同为退出码 28，报错文本随中断阶段而不同：</p>
+                    <ul>
+                        <li>建连未成时超时：<code>curl: (28) Connection timed out after 204 milliseconds</code></li>
+                        <li>建连后等待数据时超时（<code>-m 0.5</code>）：<code>curl: (28) Operation timed out after 514 milliseconds with 0 bytes received</code>（此时 <code>http_code</code> 为 <code>000</code>）</li>
+                    </ul>
+                    <p>若将限额放宽至 <code>-m 0.58</code>（足以覆盖 0.578 秒传输），则正常返回退出码 0 与 HTTP 200。</p>
+
+                    <h2 id="sec-8">7. 脚本集成实践：-sS、-f 与 JSON 结构化输出</h2>
+                    <p>在自动化部署或巡检中，默认行为极易掩盖真实的异常。</p>
+
+                    <h3 id="sec-8-1">7.1 保留错误的 -sS 与拦截异常状态的 -f</h3>
+                    <p>查询不存在的域名 <code>nonexistent.invalid</code>：</p>
+                    <pre><code class="language-bash">curl -sS -o /dev/null https://nonexistent.invalid/; echo "exit=$?"
+curl -s  -o /dev/null https://nonexistent.invalid/; echo "exit=$?"</code></pre>
+                    <pre><code class="language-plaintext">curl: (6) Could not resolve host: nonexistent.invalid
+exit=6
+=== -s alone hides error
+exit=6</code></pre>
+                    <p>单独使用 <code>-s</code> 会抹去错误信息。脚本中务必使用 <strong><code>-sS</code>（<code>--silent --show-error</code>）</strong>，在关闭进度条的同时保留 stderr 报错。域名解析失败返回退出码 <strong>6</strong>。</p>
+                    <p>更为隐蔽的是 HTTP 404 等服务端响应：</p>
+                    <pre><code class="language-bash">curl -s  -o /dev/null -w '%{http_code}\n' https://example.com/no-such-page; echo "exit(no -f)=$?"
+curl -sf -o /dev/null https://example.com/no-such-page; echo "exit(-f)=$?"</code></pre>
+                    <pre><code class="language-plaintext">404
+exit(no -f)=0
+exit(-f)=22</code></pre>
+                    <p>本次实验中收到 404 时，<strong>未带 <code>-f</code> 的 curl 仍返回退出码 0</strong>。只有附加 <strong><code>-f</code>（<code>--fail</code>）</strong>，才能在遇到 HTTP 400 及以上响应时抛出<strong>退出码 22</strong>。仅检查响应头可用 <code>-I</code>，追踪重定向需搭配 <code>-L</code>。</p>
+
+                    <p>实测验证的退出码速查表如下：</p>
+
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>测试场景</th>
+                                <th>调用参数</th>
+                                <th>退出码</th>
+                                <th>实际输出的错误提示</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>连接无响应的私有 IP</td>
+                                <td><code>--connect-timeout 2</code></td>
+                                <td>28</td>
+                                <td>Connection timed out after 2011 milliseconds</td>
+                            </tr>
+                            <tr>
+                                <td>握手阶段全局超时生效</td>
+                                <td><code>-m 0.2</code></td>
+                                <td>28</td>
+                                <td>Connection timed out after 204 milliseconds</td>
+                            </tr>
+                            <tr>
+                                <td>响应等待阶段全局超时生效</td>
+                                <td><code>-m 0.5</code></td>
+                                <td>28</td>
+                                <td>Operation timed out after 514 milliseconds with 0 bytes received</td>
+                            </tr>
+                            <tr>
+                                <td>域名无法解析</td>
+                                <td><code>-sS</code>（仅用 <code>-s</code> 时无文字，退出码仍为 6）</td>
+                                <td>6</td>
+                                <td>Could not resolve host: nonexistent.invalid</td>
+                            </tr>
+                            <tr>
+                                <td>收到 HTTP 404 响应</td>
+                                <td>未指定 <code>-f</code></td>
+                                <td>0</td>
+                                <td>（无报错，视为传输成功正常结束）</td>
+                            </tr>
+                            <tr>
+                                <td>收到 HTTP 404 响应</td>
+                                <td>指定 <code>-f</code></td>
+                                <td>22</td>
+                                <td>—（被 <code>-s</code> 隐藏，无输出）</td>
+                            </tr>
+                        </tbody>
+                    </table>
+
+                    <h3 id="sec-8-2">7.2 curl 8.12 的 %{json} 与 %{header_json} 实战</h3>
+                    <p>无需管理外部文件即可直接获取结构化数据时，可以使用在 curl 8.12.1 中确认可用的 JSON 导出：</p>
+                    <pre><code class="language-bash">curl -s -o /dev/null -w '%{json}' https://example.com/ | python -c "…输出键数量与部分键…"
+curl -s -o /dev/null -w '%{header_json}' https://example.com/ | head -c 120</code></pre>
+                    <p>解析确认输出了 67 个属性键：</p>
+                    <pre><code class="language-plaintext">keys: 67
+http_code = 200
+time_namelookup = 0.016632
+time_connect = 0.144654
+time_appconnect = 0.431361
+time_starttransfer = 0.568338
+time_total = 0.568422
+remote_ip = 172.66.147.243
+http_version = 1.1
+scheme = https
+exitcode = 0
+errormsg = None
+curl_version = libcurl/8.12.1 Schannel zlib/1.3.1 brotli/1.1.0 zstd/1.5.6 libidn2/2.3.7 libpsl/0.21.5 libssh2/1.11.1
+=== -w %{header_json} support
+{"date":["Mon, 28 Sep 2026 22:43:41 GMT"],
+"content-type":["text/html; charset=utf-8"],
+"transfer-encoding":["chunked"</code></pre>
+                    <p><code>-w '%{json}'</code> 集中导出了耗时、<code>exitcode</code> 与 <code>remote_ip</code>，便于 Python 或 <code>jq</code> 直接处理，<code>%{header_json}</code> 也以 JSON 形式输出了响应头（仅确认前 120 字节）。</p>
+
+                    <p>常见场景推荐标志组合如下：</p>
+
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>诊断场景目标</th>
+                                <th>推荐参数搭配</th>
+                                <th>预期收益与分析优势</th>
+                                <th>使用时的关键注意事项</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>各阶段延迟毫秒级分析</td>
+                                <td><code>-s -o /dev/null -w @curl-format2.txt</code></td>
+                                <td>拆解 DNS、TCP、TLS 与首字节耗时</td>
+                                <td>格式文件中换行符必须使用字面量 <code>\n</code></td>
+                            </tr>
+                            <tr>
+                                <td>交互式通信过程追踪</td>
+                                <td><code>-sv --trace-time -o /dev/null</code></td>
+                                <td>带时间戳记录首部传输全过程</td>
+                                <td>该 Schannel 构建未输出 TLS 详细行（OpenSSL 构建未验证）</td>
+                            </tr>
+                            <tr>
+                                <td>健壮的脚本自动化调用</td>
+                                <td><code>-sS -f --connect-timeout 3 -m 10</code></td>
+                                <td>建连与总耗时分离，400 及以上返回退出码 22（依文档，已用 404 实测）</td>
+                                <td>缺少 -f 时 404 响应仍将以 exit 0 退出</td>
+                            </tr>
+                        </tbody>
+                    </table>
+
+                    <h2 id="sec-9">未能确认的事项</h2>
+                    <p>本指南以实机命令执行与官方规范为准，但受当前测试环境所限，以下内容未直接验证：</p>
+                    <ul>
+                        <li><strong>OpenSSL 构建下的 TLS 详细日志</strong>: 本次验证仅基于使用 Schannel 后端的 curl 8.12.1（x86_64-w64-mingw32 构建）。Linux 或 macOS 上常见的 OpenSSL 构建在 <code>-v</code> 下如何输出 TLS 相关行，未能在当前环境中确认。</li>
+                        <li><strong>libcurl 官方手册中 time_* 的定义原文</strong>: 尽管查阅了 Everything curl 及命令手册，但未能确认 libcurl C API 的 <code>CURLINFO_*</code> 原文定义，文中所述减法计算基于实验 2 的累计实测归纳得出。</li>
+                        <li><strong>HTTP/2 多路复用时的累计耗时行为</strong>: 由于测试使用的 curl 构建未启用 HTTP/2（回退至 <code>using HTTP/1.x</code>），单连接多流请求时的指标记录特性未作测量。</li>
+                    </ul>
+
+                    <h2 id="sec-10">参考资料</h2>
+                    <ul>
+                        <li>Everything curl: write-out 官方文档 <code>https://everything.curl.dev/usingcurl/verbose/writeout.html</code></li>
+                        <li>curl 官方手册页 (curl manpage) <code>https://curl.se/docs/manpage.html</code></li>
+                        <li>curl 8.12.1 源码 (src/tool_paramhlp.c) <code>https://raw.githubusercontent.com/curl/curl/curl-8_12_1/src/tool_paramhlp.c</code></li>
+                        <li>本地 <code>curl --manual</code> 命令内置手册输出 (curl 8.12.1)</li>
+                    </ul>
+
+                    <!-- md-artifact-start -->
+                    <div class="md-artifact" style="margin:2rem 0;border:1px solid #d7dce3;border-radius:10px;overflow:hidden;background:#fbfcfd;">
+                        <div style="display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;justify-content:space-between;padding:.7rem 1rem;background:#eef2f7;border-bottom:1px solid #d7dce3;">
+                            <span style="font-weight:700;font-size:.97rem;">📋 可直接带走的检查清单</span>
+                            <span style="display:flex;gap:.5rem;align-items:center;">
+                                <code style="font-size:.82rem;color:#5a6675;background:transparent;padding:0;">curl_debug_flags_guide.md</code>
+                                <button type="button" class="md-artifact-copy" style="cursor:pointer;border:1px solid #b9c2cf;background:#fff;color:#2c3e50;font-weight:600;line-height:1.3;border-radius:6px;padding:.32rem .7rem;font-size:.85rem;">复制全部</button>
+                            </span>
+                        </div>
+                        <pre style="margin:0;max-height:420px;overflow:auto;padding:1rem;background:#fbfcfd;font-size:.86rem;line-height:1.62;"><code class="nohighlight" style="background:transparent;padding:0;white-space:pre;"># curl 诊断标志与延迟阶段拆解 - 实战速查表
+
+验证环境: Windows 10 Pro 10.0.19045, curl 8.12.1 (Schannel), Git Bash, Python 3.13.3.
+表中数值与信息均在本环境实际运行确认（耗时为单次测量）。第 4 节的第 3 条命令为示例，该组合本身未实际运行。
+
+---
+
+## 1. 瓶颈阶段判定 — 通过差值计算
+
+curl 的 `time_*` 变量均为自请求发起起的**累计时刻**。各阶段耗时需通过与上一阶段累计值相减得出。
+
+| 异常耗时阶段 | 计算公式（累计值之差） | 本机实测值（单次） | 延迟时优先排查方向（通用背景） |
+|---|---|---|---|
+| DNS 解析 | `time_namelookup` | 16.8 ms | 本地缓存失效、递归解析器响应过慢 |
+| TCP 建连 | `time_connect - time_namelookup` | 131.3 ms | 网络往返时间（RTT）、防火墙过滤或丢包 |
+| TLS 握手 | `time_appconnect - time_connect` | 328.7 ms | 证书链校验耗时、密码套件协商往返（占比最大） |
+| 服务端响应等待（TTFB） | `time_starttransfer - time_pretransfer` | 142.7 ms | 业务计算负载、数据库慢查询、反向代理穿透 |
+| 响应体传输 | `time_total - time_starttransfer` | 0.1 ms (713 B) | 响应数据包体积、出口网络带宽限制 |
+
+---
+
+## 2. 退出码实测速查表
+
+| 测试场景 | 指定选项 | 退出码 | 实际返回的错误信息 |
+|---|---|---|---|
+| 连接无响应的私有 IP | `--connect-timeout 2` | 28 | `Connection timed out after 2011 milliseconds` |
+| 握手阶段全局超时生效 | `-m 0.2` | 28 | `Connection timed out after 204 milliseconds` |
+| 响应等待阶段全局超时生效 | `-m 0.5` | 28 | `Operation timed out after 514 milliseconds with 0 bytes received` |
+| 域名无法解析 | `-sS`（仅用 `-s` 时无文字，退出码仍为 6） | 6 | `Could not resolve host: nonexistent.invalid` |
+| 接收到 HTTP 404 响应 | （无，未指定 `-f`） | 0 | （无报错，视为传输成功正常退出） |
+| 接收到 HTTP 404 响应 | `-f` (`--fail`) | 22 | —（被 `-s` 隐藏，无输出） |
+
+---
+
+## 3. 实战排查清单
+
+- [ ] **格式文件换行符陷阱**: 格式文件（`@curl-format.txt`）内部必须写入字面量 `\n`，而非物理回车换行（物理换行会被 curl 内部的 `file2string()` 自动忽略）。
+- [ ] **脚本基础参数**: 脚本自动化中务必使用 `-sS`（`--silent --show-error`），在关闭进度条的同时保留 stderr 报错。
+- [ ] **捕获 HTTP 状态异常**: 未指定 `-f`（`--fail`）时，404 响应仍返回了退出码 0（文档：`-f` 在 400 及以上返回 22），必须添加 `-f` 或检查 `%{http_code}`。
+- [ ] **超时优先级判断**: 同时指定 `--connect-timeout` 与 `-m` 时，若 `-m` 更短，即使在建连期间也由 `-m` 先终止。
+- [ ] **Schannel 构建特性**: 本环境的 Schannel 构建（curl 8.12.1，x86_64-w64-mingw32）的 `-v` 不输出 TLS 版本、密码套件与证书详情，评估 TLS 耗时应使用 `-w` 的 `time_appconnect`。
+- [ ] **协议特性核对**: 各平台构建特性不同，排查前应先执行 `curl -V` 确认 HTTP2 等特性的支持情况。
+
+---
+
+## 4. 推荐诊断模板
+
+### 毫秒级耗时格式文件 (`curl-format.txt`)
+```text
+namelookup:    %{time_namelookup}\n
+connect:       %{time_connect}\n
+appconnect:    %{time_appconnect}\n
+pretransfer:   %{time_pretransfer}\n
+starttransfer: %{time_starttransfer}\n
+total:         %{time_total}\n
+http_code:     %{http_code}\n
+size_download: %{size_download}\n
+remote_ip:     %{remote_ip}\n
+```
+
+### 命令示例
+```bash
+# 1. 精确获取分阶段耗时（毫秒级）
+curl -s -o /dev/null -w @curl-format.txt https://example.com/
+
+# 2. 导出完整 JSON 统计（已在 curl 8.12.1 中确认）
+curl -s -o /dev/null -w '%{json}' https://example.com/
+
+# 3. 健壮的脚本调用示例（3 与 10 为示例值，该组合本身未实际运行）
+curl -sS -f --connect-timeout 3 -m 10 -o output.dat https://example.com/
+```
+</code></pre>
+                        <p style="margin:0;padding:.6rem 1rem;font-size:.82rem;color:#5a6675;border-top:1px solid #e3e8ee;">复制后可直接粘贴到笔记应用或 AI 工具中。</p>
+                    </div>
+                    <script>
+                    (function(){
+                      if (window.__mdArtifactBound) return;
+                      window.__mdArtifactBound = true;
+                      document.addEventListener('click', function(ev){
+                        var btn = ev.target.closest && ev.target.closest('.md-artifact-copy');
+                        if (!btn) return;
+                        var box = btn.closest('.md-artifact');
+                        var code = box && box.querySelector('pre code');
+                        if (!code) return;
+                        var text = code.textContent;
+                        var label = btn.textContent;
+                        var ok = function(){
+                          btn.textContent = "已复制";
+                          setTimeout(function(){ btn.textContent = label; }, 1600);
+                          if (typeof gtag === 'function') {
+                            gtag('event', 'md_copy', { slug: "curl_debug_flags_guide", lang: "zh", chars: text.length });
+                          }
+                        };
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                          navigator.clipboard.writeText(text).then(ok).catch(function(){ fallback(); });
+                        } else { fallback(); }
+                        function fallback(){
+                          var ta = document.createElement('textarea');
+                          ta.value = text; ta.setAttribute('readonly','');
+                          ta.style.position='fixed'; ta.style.left='-9999px';
+                          document.body.appendChild(ta); ta.select();
+                          try { document.execCommand('copy'); ok(); } catch(e) {}
+                          document.body.removeChild(ta);
+                        }
+                      });
+                    })();
+                    </script>
+                    <!-- md-artifact-end -->
+
+                <div class="share-section">
+                        <h3>分享本文</h3>
+                        <div class="social-share">
+                            <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                            <button id="twitter-share" class="share-btn twitter-btn">X(Twitter)</button>
+                            <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                            <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                        </div>
+                    </div>
+
+                    <div class="back-to-list">
+                        <a href="../blog.html" class="back-link">返回列表</a>
+                    </div>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/curl_builder.html">curl命令生成器 2026</a></li>
+      <li><a href="../static/http_status_codes.html">HTTP状态码完全参考 2026</a></li>
+      <li><a href="../static/nginx_generator.html">Nginx 配置生成器</a></li>
+      <li><a href="../static/ssh_config_generator.html">SSH config生成器 2026</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="sed_inplace_safety.html">sed -i 不是原位修改 — 批量替换前的预览、备份与 diff 流程</a></li>
+      <li><a href="go_vanity_import_path_custom_domain.html">如何避免将Go代码直接绑定到GitHub — 自定义域名与go-import元标签架构解析</a></li>
+      <li><a href="tencent_browserskill_logged_in_browser_agent_2026.html">深度解析Tencent BrowserSkill — 将已登录的真实浏览器交付给智能体的设计与权限边界 2026</a></li>
+      <li><a href="postgres_at_time_zone_utc_trap.html">PostgreSQL中AT TIME ZONE 'UTC'的陷阱 — 会话TimeZone悄然介入的三处环节</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+
+    <script src="../../common.js"></script>
+</body>
+</html>

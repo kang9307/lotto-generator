@@ -1,0 +1,755 @@
+<!DOCTYPE html>
+<!--
+ * 기술 블로그 포스트 템플릿
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="ko">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>curl 진단 플래그 가이드 - -v와 -w로 지연 구간과 종료 코드 분석하기</title>
+    <meta name="description" content="curl 요청이 느릴 때 어디서 지체되는지 -w 누적 시각의 차이 계산과 -v 출력으로 분해하고 종료 코드 28·6·22를 실측했습니다. 형식 파일 줄바꿈 함정과 타임아웃 우선순위까지 정리합니다.">
+    <meta name="keywords" content="curl, curl 디버깅, curl 진단, curl -w, curl -v, time_namelookup, time_connect, time_appconnect, time_starttransfer, time_total, curl 종료 코드, connect-timeout, max-time, curl 8.12">
+
+    <link rel="canonical" href="https://braindetox.kr/posts/curl_debug_flags_guide.html">
+
+    <meta property="og:title" content="curl 진단 플래그 가이드 - -v와 -w로 지연 구간과 종료 코드 분석하기">
+    <meta property="og:description" content="요청이 느릴 때 어디서 지체되는지 -w 누적 시각 차이 계산과 -v 출력으로 분해하고, 종료 코드 28·6·22를 실측했습니다.">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/posts/curl_debug_flags_guide.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="ko_KR">
+    <meta property="article:published_time" content="2026-09-29">
+    <meta property="article:section" content="개발/인프라">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="curl 진단 플래그 가이드 - -v와 -w로 지연 구간과 종료 코드 분석하기">
+    <meta name="twitter:description" content="요청 지연 원인을 -w 누적 시각 차이와 종료 코드로 추적하는 실측 진단 가이드.">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../styles.css">
+
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js" defer></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "curl 진단 플래그 가이드 - -v와 -w로 지연 구간과 종료 코드 분석하기",
+      "alternativeHeadline": "How to Measure Slow HTTP Requests with curl -w and Exit Codes",
+      "datePublished": "2026-09-29",
+      "dateModified": "2026-09-29",
+      "inLanguage": "ko-KR",
+      "articleSection": "개발/인프라",
+      "author": { "@type": "Person", "name": "BrainDetox" },
+      "keywords": "curl, curl 진단, curl -w, curl -v, time_namelookup, time_connect, time_appconnect, time_starttransfer, time_total, curl 종료 코드",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" }
+      },
+      "image": { "@type": "ImageObject", "url": "https://braindetox.kr/site_logo.png" },
+      "mainEntityOfPage": "https://braindetox.kr/posts/curl_debug_flags_guide.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "curl -w 에서 출력되는 시간 값들은 각 단계별 소요 시간인가요?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "아닙니다. time_namelookup, time_connect, time_appconnect, time_starttransfer, time_total 등은 모두 요청 시작 시점부터 해당 단계가 완료된 시점까지의 「누적 시각」입니다. 따라서 순수한 TCP 연결 시간은 connect에서 namelookup을 뺀 값이며, TLS 핸드셰이크 소요 시간은 appconnect에서 connect를 뺀 차이로 계산해야 합니다."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "형식 파일(@filename)을 쓸 때 일반 줄바꿈을 넣으면 왜 한 줄로 이어붙여지나요?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "curl 8.12.1 소스 코드(tool_paramhlp.c)의 file2string 함수 구현을 살펴보면, memcrlf 함수를 통해 파일 내의 실제 CR과 LF 줄바꿈 문자를 건너뛰며 읽도록 설계되어 있습니다. 따라서 파일 안에서 줄을 나누어 출력하려면 실제 줄바꿈 대신 글자 그대로 「\\n」 문자열을 파일 안에 적어 주어야 정상적인 개행이 이루어집니다."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "--connect-timeout과 -m(--max-time) 중 어느 쪽이 먼저 적용되나요?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "-m 옵션은 전체 전송 작업을 제한하므로 연결 단계에도 그대로 적용됩니다. 실측 실험에서 --connect-timeout 5초와 -m 0.2초를 함께 지정했을 때, 연결 단계가 아직 진행 중이었음에도 더 짧은 -m 0.2초가 먼저 발동하여 종료 코드 28로 실행을 멈추었습니다. 즉 -m이 더 짧으면 연결 단계에서도 -m이 우선합니다."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "HTTP 404 오류가 발생했는데 curl 스크립트 종료 코드가 왜 0으로 끝나나요?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "이 글의 실험에서 curl은 404 응답을 받고도 -f 없이는 종료 코드 0으로 끝났습니다. HTTP 400 이상의 오류 응답이 왔을 때 셸 종료 코드를 0이 아닌 실패로 만들려면 반드시 -f(--fail) 옵션을 붙여야 하며, 이때 curl은 종료 코드 22를 반환합니다."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Schannel 빌드 curl의 -v 출력에는 왜 TLS 인증서 상세 정보가 보이지 않나요?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "이 글에서 쓴 curl 8.12.1(x86_64-w64-mingw32 빌드)은 TLS 백엔드로 Schannel을 씁니다. 이 빌드의 -v에는 TLS 버전·암호 스위트·인증서 줄이 나오지 않고 「schannel: disabled automatic use of client certificate」 한 줄뿐이었으며, --trace-config tls,dns를 줘도 추가 줄이 없었습니다. OpenSSL 빌드의 출력은 이 환경에서 확인하지 못했습니다. 그래서 TLS 시간은 -w의 appconnect 값으로 쟀습니다."
+          }
+        }
+      ]
+    }
+    </script>
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <script src="https://t1.kakaocdn.net/kakao_js_sdk/2.4.0/kakao.min.js" crossorigin="anonymous" defer></script>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/curl_debug_flags_guide.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/curl_debug_flags_guide.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/curl_debug_flags_guide.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/curl_debug_flags_guide.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/curl_debug_flags_guide.html">
+
+    <script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position": 1,
+      "name": "홈",
+      "item": "https://braindetox.kr/"
+    },
+    {
+      "@type": "ListItem",
+      "position": 2,
+      "name": "개발/인프라",
+      "item": "https://braindetox.kr/category/dev.html"
+    },
+    {
+      "@type": "ListItem",
+      "position": 3,
+      "name": "curl 진단 플래그 가이드 - -v와 -w로 지연 구간과 종료 코드 분석하기",
+      "item": "https://braindetox.kr/posts/curl_debug_flags_guide.html"
+    }
+  ]
+}
+</script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article itemscope itemtype="https://schema.org/BlogPosting" class="blog-post-content">
+                <meta itemprop="headline" content="curl 진단 플래그 가이드 - -v와 -w로 지연 구간과 종료 코드 분석하기">
+                <meta itemprop="datePublished" content="2026-09-29">
+                <meta itemprop="dateModified" content="2026-09-29">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="curl, curl 진단, curl -w, curl -v, time_namelookup, time_connect, time_appconnect, time_starttransfer, time_total, curl 종료 코드">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/posts/curl_debug_flags_guide.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">curl 진단 플래그 가이드 - -v와 -w로 지연 구간과 종료 코드 분석하기</h1>
+                    <h2 class="post-subtitle">요청이 느릴 때 어디서 느린지 숫자로 가르는 법 — -w 누적 시각의 차이 계산과 종료 코드 표</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-09-29">2026-09-29</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">개발/인프라</span></a>
+                    </div>
+                </div>
+
+                <div class="post-toc">
+                    <h3>목차</h3>
+                    <ol>
+                        <li><a href="#sec-1">서론: 요청이 느릴 때 어디서 멈추는지 숫자로 가르기</a></li>
+                        <li><a href="#sec-2">실행 환경과 검증 기준</a></li>
+                        <li><a href="#sec-3">형식 파일 줄바꿈의 함정 - 실제 줄바꿈을 버리는 curl</a></li>
+                        <li><a href="#sec-4">-w 시간 변수의 본질 - 누적이 만든 값과 차이 계산</a></li>
+                        <li><a href="#sec-5">단계별 구간 분해와 병목 진단 표</a></li>
+                        <li><a href="#sec-6">-v 상세 출력 읽기와 Schannel 환경의 한계</a></li>
+                        <li><a href="#sec-7">두 가지 타임아웃(--connect-timeout vs -m)과 종료 코드</a></li>
+                        <li><a href="#sec-8">스크립트 연동을 위한 -sS, -f, 그리고 JSON 출력</a></li>
+                        <li><a href="#sec-9">확인하지 못한 것</a></li>
+                        <li><a href="#sec-10">참고 자료</a></li>
+                    </ol>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+                    <h2 id="sec-1">서론: 요청이 느릴 때 어디서 멈추는지 숫자로 가르기</h2>
+                    <p>특정 API나 웹 서버로 보내는 HTTP 요청이 평소보다 눈에 띄게 느려질 때, 개발자나 인프라 엔지니어가 가장 먼저 부딪히는 장벽은 지연의 원인이 속한 계층을 특정하기 어렵다는 점이다. 도메인 이름을 IP 주소로 바꾸는 DNS 조회가 지연되고 있는지, 중간 라우터나 방화벽을 통과해 TCP 3방향 핸드셰이크를 맺는 구간이 밀리고 있는지, TLS 인증서 교환 및 암호 협상에서 시간을 소모하는지, 아니면 서버 애플리케이션의 데이터베이스 쿼리가 오래 걸려 첫 바이트(TTFB)가 늦게 도착하는지 산문적인 감각만으로는 판별할 수 없다.</p>
+                    <p>이러한 의문을 명확한 숫자로 규명할 수 있는 도구가 터미널의 <code>curl</code>이다. 하지만 단순히 <code>curl https://example.com/</code>을 실행하거나 <code>time</code> 명령어로 감싸는 방식은 전체 왕복 시간이라는 단 하나의 숫자만 알려줄 뿐이다. curl이 내장하고 있는 강력한 진단 플래그인 <code>-w</code>(<code>--write-out</code>)와 <code>-v</code>(<code>--verbose</code>)를 올바르게 조합해야만 지연의 각 단계를 밀리초 단위로 분해할 수 있다.</p>
+                    <p>이 글은 흔히 볼 수 있는 옵션 나열식 매뉴얼이 아니다. 요청이 지연되거나 실패할 때 <strong>어느 구간에서 몇 밀리초가 걸렸는지 숫자로 정확히 가르는 방법</strong>을 다룬다. 특히 <code>-w</code>에 전달하는 형식 파일에서 줄바꿈이 사라지는 뜻밖의 동작 원리, 형식 파일 9항목 중 누적으로 증가하는 6개 시간 지표의 뺄셈 계산법, Windows Schannel 환경에서 관찰되는 상세 로그의 특성, 그리고 실패 상황을 셸 스크립트에 안전하게 전달하기 위한 종료 코드(exit code) 28, 6, 22의 실제 동작을 검증 기록을 바탕으로 분석한다.</p>
+                    <p>이 과정에서 다루는 네트워크 기초 원리는 이미 별도 글들에서 깊이 있게 다루었다. DNS 계층 캐싱 원리는 <a href="dns_cache_optimization.html">DNS 캐시가 알려주는 것</a>을, TLS 프로토콜과 암호화 협상 배경은 <a href="tls_knowledge_expiry.html">SSL에서 배운 것이 왜 지금은 틀리나</a>를, 셸 스크립트 종료 코드 감지 체계는 <a href="shell_exit_code_pipefail.html">셸 종료 코드와 set -e</a>를, 그리고 대화형 터미널 REST 클라이언트 대안은 <a href="slumber_terminal_http_client_2026.html">Slumber 터미널 HTTP 클라이언트</a>를 함께 참고하면 좋다.</p>
+
+                    <h2 id="sec-2">1. 실행 환경과 검증 기준</h2>
+                    <p>본문에 수록된 모든 명령어 실행 결과와 출력 문자열은 가상의 예시가 아니며, 제어된 로컬 환경에서 직접 실행하여 얻은 결과다. 독자가 동일한 명령을 재현할 때 참고할 수 있도록 검증 환경의 시스템 사양과 소프트웨어 버전을 명시한다.</p>
+                    <ul>
+                        <li><strong>운영체제</strong>: Windows 10 Pro 10.0.19045</li>
+                        <li><strong>셸 환경</strong>: Git Bash (GNU sed 4.9, GNU Awk 5.0.0), Windows PowerShell 5.1</li>
+                        <li><strong>curl 버전</strong>: curl 8.12.1 (x86_64-w64-mingw32 빌드, TLS 백엔드 Schannel)</li>
+                        <li><strong>버전 관리 및 런타임</strong>: git 2.48.1.windows.1, Python 3.13.3, Node 22.16.0</li>
+                        <li><strong>권한</strong>: 일반 사용자 권한 (관리자 권한 아님)</li>
+                    </ul>
+                    <p>이 환경에서 <code>curl -V</code>를 실행했을 때 확인된 기능(Features) 목록은 다음과 같다.</p>
+                    <pre><code class="language-plaintext">alt-svc AsynchDNS brotli HSTS HTTPS-proxy IDN IPv6 Kerberos Largefile libz NTLM PSL SPNEGO SSL SSPI threadsafe UnixSockets zstd</code></pre>
+                    <p>주목할 점은 이 curl 빌드에는 <code>HTTP2</code> 기능이 없다는 사실이다. 그래서 이후 상세 출력 실험에서는 <code>using HTTP/1.x</code>가 찍혔다. 빌드마다 TLS 백엔드와 기능이 다를 수 있으므로, 진단 전에 <code>curl -V</code>의 첫 줄(버전·TLS 백엔드)과 Features 줄을 먼저 확인한다.</p>
+                    <p>실험 대상으로는 표준 테스트 도메인인 <code>https://example.com/</code>, 301 리다이렉트가 발생하는 <code>http://google.com/</code>, 응답이 없던 사설 IP인 <code>10.255.255.1</code>, 그리고 존재하지 않는 도메인인 <code>nonexistent.invalid</code>를 사용했다. 로컬 파일 시스템 경로는 가독성을 위해 <code>…/tech_lab/</code> 형태로 정규화하여 표기한다.</p>
+
+                    <h2 id="sec-3">2. 형식 파일 줄바꿈의 함정 - 실제 줄바꿈을 버리는 curl</h2>
+                    <p>curl의 <code>-w</code> 옵션은 전송이 완료된 후 사용자가 지정한 서식 문자열에 따라 전송 통계를 표준 출력으로 내보낸다. 측정해야 할 지표가 많아지면 명령줄 인자가 길어지므로, 공식 문서가 안내하는 대로 <code>@filename</code> 문법을 사용하여 별도 텍스트 파일에서 서식을 읽어오는 방식을 흔히 선택한다.</p>
+
+                    <h3 id="sec-3-1">2.1 실제 줄바꿈을 넣었을 때의 한 줄 이어붙이기 현상</h3>
+                    <p>형식 파일을 처음 작성할 때 많은 개발자가 일반적인 텍스트 에디터에서 작성하듯 각 지표 뒤에 줄바꿈(엔터)을 입력한다. 다음은 실제로 9개 줄로 구성된 <code>curl-format.txt</code>를 생성하고 호출한 실험이다.</p>
+                    <pre><code class="language-bash">printf 'namelookup:    %%{time_namelookup}\nconnect:       %%{time_connect}\n…remote_ip:     %%{remote_ip}\n' &gt; curl-format.txt
+cat curl-format.txt
+curl -s -o /dev/null -w @curl-format.txt https://example.com/</code></pre>
+                    <p>파일 안에는 분명히 9개의 행이 나뉘어 있었지만, curl 실행 결과 화면에는 전혀 다른 형태의 출력이 나타났다.</p>
+                    <pre><code class="language-plaintext">namelookup:    %{time_namelookup}
+connect:       %{time_connect}
+…(파일에는 줄이 9개 있음)
+=== run 1
+namelookup:    0.023826connect:       0.150990appconnect:    0.571661pretransfer:   0.571741starttransfer: 0.711580total:         0.734726http_code:     200size_download: 713remote_ip:     172.66.147.243=== run 2</code></pre>
+                    <p>파일 내에 존재하던 실제 줄바꿈 문자가 완전히 제거되어 모든 항목이 줄 구분 없이 한 덩어리로 이어붙여졌다. 셸 스크립트나 파서에서 줄 단위로 읽으려던 계획이 즉시 무너지는 순간이다.</p>
+
+                    <h3 id="sec-3-2">2.2 글자 그대로 \n을 적어야 하는 소스 수준의 이유</h3>
+                    <p>이러한 동작은 단순한 셸의 간섭이 아니라 curl 내부 구현에서 기인한다. curl 8.12.1 공식 소스 코드 저장소의 <code>src/tool_paramhlp.c</code>에 정의된 <code>file2string()</code> 함수를 분석하면 그 명확한 이유를 찾을 수 있다.</p>
+                    <p>해당 함수는 파일을 메모리로 읽어 들일 때 <code>memcrlf()</code> 함수를 호출하여 줄바꿈 문자를 처리한다. 소스 코드 주석에는 <code>countcrlf FALSE - return number of bytes from the start that DO NOT include any CR or LF or NULL</code>이라고 명시되어 있다. 즉, 파일에서 서식 문자열을 로드할 때 실제 CR(캐리지 리턴)이나 LF(라인 피드) 문자를 건너뛰어 버퍼를 연결한다.</p>
+                    <p>따라서 줄바꿈을 온전히 출력하려면 서식 파일 내에 실제 엔터 키 입력이 아니라, <strong>역슬래시와 영문 n으로 구성된 글자 그대로의 <code>\n</code> 문자열</strong>을 명시적으로 작성해야 한다. Everything curl 문서(writeout 절) 역시 <code>You can also output a newline by using \n, a carriage return with \r and a tab space with \t</code>라고 규정하고 있다.</p>
+                    <p>이를 반영하여 <code>curl-format2.txt</code>를 다음과 같이 준비했다.</p>
+                    <pre><code class="language-plaintext">namelookup:    %{time_namelookup}\n
+connect:       %{time_connect}\n
+appconnect:    %{time_appconnect}\n
+pretransfer:   %{time_pretransfer}\n
+starttransfer: %{time_starttransfer}\n
+total:         %{time_total}\n
+http_code:     %{http_code}\n
+size_download: %{size_download}\n
+remote_ip:     %{remote_ip}\n</code></pre>
+                    <p>이 파일은 바이너리 검사(<code>od -c</code>)를 통해 <code>\</code> 문자와 <code>n</code> 문자 두 글자가 물리적으로 기록되어 있음을 확인했다.</p>
+
+                    <h2 id="sec-4">3. -w 시간 변수의 본질 - 누적이 만든 값과 차이 계산</h2>
+                    <p>수정된 형식 파일 <code>curl-format2.txt</code>를 사용하여 <code>https://example.com/</code>에 두 차례 요청을 보내 측정값을 수집했다.</p>
+                    <pre><code class="language-bash">for i in 1 2; do echo "=== run $i"; curl -s -o /dev/null -w @curl-format2.txt https://example.com/; done</code></pre>
+                    <p>터미널에 반환된 실제 출력은 다음과 같다.</p>
+                    <pre><code class="language-plaintext">=== run 1
+namelookup:    0.016839
+connect:       0.148093
+appconnect:    0.476784
+pretransfer:   0.476995
+starttransfer: 0.619743
+total:         0.619873
+http_code:     200
+size_download: 713
+remote_ip:     172.66.147.243
+=== run 2
+namelookup:    0.016120
+connect:       0.143699
+appconnect:    0.463794
+pretransfer:   0.463936
+starttransfer: 0.600572
+total:         0.603125
+http_code:     200
+size_download: 713
+remote_ip:     172.66.147.243</code></pre>
+
+                    <h3 id="sec-4-1">3.1 6개 시간 지표가 그리는 요청 생애주기</h3>
+                    <p>출력된 숫자들을 위에서 아래로 살펴보면 값이 일관되게 <strong>점진적으로 증가</strong>한다는 사실을 알 수 있다. run 1에서 namelookup은 약 0.017초, connect는 약 0.148초, appconnect는 약 0.477초, total은 약 0.620초를 나타낸다.</p>
+                    <p>이것이 의미하는 바는 결정적이다. <strong>curl의 <code>time_*</code> 변수들은 해당 단계 자체에 소요된 독립적인 기간이 아니라, 요청 시작 시점(0.000초)부터 해당 단계가 완료된 시점까지 경과한 「누적 시각」</strong>이다. 예컨대 <code>time_connect</code>의 0.148093초는 TCP 연결에만 0.148초가 걸렸다는 뜻이 아니라, 요청 시작부터 TCP 연결이 끝날 때까지 흐른 누적 시간이다.</p>
+
+                    <h3 id="sec-4-2">3.2 단계별 소요 시간을 구하는 뺄셈 공식</h3>
+                    <p>따라서 순수한 단계별 소요 시간을 계산하려면 바로 앞선 단계의 누적 시각을 빼는 뺄셈 연산이 필요하다. run 1의 실제 수치들을 초 단위에서 밀리초(ms) 단위로 환산하여 뺄셈식을 도출하면 다음과 같다.</p>
+                    <ul>
+                        <li><strong>DNS 조회 소요</strong>: <code>time_namelookup</code> = 16.8 ms (run 2: 16.1 ms)</li>
+                        <li><strong>TCP 연결 소요</strong>: <code>time_connect - time_namelookup</code> = 148.1 - 16.8 = 131.3 ms (run 2: 127.6 ms)</li>
+                        <li><strong>TLS 핸드셰이크 소요</strong>: <code>time_appconnect - time_connect</code> = 476.8 - 148.1 = 328.7 ms (run 2: 320.1 ms)</li>
+                        <li><strong>클라이언트 요청 준비</strong>: <code>time_pretransfer - time_appconnect</code> = 477.0 - 476.8 = 0.2 ms (run 2: 0.1 ms)</li>
+                        <li><strong>서버 첫 바이트 대기(TTFB)</strong>: <code>time_starttransfer - time_pretransfer</code> = 619.7 - 477.0 = 142.7 ms (run 2: 136.6 ms)</li>
+                        <li><strong>본문 다운로드 전송</strong>: <code>time_total - time_starttransfer</code> = 619.87 - 619.74 = 0.1 ms (run 2: 2.6 ms)</li>
+                    </ul>
+                    <p>이 측정에서 전체 소요 시간 약 0.62초 중 가장 큰 비중을 차지한 구간은 전체의 절반 이상(약 328.7 ms)을 차지한 <strong>TLS 핸드셰이크</strong> 구간이었다. 앞선 실험 1의 측정에서도 <code>appconnect - connect</code> 구간은 약 0.30~0.42초로 세 번 모두 가장 컸다. 이 숫자는 이 특정 환경과 네트워크 경로에서 단 1회씩 측정한 실측값이며, 모든 인프라에 일반화할 수 있는 고정치가 아니라는 점을 분명히 한다.</p>
+
+                    <h2 id="sec-5">4. 단계별 구간 분해와 병목 진단 표</h2>
+                    <p>측정된 누적 시각의 차이를 표로 구조화하면 어떤 구간이 지연을 유발하는지 곧바로 범위를 좁힐 수 있다. 다음은 이번 환경의 실측값(1회)과 함께 각 차이가 비정상적으로 커졌을 때 점검해야 할 일반적인 네트워크 배경을 정리한 진단 결정표다.</p>
+
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>커진 구간</th>
+                                <th>계산식 (누적값의 차)</th>
+                                <th>이 환경 실측 (run 1, 1회 측정)</th>
+                                <th>지연 발생 시 의심할 배경 요인</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>DNS 조회</td>
+                                <td><code>namelookup</code></td>
+                                <td>16.8 ms</td>
+                                <td>로컬 DNS 캐시 미스, 재귀 리졸버 응답 지연, 외부 DNS 서버 장애</td>
+                            </tr>
+                            <tr>
+                                <td>TCP 연결</td>
+                                <td><code>connect - namelookup</code></td>
+                                <td>131.3 ms</td>
+                                <td>네트워크 물리적 거리(RTT), 중간 방화벽의 SYN 패킷 지연 또는 패킷 손실</td>
+                            </tr>
+                            <tr>
+                                <td>TLS 핸드셰이크</td>
+                                <td><code>appconnect - connect</code></td>
+                                <td>328.7 ms</td>
+                                <td>인증서 체인 검증 지연, 암호 스위트 협상 왕복, TLS 버전 차이</td>
+                            </tr>
+                            <tr>
+                                <td>서버 응답 대기</td>
+                                <td><code>starttransfer - pretransfer</code></td>
+                                <td>142.7 ms</td>
+                                <td>서버 측 애플리케이션 연산 부하, DB 쿼리 병목, 리버스 프록시 캐시 미스</td>
+                            </tr>
+                            <tr>
+                                <td>본문 전송 수신</td>
+                                <td><code>total - starttransfer</code></td>
+                                <td>0.1 ms (713 B)</td>
+                                <td>응답 페이로드 크기, 네트워크 대역폭 제한, 수신 버퍼 병목</td>
+                            </tr>
+                        </tbody>
+                    </table>
+
+                    <p>이처럼 계산식을 적용하면 전체 지연 620ms를 막연히 「서버가 느리다」고 치부하는 대신, 「DNS 17ms, TCP 131ms, TLS 329ms, 서버 첫 바이트 대기 143ms」(이 환경 1회 측정)로 분해하여 네트워크 팀이나 인프라 팀에 구체적인 근거 수치를 제시할 수 있다.</p>
+
+                    <h2 id="sec-6">5. -v 상세 출력 읽기와 Schannel 환경의 한계</h2>
+                    <p><code>-w</code>가 정량적인 숫자 지표를 제공한다면, <code>-v</code>(<code>--verbose</code>)는 curl이 통신하는 전 과정을 프로토콜 수준의 텍스트 로그로 보여준다.</p>
+
+                    <h3 id="sec-6-1">5.1 접두사 기호(*, &gt;, &lt;, {)로 흐름 읽기</h3>
+                    <p>실제 <code>curl -v -o /dev/null https://example.com/ 2&gt;&amp;1</code> 실행에서 얻은 핵심 출력은 다음과 같다(진행률 표시 줄은 뺐다. 쿠키·추적 헤더는 원래 없었다).</p>
+                    <pre><code class="language-plaintext">* Host example.com:443 was resolved.                 ← DNS
+* IPv6: (none)
+* IPv4: 172.66.147.243, 104.20.23.154
+*   Trying 172.66.147.243:443...                      ← TCP 연결 시도
+* schannel: disabled automatic use of client certificate   ← TLS(Schannel)
+* Connected to example.com (172.66.147.243) port 443
+* using HTTP/1.x
+&gt; GET / HTTP/1.1                                      ← 요청 헤더 ( &gt; )
+&gt; Host: example.com
+&gt; User-Agent: curl/8.12.1
+&gt; Accept: */*
+&gt;
+* Request completely sent off
+&lt; HTTP/1.1 200 OK                                     ← 응답 헤더 ( &lt; )
+&lt; Date: Mon, 28 Sep 2026 22:43:27 GMT
+&lt; Content-Type: text/html; charset=utf-8
+&lt; Transfer-Encoding: chunked
+&lt; Connection: keep-alive
+&lt; Server: cloudflare
+&lt; last-modified: Mon, 28 Sep 2026 16:19:32 GMT
+&lt; allow: GET, HEAD
+&lt; Accept-Ranges: bytes
+&lt; Age: 7950
+&lt; cf-cache-status: HIT
+&lt;
+{ [725 bytes data]
+* Connection #0 to host example.com left intact</code></pre>
+                    <p>출력 라인의 맨 앞 기호는 다음 규칙으로 구분된다.</p>
+                    <ul>
+                        <li><code>*</code>: curl 내부 제어 정보 (DNS 해석 결과, IP 주소, 소켓 상태, SSL 백엔드 동작)</li>
+                        <li><code>&gt;</code>: 클라이언트가 서버로 전송한 요청 헤더 라인</li>
+                        <li><code>&lt;</code>: 서버로부터 전달받은 응답 헤더 라인</li>
+                        <li><code>{</code>: 받은 데이터의 양 (이 출력에서는 <code>{ [725 bytes data]</code>)</li>
+                    </ul>
+
+                    <h3 id="sec-6-2">5.2 --trace-time 타임스탬프와 단계 경계 해석</h3>
+                    <p>각 라인이 출력되는 절대 시각을 기록하기 위해 <code>--trace-time</code> 플래그를 추가한 출력이다.</p>
+                    <pre><code class="language-plaintext">07:43:32.016000 * Host example.com:443 was resolved.
+07:43:32.018000 * IPv6: (none)
+07:43:32.018000 * IPv4: 172.66.147.243, 104.20.23.154
+07:43:32.018000 *   Trying 172.66.147.243:443...
+07:43:32.146000 * schannel: disabled automatic use of client certificate
+07:43:32.450000 * Connected to example.com (172.66.147.243) port 443
+07:43:32.450000 * using HTTP/1.x
+07:43:32.450000 &gt; GET / HTTP/1.1</code></pre>
+                    <p>이 출력에는 두 가지 중요한 현상이 드러난다. 첫째, <code>--trace-time</code>의 소수점 아래 여섯 자리 중 뒤 세 자리가 모두 <code>000</code>으로 찍힌다. 이 환경의 Windows curl 빌드에서는 마이크로초 대신 밀리초 단위까지만 시간 정보를 제공함을 의미한다.</p>
+                    <p>둘째, 「Connected to」 라인의 출력 시점이다. TCP 연결 시도(<code>Trying</code>)가 <code>.018</code>에 시작되었고, Schannel 관련 줄이 <code>.146</code>에 나온 뒤, <code>Connected to</code> 줄은 TLS가 사실상 마무리된 <code>.450</code>에 찍혔다. 즉, 이 Schannel 빌드에서는 소켓 수준의 TCP 연결 직후가 아니라 TLS 핸드셰이크까지 끝난 시점에 <code>Connected</code> 로그를 내보내는 것으로 읽힌다. 따라서 <strong>로그 텍스트 줄 간격으로 단계를 가늠하기보다는, 앞서 살펴본 <code>-w</code>의 <code>time_connect</code> 및 <code>time_appconnect</code> 변수 값을 확인하는 편이 훨씬 정확</strong>하다.</p>
+                    <p>또한 이 Windows Schannel 빌드는 <code>-v</code>를 붙여도 협상된 TLS 버전(TLS 1.2/1.3), 암호화 알고리즘 스위트, 서버 인증서 유효기간 등의 상세 내역을 전혀 출력하지 않았다. <code>--trace-config tls,dns</code>를 지정해도 추가 로그가 발생하지 않았다. Linux·macOS에서 쓰이는 OpenSSL 빌드의 <code>-v</code> 출력은 이 환경에서 확인하지 못했으므로, 빌드가 다르면 출력도 다를 수 있다는 점만 염두에 둔다.</p>
+
+                    <h2 id="sec-7">6. 두 가지 타임아웃(--connect-timeout vs -m)과 종료 코드</h2>
+                    <p>배치 작업이나 스크립트에서 curl을 실행할 때 타임아웃을 올바르게 제어하지 않으면 무응답 서버에 프로세스가 무한정 묶이는 사고가 발생한다. curl은 연결 구간에만 적용되는 <code>--connect-timeout</code>과 전체 요청 생애주기를 제한하는 <code>-m</code>(<code>--max-time</code>)이라는 두 가지 서로 다른 시간 제한 플래그를 제공한다.</p>
+
+                    <h3 id="sec-7-1">6.1 연결 구간만 끊는 --connect-timeout</h3>
+                    <p>응답이 없는 사설 IP인 <code>10.255.255.1</code>에 <code>--connect-timeout 2</code>를 지정하여 실행한 결과다.</p>
+                    <pre><code class="language-bash">time curl -sS --connect-timeout 2 -o /dev/null http://10.255.255.1/; echo "exit=$?"</code></pre>
+                    <pre><code class="language-plaintext">curl: (28) Connection timed out after 2011 milliseconds
+real	0m2.122s
+exit=28</code></pre>
+                    <p>정확히 2.011초 후 연결 시도가 중단되며 curl은 <strong>종료 코드 28</strong>을 반환했다. curl manpage에 따르면 <code>--connect-timeout</code>은 오직 연결 단계(connection phase)에 허용되는 최대 시간만을 규정하며, 연결이 성립된 이후의 데이터 전송 단계는 간섭하지 않는다.</p>
+
+                    <h3 id="sec-7-2">6.2 전체 작업을 끊는 -m(--max-time)의 우선순위</h3>
+                    <p>반면 <code>-m</code>(또는 <code>--max-time</code>)은 공식 문서에 <code>Maximum time in seconds that you allow the whole operation to take</code>로 정의되어 있듯이, DNS 조회부터 본문 수신 완료까지 전체 작업에 허용되는 총 시간이다.</p>
+                    <p>두 옵션이 동시에 주어졌을 때의 우선순위를 검증하기 위해 <code>--connect-timeout 5</code>와 <code>-m 0.2</code>를 동시에 지정하여 정상 서버에 요청을 보냈다.</p>
+                    <pre><code class="language-bash">curl -sS --connect-timeout 5 -m 0.2 -o /dev/null https://example.com/; echo "exit=$?"</code></pre>
+                    <pre><code class="language-plaintext">curl: (28) Connection timed out after 204 milliseconds
+exit=28</code></pre>
+                    <p>연결 타임아웃을 5초로 넉넉하게 주었음에도 불구하고, 전체 작업 제한인 <code>-m 0.2</code>가 먼저 동작하여 204밀리초 만에 통신을 끊었다. 즉, <strong><code>-m</code>이 <code>--connect-timeout</code>보다 짧으면 연결 단계라 할지라도 <code>-m</code>이 우선하여 강제 종료</strong>한다.</p>
+                    <p>흥미로운 점은 같은 종료 코드 28이라도 <strong>실패가 발생한 단계에 따라 에러 메시지가 달라진다</strong>는 사실이다.</p>
+                    <ul>
+                        <li>연결 성립 전 타임아웃: <code>curl: (28) Connection timed out after 204 milliseconds</code></li>
+                        <li>연결 후 응답 대기 중 타임아웃 (<code>-m 0.5</code> 지정 시): <code>curl: (28) Operation timed out after 514 milliseconds with 0 bytes received</code> (이때 <code>http_code</code>는 <code>000</code> 반환)</li>
+                    </ul>
+                    <p>또한 <code>-m 0.58</code>을 부여하여 총 소요 시간(0.578초) 내에 정상 전송이 완료된 경우에는 종료 코드 0과 HTTP 200이 정상적으로 반환되었다.</p>
+
+                    <h2 id="sec-8">7. 스크립트 연동을 위한 -sS, -f, 그리고 JSON 출력</h2>
+                    <p>CI/CD 파이프라인이나 감시 스크립트에서 curl을 단독 실행할 때, 플래그 선택의 미세한 차이가 심각한 감시 누락을 만든다.</p>
+
+                    <h3 id="sec-8-1">7.1 오류 출력을 살리는 -sS와 실패 종료 코드를 내는 -f</h3>
+                    <p>존재하지 않는 도메인 <code>nonexistent.invalid</code>를 조회했을 때의 실측 결과다.</p>
+                    <pre><code class="language-bash">curl -sS -o /dev/null https://nonexistent.invalid/; echo "exit=$?"
+curl -s  -o /dev/null https://nonexistent.invalid/; echo "exit=$?"</code></pre>
+                    <pre><code class="language-plaintext">curl: (6) Could not resolve host: nonexistent.invalid
+exit=6
+=== -s alone hides error
+exit=6</code></pre>
+                    <p>진행률 막대만 끄려고 <code>-s</code>(<code>--silent</code>)만 사용하면 오류 메시지까지 함께 사라져 원인을 확인할 수 없다. 스크립트에서는 반드시 <strong>조용히 실행하되 에러는 표준 에러로 출력하는 <code>-sS</code>(<code>--silent --show-error</code>)</strong> 조합을 써야 한다. 도메인 해석 실패 시 종료 코드는 로컬 매뉴얼 명세대로 <strong>6</strong>이다.</p>
+                    <p>더 위험한 함정은 HTTP 404 같은 오류 응답이다.</p>
+                    <pre><code class="language-bash">curl -s  -o /dev/null -w '%{http_code}\n' https://example.com/no-such-page; echo "exit(no -f)=$?"
+curl -sf -o /dev/null https://example.com/no-such-page; echo "exit(-f)=$?"</code></pre>
+                    <pre><code class="language-plaintext">404
+exit(no -f)=0
+exit(-f)=22</code></pre>
+                    <p>이 실험에서 curl은 404를 받고도 <strong><code>-f</code>가 없으면 종료 코드 0(성공)을 반환</strong>했다. <code>$?</code>만 보는 스크립트는 멈추지 않고 계속 진행된다. <code>-f</code>(<code>--fail</code>)를 붙여야만 HTTP 400 이상에서 <strong>종료 코드 22</strong>를 내며 스크립트가 멈춘다. 헤더만 확인할 때는 <code>-I</code>(HEAD 요청 전송)를 쓰고, 리다이렉트를 추적할 때는 <code>-L</code>을 조합하여 최종 <code>%{url_effective}</code>와 <code>%{http_code}</code>를 점검해야 한다.</p>
+
+                    <p>다음은 실제 테스트를 통해 검증된 종료 코드와 메시지 정리 표다.</p>
+
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>상황</th>
+                                <th>지정 옵션</th>
+                                <th>종료 코드</th>
+                                <th>실제 반환된 에러 메시지</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>응답 없는 사설 IP 연결 시도</td>
+                                <td><code>--connect-timeout 2</code></td>
+                                <td>28</td>
+                                <td>Connection timed out after 2011 milliseconds</td>
+                            </tr>
+                            <tr>
+                                <td>연결 중 전체 시간 초과</td>
+                                <td><code>-m 0.2</code></td>
+                                <td>28</td>
+                                <td>Connection timed out after 204 milliseconds</td>
+                            </tr>
+                            <tr>
+                                <td>응답 대기 중 전체 시간 초과</td>
+                                <td><code>-m 0.5</code></td>
+                                <td>28</td>
+                                <td>Operation timed out after 514 milliseconds with 0 bytes received</td>
+                            </tr>
+                            <tr>
+                                <td>존재하지 않는 도메인 조회</td>
+                                <td><code>-sS</code> (<code>-s</code> 만 쓰면 문구 없이 6)</td>
+                                <td>6</td>
+                                <td>Could not resolve host: nonexistent.invalid</td>
+                            </tr>
+                            <tr>
+                                <td>HTTP 404 응답 수신</td>
+                                <td>(<code>-f</code> 미지정)</td>
+                                <td>0</td>
+                                <td>(에러 없음, 정상 수신으로 처리)</td>
+                            </tr>
+                            <tr>
+                                <td>HTTP 404 응답 수신</td>
+                                <td><code>-f</code> 지정</td>
+                                <td>22</td>
+                                <td>— (<code>-s</code> 로 문구가 숨겨져 출력 없음)</td>
+                            </tr>
+                        </tbody>
+                    </table>
+
+                    <h3 id="sec-8-2">7.2 curl 8.12의 %{json} 및 %{header_json} 활용</h3>
+                    <p>별도의 복잡한 서식 파일을 관리하지 않고 구조화된 지표를 다루고자 한다면, curl이 제공하는 JSON 내보내기를 쓸 수 있다. curl 8.12.1 환경에서 <code>%{json}</code>과 <code>%{header_json}</code>을 실측했다.</p>
+                    <pre><code class="language-bash">curl -s -o /dev/null -w '%{json}' https://example.com/ | python -c "…키 개수와 일부 키 출력…"
+curl -s -o /dev/null -w '%{header_json}' https://example.com/ | head -c 120</code></pre>
+                    <p>실제 반환된 파싱 결과다.</p>
+                    <pre><code class="language-plaintext">keys: 67
+http_code = 200
+time_namelookup = 0.016632
+time_connect = 0.144654
+time_appconnect = 0.431361
+time_starttransfer = 0.568338
+time_total = 0.568422
+remote_ip = 172.66.147.243
+http_version = 1.1
+scheme = https
+exitcode = 0
+errormsg = None
+curl_version = libcurl/8.12.1 Schannel zlib/1.3.1 brotli/1.1.0 zstd/1.5.6 libidn2/2.3.7 libpsl/0.21.5 libssh2/1.11.1
+=== -w %{header_json} support
+{"date":["Mon, 28 Sep 2026 22:43:41 GMT"],
+"content-type":["text/html; charset=utf-8"],
+"transfer-encoding":["chunked"</code></pre>
+                    <p>curl 8.12.1의 <code>-w '%{json}'</code>은 67개의 키를 가진 단일 JSON 객체를 완전하게 출력한다. 시간 변수뿐만 아니라 <code>exitcode</code>, <code>errormsg</code>, <code>curl_version</code>, <code>remote_ip</code>까지 전부 포함되어 있으므로, <code>jq</code>나 Python 스크립트와 파이프라인으로 연결하여 특정 지연 임계값을 감시하기에 적합하다. <code>%{header_json}</code>도 응답 헤더를 JSON 형태로 냈다(출력 앞 120바이트만 확인).</p>
+
+                    <p>마지막으로 진단 상황별 권장 플래그 조합을 표로 정리한다.</p>
+
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>진단 목적</th>
+                                <th>권장 플래그 조합</th>
+                                <th>기대 출력 및 이점</th>
+                                <th>사용 시 주의점</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>단계별 지연시간 정밀 측정</td>
+                                <td><code>-s -o /dev/null -w @curl-format2.txt</code></td>
+                                <td>DNS·TCP·TLS·TTFB 단계별 밀리초 분해</td>
+                                <td>형식 파일 내부 개행은 반드시 리터럴 <code>\n</code> 사용</td>
+                            </tr>
+                            <tr>
+                                <td>로그 기반 핸드셰이크 흐름 점검</td>
+                                <td><code>-sv --trace-time -o /dev/null</code></td>
+                                <td>헤더 송수신 및 타임스탬프 기반 이벤트 흐름</td>
+                                <td>이 Schannel 빌드는 TLS 상세 줄이 없었음(OpenSSL 빌드는 미확인)</td>
+                            </tr>
+                            <tr>
+                                <td>장애 방지 스크립트 자동화</td>
+                                <td><code>-sS -f --connect-timeout 3 -m 10</code></td>
+                                <td>연결 및 전체 타임아웃 분리, 400 이상 응답에서 종료 코드 22(문서 기준, 404로 실측)</td>
+                                <td>-f 없이는 404 응답도 exit 0이 되므로 주의</td>
+                            </tr>
+                        </tbody>
+                    </table>
+
+                    <h2 id="sec-9">확인하지 못한 것</h2>
+                    <p>본 포스트의 모든 분석은 실제 명령 실행과 공식 문서를 대조하여 검증했으나, 현재 테스트 환경의 한계로 인하여 다음 사항은 직접 확인하지 못했다.</p>
+                    <ul>
+                        <li><strong>OpenSSL 기반 빌드의 상세 TLS 출력 줄</strong>: 본 검증은 Schannel 백엔드를 쓰는 curl 8.12.1(x86_64-w64-mingw32 빌드)에서만 수행되었다. Linux나 macOS에서 흔한 OpenSSL 기반 curl의 <code>-v</code>에 TLS 관련 줄이 어떻게 나오는지는 이 환경에서 확인하지 못했다.</li>
+                        <li><strong>libcurl manpage 공식 time_* 정의 원문</strong>: Everything curl 가이드와 manpage의 옵션 설명은 대조했으나, libcurl C API 레벨의 <code>CURLINFO_*</code> 변수별 공식 정의 문구는 확인하지 못해 실험 2의 누적 시각 관찰로 뺄셈식을 정의했다.</li>
+                        <li><strong>HTTP/2 환경에서의 다중 스트림 누적 시간</strong>: 테스트에 사용된 curl 빌드가 HTTP/2 기능을 포함하지 않아(<code>using HTTP/1.x</code>), HTTP/2 환경에서 단일 연결 위 다중 스트림 요청 시 각 지표가 어떻게 기록되는지는 직접 측정하지 못했다.</li>
+                    </ul>
+
+                    <h2 id="sec-10">참고 자료</h2>
+                    <ul>
+                        <li>Everything curl: write-out 공식 문서 <code>https://everything.curl.dev/usingcurl/verbose/writeout.html</code></li>
+                        <li>curl 공식 맨페이지 (curl manpage) <code>https://curl.se/docs/manpage.html</code></li>
+                        <li>curl 8.12.1 소스 코드 (src/tool_paramhlp.c) <code>https://raw.githubusercontent.com/curl/curl/curl-8_12_1/src/tool_paramhlp.c</code></li>
+                        <li>로컬 시스템 <code>curl --manual</code> 명령어 출력 (curl 8.12.1 built-in manual)</li>
+                    </ul>
+
+                    <!-- md-artifact-start -->
+                    <div class="md-artifact" style="margin:2rem 0;border:1px solid #d7dce3;border-radius:10px;overflow:hidden;background:#fbfcfd;">
+                        <div style="display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;justify-content:space-between;padding:.7rem 1rem;background:#eef2f7;border-bottom:1px solid #d7dce3;">
+                            <span style="font-weight:700;font-size:.97rem;">📋 그대로 가져다 쓰는 체크리스트</span>
+                            <span style="display:flex;gap:.5rem;align-items:center;">
+                                <code style="font-size:.82rem;color:#5a6675;background:transparent;padding:0;">curl_debug_flags_guide.md</code>
+                                <button type="button" class="md-artifact-copy" style="cursor:pointer;border:1px solid #b9c2cf;background:#fff;color:#2c3e50;font-weight:600;line-height:1.3;border-radius:6px;padding:.32rem .7rem;font-size:.85rem;">전체 복사</button>
+                            </span>
+                        </div>
+                        <pre style="margin:0;max-height:420px;overflow:auto;padding:1rem;background:#fbfcfd;font-size:.86rem;line-height:1.62;"><code class="nohighlight" style="background:transparent;padding:0;white-space:pre;"># curl 진단 플래그와 지연 구간 분해 - 실무 참조표
+
+검증 환경: Windows 10 Pro 10.0.19045, curl 8.12.1(Schannel), Git Bash, Python 3.13.3.
+표의 값과 메시지는 이 환경에서 실행해 확인한 것이다(시간은 1회 측정값). 4번의 3번 명령은 예시로, 이 조합 자체는 실행하지 않았다.
+
+---
+
+## 1. 어느 구간이 느린가 — 차이로 읽기
+
+curl 의 `time_*` 변수는 요청 시작부터의 **누적 시각**이다. 단계별 소요 시간은 앞선 단계 값과의 뺄셈으로 구한다.
+
+| 커진 구간 | 계산식 (누적값의 차) | 이 환경 실측 (1회) | 느릴 때 의심할 곳 (일반 배경) |
+|---|---|---|---|
+| DNS 조회 | `time_namelookup` | 16.8 ms | 로컬 캐시 미스, 재귀 리졸버 응답 지연 |
+| TCP 연결 | `time_connect - time_namelookup` | 131.3 ms | 네트워크 왕복 시간(RTT), 방화벽 패킷 지연 |
+| TLS 핸드셰이크 | `time_appconnect - time_connect` | 328.7 ms | 인증서 체인 검증, 암호 스위트 협상 (가장 큼) |
+| 서버 첫 바이트 대기 (TTFB) | `time_starttransfer - time_pretransfer` | 142.7 ms | 서버 연산 부하, DB 쿼리 병목, 캐시 미스 |
+| 본문 받기 전송 | `time_total - time_starttransfer` | 0.1 ms (713 B) | 응답 본문 크기, 네트워크 대역폭 제한 |
+
+---
+
+## 2. 종료 코드 표 (실측)
+
+| 상황 | 지정 옵션 | 종료 코드 | 실제 반환된 메시지 |
+|---|---|---|---|
+| 응답 없는 사설 IP 연결 시도 | `--connect-timeout 2` | 28 | `Connection timed out after 2011 milliseconds` |
+| 연결 중 전체 시간 초과 | `-m 0.2` | 28 | `Connection timed out after 204 milliseconds` |
+| 응답 대기 중 전체 시간 초과 | `-m 0.5` | 28 | `Operation timed out after 514 milliseconds with 0 bytes received` |
+| 존재하지 않는 도메인 조회 | `-sS` (`-s` 만 쓰면 문구 없이 6) | 6 | `Could not resolve host: nonexistent.invalid` |
+| HTTP 404 응답 수신 | (없음, `-f` 미지정) | 0 | (오류 없이 정상 수신 처리) |
+| HTTP 404 응답 수신 | `-f` (`--fail`) | 22 | — (`-s` 로 문구가 숨겨져 출력 없음) |
+
+---
+
+## 3. 실무 점검표
+
+- [ ] **형식 파일 줄바꿈 함정**: 형식 파일(`@curl-format.txt`) 안에는 실제 줄바꿈이 아니라 글자 그대로 `\n` 을 적어야 한다 (실제 줄바꿈은 curl 내부 `file2string()` 에서 버려진다).
+- [ ] **스크립트 기본 옵션**: 스크립트에서는 진행률을 끄고 에러는 보이게 하는 `-sS`(`--silent --show-error`)를 사용한다.
+- [ ] **HTTP 오류 상태 감지**: `-f`(`--fail`) 없이는 404 응답도 종료 코드 0으로 끝났으므로(문서: `-f` 는 400 이상에서 22) 반드시 `-f` 를 붙이거나 `%{http_code}` 를 검증한다.
+- [ ] **타임아웃 우선순위 제어**: `--connect-timeout`(연결 한도)과 `-m`(전체 한도)을 함께 둘 때, `-m` 이 더 짧으면 연결 단계에서도 `-m` 이 먼저 끊는다.
+- [ ] **Schannel 빌드 특성**: 이 환경의 Schannel 빌드(curl 8.12.1, x86_64-w64-mingw32)의 `-v` 에는 TLS 상세 줄(버전·암호 스위트·인증서)이 나오지 않으므로 TLS 시간은 `-w` 의 `time_appconnect` 로 잰다.
+- [ ] **지원 프로토콜 확인**: 빌드마다 기능이 다르므로 진단 전 `curl -V` 로 HTTP2 지원 여부 등을 먼저 확인한다.
+
+---
+
+## 4. 권장 진단 템플릿
+
+### 정밀 지연 측정용 형식 파일 (`curl-format.txt`)
+```text
+namelookup:    %{time_namelookup}\n
+connect:       %{time_connect}\n
+appconnect:    %{time_appconnect}\n
+pretransfer:   %{time_pretransfer}\n
+starttransfer: %{time_starttransfer}\n
+total:         %{time_total}\n
+http_code:     %{http_code}\n
+size_download: %{size_download}\n
+remote_ip:     %{remote_ip}\n
+```
+
+### 실행 명령어 예시
+```bash
+# 1. 단계별 밀리초 측정
+curl -s -o /dev/null -w @curl-format.txt https://example.com/
+
+# 2. JSON 통계 추출 (curl 8.12.1 에서 확인)
+curl -s -o /dev/null -w '%{json}' https://example.com/
+
+# 3. 안전한 스크립트 호출 예시 (값 3·10 은 예시, 이 조합 자체는 실행하지 않음)
+curl -sS -f --connect-timeout 3 -m 10 -o output.dat https://example.com/
+```
+</code></pre>
+                        <p style="margin:0;padding:.6rem 1rem;font-size:.82rem;color:#5a6675;border-top:1px solid #e3e8ee;">복사해서 메모 앱이나 AI 도구에 그대로 붙여 넣으세요.</p>
+                    </div>
+                    <script>
+                    (function(){
+                      if (window.__mdArtifactBound) return;
+                      window.__mdArtifactBound = true;
+                      document.addEventListener('click', function(ev){
+                        var btn = ev.target.closest && ev.target.closest('.md-artifact-copy');
+                        if (!btn) return;
+                        var box = btn.closest('.md-artifact');
+                        var code = box && box.querySelector('pre code');
+                        if (!code) return;
+                        var text = code.textContent;
+                        var label = btn.textContent;
+                        var ok = function(){
+                          btn.textContent = "복사됨";
+                          setTimeout(function(){ btn.textContent = label; }, 1600);
+                          if (typeof gtag === 'function') {
+                            gtag('event', 'md_copy', { slug: "curl_debug_flags_guide", lang: "ko", chars: text.length });
+                          }
+                        };
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                          navigator.clipboard.writeText(text).then(ok).catch(function(){ fallback(); });
+                        } else { fallback(); }
+                        function fallback(){
+                          var ta = document.createElement('textarea');
+                          ta.value = text; ta.setAttribute('readonly','');
+                          ta.style.position='fixed'; ta.style.left='-9999px';
+                          document.body.appendChild(ta); ta.select();
+                          try { document.execCommand('copy'); ok(); } catch(e) {}
+                          document.body.removeChild(ta);
+                        }
+                      });
+                    })();
+                    </script>
+                    <!-- md-artifact-end -->
+
+                <div class="share-section">
+                        <h3>이 글 공유하기</h3>
+                        <div class="social-share">
+                            <button id="kakao-share" class="share-btn kakao-btn">카카오톡</button>
+                            <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                            <button id="twitter-share" class="share-btn twitter-btn">X(트위터)</button>
+                            <button id="threads-share" class="share-btn threads-btn">쓰레드</button>
+                            <button id="link-copy" class="share-btn link-btn">링크 복사</button>
+                        </div>
+                    </div>
+
+                    <div class="back-to-list">
+                        <a href="../blog.html" class="back-link">목록으로 돌아가기</a>
+                    </div>
+                </div>
+            <!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">함께 쓰면 좋은 무료 도구</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/curl_builder.html">curl 명령어 생성기 2026</a></li>
+      <li><a href="../static/http_status_codes.html">HTTP 상태 코드 완전 정리 2026</a></li>
+      <li><a href="../static/nginx_generator.html">Nginx 설정 생성기</a></li>
+      <li><a href="../static/ssh_config_generator.html">SSH config 생성기 2026</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">전체 도구 보기 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">관련 글</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="sed_inplace_safety.html">sed -i 는 제자리 수정이 아니다 — 대량 치환 전에 미리 보기·백업·diff 순서</a></li>
+      <li><a href="go_vanity_import_path_custom_domain.html">Go 코드를 GitHub에 직접 묶지 않는 법 — 커스텀 도메인과 go-import 메타 태그의 구조</a></li>
+      <li><a href="tencent_browserskill_logged_in_browser_agent_2026.html">Tencent BrowserSkill 분석 — 로그인된 실제 브라우저를 에이전트에게 넘기는 설계와 권한 경계 2026</a></li>
+      <li><a href="postgres_at_time_zone_utc_trap.html">PostgreSQL AT TIME ZONE 'UTC'의 함정 — 세션 TimeZone이 소리 없이 끼어드는 세 자리</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+
+    <script src="../common.js"></script>
+</body>
+</html>
