@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<!--
+ * 技术博客文章模板
+ * Copyright (c) 2023-2026 braindetox.kr
+-->
+<html lang="zh">
+<head>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YE3ELRSMZE"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-YE3ELRSMZE');
+    </script>
+
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>交换空间如何把Go垃圾回收器的STW拉长到40ms：机制与实测分析</title>
+    <meta name="description" content="整理Go的GC在启用交换空间的环境中，STW停顿从中位数约51µs延长到最坏40ms的实测。内容涉及STW期间读取堆外元数据时发生的228次缺页，元数据位于NVMe上的条件，以及Green Tea GC的复测结果。">
+    <meta name="keywords" content="Go, 垃圾回收器, GC, STW, 交换空间, 缺页, BPF, MGLRU, Linux内核, 延迟">
+
+    <link rel="canonical" href="https://braindetox.kr/zh/posts/go_gc_40ms_pause_swap_page_faults_2026.html">
+
+    <meta property="og:title" content="交换空间如何把Go垃圾回收器的STW拉长到40ms：机制与实测分析">
+    <meta property="og:description" content="整理Go的GC在启用交换空间的环境中，STW停顿从中位数约51µs延长到最坏40ms的实测。内容涉及STW期间读取堆外元数据时发生的228次缺页，元数据位于NVMe上的条件，以及Green Tea GC的复测结果。">
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://braindetox.kr/zh/posts/go_gc_40ms_pause_swap_page_faults_2026.html">
+    <meta property="og:image" content="https://braindetox.kr/site_logo.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:locale" content="zh_CN">
+    <meta property="article:published_time" content="2026-10-06">
+    <meta property="article:section" content="开发/基础设施">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="交换空间如何把Go垃圾回收器的STW拉长到40ms：机制与实测分析">
+    <meta name="twitter:description" content="整理Go的GC在启用交换空间的环境中，STW停顿从中位数约51µs延长到最坏40ms的实测。内容涉及STW期间读取堆外元数据时发生的228次缺页，元数据位于NVMe上的条件，以及Green Tea GC的复测结果。">
+    <meta name="twitter:image" content="https://braindetox.kr/site_logo.png">
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../../styles.css">
+
+    <style>
+        .post-content-header { margin-bottom: 2rem; border-bottom: 1px solid #eaeaea; padding-bottom: 1rem; }
+        .post-title { font-size: 2rem; font-weight: 700; color: #333; margin-bottom: 0.5rem; }
+        .post-subtitle { font-size: 1.3rem; font-weight: 400; color: #666; margin-bottom: 1rem; }
+        .post-meta { display: flex; flex-wrap: wrap; gap: 1rem; color: #777; font-size: 0.9rem; }
+        .post-date { display: inline-block; }
+        .post-category { display: inline-block; background-color: #f0f0f0; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .post-content { line-height: 1.8; color: #333; }
+        .post-content h2 { margin-top: 2rem; margin-bottom: 1rem; color: #2c3e50; }
+        .post-content h3 { margin-top: 1.5rem; margin-bottom: 0.8rem; color: #34495e; }
+        .post-content p { margin-bottom: 1.2rem; }
+        .post-content ul, .post-content ol { margin-bottom: 1.2rem; padding-left: 2rem; }
+        .post-content li { margin-bottom: 0.5rem; }
+        .post-content blockquote { border-left: 4px solid #3498db; padding-left: 1rem; color: #555; font-style: italic; margin: 1.5rem 0; }
+        .post-content code { background-color: #f8f8f8; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: Consolas, Monaco, monospace; font-size: 0.9em; }
+        .post-content pre { background-color: #f8f8f8; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 1.5rem 0; }
+        .post-content pre code { background: none; padding: 0; font-size: 0.86em; line-height: 1.6; }
+        .post-content table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
+        .post-content th, .post-content td { padding: 0.7rem; border: 1px solid #e0e0e0; }
+        .post-content th { background-color: #f5f5f5; font-weight: 600; }
+        .post-content tr:nth-child(even) { background-color: #f9f9f9; }
+        .tbl-wrap { overflow-x: auto; }
+        .callout { background:#fff8e1; border-left:4px solid #f0ad4e; padding:1rem 1.2rem; margin:1.5rem 0; border-radius:4px; }
+        .post-toc { background:#f7f9fb; border:1px solid #e3e9ef; border-radius:6px; padding:1rem 1.2rem; margin:1.5rem 0; }
+        .post-toc h3 { margin:0 0 0.6rem; font-size:1.05rem; }
+        .post-toc ol { margin:0; padding-left:1.4rem; }
+        .post-toc li { margin-bottom:0.3rem; }
+        .back-to-list { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #eaeaea; }
+        .back-link { display: inline-block; padding: 0.5rem 1rem; background-color: #3498db; color: white; text-decoration: none; border-radius: 4px; }
+        .back-link:hover { background-color: #2980b9; }
+        @media (max-width: 768px) {
+            .post-title { font-size: 1.7rem; }
+            .post-subtitle { font-size: 1.1rem; }
+        }
+    </style>
+
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js" defer></script>
+
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7911569280980377" crossorigin="anonymous"></script>
+
+    <link rel="alternate" hreflang="ko" href="https://braindetox.kr/posts/go_gc_40ms_pause_swap_page_faults_2026.html">
+    <link rel="alternate" hreflang="en" href="https://braindetox.kr/en/posts/go_gc_40ms_pause_swap_page_faults_2026.html">
+    <link rel="alternate" hreflang="ja" href="https://braindetox.kr/ja/posts/go_gc_40ms_pause_swap_page_faults_2026.html">
+    <link rel="alternate" hreflang="zh" href="https://braindetox.kr/zh/posts/go_gc_40ms_pause_swap_page_faults_2026.html">
+    <link rel="alternate" hreflang="x-default" href="https://braindetox.kr/posts/go_gc_40ms_pause_swap_page_faults_2026.html">
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      "headline": "交换空间如何把Go垃圾回收器的STW拉长到40ms：机制与实测分析",
+      "alternativeHeadline": "中位数51µs的约800倍，最坏40ms——STW期间发生的228次缺页的BPF实测",
+      "datePublished": "2026-10-06",
+      "dateModified": "2026-10-06",
+      "inLanguage": "zh-CN",
+      "articleSection": "开发/基础设施",
+      "author": {
+        "@type": "Person",
+        "name": "BrainDetox"
+      },
+      "keywords": "Go, 垃圾回收器, GC, STW, 交换空间, 缺页, BPF, MGLRU, Linux内核, 延迟",
+      "publisher": {
+        "@type": "Organization",
+        "name": "BrainDetox",
+        "logo": {
+          "@type": "ImageObject",
+          "url": "https://braindetox.kr/site_logo.png"
+        }
+      },
+      "image": {
+        "@type": "ImageObject",
+        "url": "https://braindetox.kr/site_logo.png"
+      },
+      "mainEntityOfPage": "https://braindetox.kr/zh/posts/go_gc_40ms_pause_swap_page_faults_2026.html"
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "Go GC的STW停顿延长到40ms的直接原因是什么？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "GC在世界停止期间读取的堆外元数据页被换出到了交换空间，读取它们时发生了主缺页。在原文报告的最坏情况中，39,902µs的停顿里有39,013µs花在了228次缺页上。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "STW期间出现交换延迟时，为什么所有goroutine都会停下？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Go GC在清扫终止和标记终止两个时间点停止世界，此时所有P都会停止。原文解释说，即使等待中的goroutine的I/O在停顿期间完成，也没有任何主体来处理它。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "原文是如何测量228次缺页和39ms的？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "作者使用了一个bpftrace脚本，按进程汇总stopTheWorldWithSema与startTheWorldWithSema之间do_swap_page和filemap_fault的调用次数和耗时。脚本公开在仓库go-gc-swap-cost的bpf/stw.bt中。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Go 1.26的Green Tea GC能缓解这个问题吗？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "作者在9月14日的更新中测量了Green Tea是否改变GC读取元数据的方式，并写道影响可以忽略，但没有公布数字。Go官方所说的GC开销减少10%到40%，是与此问题无关的一般基准测试预期。"
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "原文是否建议关闭交换空间？",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "没有。作者同意Chris Down的观点，认为交换空间并不是坏东西，但同时写道它与垃圾回收配合得不好，而且自己的生产环境会进行大量回收。原文没有给出具体的运维建议。"
+          }
+        }
+      ]
+    }
+    </script>
+
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BreadcrumbList",
+      "itemListElement": [
+        {
+          "@type": "ListItem",
+          "position": 1,
+          "name": "首页",
+          "item": "https://braindetox.kr/zh/"
+        },
+        {
+          "@type": "ListItem",
+          "position": 2,
+          "name": "开发/基础设施",
+          "item": "https://braindetox.kr/zh/category/dev.html"
+        },
+        {
+          "@type": "ListItem",
+          "position": 3,
+          "name": "交换空间如何把Go垃圾回收器的STW拉长到40ms：机制与实测分析",
+          "item": "https://braindetox.kr/zh/posts/go_gc_40ms_pause_swap_page_faults_2026.html"
+        }
+      ]
+    }
+    </script>
+</head>
+<body>
+    <div id="header-placeholder"></div>
+
+    <main class="container">
+        <section class="content-section">
+            <article class="blog-post-content" itemscope itemtype="https://schema.org/BlogPosting">
+                <meta itemprop="inLanguage" content="zh-CN">
+                <meta itemprop="datePublished" content="2026-10-06">
+                <meta itemprop="dateModified" content="2026-10-06">
+                <meta itemprop="author" content="BrainDetox">
+                <meta itemprop="keywords" content="Go, 垃圾回收器, GC, STW, 交换空间, 缺页, BPF, MGLRU, Linux内核, 延迟">
+                <meta itemprop="image" content="https://braindetox.kr/site_logo.png">
+                <meta itemprop="mainEntityOfPage" content="https://braindetox.kr/zh/posts/go_gc_40ms_pause_swap_page_faults_2026.html">
+
+                <div class="post-content-header">
+                    <h1 class="post-title" itemprop="name">交换空间如何把Go垃圾回收器的STW拉长到40ms：机制与实测分析</h1>
+                    <h2 class="post-subtitle">中位数51µs的约800倍，最坏40ms——STW期间发生的228次缺页的BPF实测</h2>
+                    <div class="post-meta">
+                        <span class="post-date" itemprop="datePublished" content="2026-10-06">2026年10月6日</span>
+                        <a class="post-category-link" href="../category/dev.html"><span class="post-category" itemprop="articleSection">开发/基础设施</span></a>
+                    </div>
+                </div>
+
+                <div class="post-content" itemprop="articleBody">
+
+                    <nav class="post-toc">
+                        <h3>本文涵盖的内容</h3>
+                        <ol>
+                            <li><a href="#sec-1">问题提出——启用交换空间的环境中观测到的40ms停顿</a></li>
+                            <li><a href="#sec-2">STW的两个时间点与发生缺页的GC内部调用位置</a></li>
+                            <li><a href="#sec-3">原文说明的内核路径——从换出到主缺页</a></li>
+                            <li><a href="#sec-4">实验环境与bpftrace脚本——stw.bt全文</a></li>
+                            <li><a href="#sec-5">消息构建延迟——由分配goroutine独自承担的成本</a></li>
+                            <li><a href="#sec-6">Green Tea GC的复测与Go官方说明</a></li>
+                            <li><a href="#sec-7">原文的结论与阅读时的注意事项</a></li>
+                            <li><a href="#sec-8">未能确认的内容</a></li>
+                            <li><a href="#sec-9">参考资料</a></li>
+                        </ol>
+                    </nav>
+
+                    <div class="callout">
+                    本文将Fernando Simões的《A 40ms Go GC pause caused by swap》（2026年9月13日，含9月14日更新）与仓库go-gc-swap-cost中的bpf/stw.bt、Go 1.26发布说明以及Go博客的Green Tea文章对照整理而成。
+                    </div>
+                    
+                    <h2 id="sec-1">问题提出——启用交换空间的环境中观测到的40ms停顿</h2>
+                    
+                    <p>原文源于作者的一次经历：为了吸收内存突增而决定在生产环境使用交换空间，差点拍额头后悔。作者说写这篇文章是为了让读者不必重蹈覆辙。实验结构很简单：一个cgroup里放两个进程。一个是调用io.ReadAll后再调用proto.Unmarshal、生成blob和图结构体的Go进程，图结构体是Go分配器标记为scan的对象。另一个是大部分时间保持安静的HTTP服务器。</p>
+                    
+                    <p>作者最初的预期是这样的。收集器每次运行都会逐个指针地读取这些scan span，并决定如何处理。内存压力出现时，内核会把页面换出到交换设备，但换出是按cgroup而不是按进程进行的，所以两个进程的页面会一起被换出。因此内核与垃圾回收器之间陷入换入换出的悲伤循环的可能性很小。作者随后写道，这个预期是错的。</p>
+                    
+                    <p>实验中发现的问题是：Go的垃圾回收器会在世界停止（stop-the-world）的区间读取位于堆外、且不会被释放的区域中的元数据，而这些元数据可能在交换空间里。作者在启用MGLRU、内核6.8的Hetzner服务器上做了模拟运行，停顿时间中位数约为51µs，当元数据位于NVMe上时，最坏的停顿为40ms。</p>
+                    
+                    <ul>
+                    <li>中位数与最坏值：中位数约51µs，最坏值40ms（详细测量值39,902µs）。原文写40ms是中位数的800倍。直接用39,902除以51约得782倍（计算）。</li>
+                    <li>测量条件：最坏值按原文的说法是「元数据位于NVMe上时」的数值。测量51µs中位数时是否正在使用交换空间，原文没有明确说明。</li>
+                    <li>全局停顿：由于所有P都停止，例如原本在等待I/O的goroutine，其I/O在停顿期间完成返回时，也没有主体来处理。</li>
+                    </ul>
+                    
+                    <p>原文还提到，在测试中每次内存突增时这样的停顿会重复两三次。</p>
+                    
+                    <h2 id="sec-2">STW的两个时间点与发生缺页的GC内部调用位置</h2>
+                    
+                    <p>根据原文，Go GC要在两个时间点停止世界：执行清扫终止（sweep termination）时和执行标记终止（mark termination）时。在作者的实验中，30分钟内出现了312次这样的停顿。</p>
+                    
+                    <p>作者写了一个小型bpf脚本，统计世界停止期间的缺页次数。最坏的一次输出如下：停顿39,902µs，期间缺页228次，缺页内花费39,013µs。作者将其概括为「40ms中有39ms花在了228次缺页上」。这些缺页发生在GC的账目处理（bookkeeping）内部，原文用addr2line输出给出了十行调用位置。</p>
+                    
+                    <ul>
+                    <li>runtime.(*spanSet).reset — internal/runtime/atomic/types.go:194</li>
+                    <li>runtime.finishsweep_m — mcentral.go:71，另一条栈中为mgcsweep.go:268</li>
+                    <li>runtime.gcStart.func2 — mgc.go:724</li>
+                    <li>runtime.systemstack — asm_amd64.s:518</li>
+                    <li>runtime.gcStart — mgc.go:722</li>
+                    <li>runtime.nextMarkBitArenaEpoch — mheap.go:2481</li>
+                    </ul>
+                    
+                    <p>这十行可以读成两条各五帧的栈。一条从spanSet.reset开始，另一条从nextMarkBitArenaEpoch开始，两条都经过finishsweep_m、gcStart.func2、systemstack、gcStart。这与仓库脚本用ustack(5)捕获五帧相吻合。原文没有说明各函数的作用，也没有说明这些调用位置对应哪个STW时间点，因此本文也只写到名称和位置为止。</p>
+                    
+                    <h2 id="sec-3">原文说明的内核路径——从换出到主缺页</h2>
+                    
+                    <p>原文给出的理由是这样的。运行时分配了这些页面。它们不会被释放，而是被重复使用。并且它们在GC周期中被读取。内核按年龄换出页面，所以会把最久没有被访问的页面送入交换空间。GC停止世界并试图读取这些页面时，它们已经在交换空间里，于是发生主缺页。</p>
+                    
+                    <p>作者以「长话短说」的方式列出了一次缺页的处理过程：内核读取PTE，调用do_swap_page，找一个新的页框，把它计入cgroup，提交bio来读取页面，等待磁盘，再把它们放回内存。原文在这些步骤旁边附上了指向Linux 6.8源码（mm/memory.c、mm/swap_state.c、mm/page_io.c）相应行的链接。</p>
+                    
+                    <ul>
+                    <li>换出标准：访问时间。最久没有被访问的页面先被送入交换空间。</li>
+                    <li>换出单位：在作者的前提中是cgroup而不是进程，所以连安静的HTTP服务器的页面也处在同样的压力之下。</li>
+                    <li>元数据的访问模式：按原文的说法，这些页面在GC周期中被读取，也就是说在两个周期之间可能没有被触碰过。</li>
+                    <li>一次缺页的成本：由于上面的列表以等待磁盘结尾，在原文的最坏情况中，228次缺页发生在一次停顿之内。</li>
+                    </ul>
+                    
+                    <p>同样是缺页，发生的位置不同，影响范围也不同。作者在谈到构建511 KiB消息的goroutine的延迟时写道，这个成本只由执行分配的goroutine承担，所以是局部的，不像元数据停顿那样是全局的。相反，元数据缺页发生在世界停止期间，所有P一起等待。</p>
+                    
+                    <h2 id="sec-4">实验环境与bpftrace脚本——stw.bt全文</h2>
+                    
+                    <p>原文的模拟运行是在启用MGLRU、内核6.8的Hetzner服务器上进行的。图表、模拟分配器、bpf脚本、Python脚本等实验的全部内容都在仓库go-gc-swap-cost中。观测持续30分钟，其间STW出现了312次。下面是该仓库bpf/stw.bt的全文，连同注释原样抄录。</p>
+                    
+                    <pre><code>// BIN: path of the Go binary as seen by bpftrace, e.g. /proc/&lt;pid&gt;/root/tmp/pagefault
+                    // both processes run the same binary, so everything is keyed by pid: a fault counts only
+                    // against a pause of its own process
+                    uprobe:BIN:runtime.stopTheWorldWithSema /comm == "pagefault"/ {
+                      @stw_start[pid] = nsecs; @stw_faults[pid] = 0; @stw_fault_ns[pid] = 0;
+                    }
+                    uprobe:BIN:runtime.startTheWorldWithSema /@stw_start[pid]/ {
+                      $d = (uint64)(nsecs - @stw_start[pid]);
+                      @stw_us = hist($d / 1000); @stw_n[pid] = count(); @stw_ns[pid] = sum($d);
+                      printf("stw t=%d pid=%d %d us, faults during it %d, %d us in faults\n",
+                             elapsed / 1000000, pid, $d / 1000, @stw_faults[pid], @stw_fault_ns[pid] / 1000);
+                      delete(@stw_start[pid]);
+                    }
+                    // swap-in and file-backed faults both: the binary's own code pages can be evicted too
+                    kprobe:do_swap_page, kprobe:filemap_fault /comm == "pagefault" &amp;&amp; @stw_start[pid]/ {
+                      @f_start[tid] = nsecs; @stw_faults[pid]++; @stw_stack[ustack(5)] = count(); // five frames reach gcStart
+                    }
+                    kretprobe:do_swap_page, kretprobe:filemap_fault /@f_start[tid]/ {
+                      @stw_fault_ns[pid] += (uint64)(nsecs - @f_start[tid]); delete(@f_start[tid]);
+                    }
+                    END { clear(@stw_start); clear(@f_start); clear(@stw_faults); clear(@stw_fault_ns); }</code></pre>
+                    
+                    <p>脚本的结构分四部分。第一，挂在stopTheWorldWithSema上的uprobe按pid记录起始时间，并把缺页次数和缺页耗时清零。第二，挂在startTheWorldWithSema上的uprobe计算停顿时间$d并放入微秒直方图，把停顿时间、缺页次数、缺页耗时输出为一行，然后删除该pid的起始时间。第三，kprobe在进入do_swap_page和filemap_fault时记录时间戳，增加缺页次数，并用ustack(5)汇总调用栈。第四，kretprobe在这两个函数返回时把经过的时间累加到缺页耗时上。</p>
+                    
+                    <p>脚本的注释说明了两件事。一是两个进程运行同一个二进制文件，所以所有值都按pid区分，使缺页只计入自己进程的停顿；二是换入缺页和文件映射缺页都会被统计，因为二进制文件自身的代码页也可能被换出。读过脚本就能知道，原文的228次是do_swap_page与filemap_fault调用次数之和。</p>
+                    
+                    <ul>
+                    <li>观测：30分钟内STW共312次。</li>
+                    <li>最坏情况：停顿39,902µs，缺页228次，缺页处理合计39,013µs。</li>
+                    <li>缺页的占比：39,013 ÷ 39,902 ≈ 97.8%（计算）。原文自己的表述是「40ms中的39ms」。</li>
+                    <li>缺页之外的时间：39,902 − 39,013 = 889µs（计算）。原文没有给出这段时间的明细。</li>
+                    <li>重复：在测试中，每次内存突增会出现两三次这样的停顿。</li>
+                    </ul>
+                    
+                    <table>
+                    <caption>表1：原文STW停顿与缺页指标对照表</caption>
+                    <thead>
+                    <tr>
+                    <th>项目</th>
+                    <th>数值</th>
+                    <th>性质</th>
+                    <th>原文未说明的内容</th>
+                    </tr>
+                    </thead>
+                    <tbody>
+                    <tr>
+                    <td>STW停顿中位数</td>
+                    <td>约51µs</td>
+                    <td>原文</td>
+                    <td>测量时是否使用交换空间</td>
+                    </tr>
+                    <tr>
+                    <td>最坏STW停顿</td>
+                    <td>39,902µs（约40ms）</td>
+                    <td>原文，元数据位于NVMe上时</td>
+                    <td>网络卷上的STW最坏值</td>
+                    </tr>
+                    <tr>
+                    <td>最坏情况的缺页次数</td>
+                    <td>228次</td>
+                    <td>原文，脚本输出</td>
+                    <td>每次缺页的I/O大小</td>
+                    </tr>
+                    <tr>
+                    <td>缺页处理时间合计</td>
+                    <td>39,013µs</td>
+                    <td>原文，脚本输出</td>
+                    <td>缺页之外889µs的明细</td>
+                    </tr>
+                    <tr>
+                    <td>最坏值与中位数之比</td>
+                    <td>约800倍（原文），约782倍（39,902÷51的计算）</td>
+                    <td>原文与计算</td>
+                    <td>中位数的测量条件</td>
+                    </tr>
+                    <tr>
+                    <td>缺页在停顿中的占比</td>
+                    <td>约97.8%（计算）</td>
+                    <td>计算</td>
+                    <td>其他停顿案例中的占比</td>
+                    </tr>
+                    </tbody>
+                    </table>
+                    
+                    <h2 id="sec-5">消息构建延迟——由分配goroutine独自承担的成本</h2>
+                    
+                    <p>作者还注意到另一件事。构建一条511 KiB的消息通常需要3到5ms，当交换空间在NVMe上时升到了105ms，在Hetzner的网络卷上时升到了903ms。作者写道，按每条消息计算，这个成本比元数据停顿还大。不过只有执行分配的goroutine要付出这个代价，所以至少是局部的，不像元数据那样是全局的。</p>
+                    
+                    <ul>
+                    <li>范围：延迟只限于执行分配的goroutine。与全局STW不同，它不会让其他P停下来。</li>
+                    <li>介质差异：903ms相对于105ms约为8.6倍（903÷105，计算）。</li>
+                    <li>时间明细：作者亲自说明，尚未确认这段时间花在了哪里。</li>
+                    </ul>
+                    
+                    <p>作者把这一项写进文章的理由是，这是「你可能还要付出的另一项成本」。因此本文也不把消息构建延迟当作与STW缺页相同机制的结果。</p>
+                    
+                    <h2 id="sec-6">Green Tea GC的复测与Go官方说明</h2>
+                    
+                    <p>原文9月14日的更新很短。有人问Go 1.26的Green Tea垃圾回收器是否改变了GC读取元数据的方式，作者测量后发现影响可以忽略（negligible）。测量环境和数字没有公布。</p>
+                    
+                    <p>Go官方资料这样描述Green Tea。据Go博客（2025年10月29日），核心思想是「以页面而不是对象为单位工作」。它不再扫描对象而是扫描整个页面，工作列表里跟踪的也不是对象而是整个页面，已标记的对象则在每个页面内部局部跟踪，而不是在整个堆范围内跟踪。在Go中，页面大小为8 KiB，与硬件虚拟内存页大小无关。</p>
+                    
+                    <ul>
+                    <li>Go 1.25：通过GOEXPERIMENT=greenteagc启用的实验功能。博客写道，许多工作负载花在垃圾回收上的时间减少约10%，有些最多减少40%。</li>
+                    <li>Go 1.26：据发布说明，原为实验功能的Green Tea已默认启用，通过更好的局部性和CPU可扩展性改进小对象的标记与扫描。对大量使用垃圾回收的真实程序，预计GC开销减少10%到40%（Go官方数字）。</li>
+                    <li>进一步改进：在较新的amd64 CPU（Intel Ice Lake、AMD Zen 4及更新）上，扫描小对象时使用向量指令，预计GC开销还能再减少约10%。</li>
+                    <li>关闭方式：可在构建时用GOEXPERIMENT=nogreenteagc关闭，预计该设置将在Go 1.27中移除。</li>
+                    </ul>
+                    
+                    <p>10%到40%是针对GC的CPU开销的基准测试预期，而原文的问题是STW期间读取元数据时发生的缺页。两者测量的对象不同，不能用一方的数字推断另一方。本文确认到的只有一句话：作者测得Green Tea对元数据读取的影响可以忽略。</p>
+                    
+                    <h2 id="sec-7">原文的结论与阅读时的注意事项</h2>
+                    
+                    <p>原文的结论是一句半话。作者同意Chris Down的观点，认为交换空间并不是坏东西。但是交换空间与垃圾回收配合得不好，作者还补充说自己的生产环境会进行大量回收。原文中没有关闭交换空间的建议，也没有修改任何设置的建议。</p>
+                    
+                    <ul>
+                    <li>作者直接确认的：世界停止期间发生了元数据缺页，并且存在该缺页占停顿大部分的案例。</li>
+                    <li>作者写明未确认的：511 KiB消息构建延迟中的时间明细。</li>
+                    <li>作者只简短提及的：Green Tea的复测只给出了结果，没有数字。</li>
+                    <li>原文中没有的：运维建议、设置值，以及在其他环境中的复现。</li>
+                    </ul>
+                    
+                    <table>
+                    <caption>表2：原文说了什么与没说什么</caption>
+                    <thead>
+                    <tr>
+                    <th>主题</th>
+                    <th>原文所说</th>
+                    <th>原文未说</th>
+                    <th>阅读时的注意</th>
+                    </tr>
+                    </thead>
+                    <tbody>
+                    <tr>
+                    <td>对交换空间的评价</td>
+                    <td>同意Chris Down，交换空间并不是坏东西</td>
+                    <td>关闭交换空间或某项具体设置的建议</td>
+                    <td>不要把建议归到原文名下</td>
+                    </tr>
+                    <tr>
+                    <td>与GC的关系</td>
+                    <td>交换空间与垃圾回收配合得不好</td>
+                    <td>在一般条件下的发生频率</td>
+                    <td>这是一次模拟运行的结果</td>
+                    </tr>
+                    <tr>
+                    <td>Green Tea</td>
+                    <td>对元数据读取的影响可以忽略</td>
+                    <td>测量数字和条件</td>
+                    <td>Go官方的10%到40%是另一项指标</td>
+                    </tr>
+                    <tr>
+                    <td>消息构建延迟</td>
+                    <td>105ms（NVMe）、903ms（网络卷）</td>
+                    <td>时间明细</td>
+                    <td>不断言与STW缺页同因</td>
+                    </tr>
+                    </tbody>
+                    </table>
+                    
+                    <p>从这个案例只能谨慎地得出一般性的教训：即使在停顿很短的区间，如果该区间读取的内存在交换空间里，磁盘延迟就会直接叠加到停顿上。这在哪些生产环境中、以多高的频率发生，原文没有回答。</p>
+                    
+                    <h2 id="sec-8">未能确认的内容</h2>
+                    
+                    <ul>
+                    <li>测量51µs中位数时的条件。是否为使用交换空间时的数值，原文没有明确说明。</li>
+                    <li>构建511 KiB消息所花的105ms和903ms的时间明细。原文作者也写明没有确认时间花在哪里。</li>
+                    <li>元数据位于网络卷时的STW最坏值。原文只给出了NVMe情形的40ms。</li>
+                    <li>Green Tea GC复测的数字和运行条件。原文只写了影响可以忽略。</li>
+                    <li>在Hetzner服务器以外的环境以及内核6.8以外的内核上的复现结果。</li>
+                    <li>228次缺页中，换入缺页（do_swap_page）与文件映射缺页（filemap_fault）的比例。脚本把两者合并统计。</li>
+                    </ul>
+                    
+                    <h2 id="sec-9">参考资料</h2>
+                    
+                    <ul>
+                    <li><a href="https://frn.sh/go-gc/" target="_blank" rel="noopener">A 40ms Go GC pause caused by swap</a> — Fernando Simões的原文，2026年9月13日的文章，含9月14日的Green Tea更新。</li>
+                    <li><a href="https://news.hada.io/topic?id=34816" target="_blank" rel="noopener">由交换空间引发的Go垃圾回收器40ms停顿</a> — GeekNews主题摘要。</li>
+                    <li><a href="https://github.com/frnsimoes/go-gc-swap-cost" target="_blank" rel="noopener">go-gc-swap-cost</a> — 作者公开的复现仓库：bpf/stw.bt脚本、模拟分配器和分析代码。</li>
+                    <li><a href="https://go.dev/doc/go1.26" target="_blank" rel="noopener">Go 1.26 Release Notes</a> — Green Tea默认启用以及GC开销减少10%到40%的预期。</li>
+                    <li><a href="https://go.dev/blog/greenteagc" target="_blank" rel="noopener">The Green Tea Garbage Collector</a> — Go博客对Green Tea的说明（2025年10月29日）。</li>
+                    </ul>
+
+                </div>
+
+                <div class="share-section">
+                    <h3>分享这篇文章</h3>
+                    <div class="social-share">
+                        <button id="facebook-share" class="share-btn facebook-btn">Facebook</button>
+                        <button id="twitter-share" class="share-btn twitter-btn">X (Twitter)</button>
+                        <button id="threads-share" class="share-btn threads-btn">Threads</button>
+                        <button id="link-copy" class="share-btn link-btn">复制链接</button>
+                    </div>
+                </div>
+
+                <div class="back-to-list">
+                    <a href="../blog.html" class="back-link">返回文章列表</a>
+                </div>
+<!-- tools-start -->
+    <div class="related-tools" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">配合使用的免费工具</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="../static/jwt_decoder.html">JWT解码生成器 2026</a></li>
+      <li><a href="../static/base64_encoder.html">Base64 编码器/解码器</a></li>
+      <li><a href="../static/yaml_json_converter.html">YAML JSON转换器 2026</a></li>
+      <li><a href="../static/curl_builder.html">curl命令生成器 2026</a></li>
+      </ul>
+      <p style="margin-top:0.6rem;"><a href="../static_index.html">查看全部工具 &rarr;</a></p>
+    </div>
+    <!-- tools-end -->
+                <!-- related-start -->
+    <div class="related-posts" style="margin:2.5rem 0 0;padding:1.5rem 0 0;border-top:1px solid #e5e7eb;">
+      <h2 style="font-size:1.3rem;margin-bottom:0.8rem;">相关文章</h2>
+      <ul style="line-height:1.9;padding-left:1.2rem;">
+      <li><a href="io_uring_sqpoll_cpu_latency_tradeoff_2026.html">io_uring SQPOLL与无系统调用I/O — CPU与延迟之间的极致权衡</a></li>
+      <li><a href="static_allocation_constant_work.html">让最坏情况保持恒定，和让平均值变快，是两个不同的目标 - 静态分配与恒定工作量</a></li>
+      <li><a href="oom_killer_diagnosis.html">进程无声无息地死了 - 读懂 OOM Killer</a></li>
+      <li><a href="powershell_error_handling_exit_codes.html">PowerShell的错误处理不止try/catch - 退出码与$LASTEXITCODE的执行验证</a></li>
+      </ul>
+    </div>
+    <!-- related-end -->
+</article>
+        </section>
+    </main>
+
+    <div id="footer-placeholder"></div>
+    <script src="../../common.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('pre code').forEach((block) => { hljs.highlightElement(block); });
+        });
+    </script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const facebookShareBtn = document.getElementById('facebook-share');
+        if (facebookShareBtn) facebookShareBtn.addEventListener('click', () => window.open('https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(location.href), '_blank'));
+        const twitterShareBtn = document.getElementById('twitter-share');
+        if (twitterShareBtn) twitterShareBtn.addEventListener('click', () => window.open('https://twitter.com/intent/tweet?url=' + encodeURIComponent(location.href) + '&text=' + encodeURIComponent(document.title), '_blank'));
+        const threadsShareBtn = document.getElementById('threads-share');
+        if (threadsShareBtn) {
+            threadsShareBtn.addEventListener('click', function() {
+                navigator.clipboard.writeText(location.href);
+                alert("链接已复制到剪贴板。欢迎在Threads等社交平台分享！");
+            });
+        }
+        const linkCopyBtn = document.getElementById('link-copy');
+        if (linkCopyBtn) linkCopyBtn.addEventListener('click', () => { navigator.clipboard.writeText(location.href); alert("链接已复制！"); });
+    });
+    </script>
+</body>
+</html>
